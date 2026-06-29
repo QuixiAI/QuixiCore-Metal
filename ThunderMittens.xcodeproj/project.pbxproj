@@ -122,6 +122,8 @@
 				kernels/attn_fwd/correctness/c_attn.m,
 				kernels/cmplx_matmul/cmplx_matmul.cpp,
 				kernels/fftconv/fftconv.cpp,
+				kernels/qgemm/qgemm.cpp,
+				kernels/qgemv/qgemv.cpp,
 				kernels/flux/flux.cpp,
 				kernels/gelu/gelu.cpp,
 				kernels/gemm_staged/gemm_staged.cpp,

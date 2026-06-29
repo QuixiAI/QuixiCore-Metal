@@ -80,13 +80,20 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   `complex_mma_*` + transposes + pointwise complex mul, and matches `torch.fft` exactly. **No
   distinct, Apple-feasible TK kernel remains.**
 
-**Not applicable / emulation-only on Apple (documented, not "ported"):**
+**Quantized GEMM/GEMV (Marlin's method) — IN PROGRESS (was wrongly parked as N/A):**
+- The dequant-in-register approach makes the whole quantized family feasible on Apple — dequant
+  packed weights → `half` → standard `simdgroup_matrix` MMA (GEMM) or simd-reduction (GEMV). See
+  `marlin-quant.md` for the plan; references: Marlin `dequant.h`, vLLM-Metal, llama.cpp `kernel_mul_mm`.
+- ✅ Done: `kernels/qgemm/` (dequant-to-shared → MMA, prefill/batched) and `kernels/qgemv/` (batch-1
+  decode, simd-reduction) on the **q8_0** format, dual-backend; the dequant primitive lives in
+  `include/.../tile/dequant.metal`. `tk.qgemm` auto-routes M==1 → `qgemv`.
+- ☐ Remaining (fan-out): `q4_0`, `q4_K`, Marlin `kU4B8`/`kU4` (int4); `fp8_e4m3`, `fp4_e2m1`, block-scaled
+  `mxfp8`/`nvfp4` (float) — each is one `dequant_<fmt>` + host quant + instantiations. Then the
+  dequant-direct-to-fragment optimization, and retrofitting `flux`/attention to take quantized weights.
+
+**Not applicable on Apple:**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —
   multi-GPU collectives; a single Apple GPU has no NVLink/multi-device fabric. N/A for this target.
-- Quantized tensor-core GEMM `gemm/{fp8_*, mxfp8_*, nvfp4_*}` — Apple `simdgroup_matrix` has no
-  fp8/mxfp8/nvfp4 path; only **dequant-to-bf16 emulation** is possible (the MLX-style quantized
-  matmul), which is a different value proposition than the TK tensor-core kernels. `int8` is the one
-  plausible emulation port.
 - `gemm/baselines/*` (cuBLAS reference impls) — reference baselines, not TK kernels.
 
 See `discrepencies.md` for the raw file listing.

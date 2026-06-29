@@ -39,6 +39,8 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
     os.path.join(_KERNELS, "cmplx_matmul", "cmplx_matmul.metal"),
     os.path.join(_KERNELS, "fftconv", "fftconv.metal"),
+    os.path.join(_KERNELS, "qgemm", "qgemm.metal"),
+    os.path.join(_KERNELS, "qgemv", "qgemv.metal"),
 ]
 
 
@@ -179,3 +181,14 @@ def fftconv(x: torch.Tensor, fmat: torch.Tensor, twf: torch.Tensor, finv: torch.
     leading size-2 (real,imag) axis: x (2,B,H,S,S), fmat/twf/finv/twi (2,S,S), kf (2,H,S,S)
     -> real (B,H,S,S)."""
     return _ext.fftconv(x, fmat, twf, finv, twi, kf)
+
+
+def qgemm(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
+    """Quantized GEMM (Marlin's method): out = dequantize(wq) @ x. wq packed weight blocks
+    (N, K//block_k, block_bytes) uint8; x (K, M) float16 -> (N, M) float16. MPS."""
+    return _ext.qgemm(wq, x, format)
+
+
+def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
+    """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. x (K, 1) float16 -> (N, 1). MPS."""
+    return _ext.qgemv(wq, x, format)

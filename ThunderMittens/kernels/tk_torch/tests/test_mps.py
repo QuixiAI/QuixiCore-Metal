@@ -323,6 +323,46 @@ def test_fftconv(shape):
     assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
 
 
+@pytest.mark.parametrize("nkm", [(32, 32, 32), (128, 128, 128), (256, 128, 64)])
+def test_qgemm_q8_0(nkm):
+    import numpy as np
+    from tk.quant import quantize_q8_0, dequantize_q8_0
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    X = rng.standard_normal((K, M)).astype(np.float32)
+    Wq = quantize_q8_0(W)
+    wq = torch.from_numpy(Wq).to("mps")
+    x = torch.from_numpy(X).to(torch.float16).to("mps")
+    got = tk_torch.qgemm(wq, x, "q8_0")
+    torch.mps.synchronize()
+    g = got.float().cpu().numpy()
+    with np.errstate(all="ignore"):
+        ref = dequantize_q8_0(Wq).astype(np.float32) @ X
+    assert got.shape == (N, M)
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
+@pytest.mark.parametrize("nk", [(32, 32), (128, 128), (256, 512)])
+def test_qgemv_q8_0(nk):
+    import numpy as np
+    from tk.quant import quantize_q8_0, dequantize_q8_0
+    N, K = nk
+    rng = np.random.default_rng(0)
+    W = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    x = rng.standard_normal((K, 1)).astype(np.float32)
+    Wq = quantize_q8_0(W)
+    wq = torch.from_numpy(Wq).to("mps")
+    xt = torch.from_numpy(x).to(torch.float16).to("mps")
+    got = tk_torch.qgemv(wq, xt, "q8_0")
+    torch.mps.synchronize()
+    g = got.float().cpu().numpy()
+    with np.errstate(all="ignore"):
+        ref = dequantize_q8_0(Wq).astype(np.float32) @ x
+    assert got.shape == (N, 1)
+    assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

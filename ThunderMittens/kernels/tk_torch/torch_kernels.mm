@@ -401,6 +401,36 @@ static at::Tensor fftconv_mps(const at::Tensor& x_in, const at::Tensor& F_in,
   return out;
 }
 
+static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
+                            const std::string& format) {
+  TORCH_CHECK(wq_in.device().is_mps(), "qgemm: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.scalar_type() == at::kByte, "qgemm: wq must be uint8 packed blocks");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemm: x must be float16");
+  auto wq = wq_in.contiguous(), x = x_in.contiguous();
+  TORCH_CHECK(wq.dim() == 3 && x.dim() == 2, "qgemm: wq (N,K/bk,bytes), x (K,M)");
+  const int block_k = (format == "q4_K") ? 256 : 32;
+  const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
+  TORCH_CHECK(x.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm: N%32,M%32, x rows==K");
+  auto out = at::empty({N, M}, x.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm(e, out, wq, x, N, K, M, format); });
+  return out;
+}
+
+static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
+                            const std::string& format) {
+  TORCH_CHECK(wq_in.device().is_mps(), "qgemv: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.scalar_type() == at::kByte, "qgemv: wq must be uint8 packed blocks");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemv: x must be float16");
+  auto wq = wq_in.contiguous(), x = x_in.contiguous();
+  TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && x.size(1) == 1, "qgemv: wq (N,K/bk,bytes), x (K,1)");
+  const int block_k = (format == "q4_K") ? 256 : 32;
+  const int N = wq.size(0), K = (int)wq.size(1) * block_k;
+  TORCH_CHECK(x.size(0) == K, "qgemv: x rows must equal K");
+  auto out = at::empty({N, 1}, x.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemv(e, out, wq, x, N, K, format); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -422,4 +452,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
+  m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
+  m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
 }

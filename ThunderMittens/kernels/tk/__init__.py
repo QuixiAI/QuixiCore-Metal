@@ -186,3 +186,23 @@ def fftconv(x, fmat, twf, finv, twi, kf):
     if _is_torch(x):
         return _torch().fftconv(x, fmat, twf, finv, twi, kf)
     return _mlx().fftconv(x, fmat, twf, finv, twi, kf)
+
+
+def qgemm(wq, x, format="q8_0"):
+    """Quantized GEMM (Marlin's method): out = dequantize(wq) @ x. wq is packed weight blocks
+    (N, K//block_k, block_bytes) uint8; x is (K, M) float16 -> (N, M) float16.
+    Routes batch-1 (M==1) to the qgemv decode path. Accepts mlx.array or torch.Tensor (MPS)."""
+    if x.shape[-1] == 1:                       # batch-1 decode -> GEMV
+        return qgemv(wq, x, format)
+    if _is_torch(wq):
+        return _torch().qgemm(wq, x, format)
+    return _mlx().qgemm(wq, x, format=format)
+
+
+def qgemv(wq, x, format="q8_0"):
+    """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. wq packed weight blocks
+    (N, K//block_k, block_bytes) uint8; x is (K, 1) float16 -> (N, 1) float16.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemv(wq, x, format)
+    return _mlx().qgemv(wq, x, format=format)

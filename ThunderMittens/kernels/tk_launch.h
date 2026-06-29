@@ -43,6 +43,8 @@ inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
 inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmplx_matmul_" + t; }
 inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_string(S); }
+inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" + fmt; }
+inline std::string qgemv_kernel_name(const std::string& fmt) { return "qgemv_" + fmt; }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -253,6 +255,29 @@ void launch_fftconv(E& e, typename E::out_t out, typename E::in_t x, typename E:
   e.in(finv, 4); e.in(twi, 5); e.in(kf, 6);
   e.bytes(BH, 7); e.bytes(H, 8);
   e.dispatch(BH, 1, 1, 32, 1, 1);
+}
+
+// ----- qgemm (quantized GEMM, dequant-to-shared): D@0 Wq@1 X@2 ; N@3 K@4 M@5 (i32) ;
+//        grid (M/32, N/32, 1), 64 threads (2 simdgroups). D=W@X, W (N,K) quantized blocks
+//        (format `fmt`), X (K,M) half, D (N,M) half. -----
+template <class E>
+void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                  int N, int K, int M, const std::string& fmt) {
+  e.pipeline(qgemm_kernel_name(fmt));
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 32, N / 32, 1, 64, 1, 1);  // 64 threads = 2 simdgroups, BM=32
+}
+
+// ----- qgemv (quantized GEMV, batch-1 decode): D@0 Wq@1 X@2 ; N@3 K@4 (i32) ;
+//        grid (N,1,1), 32 threads (1 simdgroup) per output row. d = W @ x, x (K,1) half. -----
+template <class E>
+void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                  int N, int K, const std::string& fmt) {
+  e.pipeline(qgemv_kernel_name(fmt));
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2);
+  e.bytes(N, 3); e.bytes(K, 4);
+  e.dispatch(N, 1, 1, 32, 1, 1);  // one simdgroup per output row
 }
 
 } // namespace tk

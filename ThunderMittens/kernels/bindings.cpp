@@ -53,6 +53,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/variant.h>
+#include <nanobind/stl/string.h>
 
 #include "add_rt/add_rt.h"
 #include "attn_fwd/attn_fwd.h"
@@ -72,6 +73,8 @@
 #include "mamba2/mamba2.h"
 #include "cmplx_matmul/cmplx_matmul.h"
 #include "fftconv/fftconv.h"
+#include "qgemm/qgemm.h"
+#include "qgemv/qgemv.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -305,5 +308,29 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Monarch FFT convolution (N=S*S); complex inputs with leading size-2 axis, real output
+      )");
+
+    m.def(
+      "qgemm",
+      &qgemm,
+      "wq"_a,
+      "x"_a,
+      "format"_a = "q8_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized GEMM (Marlin's method): out = dequantize(wq) @ x; wq packed weight blocks
+      )");
+
+    m.def(
+      "qgemv",
+      &qgemv,
+      "wq"_a,
+      "x"_a,
+      "format"_a = "q8_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized GEMV (batch-1 decode): out = dequantize(wq) @ x; x is (K,1)
       )");
 }
