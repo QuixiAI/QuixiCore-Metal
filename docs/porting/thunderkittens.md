@@ -26,10 +26,12 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `gemm_staged` | `gemm/bf16_h100` | ✅ 🏎️ | `mx.matmul` | Multi-simdgroup, threadgroup-staged GEMM (2 warps share the A block via shared mem). Competitive with `matmul_custom` and `mx.matmul`. `kernels/gemm_staged/` |
 | `attn_multiwarp` | `attention/mha_h100` | ✅ 🏎️ | SDPA (scale 1/√D) | Multi-warp flash-attn fwd (4 simdgroups share each K/V block via shared mem). Correct; not yet faster than `attn_fwd` at tested shapes (staging overhead) — perf tuning is future work. `kernels/attn_multiwarp/` |
 | `linear_attn` | `linear_attention`, `based/linear_attn` | ✅ | `Q @ (Kᵀ @ V)` | Non-causal linear attention (identity feature map), D=64; `mma_AtB` then `mma_AB` with D×D register state. `kernels/linear_attn/` |
+| `hedgehog` | `hedgehog` | ✅ | `phi(Q)@(phi(K)ᵀ@V)` | Feature-map linear attention, φ(x)=exp(x−rowmax(x)) (col-layout feature map), D=64. `kernels/hedgehog/` |
+| `lin_attn_causal` | `based/linear_attn` | ✅ | `tril(Q@Kᵀ)@V` | Causal linear attention via chunked running-KV scan + intra-chunk `make_causal`, D=64. `kernels/lin_attn_causal/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(170 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+(184 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
 Benchmark the perf kernels: `python time_perf.py`.
 
 ## Completion map — the full 58-file TK inventory on Apple
@@ -49,11 +51,10 @@ TK files are hardware-specific *variants* of one algorithm:
   identity feature map).
 
 **Portable — remaining distinct kernels (open work, feasible on Apple):**
-- `hedgehog` — linear attention with a learned/softmax feature map; extends `linear_attn` with the
-  feature transform (no new substrate needed).
-- `based/linear_attn` causal + Taylor feature map — needs a causal/chunked state scan.
 - `mamba2` — selective SSD (chunked scan / segsum); large, distinct algorithm.
 - Perf tuning of `gemm_staged` (double-buffered, larger tiles) and `attn_multiwarp`.
+- (Done: `hedgehog` feature-map linear attention; `lin_attn_causal` causal linear attention.
+  A Taylor feature map for `based` is a small variant of `hedgehog`/`linear_attn`.)
 
 **Substrate-blocked:**
 - `fftconv` — needs **complex MMA** wrappers (the `crt`/`crv` complex types exist but have no

@@ -320,6 +320,38 @@ static at::Tensor linear_attn_mps(const at::Tensor& q_in, const at::Tensor& k_in
   return out;
 }
 
+static at::Tensor hedgehog_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                               const at::Tensor& v_in) {
+  TORCH_CHECK(q_in.device().is_mps(), "hedgehog: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "hedgehog: q must be bfloat16");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "hedgehog: expects (B,H,N,D)");
+  const int B = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64, "hedgehog: D must be 64");
+  TORCH_CHECK(N % 8 == 0, "hedgehog: N must be a multiple of 8");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_hedgehog(e, q, k, v, out, N, H, B, D); });
+  return out;
+}
+
+static at::Tensor lin_attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                      const at::Tensor& v_in) {
+  TORCH_CHECK(q_in.device().is_mps(), "lin_attn_causal: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "lin_attn_causal: q must be bfloat16");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "lin_attn_causal: expects (B,H,N,D)");
+  const int B = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64, "lin_attn_causal: D must be 64");
+  TORCH_CHECK(N % 8 == 0, "lin_attn_causal: N must be a multiple of 8");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_lin_attn_causal(e, q, k, v, out, N, H, B, D); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -336,4 +368,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");
   m.def("attn_multiwarp", &attn_multiwarp_mps, "ThunderMittens multi-warp attention (MPS)");
   m.def("linear_attn", &linear_attn_mps, "ThunderMittens non-causal linear attention (MPS)");
+  m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
+  m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
 }

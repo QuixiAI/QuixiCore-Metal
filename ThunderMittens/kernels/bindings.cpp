@@ -67,6 +67,8 @@
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
 #include "linear_attn/linear_attn.h"
+#include "hedgehog/hedgehog.h"
+#include "lin_attn_causal/lin_attn_causal.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -237,5 +239,29 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         non-causal linear attention (identity feature map): Q @ (K^T @ V)
+      )");
+
+    m.def(
+      "hedgehog",
+      &hedgehog,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        hedgehog linear attention: phi(Q) @ (phi(K)^T @ V), phi(x)=exp(x-rowmax(x))
+      )");
+
+    m.def(
+      "lin_attn_causal",
+      &lin_attn_causal,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        causal linear attention (identity feature map), chunked running-KV scan
       )");
 }

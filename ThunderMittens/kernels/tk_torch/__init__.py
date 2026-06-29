@@ -34,6 +34,8 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "gemm_staged", "gemm_staged.metal"),
     os.path.join(_KERNELS, "attn_multiwarp", "attn_multiwarp.metal"),
     os.path.join(_KERNELS, "linear_attn", "linear_attn.metal"),
+    os.path.join(_KERNELS, "hedgehog", "hedgehog.metal"),
+    os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
 ]
 
 
@@ -145,3 +147,13 @@ def attn_multiwarp(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 def linear_attn(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Non-causal linear attention Q@(K^T@V). bf16 (B,H,N,D) MPS; D=64, N%8."""
     return _ext.linear_attn(q, k, v)
+
+
+def hedgehog(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Hedgehog feature-map linear attention. bf16 (B,H,N,D) MPS; D=64, N%8."""
+    return _ext.hedgehog(q, k, v)
+
+
+def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Causal linear attention (chunked scan). bf16 (B,H,N,D) MPS; D=64, N%8."""
+    return _ext.lin_attn_causal(q, k, v)

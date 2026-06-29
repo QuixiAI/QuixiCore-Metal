@@ -148,3 +148,17 @@ def linear_attn(q, k, v):
     if _is_torch(q):
         return _torch().linear_attn(q, k, v)
     return _mlx().linear_attn(q, k, v)
+
+
+def hedgehog(q, k, v):
+    """Hedgehog feature-map linear attention. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().hedgehog(q, k, v)
+    return _mlx().hedgehog(q, k, v)
+
+
+def lin_attn_causal(q, k, v):
+    """Causal linear attention (chunked scan). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().lin_attn_causal(q, k, v)
+    return _mlx().lin_attn_causal(q, k, v)

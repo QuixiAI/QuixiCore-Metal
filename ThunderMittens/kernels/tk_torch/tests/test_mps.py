@@ -213,6 +213,44 @@ def test_linear_attn(shape):
     assert diff / scale < 0.03
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 4, 256, 64)])
+def test_hedgehog(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    got = tk_torch.hedgehog(q, k, v)
+
+    def phi(x):
+        xf = x.float()
+        return torch.exp(xf - xf.max(dim=-1, keepdim=True).values)
+
+    kv = phi(k).transpose(-1, -2) @ v.float()
+    exp = phi(q) @ kv
+    torch.mps.synchronize()
+    diff = (got.float() - exp).abs().max().item()
+    scale = exp.abs().max().item() + 1e-9
+    assert diff / scale < 0.03
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 4, 128, 64)])
+def test_lin_attn_causal(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    got = tk_torch.lin_attn_causal(q, k, v)
+    scores = q.float() @ k.float().transpose(-1, -2)
+    mask = torch.tril(torch.ones(N, N, device="mps"))
+    exp = (scores * mask) @ v.float()
+    torch.mps.synchronize()
+    diff = (got.float() - exp).abs().max().item()
+    scale = exp.abs().max().item() + 1e-9
+    assert diff / scale < 0.03
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

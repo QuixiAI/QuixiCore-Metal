@@ -43,6 +43,8 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.cpp
     ${CMAKE_CURRENT_LIST_DIR}/linear_attn/linear_attn.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/hedgehog/hedgehog.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/lin_attn_causal/lin_attn_causal.cpp
 )
 
 # Add include headers
@@ -77,6 +79,8 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/gemm_staged/gemm_staged.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_multiwarp/attn_multiwarp.metal
         ${CMAKE_CURRENT_LIST_DIR}/linear_attn/linear_attn.metal
+        ${CMAKE_CURRENT_LIST_DIR}/hedgehog/hedgehog.metal
+        ${CMAKE_CURRENT_LIST_DIR}/lin_attn_causal/lin_attn_causal.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}
