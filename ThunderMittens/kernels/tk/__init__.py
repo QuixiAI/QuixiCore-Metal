@@ -162,3 +162,10 @@ def lin_attn_causal(q, k, v):
     if _is_torch(q):
         return _torch().lin_attn_causal(q, k, v)
     return _mlx().lin_attn_causal(q, k, v)
+
+
+def mamba2(C, B, X, cumlog):
+    """Mamba-2 / SSD forward. cumlog = cumsum(log a). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(C):
+        return _torch().mamba2(C, B, X, cumlog)
+    return _mlx().mamba2(C, B, X, cumlog)

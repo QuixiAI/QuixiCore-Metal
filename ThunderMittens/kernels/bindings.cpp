@@ -69,6 +69,7 @@
 #include "linear_attn/linear_attn.h"
 #include "hedgehog/hedgehog.h"
 #include "lin_attn_causal/lin_attn_causal.h"
+#include "mamba2/mamba2.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -263,5 +264,18 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         causal linear attention (identity feature map), chunked running-KV scan
+      )");
+
+    m.def(
+      "mamba2",
+      &mamba2,
+      "C"_a,
+      "B"_a,
+      "X"_a,
+      "cumlog"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Mamba-2 / SSD forward: Y_t = sum_{j<=t} (C_t.B_j) exp(cumlog_t-cumlog_j) X_j
       )");
 }

@@ -352,6 +352,23 @@ static at::Tensor lin_attn_causal_mps(const at::Tensor& q_in, const at::Tensor& 
   return out;
 }
 
+static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
+                             const at::Tensor& X_in, const at::Tensor& cl_in) {
+  TORCH_CHECK(C_in.device().is_mps(), "mamba2: C must be an MPS tensor");
+  TORCH_CHECK(C_in.scalar_type() == at::kBFloat16, "mamba2: C,B,X must be bfloat16");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2: cumlog must be float32");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(), cl = cl_in.contiguous();
+  TORCH_CHECK(C.dim() == 4, "mamba2: C,B,X expect (B,H,N,D)");
+  const int Bsz = C.size(0), H = C.size(1);
+  const unsigned N = static_cast<unsigned>(C.size(2));
+  const int D = C.size(3);
+  TORCH_CHECK(D == 64, "mamba2: D must be 64");
+  TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
+  auto out = at::empty_like(C);
+  tk_encode([&](TorchEncoder& e) { tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -370,4 +387,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("linear_attn", &linear_attn_mps, "ThunderMittens non-causal linear attention (MPS)");
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
+  m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
 }

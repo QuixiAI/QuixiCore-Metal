@@ -40,6 +40,7 @@ inline std::string attn_multiwarp_kernel_name(int D) { return "attn_multiwarp_" 
 inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std::to_string(D); }
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
+inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -211,6 +212,18 @@ void launch_lin_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typena
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
   e.dispatch(1, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- mamba2 (SSD): C@0 B@1 X@2 cumlog@3 -> Y@4 ; N@5(u32) H@6(u32) ;
+//        grid (N/8, H, B) group (32,1,1). C,B,X,Y (B,H,N,D) bf16; cumlog (B,H,N) fp32. -----
+template <class E>
+void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
+                   typename E::in_t cumlog, typename E::out_t Y, unsigned N, unsigned H,
+                   int B, int D) {
+  e.pipeline(mamba2_kernel_name(D));
+  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
+  e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
 } // namespace tk

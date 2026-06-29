@@ -28,10 +28,11 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `linear_attn` | `linear_attention`, `based/linear_attn` | ✅ | `Q @ (Kᵀ @ V)` | Non-causal linear attention (identity feature map), D=64; `mma_AtB` then `mma_AB` with D×D register state. `kernels/linear_attn/` |
 | `hedgehog` | `hedgehog` | ✅ | `phi(Q)@(phi(K)ᵀ@V)` | Feature-map linear attention, φ(x)=exp(x−rowmax(x)) (col-layout feature map), D=64. `kernels/hedgehog/` |
 | `lin_attn_causal` | `based/linear_attn` | ✅ | `tril(Q@Kᵀ)@V` | Causal linear attention via chunked running-KV scan + intra-chunk `make_causal`, D=64. `kernels/lin_attn_causal/` |
+| `mamba2` | `mamba2` | ✅ | `((C@Bᵀ)⊙exp(Δcumlog)⊙tril)@X` | Selective SSD forward (materialized chunked form); decay tile via `add_row`/`sub_col`/`exp` from a host-precomputed `cumlog=cumsum(log a)`, D=64. `kernels/mamba2/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(184 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
+(191 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
 Benchmark the perf kernels: `python time_perf.py`.
 
 ## Completion map — the full 58-file TK inventory on Apple
@@ -47,14 +48,14 @@ TK files are hardware-specific *variants* of one algorithm:
   tutorials) → `matmul_custom` (+ arbitrary shapes) and `gemm_staged`.
 - Norm/rotary/activation/fusion: `layernorm`, `rotary`, `flux/{flux_gelu,flux_gate}` → ported; plus
   `rms_norm`, `softmax`, `gelu` (TK has these inline/fused).
-- Sequence (entry point): `linear_attention` / `based/linear_attn` → `linear_attn` (non-causal,
-  identity feature map).
+- Sequence / state-space (the whole family): `linear_attention` / `based/linear_attn` / `hedgehog` /
+  `mamba2` → ported as `linear_attn` (non-causal), `lin_attn_causal` (causal scan), `hedgehog`
+  (feature-map), and `mamba2` (selective SSD with the decay-tile). A Taylor feature map for `based` is
+  a small variant of `hedgehog`/`linear_attn`.
 
-**Portable — remaining distinct kernels (open work, feasible on Apple):**
-- `mamba2` — selective SSD (chunked scan / segsum); large, distinct algorithm.
-- Perf tuning of `gemm_staged` (double-buffered, larger tiles) and `attn_multiwarp`.
-- (Done: `hedgehog` feature-map linear attention; `lin_attn_causal` causal linear attention.
-  A Taylor feature map for `based` is a small variant of `hedgehog`/`linear_attn`.)
+**Portable — remaining open work (feasible on Apple):**
+- Perf tuning of `gemm_staged` (double-buffered, larger tiles) and `attn_multiwarp`. (All distinct
+  algorithmic kernels are now ported; this is throughput optimization of correct kernels.)
 
 **Substrate-blocked:**
 - `fftconv` — needs **complex MMA** wrappers (the `crt`/`crv` complex types exist but have no

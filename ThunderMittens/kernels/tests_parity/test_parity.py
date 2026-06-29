@@ -179,6 +179,20 @@ def test_lin_attn_causal_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64)])
+def test_mamba2_parity(shape):
+    B, H, N, D = shape
+    rng = np.random.default_rng(0)
+    C = rng.standard_normal(shape).astype(np.float32) * 0.5
+    Bm = rng.standard_normal(shape).astype(np.float32) * 0.5
+    X = rng.standard_normal(shape).astype(np.float32)
+    a = 1.0 / (1.0 + np.exp(-rng.standard_normal((B, H, N)))) * 0.5 + 0.5
+    cumlog = np.cumsum(np.log(a), axis=-1).astype(np.float32)
+    om = tk.mamba2(_mk(C, "mlx"), _mk(Bm, "mlx"), _mk(X, "mlx"), _mk(cumlog, "mlx", "f32"))
+    ot = tk.mamba2(_mk(C, "torch"), _mk(Bm, "torch"), _mk(X, "torch"), _mk(cumlog, "torch", "f32"))
+    _assert_parity(om, ot, atol=1.0)
+
+
 @pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 256, 64)])
 def test_hedgehog_parity(shape):
     rng = np.random.default_rng(0)

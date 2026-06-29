@@ -251,6 +251,26 @@ def test_lin_attn_causal(shape):
     assert diff / scale < 0.03
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64)])
+def test_mamba2(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    C = torch.randn(shape, dtype=torch.bfloat16, device="mps") * 0.5
+    Bm = torch.randn(shape, dtype=torch.bfloat16, device="mps") * 0.5
+    X = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    a = torch.sigmoid(torch.randn(B, H, N, device="mps")) * 0.5 + 0.5
+    cumlog = torch.cumsum(torch.log(a), dim=-1).float()
+    got = tk_torch.mamba2(C, Bm, X, cumlog)
+    scores = C.float() @ Bm.float().transpose(-1, -2)
+    decay = torch.exp(cumlog[..., :, None] - cumlog[..., None, :])
+    mask = torch.tril(torch.ones(N, N, device="mps"))
+    exp = (scores * decay * mask) @ X.float()
+    torch.mps.synchronize()
+    diff = (got.float() - exp).abs().max().item()
+    scale = exp.abs().max().item() + 1e-9
+    assert diff / scale < 0.03
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk

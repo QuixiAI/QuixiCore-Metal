@@ -36,6 +36,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "linear_attn", "linear_attn.metal"),
     os.path.join(_KERNELS, "hedgehog", "hedgehog.metal"),
     os.path.join(_KERNELS, "lin_attn_causal", "lin_attn_causal.metal"),
+    os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
 ]
 
 
@@ -157,3 +158,8 @@ def hedgehog(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Causal linear attention (chunked scan). bf16 (B,H,N,D) MPS; D=64, N%8."""
     return _ext.lin_attn_causal(q, k, v)
+
+
+def mamba2(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor):
+    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D=64, N%8."""
+    return _ext.mamba2(C, B, X, cumlog)
