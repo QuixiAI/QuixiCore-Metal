@@ -10,7 +10,7 @@
 > group-32 absmean scale, 2-bit codes)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
 > so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
 > Phase 6 (retrofit) demonstrated: `kernels/qflux/` — `qflux_gelu` = gelu(dequantize(Wq)@X + bias),
-> the dequant path + flux's bias+GELU epilogue, all formats, dual-backend.
+> the dequant-direct-to-fragment path (zero-shuffle, like qgemm) + flux bias+GELU epilogue, all formats, dual-backend.
 > **Phase 5 DONE and is now the default `qgemm` path:** dequant-direct-to-fragment (Marlin
 > zero-shuffle) — `dequant_into_register` writes the dequantized weight straight into the
 > `simdgroup_matrix` register slots (using the substrate's lane→(row,col) fragment map), skipping the

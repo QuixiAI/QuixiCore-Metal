@@ -316,14 +316,14 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
 }
 
 // ----- qflux_gelu (quantized fused GEMM+GELU): D@0 Wq@1 X@2 bias@3 ; N@4 K@5 M@6 (i32) ;
-//        grid (M/32, N/32, 1), 64 threads. D = gelu(dequant(Wq) @ X + bias), all half. -----
+//        grid (M/32, N/32, 1), 32 threads (1 simdgroup, dequant-direct-to-fragment). -----
 template <class E>
 void launch_qflux_gelu(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
                        typename E::in_t bias, int N, int K, int M, const std::string& fmt) {
   e.pipeline(qflux_gelu_kernel_name(fmt));
   e.out(d, 0); e.in(wq, 1); e.in(x, 2); e.in(bias, 3);
   e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
-  e.dispatch(M / 32, N / 32, 1, 64, 1, 1);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);  // 1 simdgroup per 32x32 tile
 }
 
 } // namespace tk
