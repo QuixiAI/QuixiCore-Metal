@@ -17,6 +17,7 @@
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
+#include "tk_mlx_launch.h"
 #endif
 
 namespace mlx::core {
@@ -156,49 +157,17 @@ void AttnFwd::eval_gpu(
 //   }
 
   out.set_data(allocator::malloc_or_wait(out.nbytes()));
-  // Resolve name of kernel (corresponds to axpby.metal)
-  std::ostringstream kname;
+
   const int B = q.shape(0);
   const int H = q.shape(1);
   const int N = q.shape(2);
   const int D = q.shape(3);
-  kname << "attn_fwd_";
-  kname << std::to_string(D);
 
-  // Make sure the metal library is available
-  d.register_library("mlx_ext");
-
-  // Make a kernel from this metal library
-  auto kernel = d.get_kernel(kname.str(), "mlx_ext");
-
-  // Prepare to encode kernel
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  compute_encoder.set_compute_pipeline_state(kernel);
-
-  // Kernel parameters are registered with buffer indices corresponding to
-  // those in the kernel declaration at axpby.metal
-  int ndim = out.ndim();
-  size_t nelem = out.size();
-
-  // Encode input arrays to kernel
-  compute_encoder.set_input_array(q, 0);
-  compute_encoder.set_input_array(k, 1);
-  compute_encoder.set_input_array(v, 2);
-  compute_encoder.set_output_array(out, 3);
-//  compute_encoder.set_bytes(H, 4);
-//  compute_encoder.set_bytes(N, 5);
-    compute_encoder.set_bytes(N, 4);
-    compute_encoder.set_bytes(H, 5);
-
-
-  MTL::Size group_dims = MTL::Size(32, 1, 1);
-
-  
-  MTL::Size grid_dims = MTL::Size(N / 8, H, B);
-
-  // Launch the grid with the given number of threads divided among
-  // the given threadgroups
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  // Dispatch via the shared host ABI (grid (N/8, H, B); one simdgroup per q-tile).
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_attn_fwd(enc, q, k, v, out, static_cast<unsigned>(N),
+                      static_cast<unsigned>(H), B, D);
 }
 
 // #else // Metal is not available

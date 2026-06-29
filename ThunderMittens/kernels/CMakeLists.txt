@@ -28,11 +28,12 @@ find_package(nanobind CONFIG REQUIRED)
 add_library(mlx_ext)
 
 # Add sources
-target_sources(mlx_ext 
-    PUBLIC 
+target_sources(mlx_ext
+    PUBLIC
     ${CMAKE_CURRENT_LIST_DIR}/add_rt/add_rt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_fwd/attn_fwd.cpp
     ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.cpp
 )
 
 # Add include headers
@@ -57,6 +58,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/add_rt/add_rt.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_fwd/attn_fwd.metal
         ${CMAKE_CURRENT_LIST_DIR}/matmul_custom/matmul_custom.metal
+        ${CMAKE_CURRENT_LIST_DIR}/layernorm/layernorm.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

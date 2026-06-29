@@ -17,6 +17,7 @@
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
 #include "mlx/backend/metal/utils.h"
+#include "tk_mlx_launch.h"
 #endif
 
 namespace mlx::core {
@@ -39,10 +40,12 @@ array add_rt(
 ) {
   // Promote dtypes between x and y as needed
   auto promoted_dtype = promote_types(x.dtype(), y.dtype());
-  assert(x.dtype() == bfloat16 && y.dtype() == bfloat16);
+  assert((promoted_dtype == float32 || promoted_dtype == float16 ||
+          promoted_dtype == bfloat16) &&
+         "add_rt only supports float32, float16, bfloat16");
 
-  // Upcast to float32 for non-floating point inputs x and y
-  auto out_dtype = bfloat16;
+  // Preserve the (promoted) floating dtype; the kernel is instantiated for all three.
+  auto out_dtype = promoted_dtype;
 
   // Cast x and y up to the determined dtype (on the same stream s)
     auto x_casted = astype(x, out_dtype, s);
@@ -171,49 +174,12 @@ void AddRT::eval_gpu(
   }
 
 
-  // Resolve name of kernel (corresponds to axpby.metal)
-  std::ostringstream kname;
-  kname << "add_rt_";
-  kname << type_to_name(out);
-
-  // Make sure the metal library is available
-  d.register_library("mlx_ext");
-
-  // Make a kernel from this metal library
-  auto kernel = d.get_kernel(kname.str(), "mlx_ext");
-
-  // Prepare to encode kernel
-  auto& compute_encoder = d.get_command_encoder(s.index);
-  compute_encoder.set_compute_pipeline_state(kernel);
-
-  // Kernel parameters are registered with buffer indices corresponding to
-  // those in the kernel declaration at axpby.metal
-  int ndim = out.ndim();
-  size_t nelem = out.size();
-
-  // Encode input arrays to kernel
-  compute_encoder.set_input_array(x, 0);
-  compute_encoder.set_input_array(y, 1);
-
-  // Encode output arrays to kernel
-  compute_encoder.set_output_array(out, 2);
-
-  compute_encoder.set_bytes(out.shape()[0], 3);
-  compute_encoder.set_bytes(out.shape()[1], 4);
-
-  // We launch 1 thread for each input and make sure that the number of
-  // threads in any given threadgroup is not higher than the max allowed
-  size_t tgp_size = std::min(nelem, kernel->maxTotalThreadsPerThreadgroup());
-
-  // Fix the 3D size of each threadgroup (in terms of threads)
-  MTL::Size group_dims = MTL::Size(32, 1, 1);
-
-  // Fix the 3D size of the launch grid (in terms of threads)
-  MTL::Size grid_dims = MTL::Size(out.shape()[1] / 8, out.shape()[0] / 8, 1);
-
-  // Launch the grid with the given number of threads divided among
-  // the given threadgroups
-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  // Elementwise add over a 2D (rows, cols) tile grid. Dispatch via the shared host ABI.
+  int rows = out.shape()[0];
+  int cols = out.shape()[1];
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_add_rt(enc, x, y, out, rows, cols, type_to_name(out));
 }
 
 // #else // Metal is not available

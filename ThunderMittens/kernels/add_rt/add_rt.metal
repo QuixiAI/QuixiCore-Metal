@@ -28,22 +28,15 @@ template <typename T>
 
     rt<T,8, 8> reg_x, reg_y, reg_z;
     int y_idx = threadgroup_id.y;
-    int x_idx = threadgroup_id.x; 
-    // load(reg_x, gl_x, {0,0,(int)threadgroup_id.y, (int)threadgroup_id.x}, laneId);
-    // load(reg_y, gl_y, {0,0,(int)threadgroup_id.y, (int)threadgroup_id.x}, laneId);
+    int x_idx = threadgroup_id.x;
+    // Elementwise add of two 8x8 register tiles: out = x + y.
+    // (Smoke test for the register-tile load/add/store path.)
     load(reg_x, gl_x, {0,0, y_idx, x_idx}, laneId);
     load(reg_y, gl_y, {0,0, y_idx, x_idx}, laneId);
-    load(reg_z, gl_y, {0,0, y_idx, x_idx}, laneId);
 
-    // add(reg_y, reg_x, reg_x);
-    mma_AB(reg_y, reg_x, reg_z, reg_y);
-    mma_AB(reg_y, reg_x, reg_z, reg_y);
-    mma_AB(reg_y, reg_x, reg_z, reg_y);
-    mma_AB(reg_y, reg_x, reg_z, reg_y);
-    
-    // store(gl_o, reg_y, {0,0,(int)threadgroup_id.y, (int)threadgroup_id.x}, laneId);
-    store(gl_o, reg_y, {0,0,y_idx, x_idx}, laneId);
-    // out[laneId] = 5;
+    add(reg_z, reg_x, reg_y);
+
+    store(gl_o, reg_z, {0,0,y_idx, x_idx}, laneId);
 }
 
 #define instantiate_add_custom(type_name, T)                           \

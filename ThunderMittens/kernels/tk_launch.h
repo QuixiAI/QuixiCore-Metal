@@ -1,0 +1,73 @@
+// Shared, framework-agnostic launch logic for the ThunderMittens kernels.
+//
+// This header is the SINGLE SOURCE OF TRUTH for each kernel's host ABI — the kernel
+// name, the buffer index mapping, the scalar parameters, and the grid/threadgroup
+// geometry. Both backends drive it through a small "encoder" adapter:
+//   - MLX  (<kernel>.cpp via MLXEncoder in tk_mlx_launch.h): binds with set_input_array
+//     so MLX's residency/scheduling bookkeeping is preserved.
+//   - Torch (tk_torch/torch_kernels.mm via TorchEncoder): binds the MTLBuffer directly.
+//
+// An adapter `E` must provide:
+//   typedefs E::in_t, E::out_t                      (input / output buffer handle types)
+//   void pipeline(const std::string& kernel_name)   (set the compute pipeline state)
+//   void in(E::in_t, int index)                     (bind an input buffer)
+//   void out(E::out_t, int index)                   (bind the output buffer)
+//   template<class T> void bytes(const T&, int idx) (set inline scalar bytes)
+//   void dispatch(int gx,int gy,int gz, int tx,int ty,int tz)  (dispatch threadgroups)
+//
+// Pure C++: depends on neither MLX nor Metal, so it compiles in both .cpp and .mm.
+
+#pragma once
+#include <cstdint>
+#include <string>
+
+namespace tk {
+
+// ----- kernel-name helpers (must match the [[host_name(...)]] in <kernel>.metal) -----
+inline std::string layernorm_kernel_name(int D) { return "layernorm_" + std::to_string(D); }
+inline std::string attn_fwd_kernel_name(int D) { return "attn_fwd_" + std::to_string(D); }
+inline std::string add_rt_kernel_name(const std::string& t) { return "add_rt_" + t; }
+inline std::string matmul_custom_kernel_name(const std::string& t) { return "matmul_custom_" + t; }
+
+// ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
+template <class E>
+void launch_layernorm(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t b,
+                      typename E::out_t o, uint32_t M, int D, float eps) {
+  e.pipeline(layernorm_kernel_name(D));
+  e.in(x, 0); e.in(w, 1); e.in(b, 2); e.out(o, 3);
+  e.bytes(M, 4); e.bytes(eps, 5);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- add_rt: x@0 y@1 -> out@2 ; rows@3(i32) cols@4(i32) ; grid (cols/8, rows/8, 1) -----
+template <class E>
+void launch_add_rt(E& e, typename E::in_t x, typename E::in_t y, typename E::out_t o,
+                   int rows, int cols, const std::string& type_name) {
+  e.pipeline(add_rt_kernel_name(type_name));
+  e.in(x, 0); e.in(y, 1); e.out(o, 2);
+  e.bytes(rows, 3); e.bytes(cols, 4);
+  e.dispatch(cols / 8, rows / 8, 1, 32, 1, 1);
+}
+
+// ----- matmul_custom: D(out)@0 A@1 B@2 ; N@3 K@4 M@5 (i32) ; grid (M/32, N/32, 1) -----
+// A is (N,K), B is (K,M), out is (N,M).
+template <class E>
+void launch_matmul_custom(E& e, typename E::out_t o, typename E::in_t a, typename E::in_t b,
+                          int N, int K, int M, const std::string& type_name) {
+  e.pipeline(matmul_custom_kernel_name(type_name));
+  e.out(o, 0); e.in(a, 1); e.in(b, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+// ----- attn_fwd: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----
+template <class E>
+void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                     typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+  e.pipeline(attn_fwd_kernel_name(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+} // namespace tk

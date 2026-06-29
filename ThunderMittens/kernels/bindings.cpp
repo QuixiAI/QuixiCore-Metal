@@ -57,6 +57,7 @@
 #include "add_rt/add_rt.h"
 #include "attn_fwd/attn_fwd.h"
 #include "matmul_custom/matmul_custom.h"
+#include "layernorm/layernorm.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -97,5 +98,18 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         gemm
+      )");
+
+    m.def(
+      "layernorm",
+      &layernorm,
+      "x"_a,
+      "weight"_a,
+      "bias"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        layernorm over the last axis: (x - mean) * rsqrt(var + eps) * weight + bias
       )");
 }

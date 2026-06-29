@@ -1,12 +1,17 @@
-//#define ENABLE_TESTS
+#define ENABLE_TESTS
 #define TEST_INTENSITY 1
 
 //#define ENABLE_TESTS
 
 #ifdef ENABLE_TESTS
-#define TEST_ALL
+// Start with a focused leaf set: the warp-level register-vector + vec-memory paths
+// that the LayerNorm kernel depends on (sum reduction, vec maps, naive rv load/store).
+// Flip to TEST_ALL for the full primitive sweep once these pass on-device.
+//#define TEST_ALL
+#define TEST_WARP_REGISTER_VEC_REDUCTIONS
+#define TEST_WARP_REGISTER_VEC_MAPS
+#define TEST_WARP_MEMORY_VEC_GLOBAL_TO_REGISTER
 //#define TEST_WARP_REGISTER_TILE_MMA
-//#define TEST_WARP_REGISTER_VEC_REDUCTIONS
 
 /* ----------  TEST INCLUSION MACROS  ---------- */
 
