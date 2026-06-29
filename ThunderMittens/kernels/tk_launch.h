@@ -97,11 +97,16 @@ void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::i
 template <class E>
 void launch_attn_q(E& e, typename E::in_t q, typename E::in_t kq, typename E::in_t vq,
                    typename E::out_t o, unsigned N, unsigned H, int B, int D,
-                   const std::string& fmt, bool causal) {
-  e.pipeline(attn_q_kernel_name(fmt, D, causal));
+                   const std::string& fmt, bool causal, bool multiwarp) {
+  const int NW = 4;  // attn_q_mw warps
+  e.pipeline(multiwarp ? ("attn_q_mw_" + fmt + "_" + std::to_string(D))
+                       : attn_q_kernel_name(fmt, D, causal));
   e.in(q, 0); e.in(kq, 1); e.in(vq, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+  if (multiwarp)
+    e.dispatch(static_cast<int>(N) / (8 * NW), static_cast<int>(H), B, 32 * NW, 1, 1);
+  else
+    e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
 // ----- rms_norm: x@0 w@1 -> o@2 ; M@3(u32) eps@4(f32) ; grid (M,1,1) group (32,1,1) -----

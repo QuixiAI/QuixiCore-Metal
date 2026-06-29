@@ -207,13 +207,13 @@ def qgemm_direct(wq, x, format="q8_0"):
     return _mlx().qgemm_direct(wq, x, format=format)
 
 
-def attn_q(q, kq, vq, format="q8_0", causal=False):
+def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
     """Quantized-KV flash attention: softmax(QK^T)·V with K,V given as quantized blocks (format).
     q bf16 (B,H,N,D); kq/vq uint8 (B,H,N,D/block_k,block_bytes) -> bf16 (B,H,N,D). D in {64,128}.
     Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
-        return _torch().attn_q(q, kq, vq, format, causal)
-    return _mlx().attn_q(q, kq, vq, format=format, causal=causal)
+        return _torch().attn_q(q, kq, vq, format, causal, multiwarp)
+    return _mlx().attn_q(q, kq, vq, format=format, causal=causal, multiwarp=multiwarp)
 
 
 def qgemm_actorder(wq, x, perm, w_format="kU4B8"):

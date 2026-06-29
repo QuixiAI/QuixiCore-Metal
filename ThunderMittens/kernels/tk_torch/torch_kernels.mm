@@ -458,7 +458,7 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
 }
 
 static at::Tensor attn_q_mps(const at::Tensor& q_in, const at::Tensor& kq_in,
-                             const at::Tensor& vq_in, const std::string& format, bool causal) {
+                             const at::Tensor& vq_in, const std::string& format, bool causal, bool multiwarp) {
   TORCH_CHECK(q_in.device().is_mps(), "attn_q: q must be an MPS tensor");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_q: q must be bfloat16");
   TORCH_CHECK(kq_in.scalar_type() == at::kByte && vq_in.scalar_type() == at::kByte,
@@ -469,7 +469,7 @@ static at::Tensor attn_q_mps(const at::Tensor& q_in, const at::Tensor& kq_in,
   const unsigned N = static_cast<unsigned>(q.size(2));
   TORCH_CHECK((D == 64 || D == 128) && N % 8 == 0, "attn_q: D in {64,128}, N%8==0");
   auto out = at::empty_like(q);
-  tk_encode([&](TorchEncoder& e) { tk::launch_attn_q(e, q, kq, vq, out, N, H, B, D, format, causal); });
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_q(e, q, kq, vq, out, N, H, B, D, format, causal, multiwarp); });
   return out;
 }
 

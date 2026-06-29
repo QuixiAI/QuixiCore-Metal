@@ -23,14 +23,14 @@
 namespace mlx::core {
 
 array attn_q(const array& q, const array& kq, const array& vq,
-             const std::string& format, bool causal, StreamOrDevice s) {
+             const std::string& format, bool causal, bool multiwarp, StreamOrDevice s) {
   assert(q.dtype() == bfloat16 && kq.dtype() == uint8 && vq.dtype() == uint8);
   assert(q.ndim() == 4 && kq.ndim() == 5 && vq.ndim() == 5);
   const int D = q.shape(3);
   assert((D == 64 || D == 128) && q.shape(2) % 8 == 0);
   (void)D;
   return array(q.shape(), bfloat16,
-               std::make_shared<AttnQ>(to_stream(s), format, causal), {q, kq, vq});
+               std::make_shared<AttnQ>(to_stream(s), format, causal, multiwarp), {q, kq, vq});
 }
 
 void AttnQ::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
@@ -46,7 +46,7 @@ void AttnQ::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outpu
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_attn_q(enc, q, kq, vq, out, static_cast<unsigned>(N),
-                    static_cast<unsigned>(H), B, D, fmt_, causal_);
+                    static_cast<unsigned>(H), B, D, fmt_, causal_, mw_);
 }
 
 std::vector<array> AttnQ::jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
@@ -58,7 +58,7 @@ std::pair<std::vector<array>, std::vector<int>> AttnQ::vmap(const std::vector<ar
 bool AttnQ::is_equivalent(const Primitive& other) const {
   if (typeid(*this) != typeid(other)) return false;
   auto& o = static_cast<const AttnQ&>(other);
-  return fmt_ == o.fmt_ && causal_ == o.causal_;
+  return fmt_ == o.fmt_ && causal_ == o.causal_ && mw_ == o.mw_;
 }
 
 } // namespace mlx::core

@@ -59,6 +59,24 @@ def test_attn_q_causal(D, fmt):
     assert rel < 0.1, f"{fmt} D{D} causal rel {rel}"
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "fp8_e4m3"])
+@pytest.mark.parametrize("D", [64, 128])
+def test_attn_q_multiwarp(D, fmt):
+    B, H, N = 1, 4, 128                                       # N % (8*4) == 0 for multiwarp
+    rng = np.random.default_rng(2)
+    q = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    Kq, Vq = quantize_kv(k, fmt), quantize_kv(v, fmt)
+    dk, dv = dequantize_kv(Kq, fmt), dequantize_kv(Vq, fmt)
+    got = attn_q(mx.array(q).astype(mx.bfloat16), mx.array(Kq), mx.array(Vq), format=fmt, multiwarp=True)
+    mx.eval(got)
+    g = np.array(got.astype(mx.float32))
+    ref = _ref_attn(q, dk, dv)
+    rel = np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9)
+    assert rel < 0.1, f"{fmt} D{D} mw rel {rel}"
+
+
 if __name__ == "__main__":
     for f in ["q8_0", "q4_0", "fp8_e4m3"]:
         test_attn_q(64, f); test_attn_q(128, f)

@@ -202,9 +202,9 @@ def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: st
     return _ext.qflux_gelu(wq, x, bias, format)
 
 
-def attn_q(q, kq, vq, format="q8_0", causal=False):
+def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
     """Quantized-KV flash attention: softmax(QK^T)V, K/V from blocks. q bf16 (B,H,N,D); kq/vq uint8. MPS."""
-    return _ext.attn_q(q, kq, vq, format, causal)
+    return _ext.attn_q(q, kq, vq, format, causal, multiwarp)
 
 
 def qgemv_w8a8(wq, xq, w_scale, a_scale):
