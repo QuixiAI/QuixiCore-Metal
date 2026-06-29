@@ -31,6 +31,8 @@ inline std::string matmul_custom_kernel_name(const std::string& t) { return "mat
 inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
+inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
+inline std::string attn_causal_kernel_name(int D) { return "attn_causal_" + std::to_string(D); }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -102,6 +104,26 @@ void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::i
   e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.out(o, 3);
   e.bytes(N, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----
+template <class E>
+void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int D) {
+  e.pipeline(gelu_kernel_name(D));
+  e.in(x, 0); e.out(o, 1);
+  e.bytes(M, 2);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- attn_causal: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----
+// Same as attn_fwd but with causal masking (lower-triangular).
+template <class E>
+void launch_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                        typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+  e.pipeline(attn_causal_kernel_name(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
 } // namespace tk

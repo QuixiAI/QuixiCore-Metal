@@ -61,6 +61,8 @@
 #include "rms_norm/rms_norm.h"
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
+#include "gelu/gelu.h"
+#include "attn_causal/attn_causal.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -148,5 +150,27 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         rotary positional embedding (split-half / GPT-NeoX); x is (B,H,N,D), cos/sin are (N,D/2)
+      )");
+
+    m.def(
+      "gelu",
+      &gelu,
+      "x"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        GELU activation (tanh approximation), over the last axis
+      )");
+
+    m.def(
+      "attn_causal",
+      &attn_causal,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        causal (lower-triangular) attention forward
       )");
 }

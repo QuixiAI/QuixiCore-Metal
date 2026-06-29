@@ -213,6 +213,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), voi
 rsqrt(thread RV &dst, thread const RV &src) {
     unary_op<base_ops::rsqrt, RV>(dst, src);
 }
+/** @brief Applies tanh element-wise to a register vector. */
+template<typename RV>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), void>::type
+tanh(thread RV &dst, thread const RV &src) {
+    unary_op<base_ops::tanh, RV>(dst, src);
+}
+/** @brief Applies GELU (tanh approx) element-wise to a register vector. */
+template<typename RV>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_vector<RV>(), void>::type
+gelu(thread RV &dst, thread const RV &src) {
+    unary_op<base_ops::gelu, RV>(dst, src);
+}
 
 // ---- binary ops ----
 

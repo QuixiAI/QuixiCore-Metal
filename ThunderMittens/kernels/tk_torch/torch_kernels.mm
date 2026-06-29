@@ -217,6 +217,35 @@ static at::Tensor rotary_mps(const at::Tensor& x_in, const at::Tensor& cos_in,
   return out;
 }
 
+static at::Tensor gelu_mps(const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "gelu: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "gelu: x must be bfloat16");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "gelu: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_gelu(e, x, out, M, D); });
+  return out;
+}
+
+static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                  const at::Tensor& v_in) {
+  TORCH_CHECK(q_in.device().is_mps(), "attn_causal: q must be an MPS tensor");
+  TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_causal: q must be bfloat16");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "attn_causal: expects (B,H,N,D)");
+  const int B = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64 || D == 128, "attn_causal: D must be 64 or 128");
+  TORCH_CHECK(N % 8 == 0, "attn_causal: N must be a multiple of 8");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_causal(e, q, k, v, out, N, H, B, D); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -226,4 +255,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
+  m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
+  m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
 }

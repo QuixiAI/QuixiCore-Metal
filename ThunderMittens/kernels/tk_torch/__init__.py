@@ -28,6 +28,8 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rms_norm", "rms_norm.metal"),
     os.path.join(_KERNELS, "softmax", "softmax.metal"),
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
+    os.path.join(_KERNELS, "gelu", "gelu.metal"),
+    os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
 ]
 
 
@@ -67,9 +69,22 @@ def add_rt(x: torch.Tensor, y: torch.Tensor):
     return _ext.add_rt(x, y)
 
 
+def _ceil(a, m):
+    return ((a + m - 1) // m) * m
+
+
 def matmul_custom(x: torch.Tensor, y: torch.Tensor):
-    """(N,K) @ (K,M) GEMM. f32/bf16 MPS tensors; N%32==0, M%32==0, K%16==0."""
-    return _ext.matmul_custom(x, y)
+    """(N,K) @ (K,M) GEMM, arbitrary shapes (f32/bf16, MPS). The tile-blocked kernel needs
+    N%32, M%32, K%16; arbitrary shapes are zero-padded to the next tile multiple and sliced."""
+    import torch.nn.functional as F
+
+    N, K = x.shape[-2], x.shape[-1]
+    M = y.shape[-1]
+    Np, Kp, Mp = _ceil(N, 32), _ceil(K, 16), _ceil(M, 32)
+    xp = F.pad(x, (0, Kp - K, 0, Np - N)) if (Np != N or Kp != K) else x
+    yp = F.pad(y, (0, Mp - M, 0, Kp - K)) if (Kp != K or Mp != M) else y
+    out = _ext.matmul_custom(xp.contiguous(), yp.contiguous())
+    return out[:N, :M].contiguous()
 
 
 def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
@@ -90,3 +105,13 @@ def softmax(x: torch.Tensor):
 def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
     """RoPE (split-half). x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}."""
     return _ext.rotary(x, cos, sin)
+
+
+def gelu(x: torch.Tensor):
+    """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
+    return _ext.gelu(x)
+
+
+def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+    """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
+    return _ext.attn_causal(q, k, v)

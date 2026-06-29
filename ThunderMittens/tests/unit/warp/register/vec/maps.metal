@@ -79,6 +79,22 @@ kernel void rv_rsqrt(gts_kern_PARAMS(T))
     store(output, vec_b, {0,0,0,0}, simd_lane_id);
 }
 
+// Exercises the tanh map op (domain is all reals).
+template<typename T, unsigned W, typename L>
+kernel void rv_tanh(gts_kern_PARAMS(T))
+{
+    using reg_vec1 = rv<T, W * 8, L>;
+    using reg_vec2 = rv<T, W * 8, L>;
+    using GL = gl<T, 1, 1, 1, W * 8>;
+    reg_vec1 vec_a;
+    reg_vec2 vec_b;
+    GL input(_input, nullptr, nullptr, nullptr, nullptr);
+    GL output(_output, nullptr, nullptr, nullptr, nullptr);
+    load(vec_a, input, {0,0,0,0}, simd_lane_id);
+    tanh(vec_b, vec_a);
+    store(output, vec_b, {0,0,0,0}, simd_lane_id);
+}
+
 
 #define gen_kernels(reg_N) \
     template [[host_name("rv_exp_float_" #reg_N "_rv_align_layout")]] [[kernel]]  \
@@ -164,6 +180,27 @@ kernel void rv_rsqrt(gts_kern_PARAMS(T))
     void rv_rsqrt<bf16, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(bf16));  \
     template [[host_name("rv_rsqrt_bf16_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
     void rv_rsqrt<bf16, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(bf16));  \
+\
+    template [[host_name("rv_tanh_float_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_tanh<float, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(float)); \
+    template [[host_name("rv_tanh_float_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_tanh<float, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(float)); \
+    template [[host_name("rv_tanh_float_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_tanh<float, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(float)); \
+\
+    template [[host_name("rv_tanh_half_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_tanh<half, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(half));  \
+    template [[host_name("rv_tanh_half_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_tanh<half, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(half));  \
+    template [[host_name("rv_tanh_half_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_tanh<half, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(half));  \
+\
+    template [[host_name("rv_tanh_bf16_" #reg_N "_rv_align_layout")]] [[kernel]]  \
+    void rv_tanh<bf16, reg_N, ducks::rv_layout::align>(gts_kern_PARAMS(bf16));  \
+    template [[host_name("rv_tanh_bf16_" #reg_N "_rv_ortho_layout")]] [[kernel]]  \
+    void rv_tanh<bf16, reg_N, ducks::rv_layout::ortho>(gts_kern_PARAMS(bf16));  \
+    template [[host_name("rv_tanh_bf16_" #reg_N "_rv_naive_layout")]] [[kernel]]  \
+    void rv_tanh<bf16, reg_N, ducks::rv_layout::naive>(gts_kern_PARAMS(bf16));  \
 
 
     

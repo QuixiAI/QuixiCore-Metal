@@ -49,11 +49,27 @@ def add_rt(x, y):
     return _mlx().add_rt(x, y)
 
 
+def _ceil(a, m):
+    return ((a + m - 1) // m) * m
+
+
 def matmul_custom(x, y):
-    """(N,K) @ (K,M) GEMM. Accepts mlx.array or torch.Tensor (MPS)."""
+    """(N,K) @ (K,M) GEMM, arbitrary shapes. Accepts mlx.array or torch.Tensor (MPS).
+
+    The kernel is tile-blocked (needs N%32, M%32, K%16); arbitrary shapes are handled by
+    zero-padding to the next tile multiple and slicing the result (shared-tile staging /
+    a truly general kernel is a perf follow-up)."""
     if _is_torch(x):
-        return _torch().matmul_custom(x, y)
-    return _mlx().matmul_custom(x, y)
+        return _torch().matmul_custom(x, y)  # tk_torch pads/slices
+    import mlx.core as mx
+
+    N, K = x.shape[-2], x.shape[-1]
+    M = y.shape[-1]
+    Np, Kp, Mp = _ceil(N, 32), _ceil(K, 16), _ceil(M, 32)
+    xp = mx.pad(x, [(0, Np - N), (0, Kp - K)]) if (Np != N or Kp != K) else x
+    yp = mx.pad(y, [(0, Kp - K), (0, Mp - M)]) if (Kp != K or Mp != M) else y
+    out = _mlx().matmul_custom(xp, yp)
+    return out[:N, :M]
 
 
 def attn_fwd(q, k, v):
@@ -82,3 +98,17 @@ def rotary(x, cos, sin):
     if _is_torch(x):
         return _torch().rotary(x, cos, sin)
     return _mlx().rotary(x, cos, sin)
+
+
+def gelu(x):
+    """GELU (tanh approx) over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().gelu(x)
+    return _mlx().gelu(x)
+
+
+def attn_causal(q, k, v):
+    """Causal attention forward. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().attn_causal(q, k, v)
+    return _mlx().attn_causal(q, k, v)

@@ -19,18 +19,21 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `rms_norm` | ✅ | bf16, D∈{256,512,768,1024} | `mx.fast.rms_norm` | layernorm minus mean/bias. `kernels/rms_norm/` |
 | `softmax` | ✅ | bf16, D∈{256,512,768,1024} | `mx.softmax` | Standalone row-softmax (attn_fwd's inline softmax extracted). `kernels/softmax/` |
 | `rotary` | ✅ | bf16, D∈{64,128} | `mx.fast.rope(traditional=False)` | Split-half RoPE; precomputed cos/sin inputs. `kernels/rotary/` |
+| `gelu` | ✅ | bf16, D∈{256,512,768,1024} | `mx.nn.gelu_approx` | Tanh-approx GELU activation. Added `tanh` base_op (via `exp`). `kernels/gelu/` |
+| `matmul_custom` (arbitrary shapes) | `gemm/bf16_h100` | ✅ | `mx.matmul` | Any N/K/M via host zero-pad-to-tile + slice (`tk.matmul_custom`). f32/bf16. |
+| `attn_causal` | `attention/mha_h100` | ✅ | masked SDPA (additive causal) | Causal flash-attn fwd; `make_causal` on the diagonal block. `kernels/attn_causal/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
-(92 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (108 passing).
+(119 passing). Primitive unit tests: Xcode `ThunderMittens` scheme (126 passing).
 
-## Next tier (difficulty order)
+## Next tier (remaining work / deferred)
 
-| Kernel | TK reference | Status | Oracle | Notes |
-|---|---|---|---|---|
-| flux gelu / gate | `kernels/flux/flux_gelu.cu`, `flux_gate.cu` | ☐ | `mx.nn.gelu_approx` | Needs a new `tanh` base_op; larger fused kernel. |
-| GEMM bf16 parity | `kernels/gemm/bf16_h100/bf16_h100_gemm.cu` | ☐ | `mx.matmul` | Generalize `matmul_custom` to arbitrary shapes + shared-tile staging. |
-| attention (causal / multi-warp) | `kernels/attention/mha_h100/` | ☐ | masked SDPA | Extend `attn_fwd`: causal mask, multi-simdgroup tiling. |
+| Item | Status | Notes |
+|---|---|---|
+| flux **fused** gelu+matmul / gate+matmul+residual | ☐ | The GELU *activation* is done (`kernels/gelu/`); the fused flux kernels (matmul+gelu, matmul+gate+residual) still need the GEMM fusion. |
+| GEMM **performance** (shared-tile staging, real general kernel) | ☐ | Arbitrary-shape *correctness* done via padding; a staged/tuned kernel (threadgroup tiles) is the perf follow-up. |
+| Attention **multi-warp / long-context tiling** | ☐ | Causal+non-causal correctness done (warp-level, 8-row query tiles); multi-simdgroup tiling for throughput is the perf follow-up. |
 
 ## Later (heavier / hardware-coupled)
 

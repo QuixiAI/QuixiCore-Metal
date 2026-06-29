@@ -24,6 +24,13 @@ primitives and need **no new substrate code**.
   (`tests/unit/warp/register/vec/maps.{metal,cpp}`, 18 cases across float/half/bf16 × align/ortho/
   naive). Useful for a future tile/vector RMS-style normalization; LayerNorm still uses scalar
   `metal::rsqrt` inline (its rsqrt argument is a reduced scalar, not a vector).
+- **`tanh` / `gelu`** — added to `base_ops.metal` + the four map files. Metal has **no `tanh`
+  intrinsic**, so `tanh` is computed from `exp`: `1 - 2/(exp(2x)+1)` (stable for both signs). `gelu`
+  is the tanh approximation `0.5*x*(1+tanh(0.7978845608*(x + 0.044715*x^3)))`, matching
+  `mx.nn.gelu_approx`. `tanh` validated on-device by `rv_tanh` (18 cases); `gelu` is exercised
+  end-to-end by `kernels/gelu/`.
+- **`make_causal`** (already in `conversions.metal`) is used by `kernels/attn_causal/` to mask the
+  diagonal block (note: its `val` arg is `thread const&`, so pass a thread-local, not a `constant`).
 
 ## Gaps (and whether they matter)
 
@@ -45,7 +52,7 @@ gated by `tests/unit/testing_commons/testing_flags.hpp` (`ENABLE_TESTS`). It is 
 focused leaf suites the LayerNorm kernel depends on — warp register-vector reductions, vec maps, and
 naive `rv` global↔register memory (flip to `TEST_ALL` for the full sweep).
 
-**Status: working — 108/108 primitive tests pass on-device** (incl. 18 `rv_rsqrt` cases). Build & run from the repo root:
+**Status: working — 126/126 primitive tests pass on-device** (incl. 18 `rv_rsqrt` + 18 `rv_tanh`). Build & run from the repo root:
 
 ```
 xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens -configuration Debug build CODE_SIGNING_ALLOWED=NO

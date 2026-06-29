@@ -46,6 +46,24 @@ def test_matmul_bf16(shape):
     assert mx.allclose(got, exp, atol=0.3, rtol=5e-2), f"max diff: {diff}"
 
 
+# Arbitrary (non-tile-multiple) shapes: tk.matmul_custom zero-pads to tile multiples.
+ARB_SHAPES = [(40, 20, 48), (100, 50, 70), (1, 1, 1), (33, 17, 65)]
+
+
+@pytest.mark.parametrize("shape", ARB_SHAPES)
+def test_matmul_arbitrary_shapes(shape):
+    N, K, M = shape
+    mx.random.seed(0)
+    x = mx.random.uniform(shape=(N, K)).astype(mx.float32)
+    y = mx.random.uniform(shape=(K, M)).astype(mx.float32)
+    got = matmul_custom(x, y)
+    exp = x @ y
+    mx.eval(got, exp)
+    assert got.shape == (N, M)
+    assert mx.allclose(got, exp, atol=1e-3, rtol=1e-4), \
+        f"max diff: {mx.max(mx.abs(got - exp)).item()}"
+
+
 if __name__ == "__main__":
     for shp in SHAPES:
         test_matmul_f32(shp)

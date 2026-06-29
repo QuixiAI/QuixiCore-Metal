@@ -125,3 +125,32 @@ def test_rotary_parity(shape):
     om = tk.rotary(_mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"))
     ot = tk.rotary(_mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"))
     _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (1, 256, 768)])
+def test_gelu_parity(shape):
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    _assert_parity(tk.gelu(_mk(x, "mlx")), tk.gelu(_mk(x, "torch")), atol=1e-2)
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (1, 2, 128, 128)])
+def test_attn_causal_parity(shape):
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal(shape).astype(np.float32)
+    k = rng.standard_normal(shape).astype(np.float32)
+    v = rng.standard_normal(shape).astype(np.float32)
+    om = tk.attn_causal(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"))
+    ot = tk.attn_causal(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"))
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize("nkm", [(40, 20, 48), (33, 17, 65)])
+def test_matmul_arbitrary_parity(nkm):
+    N, K, M = nkm
+    rng = np.random.default_rng(0)
+    x = rng.random((N, K), dtype=np.float32)
+    y = rng.random((K, M), dtype=np.float32)
+    om = tk.matmul_custom(_mk(x, "mlx", "f32"), _mk(y, "mlx", "f32"))
+    ot = tk.matmul_custom(_mk(x, "torch", "f32"), _mk(y, "torch", "f32"))
+    _assert_parity(om, ot, atol=1e-3)

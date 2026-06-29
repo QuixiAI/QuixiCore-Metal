@@ -37,6 +37,8 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.cpp
     ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
 )
 
 # Add include headers
@@ -65,6 +67,8 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/rms_norm/rms_norm.metal
         ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.metal
         ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
+        ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
+        ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
         INCLUDE_DIRS
         ${PROJECT_SOURCE_DIR}
         ${MLX_INCLUDE_DIRS}

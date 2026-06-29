@@ -249,6 +249,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::
 rsqrt(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
     unary_map<base_ops::rsqrt, ST>(dst, src, laneid);
 }
+/** @brief Applies tanh element-wise to a shared tile. */
+template<typename ST>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::type
+tanh(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
+    unary_map<base_ops::tanh, ST>(dst, src, laneid);
+}
+/** @brief Applies GELU (tanh approx) element-wise to a shared tile. */
+template<typename ST>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_tile<ST>(), void>::type
+gelu(threadgroup ST &dst, const threadgroup ST &src, const ushort laneid) {
+    unary_map<base_ops::gelu, ST>(dst, src, laneid);
+}
 /**
  * @brief Copies the elements of the source tile to the destination tile.
  *

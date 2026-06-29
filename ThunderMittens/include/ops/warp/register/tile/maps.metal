@@ -587,6 +587,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>
 rsqrt(thread RT &dst, thread const RT &src) {
     unary_map<base_ops::rsqrt, RT>(dst, src);
 }
+/** @brief Applies tanh element-wise to a register tile. */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type
+tanh(thread RT &dst, thread const RT &src) {
+    unary_map<base_ops::tanh, RT>(dst, src);
+}
+/** @brief Applies GELU (tanh approx) element-wise to a register tile. */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type
+gelu(thread RT &dst, thread const RT &src) {
+    unary_map<base_ops::gelu, RT>(dst, src);
+}
 /**
  * @brief Copies the elements from one tile to another.
  *

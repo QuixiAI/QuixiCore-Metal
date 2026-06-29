@@ -261,6 +261,41 @@ struct rsqrt {
 TEMPLATE_OPS_OVERRIDE_SINGLE(bf16  , rsqrt, return bf16(metal::rsqrt((float)x));)
 TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, rsqrt, return bf16_2(metal::rsqrt((float2)x));)
 /**
+ * @brief Hyperbolic tangent.
+ *
+ * Metal has no tanh intrinsic, so it is computed from exp (numerically stable for
+ * both signs): tanh(x) = 1 - 2/(exp(2x) + 1).
+ */
+struct tanh {
+    TEMPLATE_OPS_SINGLE(return T(1) - T(2) / (metal::exp(x + x) + T(1));)
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16, tanh,
+    float xf = (float)x; return bf16(1.0f - 2.0f / (metal::exp(xf + xf) + 1.0f));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, tanh,
+    float2 xf = (float2)x; return bf16_2(float2(1.0f) - 2.0f / (metal::exp(xf + xf) + float2(1.0f)));)
+/**
+ * @brief GELU activation (tanh approximation), matching mx.nn.gelu_approx /
+ * F.gelu(approximate='tanh'):
+ *   0.5 * x * (1 + tanh(0.7978845608 * (x + 0.044715 * x^3)))
+ */
+struct gelu {
+    TEMPLATE_OPS_SINGLE(
+        T inner = T(0.7978845608f) * (x + T(0.044715f) * x * x * x);
+        T th = T(1) - T(2) / (metal::exp(inner + inner) + T(1));
+        return T(0.5f) * x * (T(1) + th);
+    )
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16, gelu,
+    float xf = (float)x;
+    float inner = 0.7978845608f * (xf + 0.044715f * xf * xf * xf);
+    float th = 1.0f - 2.0f / (metal::exp(inner + inner) + 1.0f);
+    return bf16(0.5f * xf * (1.0f + th));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, gelu,
+    float2 xf = (float2)x;
+    float2 inner = 0.7978845608f * (xf + 0.044715f * xf * xf * xf);
+    float2 th = float2(1.0f) - 2.0f / (metal::exp(inner + inner) + float2(1.0f));
+    return bf16_2(0.5f * xf * (float2(1.0f) + th));)
+/**
  * @brief Copy operation.
  *
  * This operation returns the input value unchanged.

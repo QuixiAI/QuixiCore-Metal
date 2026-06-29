@@ -199,6 +199,18 @@ static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>
 rsqrt(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
     unary_op<base_ops::rsqrt, SV>(dst, src, laneid);
 }
+/** @brief Applies tanh element-wise to a shared vector. */
+template<typename SV>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>::type
+tanh(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
+    unary_op<base_ops::tanh, SV>(dst, src, laneid);
+}
+/** @brief Applies GELU (tanh approx) element-wise to a shared vector. */
+template<typename SV>
+static METAL_FUNC typename metal::enable_if<ducks::is_shared_vector<SV>(), void>::type
+gelu(threadgroup SV &dst, threadgroup const SV &src, const ushort laneid) {
+    unary_op<base_ops::gelu, SV>(dst, src, laneid);
+}
 
 // ---- binary ops ----
 

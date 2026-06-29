@@ -114,6 +114,38 @@ def test_rotary(shape):
     assert _maxdiff(got, exp) < 0.03
 
 
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (8, 256)])
+def test_gelu(shape):
+    torch.manual_seed(0)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    got = tk_torch.gelu(x)
+    exp = F.gelu(x.float(), approximate="tanh").to(torch.bfloat16)
+    assert _maxdiff(got, exp) < 0.02
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (2, 4, 512, 64), (2, 2, 128, 128)])
+def test_attn_causal(shape):
+    B, H, N, D = shape
+    torch.manual_seed(0)
+    q = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    got = tk_torch.attn_causal(q, k, v)
+    exp = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # scale defaults to 1/sqrt(D)
+    assert _maxdiff(got, exp) < 0.05
+
+
+@pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
+def test_matmul_arbitrary(nkm):
+    N, K, M = nkm
+    torch.manual_seed(0)
+    x = torch.rand(N, K, dtype=torch.float32, device="mps")
+    y = torch.rand(K, M, dtype=torch.float32, device="mps")
+    got = tk_torch.matmul_custom(x, y)
+    assert got.shape == (N, M)
+    assert _maxdiff(got, x @ y) < 1e-2
+
+
 def test_dispatch_routes_torch_to_mps():
     """tk.<kernel>(torch.Tensor) routes to the MPS backend (no MLX needed)."""
     import tk
