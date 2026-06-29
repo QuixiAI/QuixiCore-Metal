@@ -1,261 +1,75 @@
-# ThunderMittens / ThunderKittens Kernel Discrepancy Report
+# ThunderKittens → ThunderMittens Kernel Reconciliation
 
-Scope: this compares `.reference/ThunderKittens/kernels` against `ThunderMittens/kernels`.
+Accurate per-file status of every non-baseline ThunderKittens (CUDA) kernel under
+`.reference/ThunderKittens/kernels` against the ThunderMittens (Apple Metal) port. Maintained checklist
+(supersedes the original from-scratch inventory). Detailed parity tracking: `docs/porting/thunderkittens.md`.
 
-Summary:
+**Porting rule (from `bigpicture.md`):** port the *algorithm* on the TM substrate, not the H100/B200
+machinery (TMA, WGMMA, tcgen05, warpgroups, cp.async, NVLink). Most TK files are hardware/scheduling/
+pedagogical *variants* of one algorithm, so they collapse onto a single Apple kernel.
 
-- ThunderKittens non-baseline CUDA kernel implementations: 58
-- ThunderMittens Metal/MLX kernel implementations: 3
-- ThunderKittens baseline/reference implementations not present in ThunderMittens: 11
-- ThunderKittens non-baseline support files not present in ThunderMittens: 97
-- ThunderMittens-only kernel-package files: 19
+## Headline counts (58 non-baseline TK kernels)
+- **Algorithmically covered: 42** — attention fwd/bwd, the GEMM suite + 19 educational levels, fftconv,
+  flux, norm/rotary, the sequence/SSM family, and the low-precision GEMMs (via the `qgemm` quant family).
+- **N/A on single-GPU Apple: 16** — the `parallel/*` distributed collectives (no NVLink/NVSwitch/P2P).
+- Net: every Apple-feasible TK algorithm is ported. Four genuine gaps found during reconciliation were
+  closed (marked **NEW** below): Based Taylor map, decay/retention LA, flash-attn backward, fp8 scaled GEMM.
 
-ThunderMittens currently has these kernel directories:
+## Status legend
+`ported→X` = covered by ThunderMittens kernel X · `variant→X` = hardware/scheduling/pedagogical variant
+of an algorithm already ported as X · `N/A` = no single-GPU Apple analog.
 
-- `ThunderMittens/kernels/add_rt`
-- `ThunderMittens/kernels/attn_fwd`
-- `ThunderMittens/kernels/matmul_custom`
+## Attention (4)
+| TK file | Status |
+|---|---|
+| `attention/mha_h100/mha_h100.cu` (fwd) | ported → `attn_fwd` / `attn_causal` / `attn_multiwarp` |
+| `attention/mha_h100/mha_h100.cu` (bwd: `bwd_attend_prep`+`bwd_attend`) | **NEW** ported → `attn_bwd` (dQ/dK/dV, non-causal+causal) |
+| `attention/mha_h100_lcf/mha_h100_lcf.cu` | variant → `attn_fwd` (load-compute-finish scheduling, fwd-only) |
+| `attention/bf16_b300_mha_causal/…` | variant → `attn_causal` (Blackwell causal fwd) |
+| `attention/bf16_b300_mha_noncausal/…` | variant → `attn_fwd` (Blackwell non-causal fwd) |
 
-Possible partial conceptual overlaps:
+## Sequence / linear attention / SSM (4)
+| TK file | Status |
+|---|---|
+| `linear_attention/linear_attention.cu` | **NEW** ported → `lin_attn_decay` (RetNet/Lightning-Attn-2, per-head exp decay) |
+| `based/linear_attn.cu` | **NEW** ported → `based` (2nd-order Taylor feature map φ=[1,x,x²/√2]) |
+| `hedgehog/hedgehog.cu` | ported → `hedgehog` (φ(x)=exp(x−rowmax)); plus `linear_attn` (identity), `lin_attn_causal` |
+| `mamba2/mamba2.cu` | ported → `mamba2` (selective SSD, decay-tile materialized form) |
 
-- `ThunderMittens/kernels/attn_fwd` is a partial attention-forward port, but it is not a direct path/name match for any of the ThunderKittens attention kernels below.
-- `ThunderMittens/kernels/matmul_custom` is a partial GEMM/matmul port, but it is not a direct path/name match for the ThunderKittens GEMM suite below.
-- `ThunderMittens/kernels/add_rt` has no direct ThunderKittens kernel counterpart under `.reference/ThunderKittens/kernels`.
+## GEMM (9) + educational (19)
+| TK file | Status |
+|---|---|
+| `gemm/bf16_h100`, `gemm/bf16_b200` | ported → `matmul_custom` (+ arbitrary shapes) / `gemm_staged` |
+| `gemm/educational_h100/{launch,level_01..08}` (9) | variant → one matmul, WGMMA/TMA optimization ladder (no Apple analog) → `matmul_custom`/`gemm_staged` |
+| `gemm/educational_b200/{launch,level_01..09}` (10) | variant → one matmul, tcgen05/cluster optimization ladder → `matmul_custom`/`gemm_staged` |
+| `gemm/fp8_h100`, `gemm/fp8_b200` | ported → `qgemm` format `fp8_e4m3` |
+| `gemm/fp8_h100_scaled` | **NEW** ported → `qgemm_fp8_scaled` (per-token × per-channel rank-1 fp8 scaling) |
+| `gemm/int8_h100`, `gemm/int8_b200` | ported → `qgemm_w8a8` (int8×int8→int32) |
+| `gemm/mxfp8_b200` | ported → `qgemm` format `mxfp8` (1×32 e8m0 block scale) |
+| `gemm/nvfp4_b200` | ported → `qgemm` format `nvfp4` (1×16 e4m3 block + per-tensor scale) |
 
-## Missing ThunderKittens Non-Baseline Kernel Implementations
+## Conv / norm / rotary / fusion (6)
+| TK file | Status |
+|---|---|
+| `fftconv/fftconv_non_pc.cu` | ported → `fftconv` (Monarch FFT convolution + complex-multiply MMA) |
+| `fftconv/fftconv_pc.cu` | variant → `fftconv` (persistent producer-consumer scheduling) |
+| `flux/flux_gelu.cu`, `flux/flux_gate.cu` | ported → `flux_gelu` / `flux_gate` |
+| `layernorm/layernorm.cu` | ported → `layernorm` (+ `rms_norm`, `softmax`, `gelu` are TK-inline ops) |
+| `rotary/rotary.cu` | ported → `rotary` (split-half RoPE) |
 
-These `.cu` files exist in ThunderKittens and do not have direct ThunderMittens kernel counterparts.
+## Parallel / distributed (16) — N/A on single-GPU Apple
+`parallel/{all_reduce, all_reduce_educational, reduce_scatter, all_gather, all_to_all, ring_attn,
+ulysses_attn, ag_gemm(+b200,+fp8), gemm_rs(+b200,+fp8), gemm_ar(+lcsc), moe_dispatch_gemm}` — all need
+NVLink/NVSwitch `multimem` multicast or GPU-initiated P2P, which Apple Silicon (one GPU per SoC) has no
+analog for. At N=1 each degenerates to a local kernel ThunderMittens already has (`matmul_custom`/
+`attn_*`), so porting them adds nothing. The nearest-neighbor patterns (`ring_attn`, `all_to_all`,
+`ulysses_attn`, `ag_gemm`, `gemm_rs`, `moe_dispatch_gemm`) are network-mappable only as a full
+host-driven rewrite (MLX-distributed / MPI over Thunderbolt/Ethernet) — a separate future project, not a
+kernel port. The NVLS-multicast families (`all_reduce`, `reduce_scatter`, `all_gather`, `gemm_ar`) have
+no Apple equivalent at all.
 
-### Attention
-
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_causal/bf16_b300_mha_causal.cu`
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_noncausal/bf16_b300_mha_noncausal.cu`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/mha_h100.cu`
-- `.reference/ThunderKittens/kernels/attention/mha_h100_lcf/mha_h100_lcf.cu`
-
-### Based / Linear Attention
-
-- `.reference/ThunderKittens/kernels/based/linear_attn.cu`
-- `.reference/ThunderKittens/kernels/linear_attention/linear_attention.cu`
-
-### FFTConv
-
-- `.reference/ThunderKittens/kernels/fftconv/fftconv_non_pc.cu`
-- `.reference/ThunderKittens/kernels/fftconv/fftconv_pc.cu`
-
-### Flux
-
-- `.reference/ThunderKittens/kernels/flux/flux_gate.cu`
-- `.reference/ThunderKittens/kernels/flux/flux_gelu.cu`
-
-### GEMM
-
-- `.reference/ThunderKittens/kernels/gemm/bf16_b200/bf16_b200_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/bf16_h100/bf16_h100_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/fp8_b200/fp8_b200_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/fp8_h100/fp8_h100_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/fp8_h100_scaled/fp8_h100_gemm_scaled.cu`
-- `.reference/ThunderKittens/kernels/gemm/int8_b200/int8_b200_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/int8_h100/int8_h100_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/mxfp8_b200/mxfp8_b200_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/nvfp4_b200/nvfp4_b200_gemm.cu`
-
-### Educational GEMM
-
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/launch.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_01.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_02.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_03.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_04.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_05.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_06.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_07.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_08.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/level_09.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/launch.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_01.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_02.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_03.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_04.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_05.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_06.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_07.cu`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/level_08.cu`
-
-### Hedgehog
-
-- `.reference/ThunderKittens/kernels/hedgehog/hedgehog.cu`
-
-### LayerNorm
-
-- `.reference/ThunderKittens/kernels/layernorm/layernorm.cu`
-
-### Mamba2
-
-- `.reference/ThunderKittens/kernels/mamba2/mamba2.cu`
-
-### Parallel / Distributed
-
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm/ag_gemm_b200.cu`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm/ag_gemm_h100.cu`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm_fp8/ag_gemm_fp8_b200.cu`
-- `.reference/ThunderKittens/kernels/parallel/all_gather/all_gather.cu`
-- `.reference/ThunderKittens/kernels/parallel/all_reduce/all_reduce.cu`
-- `.reference/ThunderKittens/kernels/parallel/all_reduce_educational/all_reduce_educational.cu`
-- `.reference/ThunderKittens/kernels/parallel/all_to_all/all_to_all.cu`
-- `.reference/ThunderKittens/kernels/parallel/gemm_ar/gemm_ar_h100.cu`
-- `.reference/ThunderKittens/kernels/parallel/gemm_ar/gemm_ar_h100_lcsc.cu`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs/gemm_rs_b200.cu`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs/gemm_rs_h100.cu`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs_fp8/gemm_rs_fp8_b200.cu`
-- `.reference/ThunderKittens/kernels/parallel/moe_dispatch_gemm/moe_dispatch_gemm_h100.cu`
-- `.reference/ThunderKittens/kernels/parallel/reduce_scatter/reduce_scatter.cu`
-- `.reference/ThunderKittens/kernels/parallel/ring_attn/ring_attn_h100.cu`
-- `.reference/ThunderKittens/kernels/parallel/ulysses_attn/ulysses_attn.cu`
-
-### Rotary
-
-- `.reference/ThunderKittens/kernels/rotary/rotary.cu`
-
-## ThunderKittens Baseline / Reference Implementations Not Present
-
-These live under `baselines/` in ThunderKittens and are not counted as primary kernel ports above.
-
-- `.reference/ThunderKittens/kernels/fftconv/baselines/tk_fftconv.py`
-- `.reference/ThunderKittens/kernels/gemm/baselines/bf16_cublas/bf16_cublas_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/baselines/bf16_cublas_lt/bf16_cublas_lt_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/baselines/fp8_cublas_lt/fp8_cublas_lt_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/baselines/int8_cublas_lt/int8_cublas_lt_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/baselines/mxfp8_cublas_lt/mxfp8_cublas_lt_gemm.cu`
-- `.reference/ThunderKittens/kernels/gemm/baselines/nvfp4_cublas_lt/nvfp4_cublas_lt_gemm.cu`
-- `.reference/ThunderKittens/kernels/layernorm/baselines/layer_norm_triton.py`
-- `.reference/ThunderKittens/kernels/mamba2/baselines/ssd_minimal.py`
-- `.reference/ThunderKittens/kernels/rotary/baselines/rotary.py`
-- `.reference/ThunderKittens/kernels/rotary/baselines/triton_rotary.py`
-
-## Missing ThunderKittens Support / Test / Benchmark Files
-
-These non-`.cu`, non-baseline files are part of the ThunderKittens kernel tree and do not have direct ThunderMittens counterparts.
-
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_causal/Makefile`
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_causal/test.py`
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_noncausal/Makefile`
-- `.reference/ThunderKittens/kernels/attention/bf16_b300_mha_noncausal/test.py`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/Makefile`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/benchmark.py`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/gentests.py`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/harness.impl`
-- `.reference/ThunderKittens/kernels/attention/mha_h100/test_correctness.py`
-- `.reference/ThunderKittens/kernels/attention/mha_h100_lcf/Makefile`
-- `.reference/ThunderKittens/kernels/attention/mha_h100_lcf/gentests.py`
-- `.reference/ThunderKittens/kernels/based/Makefile`
-- `.reference/ThunderKittens/kernels/based/benchmark.py`
-- `.reference/ThunderKittens/kernels/based/gentests.py`
-- `.reference/ThunderKittens/kernels/based/harness.impl`
-- `.reference/ThunderKittens/kernels/common.mk`
-- `.reference/ThunderKittens/kernels/fftconv/Makefile`
-- `.reference/ThunderKittens/kernels/fftconv/benchmark.py`
-- `.reference/ThunderKittens/kernels/fftconv/gentests.py`
-- `.reference/ThunderKittens/kernels/fftconv/gentests_1024.py`
-- `.reference/ThunderKittens/kernels/fftconv/harness.impl`
-- `.reference/ThunderKittens/kernels/fftconv/pytorch_ref.py`
-- `.reference/ThunderKittens/kernels/fftconv/test_correctness.py`
-- `.reference/ThunderKittens/kernels/flux/Makefile`
-- `.reference/ThunderKittens/kernels/flux/benchmark.py`
-- `.reference/ThunderKittens/kernels/gemm/bf16_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/bf16_h100/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/common.cuh`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/educational_b200/README.md`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/educational_h100/README.md`
-- `.reference/ThunderKittens/kernels/gemm/fp8_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/fp8_h100/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/fp8_h100_scaled/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/fp8_h100_scaled/visualize.py`
-- `.reference/ThunderKittens/kernels/gemm/int8_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/int8_h100/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/mxfp8_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/mxfp8_b200/test_gemm.py`
-- `.reference/ThunderKittens/kernels/gemm/mxfp8_b200/test_quantize.py`
-- `.reference/ThunderKittens/kernels/gemm/nvfp4_b200/Makefile`
-- `.reference/ThunderKittens/kernels/gemm/nvfp4_b200/test_gemm.py`
-- `.reference/ThunderKittens/kernels/gemm/nvfp4_b200/test_quantize.py`
-- `.reference/ThunderKittens/kernels/hedgehog/Makefile`
-- `.reference/ThunderKittens/kernels/hedgehog/benchmark.py`
-- `.reference/ThunderKittens/kernels/hedgehog/gentests.py`
-- `.reference/ThunderKittens/kernels/hedgehog/harness.impl`
-- `.reference/ThunderKittens/kernels/hedgehog/test_correctness.py`
-- `.reference/ThunderKittens/kernels/hedgehog/util.py`
-- `.reference/ThunderKittens/kernels/layernorm/Makefile`
-- `.reference/ThunderKittens/kernels/layernorm/benchmark.py`
-- `.reference/ThunderKittens/kernels/layernorm/gentests.py`
-- `.reference/ThunderKittens/kernels/layernorm/harness.impl`
-- `.reference/ThunderKittens/kernels/layernorm/test_correctness.py`
-- `.reference/ThunderKittens/kernels/linear_attention/Makefile`
-- `.reference/ThunderKittens/kernels/linear_attention/gentests.py`
-- `.reference/ThunderKittens/kernels/mamba2/Makefile`
-- `.reference/ThunderKittens/kernels/mamba2/benchmark.py`
-- `.reference/ThunderKittens/kernels/mamba2/gentests.py`
-- `.reference/ThunderKittens/kernels/mamba2/harness.impl`
-- `.reference/ThunderKittens/kernels/mamba2/harness2.impl`
-- `.reference/ThunderKittens/kernels/mamba2/harness3.impl`
-- `.reference/ThunderKittens/kernels/mamba2/test_correctness.py`
-- `.reference/ThunderKittens/kernels/parallel/README.md`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm_fp8/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/ag_gemm_fp8/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/all_gather/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/all_gather/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/all_reduce/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/all_reduce/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/all_reduce_educational/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/all_to_all/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/all_to_all/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/common.py`
-- `.reference/ThunderKittens/kernels/parallel/gemm_ar/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/gemm_ar/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs_fp8/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/gemm_rs_fp8/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/moe_dispatch_gemm/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/moe_dispatch_gemm/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/reduce_scatter/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/reduce_scatter/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/ring_attn/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/ring_attn/benchmark.py`
-- `.reference/ThunderKittens/kernels/parallel/ulysses_attn/Makefile`
-- `.reference/ThunderKittens/kernels/parallel/ulysses_attn/benchmark.py`
-- `.reference/ThunderKittens/kernels/rotary/Makefile`
-- `.reference/ThunderKittens/kernels/rotary/benchmark.py`
-- `.reference/ThunderKittens/kernels/rotary/gentests.py`
-- `.reference/ThunderKittens/kernels/rotary/harness.impl`
-- `.reference/ThunderKittens/kernels/rotary/harness2.impl`
-- `.reference/ThunderKittens/kernels/rotary/test_correctness.py`
-
-## ThunderMittens-Only Kernel-Package Files
-
-These files exist in ThunderMittens but not in the ThunderKittens kernel tree. They are mostly the MLX extension packaging and current Metal ports.
-
-- `ThunderMittens/kernels/CMakeLists.txt`
-- `ThunderMittens/kernels/add_rt/add_rt.cpp`
-- `ThunderMittens/kernels/add_rt/add_rt.h`
-- `ThunderMittens/kernels/add_rt/add_rt.metal`
-- `ThunderMittens/kernels/attn_fwd/attn_fwd.cpp`
-- `ThunderMittens/kernels/attn_fwd/attn_fwd.h`
-- `ThunderMittens/kernels/attn_fwd/attn_fwd.metal`
-- `ThunderMittens/kernels/attn_fwd/correctness/c_attn.m`
-- `ThunderMittens/kernels/attn_fwd/correctness/gentests.py`
-- `ThunderMittens/kernels/bindings.cpp`
-- `ThunderMittens/kernels/matmul_custom/matmul_custom.cpp`
-- `ThunderMittens/kernels/matmul_custom/matmul_custom.h`
-- `ThunderMittens/kernels/matmul_custom/matmul_custom.metal`
-- `ThunderMittens/kernels/pyproject.toml`
-- `ThunderMittens/kernels/requirements.txt`
-- `ThunderMittens/kernels/setup.py`
-- `ThunderMittens/kernels/time_attn.py`
-- `ThunderMittens/kernels/time_gemm.py`
-- `ThunderMittens/kernels/tk/__init__.py`
-
+## ThunderMittens-only kernels (no TK counterpart)
+The full quant family beyond the TK GEMM subset — `qgemm`/`qgemv`/`qflux` over 29 weight formats
+(llama.cpp k-quants/i-quants, BitNet, MX, fp8/fp4 variants), `qgemv_w8a8`/`qgemv_w2a8`/`qgemm_w2a8`
+integer decode/prefill, `qgemm_blockscale` (fp8_block2d), `qgemm_actorder` (GPTQ in-kernel gather),
+`attn_q` (quantized-KV attention) — plus `add_rt`, `cmplx_matmul`. See `docs/porting/marlin-quant.md`.

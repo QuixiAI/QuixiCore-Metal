@@ -31,6 +31,10 @@ Drop async double-buffering for v1. Validate every kernel against an MLX/NumPy o
 | `mamba2` | `mamba2` | ✅ | `((C@Bᵀ)⊙exp(Δcumlog)⊙tril)@X` | Selective SSD forward (materialized chunked form); decay tile via `add_row`/`sub_col`/`exp` from a host-precomputed `cumlog=cumsum(log a)`, D=64. `kernels/mamba2/` |
 | `cmplx_matmul` | `fftconv` (building block) | ✅ | complex `A@B` | Complex GEMM exercising the **complex-multiply MMA** (`complex_mma_AB`); operands carry a leading size-2 (real,imag) axis. f32/bf16. `kernels/cmplx_matmul/` |
 | `fftconv` | `fftconv` | ✅ | `torch.fft` circular conv (exact) | Monarch FFT convolution, N=S² (S∈{16,32}); complex matmuls (`complex_mm_AB`) + transposes + pointwise complex mul. **rel=0.00000 vs torch.fft.** `kernels/fftconv/` |
+| `lin_attn_decay` | `linear_attention` | ✅ | `((QKᵀ⊙Λ)@V)`, Λ=exp(−slope·(i−j)) | RetNet/Lightning-Attn-2: causal LA with per-head exp decay; mamba2 decay-tile mechanic on a −slope·pos ramp, D=64. `kernels/lin_attn_decay/` |
+| `based` | `based/linear_attn` | ✅ | `((1+x+x²/2)⊙tril)@V`, x=QKᵀ/√Dqk | Based 2nd-order Taylor feature-map LA; materialized form, D_QK=16/D_VO=64. `kernels/based/` |
+| `attn_fwd_l` / `attn_bwd` | `attention/mha_h100` (bwd) | ✅ | PyTorch autograd on SDPA (dQ/dK/dV) | FlashAttention-2 backward; forward emits log2-logsumexp L, then prep/dQ/dKV (one simdgroup/block, `swap_layout`→`mma_AtB`), non-causal+causal, D∈{64,128}. `kernels/attn_bwd/` |
+| `qgemm_fp8_scaled` | `gemm/fp8_h100_scaled` | ✅ | `(dequant·dequant)·w_scale·a_scale` | fp8-both rank-1 scaled GEMM (per-channel × per-token); the fp8 analog of W8A8. `kernels/qgemm/` |
 
 All kernels ship on **both** backends (MLX + PyTorch MPS) via `tk_launch.h`. Run all:
 `cd ThunderMittens/kernels && python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q`
@@ -40,8 +44,25 @@ Benchmark the perf kernels: `python time_perf.py`.
 **Complex-multiply MMA** (`include/ops/warp/register/tile/mma.metal`): `complex_mma_AB`/`_ABt`/`_AtB`/
 `_AtBt` + `complex_mm_AB` operate on the `crt` complex tiles as four real MMAs on the `.real`/`.imag`
 components (`Dr = Ar·Br − Ai·Bi`, `Di = Ar·Bi + Ai·Br`; the `−Ai·Bi` is folded by negating `Ai` once).
-Validated by `cmplx_matmul` and used to build `fftconv` — **every algorithmically-distinct,
-Apple-feasible TK kernel is now ported.**
+Validated by `cmplx_matmul` and used to build `fftconv`.
+
+## Full-parity close-out — four genuine gaps closed
+
+A reconciliation pass against the full 58-file TK inventory (see the refreshed `discrepencies.md`) found
+four algorithms the earlier "everything distinct is ported" claim had missed (the rest are confirmed
+hardware/scheduling/pedagogical variants or N/A multi-GPU). All four are now ported, dual-backend, validated:
+
+| Kernel | Reference | Oracle |
+|---|---|---|
+| `qgemm_fp8_scaled` | `gemm/fp8_h100_scaled` | both operands fp8, rank-1 per-token×per-channel scaling vs `dequant·dequant·scales` |
+| `lin_attn_decay` | `linear_attention/linear_attention` | RetNet/Lightning-Attn-2 per-head exp decay vs `((QKᵀ⊙Λ)@V)` |
+| `based` | `based/linear_attn` | 2nd-order Taylor map (φ=[1,x,x²/√2]) vs `((1+x+x²/2)⊙tril)@V` |
+| `attn_bwd` (+ `attn_fwd_l`) | `attention/mha_h100` bwd | dQ/dK/dV vs PyTorch autograd on SDPA (non-causal+causal, D∈{64,128}) |
+
+`attn_bwd` is the FlashAttention-2 backward (the distinct algorithm vs the forward): `attn_fwd_l` emits
+the log2-domain logsumexp `L`, then `attn_bwd_prep`/`attn_bwd_dq`/`attn_bwd_dkv` (one simdgroup per
+block, no atomics; `swap_layout` feeds the col-layout operand to `mma_AtB`). With these, **every
+algorithmically-distinct, Apple-feasible TK kernel is ported** (897 Python + 126 Xcode tests).
 
 ## Completion map — the full 58-file TK inventory on Apple
 
@@ -58,8 +79,8 @@ TK files are hardware-specific *variants* of one algorithm:
   `rms_norm`, `softmax`, `gelu` (TK has these inline/fused).
 - Sequence / state-space (the whole family): `linear_attention` / `based/linear_attn` / `hedgehog` /
   `mamba2` → ported as `linear_attn` (non-causal), `lin_attn_causal` (causal scan), `hedgehog`
-  (feature-map), and `mamba2` (selective SSD with the decay-tile). A Taylor feature map for `based` is
-  a small variant of `hedgehog`/`linear_attn`.
+  (feature-map), `mamba2` (selective SSD with the decay-tile), plus — closed in the parity pass —
+  `based` (2nd-order Taylor feature map) and `lin_attn_decay` (RetNet/retention per-head exp decay).
 - FFT / complex: `fftconv` → ported as the Monarch FFT convolution (`kernels/fftconv/`) on the new
   complex-multiply MMA. Validated exact (rel=0.00000) vs `torch.fft`.
 
@@ -117,8 +138,14 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
 - ℹ️ `nvfp8` intentionally not added (not a real format); `fp8_e4m3` + `mxfp8` cover 8-bit float.
 
 **Not applicable on Apple:**
-- `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —
-  multi-GPU collectives; a single Apple GPU has no NVLink/multi-device fabric. N/A for this target.
+- `parallel/*` (16 kernels: `ag_gemm`(+b200,+fp8), `all_reduce`(+educational), `all_gather`,
+  `all_to_all`, `reduce_scatter`, `ring_attn`, `ulysses_attn`, `gemm_rs`(+b200,+fp8), `gemm_ar`(+lcsc),
+  `moe_dispatch_gemm`) — multi-GPU collectives. A single Apple GPU per SoC has no NVLink/NVSwitch
+  `multimem` multicast or GPU-initiated P2P. At N=1 each degenerates to a local kernel we already have
+  (`matmul_custom`/`attn_*`), so a "port" adds nothing. The nearest-neighbor patterns (`ring_attn`,
+  `all_to_all`, `ulysses_attn`, `ag_gemm`, `gemm_rs`, `moe_dispatch_gemm`) are network-mappable only as
+  a full host-driven rewrite (MLX-distributed/MPI over Thunderbolt) — a separate future project; the
+  NVLS-multicast families (`all_reduce`, `reduce_scatter`, `all_gather`, `gemm_ar`) have no Apple analog.
 - `gemm/baselines/*` (cuBLAS reference impls) — reference baselines, not TK kernels.
 - **Correction — NOT N/A:** the low-precision GEMM family (`gemm/{fp8_*, int8_*, int4, mxfp8_*,
   nvfp4_*}`) was *previously* parked here as "no Apple low-precision tensor cores." That was wrong —
