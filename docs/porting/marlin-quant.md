@@ -8,7 +8,10 @@
 > (AWQ int4 g128 + zero-point)**; float — **fp8_e4m3, fp4_e2m1, mxfp8 (e8m0 block scale), nvfp4
 > (e4m3 block scale), mxfp4 (e8m0 block scale + e2m1)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
 > so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
-> Remaining: Phase 5 dequant-direct-to-fragment (Marlin zero-shuffle); Phase 6 retrofit flux/attention.
+> Phase 6 (retrofit) demonstrated: `kernels/qflux/` — `qflux_gelu` = gelu(dequantize(Wq)@X + bias),
+> the dequant path + flux's bias+GELU epilogue, all 10 formats, dual-backend (proves the dequant
+> primitive drops into a fused kernel). Remaining: Phase 5 dequant-direct-to-fragment (Marlin
+> zero-shuffle, needs the Apple 8×8 fragment map); more retrofits (attention quantized-KV).
 
 ## The correction
 

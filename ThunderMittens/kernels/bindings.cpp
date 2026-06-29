@@ -75,6 +75,7 @@
 #include "fftconv/fftconv.h"
 #include "qgemm/qgemm.h"
 #include "qgemv/qgemv.h"
+#include "qflux/qflux.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -332,5 +333,18 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         quantized GEMV (batch-1 decode): out = dequantize(wq) @ x; x is (K,1)
+      )");
+
+    m.def(
+      "qflux_gelu",
+      &qflux_gelu,
+      "wq"_a,
+      "x"_a,
+      "bias"_a,
+      "format"_a = "q8_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias)
       )");
 }

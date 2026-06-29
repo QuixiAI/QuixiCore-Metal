@@ -124,6 +124,7 @@
 				kernels/fftconv/fftconv.cpp,
 				kernels/qgemm/qgemm.cpp,
 				kernels/qgemv/qgemv.cpp,
+				kernels/qflux/qflux.cpp,
 				kernels/flux/flux.cpp,
 				kernels/gelu/gelu.cpp,
 				kernels/gemm_staged/gemm_staged.cpp,

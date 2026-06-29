@@ -45,6 +45,7 @@ inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmpl
 inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_string(S); }
 inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" + fmt; }
 inline std::string qgemv_kernel_name(const std::string& fmt) { return "qgemv_" + fmt; }
+inline std::string qflux_gelu_kernel_name(const std::string& fmt) { return "qflux_gelu_" + fmt; }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -278,6 +279,17 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4);
   e.dispatch(N, 1, 1, 32, 1, 1);  // one simdgroup per output row
+}
+
+// ----- qflux_gelu (quantized fused GEMM+GELU): D@0 Wq@1 X@2 bias@3 ; N@4 K@5 M@6 (i32) ;
+//        grid (M/32, N/32, 1), 64 threads. D = gelu(dequant(Wq) @ X + bias), all half. -----
+template <class E>
+void launch_qflux_gelu(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                       typename E::in_t bias, int N, int K, int M, const std::string& fmt) {
+  e.pipeline(qflux_gelu_kernel_name(fmt));
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2); e.in(bias, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(M / 32, N / 32, 1, 64, 1, 1);
 }
 
 } // namespace tk

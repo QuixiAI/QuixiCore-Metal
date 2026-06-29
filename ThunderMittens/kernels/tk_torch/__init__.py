@@ -41,6 +41,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "fftconv", "fftconv.metal"),
     os.path.join(_KERNELS, "qgemm", "qgemm.metal"),
     os.path.join(_KERNELS, "qgemv", "qgemv.metal"),
+    os.path.join(_KERNELS, "qflux", "qflux.metal"),
 ]
 
 
@@ -192,3 +193,8 @@ def qgemm(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. x (K, 1) float16 -> (N, 1). MPS."""
     return _ext.qgemv(wq, x, format)
+
+
+def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: str = "q8_0"):
+    """Quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias). x (K,M) f16; bias (M,) f16. MPS."""
+    return _ext.qflux_gelu(wq, x, bias, format)

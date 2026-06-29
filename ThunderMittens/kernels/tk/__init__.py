@@ -206,3 +206,11 @@ def qgemv(wq, x, format="q8_0"):
     if _is_torch(wq):
         return _torch().qgemv(wq, x, format)
     return _mlx().qgemv(wq, x, format=format)
+
+
+def qflux_gelu(wq, x, bias, format="q8_0"):
+    """Quantized fused GEMM+GELU: gelu(dequantize(wq) @ x + bias). wq packed weight blocks;
+    x (K,M) float16; bias (M,) float16 -> (N,M) float16. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qflux_gelu(wq, x, bias, format)
+    return _mlx().qflux_gelu(wq, x, bias, format=format)

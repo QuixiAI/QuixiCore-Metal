@@ -435,6 +435,24 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   return out;
 }
 
+static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
+                                 const at::Tensor& bias_in, const std::string& format) {
+  TORCH_CHECK(wq_in.device().is_mps(), "qflux_gelu: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.scalar_type() == at::kByte, "qflux_gelu: wq must be uint8 packed blocks");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf && bias_in.scalar_type() == at::kHalf,
+              "qflux_gelu: x and bias must be float16");
+  auto wq = wq_in.contiguous(), x = x_in.contiguous(), bias = bias_in.contiguous();
+  TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && bias.dim() == 1, "qflux_gelu: wq (N,K/bk,bytes), x (K,M), bias (M)");
+  const int block_k = (format == "q4_K") ? 256
+                    : (format == "kU4B8" || format == "kU4") ? 128
+                    : (format == "nvfp4") ? 16 : 32;
+  const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
+  TORCH_CHECK(x.size(0) == K && bias.size(0) == M && N % 32 == 0 && M % 32 == 0, "qflux_gelu: shapes");
+  auto out = at::empty({N, M}, x.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qflux_gelu(e, out, wq, x, bias, N, K, M, format); });
+  return out;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
@@ -458,4 +476,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
+  m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");
 }
