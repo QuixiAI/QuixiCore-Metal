@@ -207,7 +207,7 @@ def test_fftconv_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8", "kU4", "fp8_e4m3", "fp4_e2m1", "mxfp8", "nvfp4", "mxfp4"])
 @pytest.mark.parametrize("nkm", [(64, 256, 64), (128, 512, 128)])
 def test_qgemm_parity(nkm, fmt):
     # same packed weights + same fp16 activations -> MLX and MPS run the same kernel ≈ identical
@@ -227,7 +227,7 @@ def test_qgemm_parity(nkm, fmt):
     _assert_parity(om, ot, atol=atol)
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "q4_K", "kU4B8", "kU4", "fp8_e4m3", "fp4_e2m1", "mxfp8", "nvfp4", "mxfp4"])
 @pytest.mark.parametrize("nk", [(64, 256), (128, 256)])
 def test_qgemv_parity(nk, fmt):
     from tk.quant import QUANT_FORMATS

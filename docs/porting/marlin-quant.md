@@ -1,12 +1,14 @@
 # Brainstorm: implementing the ThunderKittens kernels with Marlin's methods on Apple
 
-> **Status:** foundation + integer fan-out landed — `include/.../tile/dequant.metal` (dequant
-> primitive, with the MMA `BK=32` decoupled from `block_k` so large blocks work), `kernels/qgemm/`
-> (dequant-to-shared → simdgroup MMA, prefill) and `kernels/qgemv/` (batch-1 decode reduction).
-> Formats done: **q8_0, q4_0, q4_K (256-superblock hierarchical scales), kU4B8 (GPTQ/Marlin int4
-> group-128)** — all dual-backend, validated vs `dequantize(Wq)@x`. Host quant + a format registry in
-> `kernels/tk/quant.py`. Remaining: kU4 (AWQ zero-point); float formats (fp8_e4m3/fp4_e2m1/mxfp8/nvfp4);
-> then dequant-direct-to-fragment + retrofitting flux/attention.
+> **Status:** dequant primitive + both kernels + ALL 9 formats landed. `include/.../tile/dequant.metal`
+> (the MMA `BK=32` is decoupled from `block_k`, so any block size works), `kernels/qgemm/` (dequant-to-
+> shared → simdgroup MMA, prefill) and `kernels/qgemv/` (batch-1 decode reduction). Formats (all
+> dual-backend, validated vs `dequantize(Wq)@x`, rel ~1e-3):
+> integer — **q8_0, q4_0, q4_K (256-superblock hierarchical scales), kU4B8 (GPTQ int4 g128), kU4
+> (AWQ int4 g128 + zero-point)**; float — **fp8_e4m3, fp4_e2m1, mxfp8 (e8m0 block scale), nvfp4
+> (e4m3 block scale), mxfp4 (e8m0 block scale + e2m1)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
+> so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
+> Remaining: Phase 5 dequant-direct-to-fragment (Marlin zero-shuffle); Phase 6 retrofit flux/attention.
 
 ## The correction
 

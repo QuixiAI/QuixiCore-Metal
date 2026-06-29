@@ -178,10 +178,188 @@ def dequantize_kU4B8(packed: np.ndarray) -> np.ndarray:
     return ((nib - 8.0) * d).reshape(N, nb * KU4B8_BLOCK_K)
 
 
+# ---- kU4 : AWQ grouped int4, group=128, per-group zero-point.
+# { float16 scale; float16 zp; uint8 qs[64]; } = 68 bytes. value = scale*(nibble - zp). ----
+KU4_BLOCK_K = 128
+KU4_BLOCK_BYTES = 68
+
+
+def quantize_kU4(W: np.ndarray) -> np.ndarray:
+    W = np.ascontiguousarray(W, dtype=np.float32)
+    N, K = W.shape
+    assert K % KU4_BLOCK_K == 0, "K must be a multiple of 128"
+    nb = K // KU4_BLOCK_K
+    Wb = W.reshape(N, nb, KU4_BLOCK_K)
+    mn, mx = Wb.min(axis=2), Wb.max(axis=2)
+    scale = ((mx - mn) / 15.0).astype(np.float32)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    zp = np.clip(np.rint(-mn / ssafe), 0, 15).astype(np.float32)            # (N, nb)
+    q = np.clip(np.rint(Wb / ssafe[..., None] + zp[..., None]), 0, 15).astype(np.uint8)
+    out = np.zeros((N, nb, KU4_BLOCK_BYTES), dtype=np.uint8)
+    out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:4] = zp.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    lo, hi = q[:, :, 0:64], q[:, :, 64:128]
+    out[:, :, 4:KU4_BLOCK_BYTES] = (lo | (hi << 4)).astype(np.uint8)
+    return out
+
+
+def dequantize_kU4(packed: np.ndarray) -> np.ndarray:
+    packed = np.ascontiguousarray(packed, dtype=np.uint8)
+    N, nb, _ = packed.shape
+    scale = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    zp = np.ascontiguousarray(packed[:, :, 2:4]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = packed[:, :, 4:KU4_BLOCK_BYTES].astype(np.int32)
+    nib = np.concatenate([qs & 0x0F, qs >> 4], axis=2).astype(np.float32)
+    return (scale * (nib - zp)).reshape(N, nb * KU4_BLOCK_K)
+
+
+# ---- float-code codebooks (host encode = nearest decoded value, so host decode == kernel decode) ----
+def _e4m3_decode_arr(b):
+    b = b.astype(np.int32); s = (b >> 7) & 1; e = (b >> 3) & 0xF; m = b & 0x7
+    val = np.where(e == 0, (m / 8.0) * 2.0 ** -6, (1.0 + m / 8.0) * 2.0 ** (e - 7))
+    return np.where(s == 1, -val, val).astype(np.float32)
+
+
+def _e2m1_decode_arr(n):
+    n = n.astype(np.int32); s = (n >> 3) & 1; e = (n >> 1) & 3; m = n & 1
+    val = np.where(e == 0, np.where(m == 1, 0.5, 0.0), (1.0 + m * 0.5) * 2.0 ** (e - 1))
+    return np.where(s == 1, -val, val).astype(np.float32)
+
+
+_E4M3_CODES = np.array([b for b in range(256) if not (((b >> 3) & 0xF) == 0xF and (b & 7) == 7)], np.uint8)
+_E4M3_VALS = _e4m3_decode_arr(_E4M3_CODES)
+_E2M1_CODES = np.arange(16, dtype=np.uint8)
+_E2M1_VALS = _e2m1_decode_arr(_E2M1_CODES)
+
+
+def _nearest(x, codes, vals):
+    idx = np.abs(x[..., None].astype(np.float32) - vals).argmin(axis=-1)
+    return codes[idx]
+
+
+# ---- fp8_e4m3 : per-group (32) half-scaled fp8. { half scale; uint8 qs[32]; } = 34 bytes. ----
+def quantize_fp8_e4m3(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    scale = (np.abs(Wb).max(axis=2) / 448.0).astype(np.float32)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    codes = _nearest(Wb / ssafe[..., None], _E4M3_CODES, _E4M3_VALS)        # (N,nb,32) uint8
+    out = np.zeros((N, nb, 34), np.uint8)
+    out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:34] = codes
+    return out
+
+
+def dequantize_fp8_e4m3(packed):
+    N, nb, _ = packed.shape
+    scale = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    return (scale * _e4m3_decode_arr(packed[:, :, 2:34])).reshape(N, nb * 32)
+
+
+def _pack_nibbles(codes, half_n):
+    """codes (..., 2*half_n) -> bytes (..., half_n): byte r = codes[r] | codes[r+half_n]<<4."""
+    lo, hi = codes[..., :half_n], codes[..., half_n:]
+    return (lo | (hi << 4)).astype(np.uint8)
+
+
+# ---- fp4_e2m1 : per-group (32) half-scaled fp4 (nibbles). { half scale; uint8 qs[16]; } = 18 bytes. ----
+def quantize_fp4_e2m1(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    scale = (np.abs(Wb).max(axis=2) / 6.0).astype(np.float32)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    codes = _nearest(Wb / ssafe[..., None], _E2M1_CODES, _E2M1_VALS)        # (N,nb,32)
+    out = np.zeros((N, nb, 18), np.uint8)
+    out[:, :, 0:2] = scale.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+    out[:, :, 2:18] = _pack_nibbles(codes, 16)
+    return out
+
+
+def dequantize_fp4_e2m1(packed):
+    N, nb, _ = packed.shape
+    scale = np.ascontiguousarray(packed[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = packed[:, :, 2:18].astype(np.int32)
+    nib = np.concatenate([qs & 0x0F, qs >> 4], axis=2)
+    return (scale * _e2m1_decode_arr(nib)).reshape(N, nb * 32)
+
+
+# ---- mxfp8 : 32-block, e8m0 power-of-two scale + fp8 e4m3. { uint8 e8m0; uint8 qs[32]; } = 33 bytes. ----
+def quantize_mxfp8(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    amax = np.abs(Wb).max(axis=2)
+    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / 448.0)), 0.0)
+    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)                      # (N,nb)
+    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
+    codes = _nearest(Wb / scale[..., None], _E4M3_CODES, _E4M3_VALS)
+    out = np.zeros((N, nb, 33), np.uint8)
+    out[:, :, 0] = e8m0.astype(np.uint8)
+    out[:, :, 1:33] = codes
+    return out
+
+
+def dequantize_mxfp8(packed):
+    N, nb, _ = packed.shape
+    scale = (2.0 ** (packed[:, :, 0].astype(np.int32) - 127)).astype(np.float32)[..., None]
+    return (scale * _e4m3_decode_arr(packed[:, :, 1:33])).reshape(N, nb * 32)
+
+
+# ---- nvfp4 : 16-block, fp8 e4m3 block scale + fp4 e2m1 codes. { uint8 e4m3; uint8 qs[8]; } = 9 bytes. ----
+def quantize_nvfp4(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 16
+    Wb = W.reshape(N, nb, 16)
+    target = (np.abs(Wb).max(axis=2) / 6.0).astype(np.float32)
+    scale_byte = _nearest(target, _E4M3_CODES, _E4M3_VALS)                  # (N,nb) uint8
+    scale = _e4m3_decode_arr(scale_byte)
+    ssafe = np.where(scale == 0, 1.0, scale)
+    codes = _nearest(Wb / ssafe[..., None], _E2M1_CODES, _E2M1_VALS)        # (N,nb,16)
+    out = np.zeros((N, nb, 9), np.uint8)
+    out[:, :, 0] = scale_byte
+    out[:, :, 1:9] = _pack_nibbles(codes, 8)
+    return out
+
+
+def dequantize_nvfp4(packed):
+    N, nb, _ = packed.shape
+    scale = _e4m3_decode_arr(packed[:, :, 0])[..., None]
+    qs = packed[:, :, 1:9].astype(np.int32)
+    nib = np.concatenate([qs & 0x0F, qs >> 4], axis=2)
+    return (scale * _e2m1_decode_arr(nib)).reshape(N, nb * 16)
+
+
+# ---- mxfp4 : 32-block, e8m0 power-of-two scale + fp4 e2m1 codes. { uint8 e8m0; uint8 qs[16]; } = 17 bytes. ----
+def quantize_mxfp4(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32)
+    amax = np.abs(Wb).max(axis=2)
+    exp = np.where(amax > 0, np.floor(np.log2(np.maximum(amax, 1e-30) / 6.0)), 0.0)
+    e8m0 = np.clip(exp + 127, 0, 254).astype(np.int32)
+    scale = (2.0 ** (e8m0 - 127)).astype(np.float32)
+    codes = _nearest(Wb / scale[..., None], _E2M1_CODES, _E2M1_VALS)        # (N,nb,32)
+    out = np.zeros((N, nb, 17), np.uint8)
+    out[:, :, 0] = e8m0.astype(np.uint8)
+    out[:, :, 1:17] = _pack_nibbles(codes, 16)
+    return out
+
+
+def dequantize_mxfp4(packed):
+    N, nb, _ = packed.shape
+    scale = (2.0 ** (packed[:, :, 0].astype(np.int32) - 127)).astype(np.float32)[..., None]
+    qs = packed[:, :, 1:17].astype(np.int32)
+    nib = np.concatenate([qs & 0x0F, qs >> 4], axis=2)
+    return (scale * _e2m1_decode_arr(nib)).reshape(N, nb * 32)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
     "q4_0": (quantize_q4_0, dequantize_q4_0),
     "q4_K": (quantize_q4_K, dequantize_q4_K),
     "kU4B8": (quantize_kU4B8, dequantize_kU4B8),
+    "kU4": (quantize_kU4, dequantize_kU4),
+    "fp8_e4m3": (quantize_fp8_e4m3, dequantize_fp8_e4m3),
+    "fp4_e2m1": (quantize_fp4_e2m1, dequantize_fp4_e2m1),
+    "mxfp8": (quantize_mxfp8, dequantize_mxfp8),
+    "nvfp4": (quantize_nvfp4, dequantize_nvfp4),
+    "mxfp4": (quantize_mxfp4, dequantize_mxfp4),
 }

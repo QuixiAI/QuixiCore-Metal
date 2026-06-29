@@ -83,6 +83,96 @@ struct kU4B8 {
     }
 };
 
+// ---- kU4 : AWQ grouped int4, group=128, per-group zero-point. { half scale; half zp;
+//   uint8 qs[64]; } — 68 bytes. value = scale * (nibble - zp). ----
+struct kU4 {
+    constant static constexpr const int block_k     = 128;
+    constant static constexpr const int block_bytes = 68;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = ((device const half*)base)[0];
+        const half zp    = ((device const half*)base)[1];
+        device const uchar* qs = base + 4;
+        const int nib = (col < 64) ? (qs[col] & 0x0F) : (qs[col - 64] >> 4);
+        return scale * (half(nib) - zp);
+    }
+};
+
+// ---- float-code decoders (pure IEEE bit/field math; widen to half) ----
+// fp8 e4m3 (1-4-3, bias 7, no inf): value = (-1)^s * (1 + m/8) * 2^(e-7), subnormal at e==0.
+METAL_FUNC half tk_e4m3_decode(uchar v) {
+    const uint e = (v >> 3) & 0xF;
+    const uint m = v & 0x7;
+    half val = (e == 0) ? (half(m) * 0.125h * 0.015625h)      // (m/8) * 2^-6
+                        : (1.0h + half(m) * 0.125h) * metal::exp2(half((int)e - 7));
+    return ((v >> 7) & 1) ? -val : val;
+}
+// fp4 e2m1 (1-2-1, bias 1): values 0,.5,1,1.5,2,3,4,6 (+sign).
+METAL_FUNC half tk_e2m1_decode(uint nib) {
+    const uint e = (nib >> 1) & 0x3;
+    const uint m = nib & 0x1;
+    half val = (e == 0) ? (m ? 0.5h : 0.0h)
+                        : (1.0h + half(m) * 0.5h) * metal::exp2(half((int)e - 1));
+    return ((nib >> 3) & 1) ? -val : val;
+}
+
+// ---- fp8_e4m3 : per-group (32) half-scaled fp8. { half scale; uint8 qs[32]; } — 34 bytes.
+//   value = scale * e4m3(q). ----
+struct fp8_e4m3 {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 34;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        return ((device const half*)base)[0] * tk_e4m3_decode((base + 2)[col]);
+    }
+};
+
+// ---- fp4_e2m1 : per-group (32) half-scaled fp4 (nibbles, q4_0-style packing). 18 bytes. ----
+struct fp4_e2m1 {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 18;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar* qs = base + 2;
+        const uint nib = (col < 16) ? (qs[col] & 0x0F) : (qs[col - 16] >> 4);
+        return ((device const half*)base)[0] * tk_e2m1_decode(nib);
+    }
+};
+
+// ---- mxfp8 : OCP microscaling — 32-element block, e8m0 power-of-two block scale + fp8 e4m3.
+//   { uint8 e8m0; uint8 qs[32]; } — 33 bytes. value = 2^(e8m0-127) * e4m3(q). ----
+struct mxfp8 {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 33;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = metal::exp2(half((int)base[0] - 127));
+        return scale * tk_e4m3_decode((base + 1)[col]);
+    }
+};
+
+// ---- nvfp4 : 16-element block, fp8 e4m3 block scale + fp4 e2m1 codes (nibbles).
+//   { uint8 e4m3_scale; uint8 qs[8]; } — 9 bytes. value = e4m3(scale) * e2m1(nib). ----
+struct nvfp4 {
+    constant static constexpr const int block_k     = 16;
+    constant static constexpr const int block_bytes = 9;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = tk_e4m3_decode(base[0]);
+        device const uchar* qs = base + 1;
+        const uint nib = (col < 8) ? (qs[col] & 0x0F) : (qs[col - 8] >> 4);
+        return scale * tk_e2m1_decode(nib);
+    }
+};
+
+// ---- mxfp4 : OCP microscaling — 32-element block, e8m0 power-of-two block scale + fp4 e2m1 codes
+//   (nibbles). { uint8 e8m0; uint8 qs[16]; } — 17 bytes. value = 2^(e8m0-127) * e2m1(nib). ----
+struct mxfp4 {
+    constant static constexpr const int block_k     = 32;
+    constant static constexpr const int block_bytes = 17;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half scale = metal::exp2(half((int)base[0] - 127));
+        device const uchar* qs = base + 1;
+        const uint nib = (col < 16) ? (qs[col] & 0x0F) : (qs[col - 16] >> 4);
+        return scale * tk_e2m1_decode(nib);
+    }
+};
+
 // Cooperatively dequantize an (BN x BK) weight tile into a shared half tile. `kb` is the K-tile
 // index in units of BK (the MMA K-step). The quant grouping (FMT::block_k) is DECOUPLED from BK:
 // each tile column maps to its quant block via the global K index, so large blocks (e.g. q4_K's

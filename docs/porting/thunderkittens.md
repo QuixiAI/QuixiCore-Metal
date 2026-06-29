@@ -86,11 +86,11 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   `marlin-quant.md` for the plan; references: Marlin `dequant.h`, vLLM-Metal, llama.cpp `kernel_mul_mm`.
 - ✅ Done: `kernels/qgemm/` (dequant-to-shared → MMA, prefill/batched) and `kernels/qgemv/` (batch-1
   decode, simd-reduction); dequant primitive in `include/.../tile/dequant.metal` (MMA `BK=32`
-  decoupled from `block_k`). `tk.qgemm` auto-routes M==1 → `qgemv`. Formats: **q8_0, q4_0, q4_K, kU4B8**
-  (GPTQ/Marlin int4 group-128) — all dual-backend, validated vs `dequantize(Wq)@x`.
-- ☐ Remaining (fan-out): `kU4` (AWQ zero-point); `fp8_e4m3`, `fp4_e2m1`, block-scaled `mxfp8`/`nvfp4`
-  (float) — each is one `dequant_<fmt>` + host quant + instantiations. Then the dequant-direct-to-
-  fragment optimization, and retrofitting `flux`/attention to take quantized weights.
+  decoupled from `block_k`). `tk.qgemm` auto-routes M==1 → `qgemv`. **All 9 formats**, dual-backend,
+  validated vs `dequantize(Wq)@x`: integer `q8_0, q4_0, q4_K, kU4B8, kU4`; float `fp8_e4m3, fp4_e2m1,
+  mxfp8, nvfp4`.
+- ☐ Remaining: dequant-direct-to-fragment optimization (Marlin zero-shuffle), and retrofitting
+  `flux`/attention to take quantized weights.
 
 **Not applicable on Apple:**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —

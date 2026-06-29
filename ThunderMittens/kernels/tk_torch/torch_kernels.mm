@@ -408,7 +408,9 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemm: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2, "qgemm: wq (N,K/bk,bytes), x (K,M)");
-  const int block_k = (format == "q4_K") ? 256 : (format == "kU4B8") ? 128 : 32;
+  const int block_k = (format == "q4_K") ? 256
+                    : (format == "kU4B8" || format == "kU4") ? 128
+                    : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
   TORCH_CHECK(x.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm: N%32,M%32, x rows==K");
   auto out = at::empty({N, M}, x.options());
@@ -423,7 +425,9 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemv: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && x.size(1) == 1, "qgemv: wq (N,K/bk,bytes), x (K,1)");
-  const int block_k = (format == "q4_K") ? 256 : (format == "kU4B8") ? 128 : 32;
+  const int block_k = (format == "q4_K") ? 256
+                    : (format == "kU4B8" || format == "kU4") ? 128
+                    : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k;
   TORCH_CHECK(x.size(0) == K, "qgemv: x rows must equal K");
   auto out = at::empty({N, 1}, x.options());
