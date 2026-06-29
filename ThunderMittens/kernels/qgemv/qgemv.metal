@@ -56,5 +56,12 @@ instantiate_qgemv("qgemv_iq2_xxs", iq2_xxs);
 instantiate_qgemv("qgemv_iq2_xs", iq2_xs);
 instantiate_qgemv("qgemv_iq3_xxs", iq3_xxs);
 instantiate_qgemv("qgemv_iq1_s", iq1_s);
+instantiate_qgemv("qgemv_q4_1", q4_1);
+instantiate_qgemv("qgemv_q5_0", q5_0);
+instantiate_qgemv("qgemv_q5_1", q5_1);
+instantiate_qgemv("qgemv_q2_K", q2_K);
+instantiate_qgemv("qgemv_q3_K", q3_K);
+instantiate_qgemv("qgemv_q5_K", q5_K);
+instantiate_qgemv("qgemv_q6_K", q6_K);
 
 }

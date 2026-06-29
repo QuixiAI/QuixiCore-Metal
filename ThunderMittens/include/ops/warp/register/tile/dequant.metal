@@ -344,6 +344,119 @@ struct bitnet {
     static METAL_FUNC half gscale(device const uchar* base) { return ((device const half*)base)[0]; }
 };
 
+// ============================ Phase 3: GGUF k-quant + legacy fan-out ============================
+// Byte layouts match ggml-common.h; per-column decoders mirror the ggml CPU dequantize_row_* refs.
+
+// ---- q4_1 : { half d; half m; uint8 qs[16]; } — 20 bytes, 32/block. value = d*nibble + m. ----
+struct q4_1 {
+    constant static constexpr const int block_k = 32, block_bytes = 20;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0], m = ((device const half*)base)[1];
+        device const uchar* qs = base + 4;
+        const int nib = (col < 16) ? (qs[col] & 0xF) : (qs[col - 16] >> 4);
+        return d * half(nib) + m;
+    }
+};
+
+// ---- q5_0 : { half d; uint8 qh[4]; uint8 qs[16]; } — 22 bytes. value = d*(q-16), q = nibble |
+//   (5th bit = bit `col` of the qh uint32). ----
+struct q5_0 {
+    constant static constexpr const int block_k = 32, block_bytes = 22;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0];
+        const uint qh = (uint)base[2] | ((uint)base[3] << 8) | ((uint)base[4] << 16) | ((uint)base[5] << 24);
+        device const uchar* qs = base + 6;
+        const int nib = (col < 16) ? (qs[col] & 0xF) : (qs[col - 16] >> 4);
+        const int q = nib | (((qh >> col) & 1) << 4);
+        return d * half(q - 16);
+    }
+};
+
+// ---- q5_1 : { half d; half m; uint8 qh[4]; uint8 qs[16]; } — 24 bytes. value = d*q + m. ----
+struct q5_1 {
+    constant static constexpr const int block_k = 32, block_bytes = 24;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0], m = ((device const half*)base)[1];
+        const uint qh = (uint)base[4] | ((uint)base[5] << 8) | ((uint)base[6] << 16) | ((uint)base[7] << 24);
+        device const uchar* qs = base + 8;
+        const int nib = (col < 16) ? (qs[col] & 0xF) : (qs[col - 16] >> 4);
+        const int q = nib | (((qh >> col) & 1) << 4);
+        return d * half(q) + m;
+    }
+};
+
+// ---- q2_K : { uint8 scales[16]; uint8 qs[64]; half d; half dmin; } — 84 bytes, 256/block.
+//   16 sub-blocks of 16; scales byte = 4-bit dl-scale | 4-bit min. value = d*sc*q - dmin*m. ----
+struct q2_K {
+    constant static constexpr const int block_k = 256, block_bytes = 84;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar* scales = base; device const uchar* qs = base + 16;
+        const half d = ((device const half*)(base + 80))[0], dmin = ((device const half*)(base + 82))[0];
+        const int chunk = col >> 7, pos = col & 127, sidx = pos >> 5, sub = (pos >> 4) & 1, l = pos & 15;
+        const int is = chunk * 8 + sidx * 2 + sub;
+        const int q = (qs[chunk * 32 + sub * 16 + l] >> (2 * sidx)) & 3;
+        return d * half(scales[is] & 0xF) * half(q) - dmin * half(scales[is] >> 4);
+    }
+};
+
+// ---- q3_K : { uint8 hmask[32]; uint8 qs[64]; uint8 scales[12]; half d; } — 110 bytes, 256/block.
+//   low 2 bits in qs, high bit in hmask; 16 6-bit signed scales packed (kmask). value = d*(sc-32)*q3. ----
+struct q3_K {
+    constant static constexpr const int block_k = 256, block_bytes = 110;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar* hmask = base; device const uchar* qs = base + 32; device const uchar* sca = base + 96;
+        const half d = ((device const half*)(base + 108))[0];
+        const int chunk = col >> 7, pos = col & 127, sidx = pos >> 5, sub = (pos >> 4) & 1, l = pos & 15;
+        const int is = chunk * 8 + sidx * 2 + sub;
+        const int low2 = (qs[chunk * 32 + sub * 16 + l] >> (2 * sidx)) & 3;
+        const int hb = (hmask[sub * 16 + l] & (1 << (chunk * 4 + sidx))) ? 1 : 0;
+        const int q3v = (low2 | (hb << 2)) - 4;
+        const int w = is >> 2, b = is & 3; int s;
+        if (w == 0)      s = (sca[b] & 0xF)        | ((sca[8 + b] & 3) << 4);
+        else if (w == 1) s = (sca[4 + b] & 0xF)    | (((sca[8 + b] >> 2) & 3) << 4);
+        else if (w == 2) s = ((sca[b] >> 4) & 0xF) | (((sca[8 + b] >> 4) & 3) << 4);
+        else             s = ((sca[4 + b] >> 4) & 0xF) | (((sca[8 + b] >> 6) & 3) << 4);
+        return d * half(s - 32) * half(q3v);
+    }
+};
+
+// ---- q5_K : { half d; half dmin; uint8 scales[12]; uint8 qh[32]; uint8 qs[128]; } — 176 bytes.
+//   8 sub-blocks of 32; 6-bit scale+min (get_scale_min_k4, as q4_K); 5-bit q = nibble | (qh bit)<<4. ----
+struct q5_K {
+    constant static constexpr const int block_k = 256, block_bytes = 176;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)base)[0], dmin = ((device const half*)(base + 2))[0];
+        device const uchar* sca = base + 4; device const uchar* qh = base + 16; device const uchar* qs = base + 48;
+        const int chunk = col >> 6, pos = col & 63, sub = pos >> 5, l = pos & 31;
+        const int is = 2 * chunk + sub;
+        const int nib = sub ? (qs[chunk * 32 + l] >> 4) : (qs[chunk * 32 + l] & 0xF);
+        const int hb = (qh[l] & (1 << (2 * chunk + sub))) ? 1 : 0;
+        const int q = nib + hb * 16;
+        int sc, mn;
+        if (is < 4) { sc = sca[is] & 63; mn = sca[is + 4] & 63; }
+        else { sc = (sca[is + 4] & 0xF) | ((sca[is - 4] >> 6) << 4); mn = (sca[is + 4] >> 4) | ((sca[is] >> 6) << 4); }
+        return d * half(sc) * half(q) - dmin * half(mn);
+    }
+};
+
+// ---- q6_K : { uint8 ql[128]; uint8 qh[64]; int8 scales[16]; half d; } — 210 bytes, 256/block.
+//   16 sub-blocks of 16; 6-bit q = (4 low in ql | 2 high in qh) - 32; int8 scales. value = d*sc*q. ----
+struct q6_K {
+    constant static constexpr const int block_k = 256, block_bytes = 210;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        device const uchar* ql = base; device const uchar* qh = base + 128;
+        device const char* sca = (device const char*)(base + 192);
+        const half d = ((device const half*)(base + 208))[0];
+        const int chunk = col >> 7, pos = col & 127, group = pos >> 5, l = pos & 31;
+        const int ql_byte = ql[chunk * 64 + l + 32 * (group & 1)];
+        const int nib = (group & 2) ? (ql_byte >> 4) : (ql_byte & 0xF);
+        const int hbits = (qh[chunk * 32 + l] >> (2 * group)) & 3;
+        const int q = (nib | (hbits << 4)) - 32;
+        const int sc_idx = chunk * 8 + (l >> 4) + group * 2;
+        return d * half((int)sca[sc_idx]) * half(q);
+    }
+};
+
 // Cooperatively dequantize an (BN x BK) weight tile into a shared half tile. `kb` is the K-tile
 // index in units of BK (the MMA K-step). The quant grouping (FMT::block_k) is DECOUPLED from BK:
 // each tile column maps to its quant block via the global K index, so large blocks (e.g. q4_K's

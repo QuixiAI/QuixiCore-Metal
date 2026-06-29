@@ -728,6 +728,261 @@ def quantize_iq1_s(W):
     return out
 
 
+# ================= Phase 3: GGUF k-quant + legacy fan-out (byte layouts per ggml-common.h) =======
+def _f16le(x, N, nb):  # pack float32 -> 2 little-endian uint8 bytes (N,nb,2)
+    return x.astype(np.float16).view(np.uint8).reshape(N, nb, 2)
+
+
+def quantize_q4_1(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 32
+    Wb = W.reshape(N, nb, 32); mn = Wb.min(2); d = ((Wb.max(2) - mn) / 15.0).astype(np.float32)
+    ds = np.where(d == 0, 1.0, d)
+    q = np.clip(np.rint((Wb - mn[..., None]) / ds[..., None]), 0, 15).astype(np.uint8)
+    out = np.zeros((N, nb, 20), np.uint8)
+    out[:, :, 0:2] = _f16le(d, N, nb); out[:, :, 2:4] = _f16le(mn.astype(np.float32), N, nb)
+    out[:, :, 4:20] = q[:, :, :16] | (q[:, :, 16:] << 4)
+    return out
+
+
+def dequantize_q4_1(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    d = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    m = np.ascontiguousarray(p[:, :, 2:4]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb, 1)
+    qs = p[:, :, 4:20].astype(np.int32); nib = np.concatenate([qs & 0xF, qs >> 4], axis=2).astype(np.float32)
+    return (d * nib + m).reshape(N, nb * 32)
+
+
+def _pack_q5(W, asym):  # shared q5_0/q5_1 packer; asym=True -> d*q+m, else d*(q-16)
+    N, K = W.shape; nb = K // 32; Wb = W.reshape(N, nb, 32)
+    if asym:
+        mn = Wb.min(2); d = ((Wb.max(2) - mn) / 31.0).astype(np.float32); ds = np.where(d == 0, 1.0, d)
+        q = np.clip(np.rint((Wb - mn[..., None]) / ds[..., None]), 0, 31).astype(np.uint32)
+    else:
+        mn = None; d = (np.abs(Wb).max(2) / 15.0).astype(np.float32); ds = np.where(d == 0, 1.0, d)
+        q = np.clip(np.rint(Wb / ds[..., None]) + 16, 0, 31).astype(np.uint32)
+    nib = (q & 0xF).astype(np.uint8); hb = (q >> 4) & 1
+    qh = np.zeros((N, nb), np.uint32)
+    for c in range(32):
+        qh |= (hb[:, :, c] << c)
+    qs = (nib[:, :, :16] | (nib[:, :, 16:] << 4)).astype(np.uint8)
+    return N, nb, d, mn, qh, qs
+
+
+def quantize_q5_0(W):
+    W = np.ascontiguousarray(W, np.float32); N, nb, d, _, qh, qs = _pack_q5(W, False)
+    out = np.zeros((N, nb, 22), np.uint8)
+    out[:, :, 0:2] = _f16le(d, N, nb)
+    out[:, :, 2:6] = qh[..., None].astype(np.uint32).view(np.uint8).reshape(N, nb, 4)
+    out[:, :, 6:22] = qs
+    return out
+
+
+def dequantize_q5_0(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    d = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    qh = (p[:, :, 2].astype(np.uint32) | (p[:, :, 3].astype(np.uint32) << 8)
+          | (p[:, :, 4].astype(np.uint32) << 16) | (p[:, :, 5].astype(np.uint32) << 24))
+    qs = p[:, :, 6:22].astype(np.int32); out = np.zeros((N, nb, 32), np.float32)
+    for col in range(32):
+        nib = (qs[:, :, col] & 0xF) if col < 16 else (qs[:, :, col - 16] >> 4)
+        q = nib | (((qh >> col) & 1) << 4)
+        out[:, :, col] = d * (q.astype(np.float32) - 16)
+    return out.reshape(N, nb * 32)
+
+
+def quantize_q5_1(W):
+    W = np.ascontiguousarray(W, np.float32); N, nb, d, mn, qh, qs = _pack_q5(W, True)
+    out = np.zeros((N, nb, 24), np.uint8)
+    out[:, :, 0:2] = _f16le(d, N, nb); out[:, :, 2:4] = _f16le(mn.astype(np.float32), N, nb)
+    out[:, :, 4:8] = qh[..., None].astype(np.uint32).view(np.uint8).reshape(N, nb, 4)
+    out[:, :, 8:24] = qs
+    return out
+
+
+def dequantize_q5_1(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    d = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    m = np.ascontiguousarray(p[:, :, 2:4]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    qh = (p[:, :, 4].astype(np.uint32) | (p[:, :, 5].astype(np.uint32) << 8)
+          | (p[:, :, 6].astype(np.uint32) << 16) | (p[:, :, 7].astype(np.uint32) << 24))
+    qs = p[:, :, 8:24].astype(np.int32); out = np.zeros((N, nb, 32), np.float32)
+    for col in range(32):
+        nib = (qs[:, :, col] & 0xF) if col < 16 else (qs[:, :, col - 16] >> 4)
+        q = nib | (((qh >> col) & 1) << 4)
+        out[:, :, col] = d * q.astype(np.float32) + m
+    return out.reshape(N, nb * 32)
+
+
+def quantize_q2_K(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 16, 16)                          # sub-block g == kernel index `is`
+    mn = Wsb.min(3); sc_t = (Wsb.max(3) - mn) / 3.0; min_t = np.maximum(-mn, 0.0)
+    d = (sc_t.max(2) / 15.0).astype(np.float32); dmin = (min_t.max(2) / 15.0).astype(np.float32)
+    ds, dms = np.where(d == 0, 1.0, d), np.where(dmin == 0, 1.0, dmin)
+    sc = np.clip(np.rint(sc_t / ds[..., None]), 0, 15).astype(np.int32)
+    m = np.clip(np.rint(min_t / dms[..., None]), 0, 15).astype(np.int32)
+    dl = d[..., None] * sc; ml = dmin[..., None] * m; dls = np.where(dl == 0, 1.0, dl)
+    qel = np.clip(np.rint((Wsb + ml[..., None]) / dls[..., None]), 0, 3).astype(np.uint8)
+    out = np.zeros((N, nb, 84), np.uint8)
+    out[:, :, 0:16] = (sc | (m << 4)).astype(np.uint8)
+    for g in range(16):
+        chunk, sidx, sub = g // 8, (g % 8) // 2, g % 2
+        for l in range(16):
+            out[:, :, 16 + chunk * 32 + sub * 16 + l] |= (qel[:, :, g, l] << (2 * sidx))
+    out[:, :, 80:82] = _f16le(d, N, nb); out[:, :, 82:84] = _f16le(dmin, N, nb)
+    return out
+
+
+def dequantize_q2_K(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    scales = p[:, :, 0:16].astype(np.int32); qs = p[:, :, 16:80].astype(np.int32)
+    d = np.ascontiguousarray(p[:, :, 80:82]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    dmin = np.ascontiguousarray(p[:, :, 82:84]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    out = np.zeros((N, nb, 256), np.float32)
+    for col in range(256):
+        chunk, pos = col >> 7, col & 127; sidx, sub, l = pos >> 5, (pos >> 4) & 1, pos & 15
+        is_ = chunk * 8 + sidx * 2 + sub
+        q = (qs[:, :, chunk * 32 + sub * 16 + l] >> (2 * sidx)) & 3
+        out[:, :, col] = d * (scales[:, :, is_] & 0xF) * q - dmin * (scales[:, :, is_] >> 4)
+    return out.reshape(N, nb * 256)
+
+
+def quantize_q3_K(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 16, 16)
+    scl = (np.abs(Wsb).max(3) / 4.0).astype(np.float32)     # q3 in -4..3
+    d = (scl.max(2) / 31.0).astype(np.float32); ds = np.where(d == 0, 1.0, d)
+    s6 = np.clip(np.rint(scl / ds[..., None]) + 32, 1, 63).astype(np.int32)   # 6-bit, used as s-32
+    dl = d[..., None] * (s6 - 32); dls = np.where(dl == 0, 1.0, dl)
+    code = np.clip(np.rint(Wsb / dls[..., None]) + 4, 0, 7).astype(np.int32)  # q3v+4 in 0..7
+    out = np.zeros((N, nb, 110), np.uint8)
+    for g in range(16):
+        chunk, sidx, sub = g // 8, (g % 8) // 2, g % 2
+        for l in range(16):
+            low2 = code[:, :, g, l] & 3; hb = (code[:, :, g, l] >> 2) & 1
+            out[:, :, 32 + chunk * 32 + sub * 16 + l] |= (low2.astype(np.uint8) << (2 * sidx))
+            out[:, :, sub * 16 + l] |= (hb.astype(np.uint8) << (chunk * 4 + sidx))
+    sca = np.zeros((N, nb, 12), np.uint8)                   # pack 16 6-bit scales (inverse of kernel unpack)
+    for g in range(16):
+        w, b = g >> 2, g & 3; v = s6[:, :, g].astype(np.uint8)
+        if w == 0:   sca[:, :, b] |= (v & 0xF); sca[:, :, 8 + b] |= ((v >> 4) & 3)
+        elif w == 1: sca[:, :, 4 + b] |= (v & 0xF); sca[:, :, 8 + b] |= (((v >> 4) & 3) << 2)
+        elif w == 2: sca[:, :, b] |= ((v & 0xF) << 4); sca[:, :, 8 + b] |= (((v >> 4) & 3) << 4)
+        else:        sca[:, :, 4 + b] |= ((v & 0xF) << 4); sca[:, :, 8 + b] |= (((v >> 4) & 3) << 6)
+    out[:, :, 96:108] = sca; out[:, :, 108:110] = _f16le(d, N, nb)
+    return out
+
+
+def dequantize_q3_K(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    hmask = p[:, :, 0:32].astype(np.int32); qs = p[:, :, 32:96].astype(np.int32); sca = p[:, :, 96:108].astype(np.int32)
+    d = np.ascontiguousarray(p[:, :, 108:110]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    out = np.zeros((N, nb, 256), np.float32)
+    for col in range(256):
+        chunk, pos = col >> 7, col & 127; sidx, sub, l = pos >> 5, (pos >> 4) & 1, pos & 15
+        is_ = chunk * 8 + sidx * 2 + sub
+        low2 = (qs[:, :, chunk * 32 + sub * 16 + l] >> (2 * sidx)) & 3
+        hb = ((hmask[:, :, sub * 16 + l] >> (chunk * 4 + sidx)) & 1)
+        q3v = (low2 | (hb << 2)) - 4
+        w, b = is_ >> 2, is_ & 3
+        if w == 0:   s = (sca[:, :, b] & 0xF) | ((sca[:, :, 8 + b] & 3) << 4)
+        elif w == 1: s = (sca[:, :, 4 + b] & 0xF) | (((sca[:, :, 8 + b] >> 2) & 3) << 4)
+        elif w == 2: s = ((sca[:, :, b] >> 4) & 0xF) | (((sca[:, :, 8 + b] >> 4) & 3) << 4)
+        else:        s = ((sca[:, :, 4 + b] >> 4) & 0xF) | (((sca[:, :, 8 + b] >> 6) & 3) << 4)
+        out[:, :, col] = d * (s - 32) * q3v
+    return out.reshape(N, nb * 256)
+
+
+def quantize_q5_K(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    Wsb = W.reshape(N, nb, 8, 32)                           # sub-block g32 == kernel index `is`
+    mn = Wsb.min(3); sc_t = (Wsb.max(3) - mn) / 31.0; min_t = np.maximum(-mn, 0.0)
+    d = (sc_t.max(2) / 63.0).astype(np.float32); dmin = (min_t.max(2) / 63.0).astype(np.float32)
+    ds, dms = np.where(d == 0, 1.0, d), np.where(dmin == 0, 1.0, dmin)
+    sc = np.clip(np.rint(sc_t / ds[..., None]), 0, 63).astype(np.int32)
+    m = np.clip(np.rint(min_t / dms[..., None]), 0, 63).astype(np.int32)
+    dl = d[..., None] * sc; ml = dmin[..., None] * m; dls = np.where(dl == 0, 1.0, dl)
+    code = np.clip(np.rint((Wsb + ml[..., None]) / dls[..., None]), 0, 31).astype(np.int32)
+    out = np.zeros((N, nb, 176), np.uint8)
+    out[:, :, 0:2] = _f16le(d, N, nb); out[:, :, 2:4] = _f16le(dmin, N, nb)
+    sca = np.zeros((N, nb, 12), np.uint8)                   # get_scale_min_k4 inverse (as q4_K)
+    for j in range(4):
+        sca[:, :, j] = (sc[:, :, j] & 63) | (((sc[:, :, j + 4] >> 4) & 3) << 6)
+        sca[:, :, 8 + j] = (sc[:, :, j + 4] & 0xF) | ((m[:, :, j + 4] & 0xF) << 4)
+        sca[:, :, 4 + j] = (m[:, :, j] & 63) | (((m[:, :, j + 4] >> 4) & 3) << 6)
+    out[:, :, 4:16] = sca
+    for g in range(8):
+        chunk, sub = g // 2, g % 2
+        for l in range(32):
+            byte = chunk * 32 + l
+            out[:, :, 48 + byte] |= ((code[:, :, g, l] & 0xF) << (4 * sub)).astype(np.uint8)
+            out[:, :, 16 + l] |= (((code[:, :, g, l] >> 4) & 1) << (2 * chunk + sub)).astype(np.uint8)
+    return out
+
+
+def dequantize_q5_K(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    d = np.ascontiguousarray(p[:, :, 0:2]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    dmin = np.ascontiguousarray(p[:, :, 2:4]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    sca = p[:, :, 4:16].astype(np.int32); qh = p[:, :, 16:48].astype(np.int32); qs = p[:, :, 48:176].astype(np.int32)
+    out = np.zeros((N, nb, 256), np.float32)
+    for col in range(256):
+        chunk, pos = col >> 6, col & 63; sub, l = pos >> 5, pos & 31; is_ = 2 * chunk + sub
+        nib = (qs[:, :, chunk * 32 + l] >> 4) if sub else (qs[:, :, chunk * 32 + l] & 0xF)
+        hb = (qh[:, :, l] >> (2 * chunk + sub)) & 1
+        q = nib + hb * 16
+        if is_ < 4:
+            sc = sca[:, :, is_] & 63; mn = sca[:, :, is_ + 4] & 63
+        else:
+            sc = (sca[:, :, is_ + 4] & 0xF) | ((sca[:, :, is_ - 4] >> 6) << 4)
+            mn = (sca[:, :, is_ + 4] >> 4) | ((sca[:, :, is_] >> 6) << 4)
+        out[:, :, col] = d * sc * q - dmin * mn
+    return out.reshape(N, nb * 256)
+
+
+def quantize_q6_K(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape; nb = K // 256
+    sc_of_col = np.array([(c >> 7) * 8 + ((c & 31) >> 4) + ((c & 127) >> 5) * 2 for c in range(256)])
+    Wf = W.reshape(N, nb, 256)
+    scl = np.zeros((N, nb, 16), np.float32)
+    for s in range(16):
+        cols = np.where(sc_of_col == s)[0]
+        scl[:, :, s] = np.abs(Wf[:, :, cols]).max(2) / 32.0
+    d = (scl.max(2) / 127.0).astype(np.float32); dsf = np.where(d == 0, 1.0, d)
+    sc8 = np.clip(np.rint(scl / dsf[..., None]), -127, 127).astype(np.int32)
+    out = np.zeros((N, nb, 210), np.uint8)
+    for col in range(256):
+        chunk, pos = col >> 7, col & 127; group, l = pos >> 5, pos & 31; s = sc_of_col[col]
+        dl = d * sc8[:, :, s]; dls = np.where(dl == 0, 1.0, dl)
+        code = np.clip(np.rint(Wf[:, :, col] / dls) + 32, 0, 63).astype(np.int32)
+        ql_byte = chunk * 64 + l + 32 * (group & 1)
+        if group & 2:
+            out[:, :, ql_byte] |= ((code & 0xF) << 4).astype(np.uint8)
+        else:
+            out[:, :, ql_byte] |= (code & 0xF).astype(np.uint8)
+        out[:, :, 128 + chunk * 32 + l] |= (((code >> 4) & 3) << (2 * group)).astype(np.uint8)
+    out[:, :, 192:208] = sc8.astype(np.int8).view(np.uint8)
+    out[:, :, 208:210] = _f16le(d, N, nb)
+    return out
+
+
+def dequantize_q6_K(packed):
+    p = np.ascontiguousarray(packed, np.uint8); N, nb, _ = p.shape
+    ql = p[:, :, 0:128].astype(np.int32); qh = p[:, :, 128:192].astype(np.int32)
+    sca = np.ascontiguousarray(p[:, :, 192:208]).view(np.int8).astype(np.int32)
+    d = np.ascontiguousarray(p[:, :, 208:210]).reshape(N, nb * 2).view(np.float16).astype(np.float32).reshape(N, nb)
+    out = np.zeros((N, nb, 256), np.float32)
+    for col in range(256):
+        chunk, pos = col >> 7, col & 127; group, l = pos >> 5, pos & 31
+        ql_byte = ql[:, :, chunk * 64 + l + 32 * (group & 1)]
+        nib = (ql_byte >> 4) if (group & 2) else (ql_byte & 0xF)
+        hbits = (qh[:, :, chunk * 32 + l] >> (2 * group)) & 3
+        q = (nib | (hbits << 4)) - 32
+        sc_idx = chunk * 8 + (l >> 4) + group * 2
+        out[:, :, col] = d * sca[:, :, sc_idx] * q
+    return out.reshape(N, nb * 256)
+
+
 # Format registry: name -> (quantize, dequantize). Drives the parametrized tests.
 QUANT_FORMATS = {
     "q8_0": (quantize_q8_0, dequantize_q8_0),
@@ -744,6 +999,13 @@ QUANT_FORMATS = {
     "iq4_nl": (quantize_iq4_nl, dequantize_iq4_nl),
     "iq4_xs": (quantize_iq4_xs, dequantize_iq4_xs),
     "iq2_xxs": (quantize_iq2_xxs, dequantize_iq2_xxs),
+    "q4_1": (quantize_q4_1, dequantize_q4_1),
+    "q5_0": (quantize_q5_0, dequantize_q5_0),
+    "q5_1": (quantize_q5_1, dequantize_q5_1),
+    "q2_K": (quantize_q2_K, dequantize_q2_K),
+    "q3_K": (quantize_q3_K, dequantize_q3_K),
+    "q5_K": (quantize_q5_K, dequantize_q5_K),
+    "q6_K": (quantize_q6_K, dequantize_q6_K),
     "iq2_xs": (quantize_iq2_xs, dequantize_iq2_xs),
     "iq3_xxs": (quantize_iq3_xxs, dequantize_iq3_xxs),
     "iq1_s": (quantize_iq1_s, dequantize_iq1_s),

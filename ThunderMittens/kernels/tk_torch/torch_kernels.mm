@@ -408,7 +408,7 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemm: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2, "qgemm: wq (N,K/bk,bytes), x (K,M)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
                     : (format == "kU4B8" || format == "kU4") ? 128
                     : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
@@ -426,7 +426,7 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemv: x must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && x.size(1) == 1, "qgemv: wq (N,K/bk,bytes), x (K,1)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
                     : (format == "kU4B8" || format == "kU4") ? 128
                     : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k;
@@ -444,7 +444,7 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
               "qflux_gelu: x and bias must be float16");
   auto wq = wq_in.contiguous(), x = x_in.contiguous(), bias = bias_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && bias.dim() == 1, "qflux_gelu: wq (N,K/bk,bytes), x (K,M), bias (M)");
-  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s") ? 256
+  const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K") ? 256
                     : (format == "kU4B8" || format == "kU4") ? 128
                     : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);

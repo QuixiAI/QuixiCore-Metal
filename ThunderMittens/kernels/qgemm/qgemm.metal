@@ -77,6 +77,13 @@ instantiate_qgemm("qgemm_iq2_xxs", iq2_xxs, 2, 16);
 instantiate_qgemm("qgemm_iq2_xs", iq2_xs, 2, 16);
 instantiate_qgemm("qgemm_iq3_xxs", iq3_xxs, 2, 16);
 instantiate_qgemm("qgemm_iq1_s", iq1_s, 2, 16);
+instantiate_qgemm("qgemm_q4_1", q4_1, 2, 16);
+instantiate_qgemm("qgemm_q5_0", q5_0, 2, 16);
+instantiate_qgemm("qgemm_q5_1", q5_1, 2, 16);
+instantiate_qgemm("qgemm_q2_K", q2_K, 2, 16);
+instantiate_qgemm("qgemm_q3_K", q3_K, 2, 16);
+instantiate_qgemm("qgemm_q5_K", q5_K, 2, 16);
+instantiate_qgemm("qgemm_q6_K", q6_K, 2, 16);
 
 // ---- qgemm_frag: dequant-direct-to-fragment (Marlin zero-shuffle). Single simdgroup per
 // (32x32) output tile; the weight block is dequantized straight into the register fragment
@@ -132,5 +139,12 @@ instantiate_qgemm_frag("qgemm_frag_iq2_xxs", iq2_xxs);
 instantiate_qgemm_frag("qgemm_frag_iq2_xs", iq2_xs);
 instantiate_qgemm_frag("qgemm_frag_iq3_xxs", iq3_xxs);
 instantiate_qgemm_frag("qgemm_frag_iq1_s", iq1_s);
+instantiate_qgemm_frag("qgemm_frag_q4_1", q4_1);
+instantiate_qgemm_frag("qgemm_frag_q5_0", q5_0);
+instantiate_qgemm_frag("qgemm_frag_q5_1", q5_1);
+instantiate_qgemm_frag("qgemm_frag_q2_K", q2_K);
+instantiate_qgemm_frag("qgemm_frag_q3_K", q3_K);
+instantiate_qgemm_frag("qgemm_frag_q5_K", q5_K);
+instantiate_qgemm_frag("qgemm_frag_q6_K", q6_K);
 
 }
