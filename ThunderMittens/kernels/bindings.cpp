@@ -71,6 +71,7 @@
 #include "hedgehog/hedgehog.h"
 #include "lin_attn_causal/lin_attn_causal.h"
 #include "mamba2/mamba2.h"
+#include "lin_attn_decay/lin_attn_decay.h"
 #include "cmplx_matmul/cmplx_matmul.h"
 #include "fftconv/fftconv.h"
 #include "qgemm/qgemm.h"
@@ -286,6 +287,16 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Mamba-2 / SSD forward: Y_t = sum_{j<=t} (C_t.B_j) exp(cumlog_t-cumlog_j) X_j
+      )");
+
+    m.def(
+      "lin_attn_decay",
+      &lin_attn_decay,
+      "q"_a, "k"_a, "v"_a, "cl"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        decay/retention linear attention: out_i = sum_{j<=i} exp(cl_i-cl_j) (q_i.k_j) v_j; cl=-slope*pos
       )");
 
     m.def(

@@ -369,6 +369,21 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   return out;
 }
 
+static at::Tensor lin_attn_decay_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                     const at::Tensor& v_in, const at::Tensor& cl_in) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "lin_attn_decay: q,k,v bf16 MPS");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "lin_attn_decay: cl must be float32");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous(), cl = cl_in.contiguous();
+  TORCH_CHECK(q.dim() == 4, "lin_attn_decay: q,k,v expect (B,H,N,D)");
+  const int Bsz = q.size(0), H = q.size(1);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  const int D = q.size(3);
+  TORCH_CHECK(D == 64 && N % 8 == 0, "lin_attn_decay: D=64, N%8==0");
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_lin_attn_decay(e, q, k, v, cl, out, N, H, Bsz, D); });
+  return out;
+}
+
 static at::Tensor cmplx_matmul_mps(const at::Tensor& a_in, const at::Tensor& b_in) {
   TORCH_CHECK(a_in.device().is_mps(), "cmplx_matmul: a must be an MPS tensor");
   TORCH_CHECK(a_in.scalar_type() == at::kFloat || a_in.scalar_type() == at::kBFloat16,
@@ -585,6 +600,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
+  m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");

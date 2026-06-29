@@ -193,6 +193,18 @@ def test_lin_attn_causal_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64)])
+def test_lin_attn_decay_parity(shape):
+    rng = np.random.default_rng(0)
+    q = rng.standard_normal(shape).astype(np.float32)
+    k = rng.standard_normal(shape).astype(np.float32)
+    v = rng.standard_normal(shape).astype(np.float32)
+    slopes = np.linspace(0.05, 0.5, shape[1]).astype(np.float32)
+    om = tk.lin_attn_decay(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), slopes)
+    ot = tk.lin_attn_decay(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), slopes)
+    _assert_parity(om, ot, atol=1.0)
+
+
 @pytest.mark.parametrize("shape", [(1, 1, 16), (2, 2, 32)])
 def test_fftconv_parity(shape):
     B, H, S = shape

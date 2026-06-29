@@ -171,6 +171,24 @@ def mamba2(C, B, X, cumlog):
     return _mlx().mamba2(C, B, X, cumlog)
 
 
+def lin_attn_decay(q, k, v, slopes):
+    """Decay / retention linear attention (RetNet / Lightning-Attention-2):
+    out_i = sum_{j<=i} exp(-slope_h*(i-j)) * (q_i.k_j) * v_j. q,k,v (B,H,N,D) bf16, D=64; `slopes`
+    is the per-head decay rate (H,). Builds the decay-log ramp cl=-slope*position internally and runs
+    the retention kernel. Accepts mlx.array or torch.Tensor (MPS)."""
+    import numpy as np
+    B, H, N, _ = q.shape
+    pos = np.arange(int(N), dtype=np.float32)
+    sl = np.asarray(slopes, np.float32).reshape(int(H))
+    cl = np.ascontiguousarray(
+        np.broadcast_to(-(sl[:, None] * pos[None, :])[None], (int(B), int(H), int(N))), np.float32)
+    if _is_torch(q):
+        import torch
+        return _torch().lin_attn_decay(q, k, v, torch.from_numpy(cl).to(q.device))
+    import mlx.core as mx
+    return _mlx().lin_attn_decay(q, k, v, mx.array(cl))
+
+
 def cmplx_matmul(a, b):
     """Complex GEMM D=A@B; operands carry a leading size-2 (real,imag) axis: a (2,N,K),
     b (2,K,M) -> (2,N,M). Accepts mlx.array or torch.Tensor (MPS)."""

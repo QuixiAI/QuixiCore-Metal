@@ -44,6 +44,7 @@ inline std::string linear_attn_kernel_name(int D) { return "linear_attn_" + std:
 inline std::string hedgehog_kernel_name(int D) { return "hedgehog_" + std::to_string(D); }
 inline std::string lin_attn_causal_kernel_name(int D) { return "lin_attn_causal_" + std::to_string(D); }
 inline std::string mamba2_kernel_name(int D) { return "mamba2_" + std::to_string(D); }
+inline std::string lin_attn_decay_kernel_name(int D) { return "lin_attn_decay_" + std::to_string(D); }
 inline std::string cmplx_matmul_kernel_name(const std::string& t) { return "cmplx_matmul_" + t; }
 inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_string(S); }
 inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" + fmt; }
@@ -250,6 +251,18 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
                    int B, int D) {
   e.pipeline(mamba2_kernel_name(D));
   e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cumlog, 3); e.out(Y, 4);
+  e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- lin_attn_decay (retention): q@0 k@1 v@2 cl@3(=-slope*pos) -> o@4 ; N@5(u32) H@6(u32) ;
+//        grid (N/8, H, B) group (32,1,1). q,k,v,o (B,H,N,D) bf16; cl (B,H,N) fp32. -----
+template <class E>
+void launch_lin_attn_decay(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                           typename E::in_t cl, typename E::out_t o, unsigned N, unsigned H,
+                           int B, int D) {
+  e.pipeline(lin_attn_decay_kernel_name(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(cl, 3); e.out(o, 4);
   e.bytes(N, 5); e.bytes(H, 6);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
