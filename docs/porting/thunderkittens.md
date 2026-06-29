@@ -80,7 +80,7 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   `complex_mma_*` + transposes + pointwise complex mul, and matches `torch.fft` exactly. **No
   distinct, Apple-feasible TK kernel remains.**
 
-**Quantized GEMM/GEMV (Marlin's method) — IN PROGRESS (was wrongly parked as N/A):**
+**Quantized GEMM/GEMV (Marlin's method) — COMPLETE (was wrongly parked as N/A):**
 - The dequant-in-register approach makes the whole quantized family feasible on Apple — dequant
   packed weights → `half` → standard `simdgroup_matrix` MMA (GEMM) or simd-reduction (GEMV). See
   `marlin-quant.md` for the plan; references: Marlin `dequant.h`, vLLM-Metal, llama.cpp `kernel_mul_mm`.
@@ -97,11 +97,33 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   (`dequant_into_register`); bit-identical to staged, **~40% faster**. The one multi-simdgroup
   optimization that wins on Apple (quantized GEMM is weight-bandwidth-bound).
 - ✅ Layout/indexing: GPTQ act-order (`tk.qgemm_actorder`, g_idx reorder layer), HQQ (int4+zp g64).
-- ☐ Optional future work: quantized-KV attention.
+
+**Quant — deferrals & flags (deliberate; correctness is complete, these are scope/quality choices):**
+- ☐ **Quantized-KV attention** — not built. The dequant primitive would drop into the attention K/V
+  `load`s exactly as it did for `qgemm`/`qflux_gelu`; only optional future work remaining in this family.
+- ⚠️ **Integer *prefill* is decode-only by design.** The exact-int32 `idot` path is `qgemv_w8a8`/
+  `_w2a8` (batch-1) only — Apple has no int8 `simdgroup_matrix`, so a tiled int prefill would lose to
+  the half tensor cores. W8A8/W2A8 *prefill* (M>1) parity is via `tk.qmm(act="int8")`, which is
+  dequant-both-to-half (fp16 accumulate) — NOT bit-exact int32. No fused (`qflux`) integer variant.
+- ⚠️ **Host encoders are naive (kernel decoders are faithful).** `quantize_*` for the k-quants/i-quants
+  use nearest-grid / simple scale selection, not ggml's optimized encoders, so round-trip-vs-original
+  error is poor for some (q3_K ~20%, mxfp6 ~38% — the latter the same e8m0-floor artifact as mxfp4/8).
+  The kernel *decoders* match the GGUF byte layouts (real GGUF weights decode correctly); kernel-vs-
+  oracle testing isolates this. Production-grade encoders deferred.
+- ⚠️ **`fp8_block`** stores the 128×128 tile scale **replicated per row** (correct block scale, but
+  storage-redundant), and falls back to smaller row-tiles when N % 128 ≠ 0. Storage-optimal 2D-scale
+  layout deferred.
+- ⚠️ **GPTQ act-order** is a host-side activation gather (`tk.qgemm_actorder`), not a fused in-kernel
+  `g_idx` gather (this is the "reordering layer at load" that was specified).
+- ℹ️ `nvfp8` intentionally not added (not a real format); `fp8_e4m3` + `mxfp8` cover 8-bit float.
 
 **Not applicable on Apple:**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —
   multi-GPU collectives; a single Apple GPU has no NVLink/multi-device fabric. N/A for this target.
 - `gemm/baselines/*` (cuBLAS reference impls) — reference baselines, not TK kernels.
+- **Correction — NOT N/A:** the low-precision GEMM family (`gemm/{fp8_*, int8_*, int4, mxfp8_*,
+  nvfp4_*}`) was *previously* parked here as "no Apple low-precision tensor cores." That was wrong —
+  Marlin's dequant-to-half-then-standard-MMA makes all of it feasible, and it is now fully implemented
+  (29 formats, above). The only genuinely-N/A items are the multi-GPU collectives and reference baselines.
 
 See `discrepencies.md` for the raw file listing.
