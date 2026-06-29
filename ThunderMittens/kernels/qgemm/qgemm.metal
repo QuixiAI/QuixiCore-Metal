@@ -157,4 +157,98 @@ instantiate_qgemm_frag("qgemm_frag_mxfp6_e3m2", mxfp6_e3m2);
 instantiate_qgemm_frag("qgemm_frag_mxfp6_e2m3", mxfp6_e2m3);
 instantiate_qgemm_frag("qgemm_frag_hqq", hqq);
 
+// ---- qgemm_actorder: GPTQ act-order with an IN-KERNEL g_idx gather. The weight is quantized in
+// permuted (K) order (groups contiguous); the X K-rows are gathered by `perm` during the X load
+// (fused into the fragment fill — no materialized permuted-X copy). Mirrors qgemm_frag otherwise. ----
+template<typename FMT>
+kernel void qgemm_actorder(
+    device   half*  D    [[buffer(0)]],
+    device   uchar* Wq   [[buffer(1)]],
+    device   half*  X    [[buffer(2)]],
+    device   int*   perm [[buffer(3)]],   // (K,) g_idx-derived permutation of the K axis
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    const constant int &M [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr const int BN = 32, BK = 32, BM = 32;
+    using gl_h = gl<half, 1, 1, -1, -1>;
+    gl_h gl_d(D, nullptr, nullptr, N, M);
+    rt<half, BN, BK> w_reg;
+    rt<half, BK, BM> x_reg;
+    rt<float, BN, BM> d_reg;
+    zero(d_reg);
+    const int by = tgid.y, bx = tgid.x;
+    const int qid = (int)lane / 4;
+    const int simd_y = (qid & 4) + ((int)lane / 2) % 4;
+    const int simd_x = (qid & 2) * 2 + ((int)lane % 2) * 2;
+    for (int kb = 0; kb < K / BK; kb++) {
+        dequant_into_register<FMT>(w_reg, Wq, N, K, by, kb, lane);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < x_reg.height; i++) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < x_reg.width; j++) {
+                const int kr = perm[kb * BK + i * mittens::TILE_DIM + simd_y];   // gathered K row
+                const int col = bx * BM + j * mittens::TILE_DIM + simd_x;
+                x_reg.tiles[i][j].data.thread_elements()[0] = X[(uint)kr * M + col];
+                x_reg.tiles[i][j].data.thread_elements()[1] = X[(uint)kr * M + col + 1];
+            }
+        }
+        mma_AB(d_reg, w_reg, x_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, by, bx}, lane);
+}
+
+#define instantiate_qgemm_actorder(name, FMT)                                 \
+   template [[host_name(name)]] [[kernel]] void qgemm_actorder<FMT>(          \
+     device half* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device half* X [[buffer(2)]], \
+     device int* perm [[buffer(3)]],                                          \
+     const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]], \
+     const constant int &M [[buffer(6)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemm_actorder("qgemm_actorder_kU4B8", kU4B8);
+instantiate_qgemm_actorder("qgemm_actorder_kU4", kU4);
+instantiate_qgemm_actorder("qgemm_actorder_q4_0", q4_0);
+
+// ---- qgemm_blockscale: fp8_block with a storage-optimal SEPARATE 2D scale buffer. Codes-only
+// weights (fp8_raw) are dequantized, then scaled by the (128-row x 128-col) tile scale from
+// scale2d (N/128 x K/128) — no per-row scale replication. -----
+template<typename FMT>
+kernel void qgemm_blockscale(
+    device   half*  D       [[buffer(0)]],
+    device   uchar* Wq      [[buffer(1)]],
+    device   half*  X       [[buffer(2)]],
+    device   half*  scale2d [[buffer(3)]],   // (N/128, K/128) per-tile fp16 scale
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    const constant int &M [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr const int BN = 32, BK = 32, BM = 32;
+    using gl_h = gl<half, 1, 1, -1, -1>;
+    gl_h gl_x(X, nullptr, nullptr, K, M);
+    gl_h gl_d(D, nullptr, nullptr, N, M);
+    rt<half, BN, BK> w_reg;
+    rt<half, BK, BM> x_reg;
+    rt<float, BN, BM> d_reg;
+    zero(d_reg);
+    const int by = tgid.y, bx = tgid.x, KT = K / 128;          // 128-tile = 4 of the 32-wide blocks
+    for (int kb = 0; kb < K / BK; kb++) {
+        dequant_into_register<FMT>(w_reg, Wq, N, K, by, kb, lane);
+        const half sc = scale2d[(by / 4) * KT + (kb / 4)];     // thread-space tile scale
+        mul(w_reg, w_reg, sc);
+        load(x_reg, gl_x, {0, 0, kb, bx}, lane);
+        mma_AB(d_reg, w_reg, x_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, by, bx}, lane);
+}
+
+template [[host_name("qgemm_blockscale_fp8_raw")]] [[kernel]] void qgemm_blockscale<fp8_raw>(
+    device half* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device half* X [[buffer(2)]],
+    device half* scale2d [[buffer(3)]],
+    const constant int &N [[buffer(4)]], const constant int &K [[buffer(5)]],
+    const constant int &M [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
 }

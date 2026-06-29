@@ -59,6 +59,67 @@ array qgemm_direct(const array& wq, const array& x, const std::string& format, S
                std::make_shared<QGemm>(to_stream(s), format, true), {wq, x});
 }
 
+array qgemm_actorder_k(const array& wq, const array& x, const array& perm,
+                       const std::string& format, StreamOrDevice s) {
+  assert(wq.dtype() == uint8 && x.dtype() == float16 && perm.dtype() == int32);
+  assert(wq.ndim() == 3 && x.ndim() == 2 && perm.ndim() == 1);
+  const int N = wq.shape(0);
+  const int K = wq.shape(1) * format_block_k(format);
+  const int M = x.shape(1);
+  assert(x.shape(0) == K && perm.shape(0) == K && N % 32 == 0 && M % 32 == 0);
+  (void)N; (void)K; (void)M;
+  return array({N, M}, float16,
+               std::make_shared<QGemmActorder>(to_stream(s), format), {wq, x, perm});
+}
+
+array qgemm_blockscale(const array& wq, const array& x, const array& scale2d, StreamOrDevice s) {
+  assert(wq.dtype() == uint8 && x.dtype() == float16 && scale2d.dtype() == float16);
+  assert(wq.ndim() == 3 && x.ndim() == 2);
+  const int N = wq.shape(0), K = wq.shape(1) * 128, M = x.shape(1);
+  assert(x.shape(0) == K && N % 32 == 0 && M % 32 == 0);
+  (void)N; (void)K; (void)M;
+  return array({N, M}, float16,
+               std::make_shared<QGemmBlockScale>(to_stream(s)), {wq, x, scale2d});
+}
+
+void QGemmBlockScale::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
+void QGemmBlockScale::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
+void QGemmBlockScale::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& wq = inputs[0]; auto& x = inputs[1]; auto& sc = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int N = wq.shape(0), K = wq.shape(1) * 128, M = x.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_qgemm_blockscale(enc, out, wq, x, sc, N, K, M);
+}
+std::vector<array> QGemmBlockScale::jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmBlockScale has no jvp."); }
+std::vector<array> QGemmBlockScale::vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("QGemmBlockScale has no vjp."); }
+std::pair<std::vector<array>, std::vector<int>> QGemmBlockScale::vmap(const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmBlockScale has no vmap."); }
+
+void QGemmActorder::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
+void QGemmActorder::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
+void QGemmActorder::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& wq = inputs[0]; auto& x = inputs[1]; auto& perm = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int N = wq.shape(0), K = wq.shape(1) * format_block_k(fmt_), M = x.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_qgemm_actorder(enc, out, wq, x, perm, N, K, M, fmt_);
+}
+std::vector<array> QGemmActorder::jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmActorder has no jvp."); }
+std::vector<array> QGemmActorder::vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("QGemmActorder has no vjp."); }
+std::pair<std::vector<array>, std::vector<int>> QGemmActorder::vmap(const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemmActorder has no vmap."); }
+
 void QGemm::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
 void QGemm::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
 

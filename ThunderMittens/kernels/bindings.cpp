@@ -327,6 +327,18 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "qgemm_blockscale", &qgemm_blockscale,
+      "wq"_a, "x"_a, "scale2d"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fp8_block2d: codes-only fp8 weights + separate (N/128,K/128) tile scale -> dequant @ x)");
+
+    m.def(
+      "qgemm_actorder_k", &qgemm_actorder_k,
+      "wq"_a, "x"_a, "perm"_a, "format"_a = "kU4B8",
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(GPTQ act-order qgemm with an in-kernel g_idx gather (no materialized permuted X))");
+
+    m.def(
       "qgemm_direct",
       &qgemm_direct,
       "wq"_a,

@@ -400,6 +400,15 @@ struct fp8_block {
     }
 };
 
+// ---- fp8_raw : codes-only fp8 e4m3 (no per-block scale), 128/block. For fp8_block2d, where the
+//   128x128 tile scale is a SEPARATE buffer (storage-optimal — no per-row scale replication). ----
+struct fp8_raw {
+    constant static constexpr const int block_k = 128, block_bytes = 128;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        return tk_e4m3_decode(base[col]);
+    }
+};
+
 // ---- mxfp6 (e3m2 / e2m3) : OCP microscaling 6-bit. { uint8 e8m0; uint8 codes[24]; } — 25 bytes,
 //   32 weights. 4 six-bit codes pack into 3 bytes (little-endian 24-bit groups). scale = 2^(e-127). ----
 template<bool E3M2>

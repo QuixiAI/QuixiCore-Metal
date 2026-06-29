@@ -193,6 +193,16 @@ def qgemm(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     return _ext.qgemm(wq, x, format)
 
 
+def qgemm_actorder_k(wq, x, perm, format="kU4B8"):
+    """GPTQ act-order qgemm with in-kernel g_idx gather. wq uint8; x f16 (K,M); perm int32 (K,). MPS."""
+    return _ext.qgemm_actorder_k(wq, x, perm, format)
+
+
+def qgemm_blockscale(wq, x, scale2d):
+    """fp8_block2d GEMM: codes-only fp8 + separate (N/128,K/128) tile scale. wq uint8; x,scale2d f16. MPS."""
+    return _ext.qgemm_blockscale(wq, x, scale2d)
+
+
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. x (K, 1) float16 -> (N, 1). MPS."""
     return _ext.qgemv(wq, x, format)

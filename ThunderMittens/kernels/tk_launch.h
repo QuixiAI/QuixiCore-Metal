@@ -50,6 +50,7 @@ inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" +
 inline std::string qgemv_kernel_name(const std::string& fmt) { return "qgemv_" + fmt; }
 inline std::string qflux_gelu_kernel_name(const std::string& fmt) { return "qflux_gelu_" + fmt; }
 inline std::string qgemm_frag_kernel_name(const std::string& fmt) { return "qgemm_frag_" + fmt; }
+inline std::string qgemm_actorder_kernel_name(const std::string& fmt) { return "qgemm_actorder_" + fmt; }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -289,6 +290,28 @@ void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
   e.dispatch(M / 32, N / 32, 1, 64, 1, 1);  // 64 threads = 2 simdgroups, BM=32
+}
+
+// ----- qgemm_actorder: GPTQ act-order, in-kernel g_idx gather. D@0 Wq@1 X@2 perm@3(int) ; N@4 K@5
+//        M@6 ; grid (M/32, N/32, 1), 32 threads. Gathers X K-rows by perm during the X load. -----
+template <class E>
+void launch_qgemm_actorder(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                           typename E::in_t perm, int N, int K, int M, const std::string& fmt) {
+  e.pipeline(qgemm_actorder_kernel_name(fmt));
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2); e.in(perm, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+// ----- qgemm_blockscale (fp8_block2d): D@0 Wq@1(codes) X@2 scale2d@3 ; N@4 K@5 M@6 ; grid
+//        (M/32, N/32, 1), 32 threads. Separate (N/128,K/128) tile scale. -----
+template <class E>
+void launch_qgemm_blockscale(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                             typename E::in_t scale2d, int N, int K, int M) {
+  e.pipeline("qgemm_blockscale_fp8_raw");
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2); e.in(scale2d, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
 }
 
 // ----- qgemm_frag: dequant-direct-to-fragment. D@0 Wq@1 X@2 ; N@3 K@4 M@5 ; grid (M/32, N/32, 1),

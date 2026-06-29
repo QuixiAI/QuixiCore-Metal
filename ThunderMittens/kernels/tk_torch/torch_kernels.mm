@@ -420,6 +420,32 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   return out;
 }
 
+static at::Tensor qgemm_blockscale_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
+                                       const at::Tensor& sc_in) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte, "qgemm_blockscale: wq uint8");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf && sc_in.scalar_type() == at::kHalf, "qgemm_blockscale: x,scale2d f16");
+  auto wq = wq_in.contiguous(), x = x_in.contiguous(), sc = sc_in.contiguous();
+  const int N = wq.size(0), K = (int)wq.size(1) * 128, M = x.size(1);
+  TORCH_CHECK(x.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm_blockscale: shapes");
+  auto out = at::empty({N, M}, x.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_blockscale(e, out, wq, x, sc, N, K, M); });
+  return out;
+}
+
+static at::Tensor qgemm_actorder_k_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
+                                       const at::Tensor& perm_in, const std::string& format) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kByte, "qgemm_actorder_k: wq uint8 MPS");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf && perm_in.scalar_type() == at::kInt,
+              "qgemm_actorder_k: x float16, perm int32");
+  auto wq = wq_in.contiguous(), x = x_in.contiguous(), perm = perm_in.contiguous();
+  const int block_k = (format == "kU4B8" || format == "kU4") ? 128 : 32;
+  const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
+  TORCH_CHECK(x.size(0) == K && perm.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm_actorder_k: shapes");
+  auto out = at::empty({N, M}, x.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_actorder(e, out, wq, x, perm, N, K, M, format); });
+  return out;
+}
+
 static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                             const std::string& format) {
   TORCH_CHECK(wq_in.device().is_mps(), "qgemv: wq must be an MPS tensor");
@@ -548,6 +574,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");
+  m.def("qgemm_blockscale", &qgemm_blockscale_mps, "ThunderMittens fp8_block2d GEMM (MPS)");
+  m.def("qgemm_actorder_k", &qgemm_actorder_k_mps, "ThunderMittens GPTQ act-order qgemm, in-kernel gather (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
   m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");
   m.def("attn_q", &attn_q_mps, "ThunderMittens quantized-KV flash attention (MPS)");

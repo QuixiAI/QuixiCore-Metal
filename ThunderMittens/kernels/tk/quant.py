@@ -1326,3 +1326,23 @@ def dequantize_kv(packed, format="q8_0"):
     _, dequantize = QUANT_FORMATS[format]
     dW = dequantize(np.ascontiguousarray(packed).reshape(B * H * N, nbk, nby))
     return dW.reshape(B, H, N, -1)
+
+
+# ---- fp8_block2d : storage-optimal fp8_block — codes-only (N, K/128, 128) + a separate
+# (N/128, K/128) fp16 tile scale (no per-row scale replication). value = scale_tile * e4m3(code). ----
+def quantize_fp8_block2d(W):
+    W = np.ascontiguousarray(W, np.float32); N, K = W.shape
+    assert N % 128 == 0 and K % 128 == 0, "fp8_block2d: N,K multiples of 128"
+    nt, kt = N // 128, K // 128
+    tile_amax = np.abs(W.reshape(nt, 128, kt, 128)).max(axis=(1, 3))            # (nt,kt)
+    scale2d = (tile_amax / 448.0).astype(np.float32)
+    srow = np.repeat(scale2d, 128, axis=0)                                     # (N,kt) per row
+    ssafe = np.where(srow == 0, 1.0, srow)
+    codes = _nearest(W.reshape(N, kt, 128) / ssafe[:, :, None], _E4M3_CODES, _E4M3_VALS)  # (N,kt,128)
+    return codes.astype(np.uint8), scale2d.astype(np.float16)
+
+
+def dequantize_fp8_block2d(codes, scale2d):
+    codes = np.ascontiguousarray(codes, np.uint8); N, kt, _ = codes.shape
+    srow = np.repeat(scale2d.astype(np.float32), 128, axis=0)                  # (N,kt)
+    return (srow[:, :, None] * _e4m3_decode_arr(codes)).reshape(N, kt * 128)

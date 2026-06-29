@@ -216,12 +216,22 @@ def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
     return _mlx().attn_q(q, kq, vq, format=format, causal=causal, multiwarp=multiwarp)
 
 
-def qgemm_actorder(wq, x, perm, w_format="kU4B8"):
+def qgemm_actorder(wq, x, perm, w_format="kU4B8", fused=False):
     """GPTQ act-order (desc_act): the weight is quantized in g_idx-permuted column (K) order so its
     groups are contiguous; recover W@X by gathering the activation rows by the same permutation, then
     running the standard qgemm. `perm` is a length-K index array (= argsort(g_idx)). A load-time
-    reordering layer, not a new format. Accepts mlx.array or torch.Tensor (MPS)."""
+    reordering layer, not a new format. `fused=True` (MLX/torch) instead gathers the X K-rows inside
+    the kernel (qgemm_actorder_k) — no materialized permuted-X copy; needs M%32==0, N%32==0, x fp16.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     import numpy as np
+    if fused:
+        if _is_torch(x):
+            import torch
+            p = torch.as_tensor(np.asarray(perm), dtype=torch.int32, device=x.device)
+            return _torch().qgemm_actorder_k(wq, x.to(torch.float16), p, w_format)
+        import mlx.core as mx
+        return _mlx().qgemm_actorder_k(wq, x.astype(mx.float16),
+                                       mx.array(np.asarray(perm, np.int32)), format=w_format)
     if _is_torch(x):
         import torch
         idx = torch.as_tensor(np.asarray(perm), dtype=torch.long, device=x.device)
@@ -245,6 +255,14 @@ def qgemm_w2a8(wq, xq, a_scale):
     if _is_torch(wq):
         return _torch().qgemm_w2a8(wq, xq, a_scale)
     return _mlx().qgemm_w2a8(wq, xq, a_scale)
+
+
+def qgemm_fp8_block2d(wq, x, scale2d):
+    """fp8_block2d GEMM: codes-only fp8 weights (N,K/128,128) + a separate (N/128,K/128) tile scale
+    (storage-optimal fp8_block). x (K,M) f16 -> (N,M) f16. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemm_blockscale(wq, x, scale2d)
+    return _mlx().qgemm_blockscale(wq, x, scale2d)
 
 
 def qgemv_w8a8(wq, xq, w_scale, a_scale):
