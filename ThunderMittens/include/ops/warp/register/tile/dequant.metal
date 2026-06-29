@@ -211,4 +211,32 @@ METAL_FUNC void dequant_into_shared(threadgroup st<half, BN, BK>& dst,
     }
 }
 
+// Dequantize an (RT::rows x RT::cols) weight tile DIRECTLY into the simdgroup register fragment —
+// no threadgroup round-trip, no barrier (Marlin's "zero-shuffle" idea on Apple). Each lane fills
+// only its own 2 elements per 8x8 subtile, using the substrate's lane->(row,col) fragment map
+// (mirrors load(rt, gl) in global_to_register.metal): thread_elements()[0]/[1] = the weights at
+// (row = by*rows + i*8 + simd_y, col = kb*cols + j*8 + simd_x [+1]). `by`/`kb` are tile-block indices.
+template<typename FMT, typename RT>
+METAL_FUNC void dequant_into_register(thread RT& dst, device const uchar* Wq, int N, int K,
+                                      int by, int kb, uint laneid) {
+    const int qid    = (int)laneid / 4;
+    const int simd_y = (qid & 4) + ((int)laneid / 2) % 4;
+    const int simd_x = (qid & 2) * 2 + ((int)laneid % 2) * 2;
+    const int bpr = K / FMT::block_k;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < RT::height; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < RT::width; j++) {
+            const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y;
+            const int gc   = kb * RT::cols + j * mittens::TILE_DIM + simd_x;
+            const int blk0 = gc / FMT::block_k,       cib0 = gc % FMT::block_k;
+            const int blk1 = (gc + 1) / FMT::block_k, cib1 = (gc + 1) % FMT::block_k;
+            device const uchar* b0 = Wq + (uint)(grow * bpr + blk0) * FMT::block_bytes;
+            device const uchar* b1 = Wq + (uint)(grow * bpr + blk1) * FMT::block_bytes;
+            dst.tiles[i][j].data.thread_elements()[0] = FMT::dequant(b0, cib0);
+            dst.tiles[i][j].data.thread_elements()[1] = FMT::dequant(b1, cib1);
+        }
+    }
+}
+
 } // namespace mittens

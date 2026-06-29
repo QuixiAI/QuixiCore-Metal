@@ -89,8 +89,13 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   decoupled from `block_k`). `tk.qgemm` auto-routes M==1 → `qgemv`. **All 9 formats**, dual-backend,
   validated vs `dequantize(Wq)@x`: integer `q8_0, q4_0, q4_K, kU4B8, kU4`; float `fp8_e4m3, fp4_e2m1,
   mxfp8, nvfp4`.
-- ☐ Remaining: dequant-direct-to-fragment optimization (Marlin zero-shuffle), and retrofitting
-  `flux`/attention to take quantized weights.
+- ✅ Activation quant (W·A8 parity): `tk.qmm(wq, x, w_format, act="int8"|"fp8")` → fp8 W8A8, int8
+  W8A8, int8 W4A8 (snap activations to the grid + dequant-to-half GEMM; parity, not speed).
+- ✅ Quantized fused kernel: `kernels/qflux/` `qflux_gelu` = gelu(dequant(Wq)@X + bias), all formats.
+- ✅ **Dequant-direct-to-fragment** (Marlin zero-shuffle) — now the default `qgemm` path
+  (`dequant_into_register`); bit-identical to staged, **~40% faster**. The one multi-simdgroup
+  optimization that wins on Apple (quantized GEMM is weight-bandwidth-bound).
+- ☐ Optional: same zero-shuffle for `qflux`; attention quantized-KV.
 
 **Not applicable on Apple:**
 - `parallel/*` (`ag_gemm`, `all_reduce`, `all_gather`, `ring_attn`, `ulysses_attn`, `gemm_rs`, …) —

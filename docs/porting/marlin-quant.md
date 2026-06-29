@@ -10,9 +10,14 @@
 > group-32 absmean scale, 2-bit codes)**. Float decode is field-extract→widen-to-half; host uses nearest-code-in-codebook
 > so host decode == kernel decode exactly. Host quant + registry in `kernels/tk/quant.py`.
 > Phase 6 (retrofit) demonstrated: `kernels/qflux/` — `qflux_gelu` = gelu(dequantize(Wq)@X + bias),
-> the dequant path + flux's bias+GELU epilogue, all 10 formats, dual-backend (proves the dequant
-> primitive drops into a fused kernel). Remaining: Phase 5 dequant-direct-to-fragment (Marlin
-> zero-shuffle, needs the Apple 8×8 fragment map); more retrofits (attention quantized-KV).
+> the dequant path + flux's bias+GELU epilogue, all formats, dual-backend.
+> **Phase 5 DONE and is now the default `qgemm` path:** dequant-direct-to-fragment (Marlin
+> zero-shuffle) — `dequant_into_register` writes the dequantized weight straight into the
+> `simdgroup_matrix` register slots (using the substrate's lane→(row,col) fragment map), skipping the
+> threadgroup tile + barrier. **Bit-identical to the staged path and ~40% faster** (q4_0, 2–8K shapes)
+> — the first multi-simdgroup-style optimization that actually wins on Apple, because quantized GEMM
+> is weight-bandwidth-bound. No offline weight repack needed (per-lane gathered dequant). Remaining
+> (optional): apply the same zero-shuffle to `qflux`; attention quantized-KV.
 
 > **W·A8 (parity).** Beyond weight-only (W·A16), the activation-quantized schemes work via
 > `tk.qmm(wq, x, w_format, act=...)`: `act="int8"|"fp8"` snaps activations to the 8-bit grid

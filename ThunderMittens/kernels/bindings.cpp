@@ -324,6 +324,18 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "qgemm_direct",
+      &qgemm_direct,
+      "wq"_a,
+      "x"_a,
+      "format"_a = "q8_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized GEMM, dequant-direct-to-fragment (Marlin zero-shuffle; no threadgroup staging)
+      )");
+
+    m.def(
       "qgemv",
       &qgemv,
       "wq"_a,

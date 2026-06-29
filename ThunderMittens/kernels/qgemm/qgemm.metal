@@ -72,4 +72,53 @@ instantiate_qgemm("qgemm_nvfp4", nvfp4, 2, 16);
 instantiate_qgemm("qgemm_mxfp4", mxfp4, 2, 16);
 instantiate_qgemm("qgemm_bitnet", bitnet, 2, 16);
 
+// ---- qgemm_frag: dequant-direct-to-fragment (Marlin zero-shuffle). Single simdgroup per
+// (32x32) output tile; the weight block is dequantized straight into the register fragment
+// (dequant_into_register) — no threadgroup tile, no barrier. -----
+template<typename FMT>
+kernel void qgemm_frag(
+    device   half*  D  [[buffer(0)]],
+    device   uchar* Wq [[buffer(1)]],
+    device   half*  X  [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    const constant int &M [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    constexpr const int BN = 32, BK = 32, BM = 32;
+    using gl_h = gl<half, 1, 1, -1, -1>;
+    gl_h gl_x(X, nullptr, nullptr, K, M);
+    gl_h gl_d(D, nullptr, nullptr, N, M);
+    rt<half, BN, BK> w_reg;
+    rt<half, BK, BM> x_reg;
+    rt<float, BN, BM> d_reg;
+    zero(d_reg);
+    const int by = tgid.y, bx = tgid.x;
+    for (int kb = 0; kb < K / BK; kb++) {
+        dequant_into_register<FMT>(w_reg, Wq, N, K, by, kb, lane);  // straight to fragment
+        load(x_reg, gl_x, {0, 0, kb, bx}, lane);
+        mma_AB(d_reg, w_reg, x_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, by, bx}, lane);
+}
+
+#define instantiate_qgemm_frag(name, FMT)                                     \
+   template [[host_name(name)]] [[kernel]] void qgemm_frag<FMT>(             \
+     device half* D [[buffer(0)]], device uchar* Wq [[buffer(1)]], device half* X [[buffer(2)]], \
+     const constant int &N [[buffer(3)]], const constant int &K [[buffer(4)]], \
+     const constant int &M [[buffer(5)]],                                     \
+     uint3 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_qgemm_frag("qgemm_frag_q8_0", q8_0);
+instantiate_qgemm_frag("qgemm_frag_q4_0", q4_0);
+instantiate_qgemm_frag("qgemm_frag_q4_K", q4_K);
+instantiate_qgemm_frag("qgemm_frag_kU4B8", kU4B8);
+instantiate_qgemm_frag("qgemm_frag_kU4", kU4);
+instantiate_qgemm_frag("qgemm_frag_fp8_e4m3", fp8_e4m3);
+instantiate_qgemm_frag("qgemm_frag_fp4_e2m1", fp4_e2m1);
+instantiate_qgemm_frag("qgemm_frag_mxfp8", mxfp8);
+instantiate_qgemm_frag("qgemm_frag_nvfp4", nvfp4);
+instantiate_qgemm_frag("qgemm_frag_mxfp4", mxfp4);
+instantiate_qgemm_frag("qgemm_frag_bitnet", bitnet);
+
 }

@@ -46,6 +46,7 @@ inline std::string fftconv_kernel_name(int S) { return "fftconv_" + std::to_stri
 inline std::string qgemm_kernel_name(const std::string& fmt) { return "qgemm_" + fmt; }
 inline std::string qgemv_kernel_name(const std::string& fmt) { return "qgemv_" + fmt; }
 inline std::string qflux_gelu_kernel_name(const std::string& fmt) { return "qflux_gelu_" + fmt; }
+inline std::string qgemm_frag_kernel_name(const std::string& fmt) { return "qgemm_frag_" + fmt; }
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -268,6 +269,17 @@ void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
   e.dispatch(M / 32, N / 32, 1, 64, 1, 1);  // 64 threads = 2 simdgroups, BM=32
+}
+
+// ----- qgemm_frag: dequant-direct-to-fragment. D@0 Wq@1 X@2 ; N@3 K@4 M@5 ; grid (M/32, N/32, 1),
+//        32 threads (1 simdgroup) per 32x32 output tile. No shared staging / barrier. -----
+template <class E>
+void launch_qgemm_frag(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
+                       int N, int K, int M, const std::string& fmt) {
+  e.pipeline(qgemm_frag_kernel_name(fmt));
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);  // 32 threads = 1 simdgroup
 }
 
 // ----- qgemv (quantized GEMV, batch-1 decode): D@0 Wq@1 X@2 ; N@3 K@4 (i32) ;

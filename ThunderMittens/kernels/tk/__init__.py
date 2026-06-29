@@ -199,6 +199,14 @@ def qgemm(wq, x, format="q8_0"):
     return _mlx().qgemm(wq, x, format=format)
 
 
+def qgemm_direct(wq, x, format="q8_0"):
+    """qgemm with dequant-direct-to-fragment (Marlin zero-shuffle, no threadgroup staging). MLX
+    only (experimental perf variant of qgemm; same result). Falls back to qgemm on torch."""
+    if _is_torch(wq):
+        return _torch().qgemm(wq, x, format)
+    return _mlx().qgemm_direct(wq, x, format=format)
+
+
 def qgemv(wq, x, format="q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. wq packed weight blocks
     (N, K//block_k, block_bytes) uint8; x is (K, 1) float16 -> (N, 1) float16.

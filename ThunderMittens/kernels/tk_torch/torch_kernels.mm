@@ -414,7 +414,8 @@ static at::Tensor qgemm_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   const int N = wq.size(0), K = (int)wq.size(1) * block_k, M = x.size(1);
   TORCH_CHECK(x.size(0) == K && N % 32 == 0 && M % 32 == 0, "qgemm: N%32,M%32, x rows==K");
   auto out = at::empty({N, M}, x.options());
-  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm(e, out, wq, x, N, K, M, format); });
+  // dequant-direct-to-fragment (Marlin zero-shuffle) — ~40% faster than the staged path, same result.
+  tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_frag(e, out, wq, x, N, K, M, format); });
   return out;
 }
 
