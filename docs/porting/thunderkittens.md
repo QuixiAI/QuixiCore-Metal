@@ -98,23 +98,22 @@ single-simdgroup kernels on Apple GPUs, and tuning confirmed this is structural:
   optimization that wins on Apple (quantized GEMM is weight-bandwidth-bound).
 - ✅ Layout/indexing: GPTQ act-order (`tk.qgemm_actorder`, g_idx reorder layer), HQQ (int4+zp g64).
 
-**Quant — deferrals & flags (deliberate; correctness is complete, these are scope/quality choices):**
-- ☐ **Quantized-KV attention** — not built. The dequant primitive would drop into the attention K/V
-  `load`s exactly as it did for `qgemm`/`qflux_gelu`; only optional future work remaining in this family.
-- ⚠️ **Integer *prefill* is decode-only by design.** The exact-int32 `idot` path is `qgemv_w8a8`/
-  `_w2a8` (batch-1) only — Apple has no int8 `simdgroup_matrix`, so a tiled int prefill would lose to
-  the half tensor cores. W8A8/W2A8 *prefill* (M>1) parity is via `tk.qmm(act="int8")`, which is
-  dequant-both-to-half (fp16 accumulate) — NOT bit-exact int32. No fused (`qflux`) integer variant.
-- ⚠️ **Host encoders are naive (kernel decoders are faithful).** `quantize_*` for the k-quants/i-quants
-  use nearest-grid / simple scale selection, not ggml's optimized encoders, so round-trip-vs-original
-  error is poor for some (q3_K ~20%, mxfp6 ~38% — the latter the same e8m0-floor artifact as mxfp4/8).
-  The kernel *decoders* match the GGUF byte layouts (real GGUF weights decode correctly); kernel-vs-
-  oracle testing isolates this. Production-grade encoders deferred.
-- ⚠️ **`fp8_block`** stores the 128×128 tile scale **replicated per row** (correct block scale, but
-  storage-redundant), and falls back to smaller row-tiles when N % 128 ≠ 0. Storage-optimal 2D-scale
-  layout deferred.
-- ⚠️ **GPTQ act-order** is a host-side activation gather (`tk.qgemm_actorder`), not a fused in-kernel
-  `g_idx` gather (this is the "reordering layer at load" that was specified).
+**Quant — former deferrals, now all PAID DOWN:**
+- ✅ **Quantized-KV attention** — `kernels/attn_q/` `attn_q<FMT,D[,CAUSAL]>` + `attn_q_mw` (multiwarp):
+  K dequant→shared→col-load, V dequant→register; non-causal + causal + multiwarp, q8_0/q4_0/fp8_e4m3
+  × D{64,128}, dual-backend (`tk.attn_q(q,kq,vq,format,causal,multiwarp)`, host `quantize_kv`).
+- ✅ **Integer prefill (exact int32)** — `kernels/qgemm_int/` `qgemm_w8a8`/`qgemm_w2a8` (M>1, tiled
+  int8 MAC + simd_sum on `idot4`). Validated vs the integer oracle. **Honest perf: ~7–10× slower than
+  the dequant-to-half MMA** (Apple has no int8 matrix unit) — it buys bit-exact int32 numerics, not
+  speed; `qmm(act="int8")` (dequant-to-half) stays the recommended prefill default.
+- ✅ **Production-grade encoders** — `quantize_*` now port ggml's optimizers (`make_qkx2`/`make_qx`/
+  `make_q3`, the iq4 scale sweep, lattice scale+parity refit, best-of-floor/ceil e8m0 for MX). Round-
+  trip-vs-W is now ggml-grade (mxfp8 0.19→0.027, q2_K 0.33→0.30 [2-bit floor], iq2_xxs 0.71→0.34, …);
+  decoders unchanged. Locked in by `tk/tests/test_encoders.py`.
+- ✅ **fp8_block2d** — codes-only fp8 (`fp8_raw`) + a separate `(N/128,K/128)` tile scale buffer
+  (`qgemm_blockscale` / `tk.qgemm_fp8_block2d`); removes the 128× per-row scale replication.
+- ✅ **GPTQ act-order in-kernel g_idx** — `qgemm_actorder<FMT>` gathers the X K-rows by `perm` during
+  the fragment fill (`tk.qgemm_actorder(..., fused=True)`); no materialized permuted-X copy.
 - ℹ️ `nvfp8` intentionally not added (not a real format); `fp8_e4m3` + `mxfp8` cover 8-bit float.
 
 **Not applicable on Apple:**

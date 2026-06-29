@@ -20,7 +20,13 @@
 > threadgroup tile + barrier. **Bit-identical to the staged path and ~40% faster** (q4_0, 2–8K shapes)
 > — the first multi-simdgroup-style optimization that actually wins on Apple, because quantized GEMM
 > is weight-bandwidth-bound. No offline weight repack needed (per-lane gathered dequant). `qflux_gelu`
-> uses the same zero-shuffle path. (Optional future work: quantized-KV attention.)
+> uses the same zero-shuffle path.
+
+> **Deferrals all paid down** (see `thunderkittens.md` for the per-item detail): production-grade
+> ggml encoders (incl. the E8-lattice i-quants); quantized-KV attention (`kernels/attn_q/`, non-causal
+> + causal + multiwarp); integer-accumulate prefill (`kernels/qgemm_int/`, exact int32 — ~7–10× slower
+> than the half MMA, for numerics not speed); fp8_block2d (separate 2D tile scale); and GPTQ act-order
+> in-kernel g_idx gather. 875 Python + 126 Xcode tests.
 
 > **W·A8 (parity).** Beyond weight-only (W·A16), the activation-quantized schemes work via
 > `tk.qmm(wq, x, w_format, act=...)`: `act="int8"|"fp8"` snaps activations to the 8-bit grid
