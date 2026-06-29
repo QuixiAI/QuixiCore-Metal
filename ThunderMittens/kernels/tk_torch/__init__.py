@@ -39,6 +39,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "mamba2", "mamba2.metal"),
     os.path.join(_KERNELS, "lin_attn_decay", "lin_attn_decay.metal"),
     os.path.join(_KERNELS, "based", "based.metal"),
+    os.path.join(_KERNELS, "attn_bwd", "attn_bwd.metal"),
     os.path.join(_KERNELS, "cmplx_matmul", "cmplx_matmul.metal"),
     os.path.join(_KERNELS, "fftconv", "fftconv.metal"),
     os.path.join(_KERNELS, "qgemm", "qgemm.metal"),
@@ -183,6 +184,26 @@ def lin_attn_decay(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cl: torch.
 def based(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
     """Based Taylor-map linear attention. q,k bf16 (B,H,N,16); v bf16 (B,H,N,64). MPS; N%8."""
     return _ext.based(q, k, v)
+
+
+def attn_fwd_l(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: bool = False):
+    """Flash-attn forward + logsumexp -> (o, L). q,k,v bf16 (B,H,N,D); L fp32 (B,H,N). MPS; D in {64,128}."""
+    return _ext.attn_fwd_l(q, k, v, causal)
+
+
+def attn_bwd_prep(o: torch.Tensor, do: torch.Tensor):
+    """Backward prep: delta = rowsum(dO . O) (B,H,N) fp32. MPS."""
+    return _ext.attn_bwd_prep(o, do)
+
+
+def attn_bwd_dq(q, k, v, do, L, delta, causal=False):
+    """Flash-attn backward dQ. bf16 (B,H,N,D); L,delta fp32 (B,H,N). MPS."""
+    return _ext.attn_bwd_dq(q, k, v, do, L, delta, causal)
+
+
+def attn_bwd_dkv(q, k, v, do, L, delta, causal=False):
+    """Flash-attn backward -> (dK, dV). bf16 (B,H,N,D); L,delta fp32 (B,H,N). MPS."""
+    return _ext.attn_bwd_dkv(q, k, v, do, L, delta, causal)
 
 
 def cmplx_matmul(a: torch.Tensor, b: torch.Tensor):

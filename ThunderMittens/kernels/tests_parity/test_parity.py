@@ -217,6 +217,22 @@ def test_based_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_attn_bwd_parity(causal):
+    B, H, N, D = 1, 2, 64, 64
+    rng = np.random.default_rng(0)
+    q = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    k = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    v = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    do = (rng.standard_normal((B, H, N, D)) * 0.5).astype(np.float32)
+    om, Lm = tk.attn_fwd_l(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), causal=causal)
+    ot, Lt = tk.attn_fwd_l(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), causal=causal)
+    dqm, dkm, dvm = tk.attn_bwd(_mk(q, "mlx"), _mk(k, "mlx"), _mk(v, "mlx"), om, _mk(do, "mlx"), Lm, causal=causal)
+    dqt, dkt, dvt = tk.attn_bwd(_mk(q, "torch"), _mk(k, "torch"), _mk(v, "torch"), ot, _mk(do, "torch"), Lt, causal=causal)
+    for am, at_ in [(dqm, dqt), (dkm, dkt), (dvm, dvt)]:
+        _assert_parity(am, at_, atol=1.0)
+
+
 @pytest.mark.parametrize("shape", [(1, 1, 16), (2, 2, 32)])
 def test_fftconv_parity(shape):
     B, H, S = shape

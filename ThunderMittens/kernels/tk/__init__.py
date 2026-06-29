@@ -198,6 +198,25 @@ def based(q, k, v):
     return _mlx().based(q, k, v)
 
 
+def attn_fwd_l(q, k, v, causal=False):
+    """Flash-attention forward returning (o, L). o is (B,H,N,D) bf16; L is (B,H,N) fp32 — the
+    log2-domain logsumexp per query row, needed by the backward. `causal` masks future positions.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().attn_fwd_l(q, k, v, causal)
+    return _mlx().attn_fwd_l(q, k, v, causal=causal)
+
+
+def attn_bwd(q, k, v, o, do, L, causal=False):
+    """FlashAttention-2 backward -> (dq, dk, dv). q,k,v,o,do are (B,H,N,D) bf16; L (B,H,N) fp32 from
+    the forward (tk.attn_fwd_l). D in {64,128}, N%8==0. Accepts mlx.array or torch.Tensor (MPS)."""
+    be = _torch() if _is_torch(q) else _mlx()
+    delta = be.attn_bwd_prep(o, do)
+    dq = be.attn_bwd_dq(q, k, v, do, L, delta, causal)
+    dk, dv = be.attn_bwd_dkv(q, k, v, do, L, delta, causal)
+    return dq, dk, dv
+
+
 def cmplx_matmul(a, b):
     """Complex GEMM D=A@B; operands carry a leading size-2 (real,imag) axis: a (2,N,K),
     b (2,K,M) -> (2,N,M). Accepts mlx.array or torch.Tensor (MPS)."""

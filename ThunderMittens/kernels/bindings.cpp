@@ -54,6 +54,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 
 #include "add_rt/add_rt.h"
 #include "attn_fwd/attn_fwd.h"
@@ -73,6 +74,7 @@
 #include "mamba2/mamba2.h"
 #include "lin_attn_decay/lin_attn_decay.h"
 #include "based/based.h"
+#include "attn_bwd/attn_bwd.h"
 #include "cmplx_matmul/cmplx_matmul.h"
 #include "fftconv/fftconv.h"
 #include "qgemm/qgemm.h"
@@ -309,6 +311,30 @@ NB_MODULE(_ext, m) {
       R"(
         Based Taylor-map linear attention: out_i = sum_{j<=i} (1 + x + x^2/2) v_j, x=(q.k)/sqrt(D_QK)
       )");
+
+    m.def(
+      "attn_fwd_l", &attn_fwd_l,
+      "q"_a, "k"_a, "v"_a, "causal"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(flash-attention forward returning (o, L) where L is the log2-domain logsumexp per query row)");
+
+    m.def(
+      "attn_bwd_prep", &attn_bwd_prep,
+      "o"_a, "do_"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(backward prep: delta = rowsum(dO . O) (B,H,N) fp32)");
+
+    m.def(
+      "attn_bwd_dq", &attn_bwd_dq,
+      "q"_a, "k"_a, "v"_a, "do_"_a, "L"_a, "delta"_a, "causal"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(flash-attention backward dQ)");
+
+    m.def(
+      "attn_bwd_dkv", &attn_bwd_dkv,
+      "q"_a, "k"_a, "v"_a, "do_"_a, "L"_a, "delta"_a, "causal"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(flash-attention backward returning (dK, dV))");
 
     m.def(
       "cmplx_matmul",

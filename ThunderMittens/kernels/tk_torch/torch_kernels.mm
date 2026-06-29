@@ -397,6 +397,55 @@ static at::Tensor based_mps(const at::Tensor& q_in, const at::Tensor& k_in, cons
   return out;
 }
 
+static std::tuple<at::Tensor, at::Tensor> attn_fwd_l_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                                         const at::Tensor& v_in, bool causal) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "attn_fwd_l: q,k,v bf16 MPS");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  const int B = q.size(0), H = q.size(1), D = q.size(3);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  TORCH_CHECK((D == 64 || D == 128) && N % 8 == 0, "attn_fwd_l: D in {64,128}, N%8==0");
+  auto o = at::empty_like(q);
+  auto L = at::empty({B, H, (int)N}, q.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_fwd_l(e, q, k, v, o, L, N, H, B, D, causal); });
+  return {o, L};
+}
+
+static at::Tensor attn_bwd_prep_mps(const at::Tensor& o_in, const at::Tensor& do_in) {
+  TORCH_CHECK(o_in.device().is_mps() && o_in.scalar_type() == at::kBFloat16, "attn_bwd_prep: o,do bf16 MPS");
+  auto o = o_in.contiguous(), dd = do_in.contiguous();
+  const int B = o.size(0), H = o.size(1), D = o.size(3);
+  const unsigned N = static_cast<unsigned>(o.size(2));
+  auto delta = at::empty({B, H, (int)N}, o.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_bwd_prep(e, o, dd, delta, N, H, B, D); });
+  return delta;
+}
+
+static at::Tensor attn_bwd_dq_mps(const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in,
+                                  const at::Tensor& do_in, const at::Tensor& L_in, const at::Tensor& delta_in,
+                                  bool causal) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "attn_bwd_dq: q bf16 MPS");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous(), dd = do_in.contiguous();
+  auto L = L_in.contiguous(), delta = delta_in.contiguous();
+  const int B = q.size(0), H = q.size(1), D = q.size(3);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  auto dq = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_bwd_dq(e, q, k, v, dd, L, delta, dq, N, H, B, D, causal); });
+  return dq;
+}
+
+static std::tuple<at::Tensor, at::Tensor> attn_bwd_dkv_mps(
+    const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in, const at::Tensor& do_in,
+    const at::Tensor& L_in, const at::Tensor& delta_in, bool causal) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.scalar_type() == at::kBFloat16, "attn_bwd_dkv: q bf16 MPS");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous(), dd = do_in.contiguous();
+  auto L = L_in.contiguous(), delta = delta_in.contiguous();
+  const int B = q.size(0), H = q.size(1), D = q.size(3);
+  const unsigned N = static_cast<unsigned>(q.size(2));
+  auto dk = at::empty_like(k), dv = at::empty_like(v);
+  tk_encode([&](TorchEncoder& e) { tk::launch_attn_bwd_dkv(e, q, k, v, dd, L, delta, dk, dv, N, H, B, D, causal); });
+  return {dk, dv};
+}
+
 static at::Tensor cmplx_matmul_mps(const at::Tensor& a_in, const at::Tensor& b_in) {
   TORCH_CHECK(a_in.device().is_mps(), "cmplx_matmul: a must be an MPS tensor");
   TORCH_CHECK(a_in.scalar_type() == at::kFloat || a_in.scalar_type() == at::kBFloat16,
@@ -615,6 +664,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
   m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
   m.def("based", &based_mps, "ThunderMittens Based Taylor-map linear attention (MPS)");
+  m.def("attn_fwd_l", &attn_fwd_l_mps, "ThunderMittens flash-attn forward + L (MPS)");
+  m.def("attn_bwd_prep", &attn_bwd_prep_mps, "ThunderMittens flash-attn backward prep delta (MPS)");
+  m.def("attn_bwd_dq", &attn_bwd_dq_mps, "ThunderMittens flash-attn backward dQ (MPS)");
+  m.def("attn_bwd_dkv", &attn_bwd_dkv_mps, "ThunderMittens flash-attn backward dK,dV (MPS)");
   m.def("cmplx_matmul", &cmplx_matmul_mps, "ThunderMittens complex GEMM (MPS)");
   m.def("fftconv", &fftconv_mps, "ThunderMittens Monarch FFT convolution (MPS)");
   m.def("qgemm", &qgemm_mps, "ThunderMittens quantized GEMM (MPS)");

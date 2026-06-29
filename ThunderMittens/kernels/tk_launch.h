@@ -258,6 +258,44 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- attn backward family (FlashAttention-2 bwd). All grid (N/8, H, B) group (32,1,1). -----
+template <class E>
+void launch_attn_fwd_l(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                       typename E::out_t o, typename E::out_t L, unsigned N, unsigned H, int B, int D,
+                       bool causal) {
+  e.pipeline("attn_fwd_l_" + std::string(causal ? "causal_" : "noncausal_") + std::to_string(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3); e.out(L, 4);
+  e.bytes(N, 5); e.bytes(H, 6);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_attn_bwd_prep(E& e, typename E::in_t o, typename E::in_t ddo, typename E::out_t delta,
+                          unsigned N, unsigned H, int B, int D) {
+  e.pipeline("attn_bwd_prep_" + std::to_string(D));
+  e.in(o, 0); e.in(ddo, 1); e.out(delta, 2);
+  e.bytes(N, 3); e.bytes(H, 4);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_attn_bwd_dq(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                        typename E::in_t ddo, typename E::in_t L, typename E::in_t delta,
+                        typename E::out_t dq, unsigned N, unsigned H, int B, int D, bool causal) {
+  e.pipeline("attn_bwd_dq_" + std::string(causal ? "causal_" : "noncausal_") + std::to_string(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(ddo, 3); e.in(L, 4); e.in(delta, 5); e.out(dq, 6);
+  e.bytes(N, 7); e.bytes(H, 8);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_attn_bwd_dkv(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                         typename E::in_t ddo, typename E::in_t L, typename E::in_t delta,
+                         typename E::out_t dk, typename E::out_t dv, unsigned N, unsigned H, int B,
+                         int D, bool causal) {
+  e.pipeline("attn_bwd_dkv_" + std::string(causal ? "causal_" : "noncausal_") + std::to_string(D));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(ddo, 3); e.in(L, 4); e.in(delta, 5); e.out(dk, 6); e.out(dv, 7);
+  e.bytes(N, 8); e.bytes(H, 9);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
 // ----- lin_attn_decay (retention): q@0 k@1 v@2 cl@3(=-slope*pos) -> o@4 ; N@5(u32) H@6(u32) ;
 //        grid (N/8, H, B) group (32,1,1). q,k,v,o (B,H,N,D) bf16; cl (B,H,N) fp32. -----
 template <class E>
