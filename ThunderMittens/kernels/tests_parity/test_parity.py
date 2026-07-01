@@ -284,6 +284,36 @@ def test_paged_attention_v2_parity(H, H_KV, ps):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+@pytest.mark.parametrize("H,H_KV,ps", [(2, 2, 4), (4, 1, 8)])
+def test_paged_attention_v2_fp8_parity(fmt, H, H_KV, ps):
+    # Long-context fp8 decode must match across MLX and MPS for both fp8 formats.
+    rng = np.random.default_rng(33)
+    B, D, num_blocks, block_size = 2, 64, 8, 4
+    total = num_blocks * block_size
+    qmax = 448.0 if fmt == "e4m3" else 57344.0
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    ks = float(np.abs(K).max() / qmax)
+    vs = float(np.abs(V).max() / qmax)
+    slot = np.arange(total, dtype=np.int64)
+
+    kcm, vcm = tk.kv_cache_scatter_fp8(_mk(K, "mlx"), _mk(V, "mlx"), mx.array(slot),
+                                       num_blocks, block_size, ks, vs, fmt=fmt)
+    om = tk.paged_attention_v2_fp8(_mk(q, "mlx"), kcm, vcm, mx.array(bt), mx.array(cl),
+                                   ks, vs, partition_size=ps, fmt=fmt)
+    kct, vct = tk.kv_cache_scatter_fp8(_mk(K, "torch"), _mk(V, "torch"),
+                                       torch.from_numpy(slot).to("mps"), num_blocks, block_size,
+                                       ks, vs, fmt=fmt)
+    ot = tk.paged_attention_v2_fp8(_mk(q, "torch"), kct, vct,
+                                   torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                   ks, vs, partition_size=ps, fmt=fmt)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("D,gemma", [(64, False), (128, True)])
 def test_rope_kv_insert_norm_parity(D, gemma):
     rng = np.random.default_rng(6)

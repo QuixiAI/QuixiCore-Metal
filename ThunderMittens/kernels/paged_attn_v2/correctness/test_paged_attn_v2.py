@@ -12,7 +12,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import paged_attention_v2
+from tk import paged_attention_v2, kv_cache_scatter_fp8, paged_attention_v2_fp8
+from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
 _MX = {"float32": mx.float32, "bfloat16": mx.bfloat16}
 
@@ -63,6 +64,42 @@ def test_paged_attention_v2(dtype, atol, D, H, H_KV, partition_size):
 
     ref = _ref(q, kc, vc, bt, cl, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=atol, rtol=2e-3)
+
+
+@pytest.mark.parametrize("fmt,qmax,decode",
+                         [("e4m3", 448.0, _e4m3_decode_arr), ("e5m2", 57344.0, _e5m2_decode_arr)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1)])
+@pytest.mark.parametrize("partition_size", [4, 16])  # 4 or 1 partitions
+def test_paged_attention_v2_fp8(fmt, qmax, decode, D, H, H_KV, partition_size):
+    # Long-context fp8 path: scatter into a uint8 cache, then partition/reduce dequantizing on
+    # read. Oracle = the same full softmax over the dequantized codes.
+    rng = np.random.default_rng(90 + D + H + H_KV + partition_size + len(fmt))
+    B, num_blocks, block_size = 2, 8, 4
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    k_scale = float(np.abs(K).max() / qmax)
+    v_scale = float(np.abs(V).max() / qmax)
+    scale = 1.0 / math.sqrt(D)
+    slot = np.arange(total, dtype=np.int64)
+
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(slot), num_blocks, block_size, k_scale, v_scale, fmt=fmt)
+    got = paged_attention_v2_fp8(
+        mx.array(q).astype(mx.bfloat16), kc, vc, mx.array(bt), mx.array(cl),
+        k_scale, v_scale, scale=0.0, partition_size=partition_size, fmt=fmt)
+    mx.eval(kc, vc, got)
+
+    kc_deq = decode(np.array(kc)) * k_scale
+    vc_deq = decode(np.array(vc)) * v_scale
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = _ref(q_bf, kc_deq, vc_deq, bt, cl, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)
 
 
 if __name__ == "__main__":

@@ -299,6 +299,19 @@ def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: to
                                    float(scale), int(partition_size))
 
 
+def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
+                           k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3"):
+    """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA aware. MPS.
+
+    k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) tensor (per-head).
+    fmt: 'e4m3' (default) or 'e5m2' — must match how the cache was written.
+    """
+    H_KV = key_cache.shape[2]
+    return _ext.paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
+                                       _scale_vec_t(k_scale, H_KV, q), _scale_vec_t(v_scale, H_KV, q),
+                                       float(scale), int(partition_size), _fmt_code(fmt))
+
+
 def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""

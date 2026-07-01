@@ -731,6 +731,59 @@ static at::Tensor paged_attention_v2_mps(
   return out;
 }
 
+// Long-context paged decode over an fp8 (uint8) cache, dequantized on read with per-head scales.
+static at::Tensor paged_attention_v2_fp8_mps(
+    const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
+    const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
+    const at::Tensor& k_scale_in, const at::Tensor& v_scale_in,
+    double scale, int64_t partition_size, int64_t fmt) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_v2_fp8: q must be float MPS");
+  TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2_fp8: q must be (B,H,D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "paged_attention_v2_fp8: caches must be (num_blocks, block_size, num_kv_heads, D)");
+  TORCH_CHECK(key_cache_in.scalar_type() == at::kByte && value_cache_in.scalar_type() == at::kByte,
+              "paged_attention_v2_fp8: caches must be uint8 (fp8 codes)");
+  TORCH_CHECK(key_cache_in.size(3) == q_in.size(2), "paged_attention_v2_fp8: head_size mismatch");
+  TORCH_CHECK(key_cache_in.size(2) > 0 && q_in.size(1) % key_cache_in.size(2) == 0,
+              "paged_attention_v2_fp8: num_q_heads must be a positive multiple of num_kv_heads");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "paged_attention_v2_fp8: block_table and context_lens must be int32");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2), block_size = key_cache_in.size(1);
+  TORCH_CHECK(D == 64 || D == 128, "paged_attention_v2_fp8: head_size must be 64 or 128");
+  TORCH_CHECK(partition_size > 0 && partition_size % block_size == 0,
+              "paged_attention_v2_fp8: partition_size must be a positive multiple of block_size");
+  TORCH_CHECK(k_scale_in.dim() == 1 && k_scale_in.size(0) == H_KV && v_scale_in.sizes() == k_scale_in.sizes(),
+              "paged_attention_v2_fp8: k_scale/v_scale must be (num_kv_heads,)");
+
+  auto q = q_in.contiguous();
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.contiguous();
+  auto context_lens = context_lens_in.contiguous();
+  auto ks = k_scale_in.to(at::kFloat).contiguous(), vs = v_scale_in.to(at::kFloat).contiguous();
+  const int max_ctx = static_cast<int>(block_table.size(1)) * block_size;
+  const int num_partitions = std::max(1, (max_ctx + static_cast<int>(partition_size) - 1) /
+                                             static_cast<int>(partition_size));
+  auto f32 = q.options().dtype(at::kFloat);
+  auto tmp_out = at::empty({B, H, num_partitions, D}, f32);
+  auto max_logits = at::empty({B, H, num_partitions}, f32);
+  auto exp_sums = at::empty({B, H, num_partitions}, f32);
+  auto out = at::empty_like(q);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_partition_fp8(
+        e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
+        B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
+        num_partitions, static_cast<int>(partition_size), ks, vs, static_cast<int>(fmt), tn);
+    tk::launch_paged_attention_reduce(
+        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
+  });
+  return out;
+}
+
 // MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
 static std::tuple<at::Tensor, at::Tensor> moe_route_topk_mps(const at::Tensor& logits_in, int64_t k) {
   TORCH_CHECK(logits_in.device().is_mps(), "moe_route_topk: logits must be an MPS tensor");
@@ -1418,6 +1471,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
+  m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");

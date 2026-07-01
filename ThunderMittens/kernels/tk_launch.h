@@ -70,6 +70,9 @@ inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D) 
 inline std::string paged_attention_partition_kernel_name(const std::string& t, int D) {
   return "paged_attention_partition_" + t + "_" + std::to_string(D);
 }
+inline std::string paged_attention_partition_fp8_kernel_name(const std::string& t, int D) {
+  return "paged_attention_partition_fp8_" + t + "_" + std::to_string(D);
+}
 inline std::string paged_attention_reduce_kernel_name(const std::string& t, int D) {
   return "paged_attention_reduce_" + t + "_" + std::to_string(D);
 }
@@ -728,6 +731,26 @@ void launch_paged_attention_partition(
   e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
   e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12);
   e.bytes(num_partitions, 13); e.bytes(partition_size, 14);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
+
+// fp8 partition: uint8 caches, per-head k_scale/v_scale@15,16 (in), fmt@17. Reduce is reused.
+template <class E>
+void launch_paged_attention_partition_fp8(
+    E& e, typename E::in_t q, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::in_t block_table, typename E::in_t context_lens,
+    typename E::out_t tmp_out, typename E::out_t max_logits, typename E::out_t exp_sums,
+    int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int num_partitions, int partition_size,
+    typename E::in_t k_scale, typename E::in_t v_scale, int fmt, const std::string& type_name) {
+  e.pipeline(paged_attention_partition_fp8_kernel_name(type_name, head_size));
+  e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
+  e.in(block_table, 3); e.in(context_lens, 4);
+  e.out(tmp_out, 5); e.out(max_logits, 6); e.out(exp_sums, 7);
+  e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
+  e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12);
+  e.bytes(num_partitions, 13); e.bytes(partition_size, 14);
+  e.in(k_scale, 15); e.in(v_scale, 16); e.bytes(fmt, 17);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 

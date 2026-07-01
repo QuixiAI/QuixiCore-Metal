@@ -100,6 +100,94 @@ kernel void paged_attention_partition(
     }
 }
 
+// fp8 partition: identical online-softmax, but the caches hold uint8 (e4m3/e5m2) codes
+// dequantized on read with per-head k_scale/v_scale. tmp_out/max_logits/exp_sums stay fp32
+// so the existing (format-agnostic) reduce kernel merges the partitions unchanged.
+template <typename T, int D>
+kernel void paged_attention_partition_fp8(
+    device const T *q [[buffer(0)]],
+    device const uchar *key_cache [[buffer(1)]],
+    device const uchar *value_cache [[buffer(2)]],
+    device const int *block_table [[buffer(3)]],
+    device const int *context_lens [[buffer(4)]],
+    device float *tmp_out [[buffer(5)]],
+    device float *max_logits [[buffer(6)]],
+    device float *exp_sums [[buffer(7)]],
+    constant int &block_size [[buffer(8)]],
+    constant int &block_table_stride [[buffer(9)]],
+    constant float &scale [[buffer(10)]],
+    constant int &num_heads [[buffer(11)]],
+    constant int &num_kv_heads [[buffer(12)]],
+    constant int &num_partitions [[buffer(13)]],
+    constant int &partition_size [[buffer(14)]],
+    device const float *k_scale [[buffer(15)]],
+    device const float *v_scale [[buffer(16)]],
+    constant int &fmt [[buffer(17)]],       // 0 = e4m3, 1 = e5m2
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const float ks = k_scale[kv_head], vs = v_scale[kv_head];
+    const int context_len = context_lens[batch];
+    const int start = part * partition_size;
+    const int end = min(start + partition_size, context_len);
+
+    const long q_base = ((long)batch * num_heads + head) * D;
+    const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
+    const long out_base = stat_idx * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[q_base + d]);
+        acc[i] = 0.0f;
+    }
+
+    float m = NEG_INF, l = 0.0f;
+    for (int t = start; t < end; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) {
+            continue;
+        }
+        const long cache_base =
+            (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            const uchar kc = key_cache[cache_base + d];
+            const float kdec = fmt == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
+            partial += qv[i] * (kdec * ks);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            const uchar vc = value_cache[cache_base + d];
+            const float vdec = fmt == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
+            acc[i] = acc[i] * alpha + beta * (vdec * vs);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (lane == 0) {
+        max_logits[stat_idx] = l == 0.0f ? NEG_INF : m;
+        exp_sums[stat_idx] = l;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+    }
+}
+
 template <typename T, int D>
 kernel void paged_attention_reduce(
     device const float *tmp_out [[buffer(0)]],    // (B, H, P, D)
@@ -184,9 +272,39 @@ kernel void paged_attention_reduce(
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);
 
+#define instantiate_paged_v2_fp8(type_name, T, DVAL)                          \
+  template [[host_name("paged_attention_partition_fp8_" #type_name "_" #DVAL)]] \
+  [[kernel]] void paged_attention_partition_fp8<T, DVAL>(                      \
+      device const T *q [[buffer(0)]],                                        \
+      device const uchar *key_cache [[buffer(1)]],                            \
+      device const uchar *value_cache [[buffer(2)]],                          \
+      device const int *block_table [[buffer(3)]],                            \
+      device const int *context_lens [[buffer(4)]],                           \
+      device float *tmp_out [[buffer(5)]],                                    \
+      device float *max_logits [[buffer(6)]],                                 \
+      device float *exp_sums [[buffer(7)]],                                   \
+      constant int &block_size [[buffer(8)]],                                 \
+      constant int &block_table_stride [[buffer(9)]],                         \
+      constant float &scale [[buffer(10)]],                                   \
+      constant int &num_heads [[buffer(11)]],                                 \
+      constant int &num_kv_heads [[buffer(12)]],                              \
+      constant int &num_partitions [[buffer(13)]],                            \
+      constant int &partition_size [[buffer(14)]],                            \
+      device const float *k_scale [[buffer(15)]],                             \
+      device const float *v_scale [[buffer(16)]],                             \
+      constant int &fmt [[buffer(17)]],                                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint lane [[thread_index_in_simdgroup]]);
+
 instantiate_paged_v2(float32, float, 64)
 instantiate_paged_v2(float32, float, 128)
 instantiate_paged_v2(float16, half, 64)
 instantiate_paged_v2(float16, half, 128)
 instantiate_paged_v2(bfloat16, bf16, 64)
 instantiate_paged_v2(bfloat16, bf16, 128)
+instantiate_paged_v2_fp8(float32, float, 64)
+instantiate_paged_v2_fp8(float32, float, 128)
+instantiate_paged_v2_fp8(float16, half, 64)
+instantiate_paged_v2_fp8(float16, half, 128)
+instantiate_paged_v2_fp8(bfloat16, bf16, 64)
+instantiate_paged_v2_fp8(bfloat16, bf16, 128)

@@ -250,6 +250,25 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "paged_attention_v2_fp8",
+      &paged_attention_v2_fp8,
+      "q"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "k_scale"_a,
+      "v_scale"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "partition_size"_a = 512,
+      "fmt"_a = 0,
+      "stream"_a = nb::none(),
+      R"(
+        long-context paged decode over an fp8 (uint8) cache, per-head scales; fmt 0=e4m3, 1=e5m2. GQA aware.
+      )");
+
+    m.def(
       "moe_route_topk",
       &moe_route_topk,
       "logits"_a,
