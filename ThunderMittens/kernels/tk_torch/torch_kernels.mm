@@ -229,6 +229,69 @@ static std::tuple<at::Tensor, at::Tensor> layernorm_add_mps(
   return {out, res_out};
 }
 
+// fp8 norm epilogues (MPS). Static returns (codes, res_out); dynamic returns (codes, res_out, scale).
+static void anfp8_check(const at::Tensor& x, const at::Tensor& r, int& D, uint32_t& M) {
+  TORCH_CHECK(x.device().is_mps() && x.scalar_type() == at::kBFloat16, "fp8 norm: x must be bf16 MPS");
+  TORCH_CHECK(r.sizes() == x.sizes(), "fp8 norm: residual must match x");
+  D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024, "fp8 norm: D in {256,512,768,1024}");
+  M = static_cast<uint32_t>(x.numel() / D);
+}
+static std::tuple<at::Tensor, at::Tensor> rms_norm_add_fp8_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, double eps, double scale) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  auto res_out = at::empty_like(x);
+  const float inv = scale > 0.0 ? 1.0f / static_cast<float>(scale) : 0.0f;
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_add_fp8(e, x, r, w, codes, res_out, M, D, static_cast<float>(eps), inv);
+  });
+  return {codes, res_out};
+}
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> rms_norm_add_fp8_dyn_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, double eps) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_add_fp8_dyn(e, x, r, w, codes, res_out, scale, M, D, static_cast<float>(eps));
+  });
+  return {codes, res_out, scale};
+}
+static std::tuple<at::Tensor, at::Tensor> layernorm_add_fp8_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, const at::Tensor& b_in,
+    double eps, double scale) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  auto res_out = at::empty_like(x);
+  const float inv = scale > 0.0 ? 1.0f / static_cast<float>(scale) : 0.0f;
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_add_fp8(e, x, r, w, b, codes, res_out, M, D, static_cast<float>(eps), inv);
+  });
+  return {codes, res_out};
+}
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> layernorm_add_fp8_dyn_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, const at::Tensor& b_in,
+    double eps) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_add_fp8_dyn(e, x, r, w, b, codes, res_out, scale, M, D, static_cast<float>(eps));
+  });
+  return {codes, res_out, scale};
+}
+
 static at::Tensor softmax_mps(const at::Tensor& x_in) {
   TORCH_CHECK(x_in.device().is_mps(), "softmax: x must be an MPS tensor");
   TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "softmax: x must be bfloat16");
@@ -1251,6 +1314,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
   m.def("rms_norm_add", &rms_norm_add_mps, "ThunderMittens fused residual-add + RMSNorm (MPS)");
   m.def("layernorm_add", &layernorm_add_mps, "ThunderMittens fused residual-add + LayerNorm (MPS)");
+  m.def("rms_norm_add_fp8", &rms_norm_add_fp8_mps, "ThunderMittens fused add+rms_norm static fp8 (MPS)");
+  m.def("rms_norm_add_fp8_dyn", &rms_norm_add_fp8_dyn_mps, "ThunderMittens fused add+rms_norm dyn fp8 (MPS)");
+  m.def("layernorm_add_fp8", &layernorm_add_fp8_mps, "ThunderMittens fused add+layernorm static fp8 (MPS)");
+  m.def("layernorm_add_fp8_dyn", &layernorm_add_fp8_dyn_mps, "ThunderMittens fused add+layernorm dyn fp8 (MPS)");
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");

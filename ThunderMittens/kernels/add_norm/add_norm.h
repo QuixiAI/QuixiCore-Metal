@@ -41,9 +41,52 @@ std::vector<array> layernorm_add(
     float eps = 1e-5f,
     StreamOrDevice s = {});
 
+/**
+ *  fp8 e4m3 epilogue variants: out = e4m3(norm(x+residual)*weight[+bias] / scale) as uint8
+ *  codes, plus res_out = x+residual (bf16). Static returns [codes, res_out]; dynamic (per-row
+ *  absmax/448) returns [codes, res_out, scale (per row)].
+ **/
+std::vector<array> rms_norm_add_fp8(
+    const array& x, const array& residual, const array& weight, float eps, float scale,
+    StreamOrDevice s = {});
+std::vector<array> rms_norm_add_fp8_dyn(
+    const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s = {});
+std::vector<array> layernorm_add_fp8(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    float scale, StreamOrDevice s = {});
+std::vector<array> layernorm_add_fp8_dyn(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    StreamOrDevice s = {});
+
 ///////////////////////////////////////////////////////////////////////////////
 // Primitives
 ///////////////////////////////////////////////////////////////////////////////
+
+class AddNormFp8 : public Primitive {
+ public:
+  AddNormFp8(Stream stream, bool layernorm, bool dynamic, float eps, float inv_scale)
+    : Primitive(stream), layernorm_(layernorm), dynamic_(dynamic), eps_(eps), inv_scale_(inv_scale) {};
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AddNormFp8"; }
+  void print(std::ostream& os) override { os << "AddNormFp8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const AddNormFp8&>(other);
+    return layernorm_ == o.layernorm_ && dynamic_ == o.dynamic_ && eps_ == o.eps_ &&
+        inv_scale_ == o.inv_scale_;
+  }
+
+ private:
+  bool layernorm_, dynamic_;
+  float eps_, inv_scale_;
+};
 
 class RMSNormAdd : public Primitive {
  public:

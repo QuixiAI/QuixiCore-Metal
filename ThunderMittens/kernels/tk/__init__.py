@@ -110,6 +110,26 @@ def layernorm_add(x, residual, weight, bias, eps=1e-5):
     return _mlx().layernorm_add(x, residual, weight, bias, eps=eps)
 
 
+def rms_norm_add_fp8(x, residual, weight, eps=1e-5, scale=None):
+    """Fused add + rms_norm + fp8. scale=None -> dynamic per-row (returns codes, x+residual, scale);
+    else static per-tensor (returns codes, x+residual). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().rms_norm_add_fp8(x, residual, weight, eps, scale)
+    if scale is None:
+        return _mlx().rms_norm_add_fp8_dyn(x, residual, weight, eps=eps)
+    return _mlx().rms_norm_add_fp8(x, residual, weight, eps=eps, scale=scale)
+
+
+def layernorm_add_fp8(x, residual, weight, bias, eps=1e-5, scale=None):
+    """Fused add + layernorm + fp8. scale=None -> dynamic (codes, x+residual, scale); else static.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().layernorm_add_fp8(x, residual, weight, bias, eps, scale)
+    if scale is None:
+        return _mlx().layernorm_add_fp8_dyn(x, residual, weight, bias, eps=eps)
+    return _mlx().layernorm_add_fp8(x, residual, weight, bias, eps=eps, scale=scale)
+
+
 def rms_norm(x, weight, eps=1e-5):
     """RMSNorm over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):

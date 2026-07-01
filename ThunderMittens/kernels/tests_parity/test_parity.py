@@ -278,6 +278,20 @@ def test_rope_kv_insert_parity(D, H_KV):
     _assert_parity(vm, vt, atol=2e-2)
 
 
+@pytest.mark.parametrize("shape", [(8, 256), (3, 1024)])
+def test_rms_norm_add_fp8_parity(shape):
+    D = shape[-1]
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(shape).astype(np.float32)
+    r = rng.standard_normal(shape).astype(np.float32)
+    w = rng.standard_normal((D,)).astype(np.float32)
+    cm, am, sm = tk.rms_norm_add_fp8(_mk(x, "mlx"), _mk(r, "mlx"), _mk(w, "mlx"))
+    ct, at, st = tk.rms_norm_add_fp8(_mk(x, "torch"), _mk(r, "torch"), _mk(w, "torch"))
+    _assert_parity(cm, ct, atol=0)        # same metallib -> identical codes
+    _assert_parity(am, at, atol=2e-2)
+    _assert_parity(sm, st, atol=1e-4)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_layernorm_add_parity(shape):
     D = shape[-1]

@@ -32,6 +32,10 @@ inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_st
 inline std::string rms_norm_add_kernel_name(int D) { return "rms_norm_add_" + std::to_string(D); }
 inline std::string layernorm_add_kernel_name(int D) { return "layernorm_add_" + std::to_string(D); }
 inline std::string rope_kv_insert_kernel_name(int D) { return "rope_kv_insert_" + std::to_string(D); }
+inline std::string rms_norm_add_fp8_kernel_name(int D) { return "rms_norm_add_fp8_" + std::to_string(D); }
+inline std::string rms_norm_add_fp8_dyn_kernel_name(int D) { return "rms_norm_add_fp8_dyn_" + std::to_string(D); }
+inline std::string layernorm_add_fp8_kernel_name(int D) { return "layernorm_add_fp8_" + std::to_string(D); }
+inline std::string layernorm_add_fp8_dyn_kernel_name(int D) { return "layernorm_add_fp8_dyn_" + std::to_string(D); }
 inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" + t; }
 inline std::string moe_route_topk_kernel_name(const std::string& t) { return "moe_route_topk_" + t; }
 inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_finalize_" + t; }
@@ -341,6 +345,45 @@ void launch_quantize_per_token_int8(E& e, typename E::in_t x, typename E::out_t 
   e.in(x, 0); e.out(codes, 1); e.out(scale, 2);
   e.bytes(D, 3);
   e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- fp8 norm epilogues: codes=e4m3(norm(x+residual)*w[+b]/scale). res_out=x+residual (bf16).
+//        static: inv_scale param; dyn: per-row absmax/448 -> scale output. grid (M,1,1). -----
+template <class E>
+void launch_rms_norm_add_fp8(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                             typename E::out_t codes, typename E::out_t res_out,
+                             uint32_t M, int D, float eps, float inv_scale) {
+  e.pipeline(rms_norm_add_fp8_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4);
+  e.bytes(M, 5); e.bytes(eps, 6); e.bytes(inv_scale, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_rms_norm_add_fp8_dyn(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                 typename E::out_t codes, typename E::out_t res_out,
+                                 typename E::out_t scale, uint32_t M, int D, float eps) {
+  e.pipeline(rms_norm_add_fp8_dyn_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4); e.out(scale, 5);
+  e.bytes(M, 6); e.bytes(eps, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_layernorm_add_fp8(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                              typename E::in_t b, typename E::out_t codes, typename E::out_t res_out,
+                              uint32_t M, int D, float eps, float inv_scale) {
+  e.pipeline(layernorm_add_fp8_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(codes, 4); e.out(res_out, 5);
+  e.bytes(M, 6); e.bytes(eps, 7); e.bytes(inv_scale, 8);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_layernorm_add_fp8_dyn(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                  typename E::in_t b, typename E::out_t codes, typename E::out_t res_out,
+                                  typename E::out_t scale, uint32_t M, int D, float eps) {
+  e.pipeline(layernorm_add_fp8_dyn_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(codes, 4); e.out(res_out, 5); e.out(scale, 6);
+  e.bytes(M, 7); e.bytes(eps, 8);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 
 // ----- softmax (last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----

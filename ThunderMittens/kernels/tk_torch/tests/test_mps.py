@@ -483,6 +483,31 @@ def test_quantize_per_token_int8(dtype, shape):
     assert np.all(np.abs(deq - xd) <= 0.5 * ssafe + 1e-6)
 
 
+@pytest.mark.parametrize("shape", [(8, 256), (3, 1024)])
+def test_rms_norm_add_fp8(shape):
+    import numpy as np
+    from tk.quant import _e4m3_decode_arr
+    D, eps = shape[-1], 1e-5
+    rng = np.random.default_rng(0)
+    x = torch.from_numpy(rng.standard_normal(shape).astype(np.float32)).to(torch.bfloat16).to("mps")
+    r = torch.from_numpy(rng.standard_normal(shape).astype(np.float32)).to(torch.bfloat16).to("mps")
+    w = torch.from_numpy(rng.standard_normal((D,)).astype(np.float32)).to(torch.bfloat16).to("mps")
+    codes, added, scale = tk_torch.rms_norm_add_fp8(x, r, w)   # dynamic
+    s = x.float().cpu().numpy() + r.float().cpu().numpy()
+    ms = (s * s).mean(-1, keepdims=True)
+    normed = s / np.sqrt(ms + eps) * w.float().cpu().numpy()
+    ref_scale = np.abs(normed).max(-1) / 448.0
+    ssafe = np.maximum(ref_scale, 1e-30)[:, None]
+    np.testing.assert_allclose(scale.cpu().numpy().reshape(-1), ref_scale, rtol=1e-3, atol=1e-8)
+    deq = _e4m3_decode_arr(codes.cpu().numpy()) * ssafe
+    assert np.all(np.abs(deq - normed) <= 0.0625 * np.abs(normed) + 2.0 * ssafe)
+    # static mode
+    sc = float(np.abs(normed).max() / 448.0)
+    codes2, _ = tk_torch.rms_norm_add_fp8(x, r, w, scale=sc)
+    deq2 = _e4m3_decode_arr(codes2.cpu().numpy()) * np.float32(sc)
+    assert np.all(np.abs(deq2 - normed) <= 0.0625 * np.abs(normed) + 2.0 * sc)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
 def test_layernorm_add(shape):
     D = shape[-1]

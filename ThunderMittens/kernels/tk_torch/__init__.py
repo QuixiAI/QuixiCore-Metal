@@ -135,6 +135,21 @@ def layernorm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
     return _ext.layernorm_add(x, residual, weight, bias, float(eps))
 
 
+def rms_norm_add_fp8(x, residual, weight, eps: float = 1e-5, scale=None):
+    """Fused add + rms_norm + fp8. scale=None -> dynamic per-row (codes,added,scale);
+    else static per-tensor (codes,added). codes are e4m3 uint8. bf16 MPS."""
+    if scale is None:
+        return _ext.rms_norm_add_fp8_dyn(x, residual, weight, float(eps))
+    return _ext.rms_norm_add_fp8(x, residual, weight, float(eps), float(scale))
+
+
+def layernorm_add_fp8(x, residual, weight, bias, eps: float = 1e-5, scale=None):
+    """Fused add + layernorm + fp8. scale=None -> dynamic (codes,added,scale); else static (codes,added)."""
+    if scale is None:
+        return _ext.layernorm_add_fp8_dyn(x, residual, weight, bias, float(eps))
+    return _ext.layernorm_add_fp8(x, residual, weight, bias, float(eps), float(scale))
+
+
 def softmax(x: torch.Tensor):
     """Softmax over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
     return _ext.softmax(x)

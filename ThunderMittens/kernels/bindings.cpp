@@ -189,6 +189,27 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "rms_norm_add_fp8", &rms_norm_add_fp8,
+      "x"_a, "residual"_a, "weight"_a, "eps"_a, "scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + rms_norm + static-scale fp8. Returns (codes uint8, x+residual).)");
+    m.def(
+      "rms_norm_add_fp8_dyn", &rms_norm_add_fp8_dyn,
+      "x"_a, "residual"_a, "weight"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + rms_norm + dynamic per-row fp8. Returns (codes, x+residual, scale).)");
+    m.def(
+      "layernorm_add_fp8", &layernorm_add_fp8,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a, "scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + layernorm + static-scale fp8. Returns (codes uint8, x+residual).)");
+    m.def(
+      "layernorm_add_fp8_dyn", &layernorm_add_fp8_dyn,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + layernorm + dynamic per-row fp8. Returns (codes, x+residual, scale).)");
+
+    m.def(
       "rope_kv_insert",
       &rope_kv_insert,
       "k"_a,

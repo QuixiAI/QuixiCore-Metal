@@ -296,6 +296,20 @@ TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, gelu,
     float2 th = float2(1.0f) - 2.0f / (metal::exp(inner + inner) + float2(1.0f));
     return bf16_2(0.5f * xf * (float2(1.0f) + th));)
 /**
+ * @brief SiLU / swish activation: silu(x) = x / (1 + exp(-x)) = x * sigmoid(x). (For SwiGLU.)
+ */
+struct silu {
+    TEMPLATE_OPS_SINGLE(
+        return x / (T(1) + metal::exp(-x));
+    )
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16, silu,
+    float xf = (float)x;
+    return bf16(xf / (1.0f + metal::exp(-xf)));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, silu,
+    float2 xf = (float2)x;
+    return bf16_2(xf / (float2(1.0f) + metal::exp(-xf)));)
+/**
  * @brief Copy operation.
  *
  * This operation returns the input value unchanged.
