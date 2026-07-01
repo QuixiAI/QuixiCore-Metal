@@ -4,9 +4,11 @@
 namespace mittens {
 
 // Quantized GEMV (batch-1 decode):  d = dequantize(W) @ x,  W (N,K) quantized blocks, x (K,1).
-// No MMA — one simdgroup (32 lanes) per output row: each lane dequantizes + dots a strided slice
-// of the row, then simd_sum reduces. This is the memory-bound decode path where shrinking the
-// weight bytes (4-8x) is the real Apple win. Mirrors llama.cpp's mul_vec_q_n.
+// No MMA — one simdgroup (32 lanes) per output row, walked block-major: each lane owns an
+// 8-col contiguous span inside a block (block_k/8 lanes cover a block; the simdgroup covers
+// 32/(block_k/8) blocks per iteration). The span keeps the block-scale reads CSE-able, kills
+// the per-element div/mod of the old strided walk, and lets X load as half4. This is the
+// memory-bound decode path where shrinking the weight bytes (4-8x) is the real Apple win.
 template<typename FMT>
 kernel void qgemv(
     device   half*  D  [[buffer(0)]],   // (N, 1) output
@@ -20,12 +22,23 @@ kernel void qgemv(
     const int bpr = K / FMT::block_k;
     device const uchar* row_base = Wq + (uint)(row * bpr) * FMT::block_bytes;
 
+    constexpr int CPL = 8;                           // contiguous cols per lane
+    constexpr int LPB = FMT::block_k / CPL;          // lanes per block (2..32)
+    constexpr int BPI = 32 / LPB;                    // blocks per simdgroup iteration (1..16)
+    const int b_off = (int)lane / LPB;
+    const int col0  = ((int)lane % LPB) * CPL;
+
     float acc = 0.0f;
-    for (int k = (int)lane; k < K; k += 32) {
-        const int kb  = k / FMT::block_k;
-        const int col = k % FMT::block_k;
-        const half w = FMT::dequant(row_base + (uint)kb * FMT::block_bytes, col);
-        acc += float(w) * float(X[k]);
+    for (int kb = b_off; kb < bpr; kb += BPI) {
+        device const uchar* base = row_base + (uint)kb * FMT::block_bytes;
+        device const half4* xv = (device const half4*)(X + kb * FMT::block_k + col0);
+        const half4 x0 = xv[0], x1 = xv[1];
+        half w[8];
+        tk_dequant8<FMT>(base, col0, w);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) acc += float(w[i]) * float(x0[i]);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) acc += float(w[4 + i]) * float(x1[i]);
     }
     acc = metal::simd_sum(acc);                      // reduce the dot across the 32 lanes
     if (lane == 0) D[row] = half(acc);

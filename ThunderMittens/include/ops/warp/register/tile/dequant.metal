@@ -260,30 +260,30 @@ struct hqq {
     }
 };
 
-// ---- float-code decoders (pure IEEE bit/field math; widen to half) ----
-// fp8 e4m3 (1-4-3, bias 7, no inf): value = (-1)^s * (1 + m/8) * 2^(e-7), subnormal at e==0.
+// ---- float-code decoders (bit tricks; widen to half) ----
+// Normal codes shift the exponent/mantissa fields into the fp16 field positions, then rescale by
+// a power-of-two constant to fix the bias difference — exact, no exp2. Subnormal codes (e == 0)
+// take a select computed in NORMAL half arithmetic: the shifted bit pattern would be a subnormal
+// half, and the offline `xcrun metal` build (tk_torch) flushes subnormal arithmetic to zero
+// (fast-math FTZ) while MLX's metallib does not — the select keeps both backends exact. The
+// encoders clamp NaN/inf codes so they never reach the decoders.
+// fp8 e4m3 (1-4-3, bias 7): normal = as_half(code<<7) * 2^(15-7); subnormal = m * 2^-9.
 METAL_FUNC half tk_e4m3_decode(uchar v) {
-    const uint e = (v >> 3) & 0xF;
-    const uint m = v & 0x7;
-    half val = (e == 0) ? (half(m) * 0.125h * 0.015625h)      // (m/8) * 2^-6
-                        : (1.0h + half(m) * 0.125h) * metal::exp2(half((int)e - 7));
-    return ((v >> 7) & 1) ? -val : val;
+    const ushort h = ushort(v & 0x7F) << 7;
+    const half mag = (v & 0x78) ? as_type<half>(h) * 256.0h : half(v & 0x7) * 0.001953125h;
+    return (v & 0x80) ? -mag : mag;
 }
-// fp4 e2m1 (1-2-1, bias 1): values 0,.5,1,1.5,2,3,4,6 (+sign).
+// fp4 e2m1 (1-2-1, bias 1): normal = as_half(code<<9) * 2^(15-1); subnormal values are 0 / 0.5.
 METAL_FUNC half tk_e2m1_decode(uint nib) {
-    const uint e = (nib >> 1) & 0x3;
-    const uint m = nib & 0x1;
-    half val = (e == 0) ? (m ? 0.5h : 0.0h)
-                        : (1.0h + half(m) * 0.5h) * metal::exp2(half((int)e - 1));
-    return ((nib >> 3) & 1) ? -val : val;
+    const ushort h = ushort(nib & 0x7) << 9;
+    const half mag = (nib & 0x6) ? as_type<half>(h) * 16384.0h : ((nib & 1) ? 0.5h : 0.0h);
+    return (nib & 0x8) ? -mag : mag;
 }
-// fp8 e5m2 (1-5-2, bias 15): value = (-1)^s * (1 + m/4) * 2^(e-15), subnormal at e==0 (e=31 is inf/nan).
+// fp8 e5m2 (1-5-2, bias 15): e5m2 IS truncated fp16 — value = as_half(code << 8), a pure bitcast
+// (e5m2 subnormals are genuine fp16 subnormals; constructing the bits directly involves no
+// arithmetic, so FTZ cannot flush the decode itself).
 METAL_FUNC half tk_e5m2_decode(uchar v) {
-    const uint e = (v >> 2) & 0x1F;
-    const uint m = v & 0x3;
-    half val = (e == 0) ? (half(m) * 0.25h * metal::exp2(-14.0h))     // (m/4) * 2^-14
-                        : (1.0h + half(m) * 0.25h) * metal::exp2(half((int)e - 15));
-    return ((v >> 7) & 1) ? -val : val;
+    return as_type<half>(ushort(ushort(v) << 8));
 }
 
 // --- Quantize/pack: round-to-nearest float -> fp8 / int8 codes (inverse of the
@@ -355,21 +355,17 @@ METAL_FUNC char tk_int8_encode(float x) {
     r = metal::clamp(r, -127.0f, 127.0f);
     return char(int(r));
 }
-// fp6 e3m2 (1-3-2, bias 3): 6-bit code, sign at bit 5.
+// fp6 e3m2 (1-3-2, bias 3): normal = as_half(code<<8) * 2^(15-3); subnormal = m * 2^-4.
 METAL_FUNC half tk_e3m2_decode(uint c) {
-    const uint e = (c >> 2) & 0x7;
-    const uint m = c & 0x3;
-    half val = (e == 0) ? (half(m) * 0.25h * metal::exp2(-2.0h))      // subnormal (m/4)*2^-2
-                        : (1.0h + half(m) * 0.25h) * metal::exp2(half((int)e - 3));
-    return ((c >> 5) & 1) ? -val : val;
+    const ushort h = ushort(c & 0x1F) << 8;
+    const half mag = (c & 0x1C) ? as_type<half>(h) * 4096.0h : half(c & 0x3) * 0.0625h;
+    return (c & 0x20) ? -mag : mag;
 }
-// fp6 e2m3 (1-2-3, bias 1): 6-bit code, sign at bit 5.
+// fp6 e2m3 (1-2-3, bias 1): normal = as_half(code<<7) * 2^(15-1); subnormal = m * 0.125.
 METAL_FUNC half tk_e2m3_decode(uint c) {
-    const uint e = (c >> 3) & 0x3;
-    const uint m = c & 0x7;
-    half val = (e == 0) ? (half(m) * 0.125h)                          // subnormal (m/8)*2^0
-                        : (1.0h + half(m) * 0.125h) * metal::exp2(half((int)e - 1));
-    return ((c >> 5) & 1) ? -val : val;
+    const ushort h = ushort(c & 0x1F) << 7;
+    const half mag = (c & 0x18) ? as_type<half>(h) * 16384.0h : half(c & 0x7) * 0.125h;
+    return (c & 0x20) ? -mag : mag;
 }
 
 // ---- fp8_e4m3 : per-group (32) half-scaled fp8. { half scale; uint8 qs[32]; } — 34 bytes.
@@ -608,6 +604,239 @@ struct q6_K {
         return d * half((int)sca[sc_idx]) * half(q);
     }
 };
+
+// ================================ span decode (8 contiguous cols) ===============================
+// w[0..7] = dequant(base, col0 .. col0+7), with col0 % 8 == 0. The generic version just loops —
+// the Metal compiler CSEs the simple scale reads. Formats with a branchy sub-block scale unpack
+// (k-quants, grouped int4, fp4 nibbles) specialize so the unpack runs ONCE per span instead of
+// per element; every span of 8 stays inside one sub-block/nibble-half for all supported layouts,
+// so the extraction mode is uniform across the span.
+template<typename FMT>
+METAL_FUNC void tk_dequant8(device const uchar* base, int col0, thread half* w) {
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) w[i] = FMT::dequant(base, col0 + i);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q4_K>(device const uchar* base, int col0, thread half* w) {
+    const half d    = ((device const half*)base)[0];
+    const half dmin = ((device const half*)base)[1];
+    device const uchar* scales = base + 4;
+    device const uchar* qs     = base + 16;
+    const int chunk = col0 >> 6, pos = col0 & 63;
+    const bool hi   = pos >= 32;
+    const int sub   = chunk * 2 + (hi ? 1 : 0);
+    uchar sc, m;
+    if (sub < 4) { sc = scales[sub] & 63; m = scales[sub + 4] & 63; }
+    else {
+        sc = (scales[sub + 4] & 0x0F) | ((scales[sub - 4] >> 6) << 4);
+        m  = (scales[sub + 4] >> 4)   | ((scales[sub]     >> 6) << 4);
+    }
+    const half dl = d * half(sc), ml = dmin * half(m);
+    device const uchar* q = qs + chunk * 32 + (hi ? pos - 32 : pos);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = dl * half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - ml;
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q5_K>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0], dmin = ((device const half*)(base + 2))[0];
+    device const uchar* sca = base + 4;
+    device const uchar* qh  = base + 16;
+    device const uchar* qs  = base + 48;
+    const int chunk = col0 >> 6, pos = col0 & 63, sub = pos >> 5, l0 = pos & 31;
+    const int is = 2 * chunk + sub;
+    int sc, mn;
+    if (is < 4) { sc = sca[is] & 63; mn = sca[is + 4] & 63; }
+    else {
+        sc = (sca[is + 4] & 0x0F) | ((sca[is - 4] >> 6) << 4);
+        mn = (sca[is + 4] >> 4)   | ((sca[is]     >> 6) << 4);
+    }
+    const half dl = d * half(sc), ml = dmin * half(mn);
+    const uchar hmask = uchar(1u << is);
+    device const uchar* q = qs + chunk * 32 + l0;
+    device const uchar* h = qh + l0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int q5 = (sub ? (q[i] >> 4) : (q[i] & 0x0F)) + ((h[i] & hmask) ? 16 : 0);
+        w[i] = dl * half(q5) - ml;
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q6_K>(device const uchar* base, int col0, thread half* w) {
+    device const uchar* ql = base;
+    device const uchar* qh = base + 128;
+    device const char* sca = (device const char*)(base + 192);
+    const half d = ((device const half*)(base + 208))[0];
+    const int chunk = col0 >> 7, pos = col0 & 127, group = pos >> 5, l0 = pos & 31;
+    const half dsc = d * half((int)sca[chunk * 8 + (l0 >> 4) + group * 2]);
+    device const uchar* q = ql + chunk * 64 + l0 + 32 * (group & 1);
+    device const uchar* h = qh + chunk * 32 + l0;
+    const int hshift = 2 * group;
+    const bool hi = (group & 2) != 0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int nib = hi ? (q[i] >> 4) : (q[i] & 0x0F);
+        const int qv  = (nib | (((h[i] >> hshift) & 3) << 4)) - 32;
+        w[i] = dsc * half(qv);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q2_K>(device const uchar* base, int col0, thread half* w) {
+    device const uchar* scales = base;
+    device const uchar* qs = base + 16;
+    const half d = ((device const half*)(base + 80))[0], dmin = ((device const half*)(base + 82))[0];
+    const int chunk = col0 >> 7, pos = col0 & 127, sidx = pos >> 5, sub = (pos >> 4) & 1, l0 = pos & 15;
+    const uchar sb = scales[chunk * 8 + sidx * 2 + sub];
+    const half dl = d * half(sb & 0x0F), ml = dmin * half(sb >> 4);
+    device const uchar* q = qs + chunk * 32 + sub * 16 + l0;
+    const int shift = 2 * sidx;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = dl * half((q[i] >> shift) & 3) - ml;
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q3_K>(device const uchar* base, int col0, thread half* w) {
+    device const uchar* hmask = base;
+    device const uchar* qs = base + 32;
+    device const uchar* sca = base + 96;
+    const half d = ((device const half*)(base + 108))[0];
+    const int chunk = col0 >> 7, pos = col0 & 127, sidx = pos >> 5, sub = (pos >> 4) & 1, l0 = pos & 15;
+    const int is = chunk * 8 + sidx * 2 + sub;
+    const int wi = is >> 2, b = is & 3;
+    int s;
+    if (wi == 0)      s = (sca[b] & 0xF)        | ((sca[8 + b] & 3) << 4);
+    else if (wi == 1) s = (sca[4 + b] & 0xF)    | (((sca[8 + b] >> 2) & 3) << 4);
+    else if (wi == 2) s = ((sca[b] >> 4) & 0xF) | (((sca[8 + b] >> 4) & 3) << 4);
+    else              s = ((sca[4 + b] >> 4) & 0xF) | (((sca[8 + b] >> 6) & 3) << 4);
+    const half dsc = d * half(s - 32);
+    device const uchar* q = qs + chunk * 32 + sub * 16 + l0;
+    device const uchar* h = hmask + sub * 16 + l0;
+    const int shift = 2 * sidx;
+    const uchar hbit = uchar(1u << (chunk * 4 + sidx));
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int q3v = (((q[i] >> shift) & 3) | (((h[i] & hbit) ? 1 : 0) << 2)) - 4;
+        w[i] = dsc * half(q3v);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq4_xs>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    const ushort scales_h = ((device const ushort*)(base + 2))[0];
+    device const uchar* scales_l = base + 4;
+    device const uchar* qs = base + 8;
+    const int ib = col0 >> 5, local = col0 & 31;
+    const int sl = (scales_l[ib >> 1] >> (4 * (ib & 1))) & 0x0F;
+    const int sh = (scales_h >> (2 * ib)) & 0x3;
+    const half dl = d * half((sl | (sh << 4)) - 32);
+    const bool hi = local >= 16;
+    device const uchar* q = qs + 16 * ib + (hi ? local - 16 : local);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = dl * half(kvalues_iq4nl[hi ? (q[i] >> 4) : (q[i] & 0x0F)]);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<iq4_nl>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 2 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = d * half(kvalues_iq4nl[hi ? (q[i] >> 4) : (q[i] & 0x0F)]);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<kU4B8>(device const uchar* base, int col0, thread half* w) {
+    const half s = ((device const half*)base)[0];
+    const bool hi = col0 >= 64;
+    device const uchar* q = base + 2 + (hi ? col0 - 64 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = s * half((hi ? (q[i] >> 4) : (q[i] & 0x0F)) - 8);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<kU4>(device const uchar* base, int col0, thread half* w) {
+    const half s = ((device const half*)base)[0], zp = ((device const half*)base)[1];
+    const bool hi = col0 >= 64;
+    device const uchar* q = base + 4 + (hi ? col0 - 64 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = s * (half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - zp);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<hqq>(device const uchar* base, int col0, thread half* w) {
+    const half s = ((device const half*)base)[0], zp = ((device const half*)base)[1];
+    const bool hi = col0 >= 32;
+    device const uchar* q = base + 4 + (hi ? col0 - 32 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = s * (half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - zp);
+}
+
+template<>
+METAL_FUNC void tk_dequant8<nvfp4>(device const uchar* base, int col0, thread half* w) {
+    const half s = tk_e4m3_decode(base[0]);
+    const bool hi = col0 >= 8;
+    device const uchar* q = base + 1 + (hi ? col0 - 8 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = s * tk_e2m1_decode(hi ? uint(q[i] >> 4) : uint(q[i] & 0x0F));
+}
+
+template<>
+METAL_FUNC void tk_dequant8<mxfp4>(device const uchar* base, int col0, thread half* w) {
+    const half s = metal::exp2(half((int)base[0] - 127));
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 1 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = s * tk_e2m1_decode(hi ? uint(q[i] >> 4) : uint(q[i] & 0x0F));
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q4_1>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0], m = ((device const half*)base)[1];
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 4 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i)
+        w[i] = d * half(hi ? (q[i] >> 4) : (q[i] & 0x0F)) + m;
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q5_0>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0];
+    const uint qh = (uint)base[2] | ((uint)base[3] << 8) | ((uint)base[4] << 16) | ((uint)base[5] << 24);
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 6 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int qv = (hi ? (q[i] >> 4) : (q[i] & 0x0F)) | (((qh >> (col0 + i)) & 1) << 4);
+        w[i] = d * half(qv - 16);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8<q5_1>(device const uchar* base, int col0, thread half* w) {
+    const half d = ((device const half*)base)[0], m = ((device const half*)base)[1];
+    const uint qh = (uint)base[4] | ((uint)base[5] << 8) | ((uint)base[6] << 16) | ((uint)base[7] << 24);
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 8 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int qv = (hi ? (q[i] >> 4) : (q[i] & 0x0F)) | (((qh >> (col0 + i)) & 1) << 4);
+        w[i] = d * half(qv) + m;
+    }
+}
 
 // Cooperatively dequantize an (BN x BK) weight tile into a shared half tile. `kb` is the K-tile
 // index in units of BK (the MMA K-step). The quant grouping (FMT::block_k) is DECOUPLED from BK:

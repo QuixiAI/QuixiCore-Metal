@@ -110,8 +110,13 @@ def time_thunk(fn, be, warmup, iters, min_sample_ms=2.0):
     (~0.2 ms) does not swamp the kernel time; the reported number is throughput-style
     per-call latency. Kernels above min_sample_ms run one call per sample.
     """
-    for _ in range(warmup):
+    # Warm by TIME, not call count: GPU clocks decay whenever the host does setup work
+    # between cases, and a handful of sub-ms calls will not re-ramp them.
+    t0 = time.perf_counter()
+    calls = 0
+    while calls < warmup or time.perf_counter() - t0 < 0.05:
         be.sync(fn())
+        calls += 1
     t0 = time.perf_counter()
     be.sync(fn())
     est_ms = 1e3 * (time.perf_counter() - t0)
@@ -1274,6 +1279,17 @@ def main():
     meta = _env_meta(args.backend)
     meta.update(backend=args.backend, preset=args.preset, warmup=args.warmup,
                 iters=args.iters, kernels=names, formats=formats)
+
+    # Spin the GPU clocks up before any measurement (the first-timed case otherwise
+    # reads 1.5-5x slow while the GPU ramps from idle frequency).
+    _warm = be.array(np.random.default_rng(0).standard_normal((2048, 2048)), "f16")
+    t0 = time.perf_counter()
+    while time.perf_counter() - t0 < 1.0:
+        if be.name == "mlx":
+            be.sync(be.mx.matmul(_warm, _warm))
+        else:
+            be.sync(_warm @ _warm)
+    del _warm
 
     rows = []
     t_start = time.perf_counter()

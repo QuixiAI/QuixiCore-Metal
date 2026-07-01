@@ -64,7 +64,12 @@ _METAL_SOURCES = [
 def build_metallib(force: bool = False) -> str:
     """Compile the shared .metal kernels into tk.metallib via xcrun metal. MLX-independent."""
     if not force and os.path.exists(_METALLIB):
-        newest_src = max(os.path.getmtime(s) for s in _METAL_SOURCES)
+        # staleness must also track the header-only substrate under include/ (tk.metal pulls
+        # in everything there), not just the listed kernel sources
+        deps = list(_METAL_SOURCES)
+        for root, _dirs, files in os.walk(_INCLUDE):
+            deps.extend(os.path.join(root, f) for f in files if f.endswith(".metal"))
+        newest_src = max(os.path.getmtime(s) for s in deps)
         if os.path.getmtime(_METALLIB) >= newest_src:
             return _METALLIB
     cmd = ["xcrun", "metal", "-std=metal3.1", "-O2", "-I", _INCLUDE,

@@ -61,26 +61,67 @@ decode loops (one call per step, no pipelining) before changing any default.
 
 ## Per-kernel log
 
-### qgemv — status: experimenting (highest priority)
-- References: llama.cpp `ggml-metal` GEMV geometry (N rows/simdgroup, register-
-  cached activations, block-major iteration) — mirror not on disk, working from
-  structure knowledge + measurement.
-- Fast paths (hand-written q8_0/q4_0) hit 204–430 W-GB/s; generic template
-  (26 formats) does per-element `k/block_k`, `k%block_k`, re-reads the block
-  scale per element, branches per nibble, scalar X loads → 44–127 W-GB/s.
-- MLX quantized_matmul comparison: tk q4_0 wins 1.73× at N=11008 but loses
-  0.64× at N=4096 → geometry (one simdgroup per row, 32-thread TGs) starves the
-  GPU at moderate N; bigger TGs (multiple simdgroups) should fix small-N.
-- Plan: (a) restructure the generic template block-major (each lane owns
-  contiguous cols within a block; scale loaded once per block; no div/mod),
-  (b) 2–4 simdgroups per threadgroup, (c) vectorized X loads, then re-sweep all
-  formats; correctness gate `qgemv/correctness/`.
+### qgemv — status: LANDED (2026-07-01, three stacked wins)
+Three changes, all format-generic, validated by the full regression
+(862 MLX + 601 parity/MPS green):
 
-### qgemm — status: experimenting
-- M=512 q4_0 via the default (staged) path is 9.2× slower than qgemm_direct.
-  Fix routing (M threshold or make direct the only path), then re-sweep BK.
-- vs fp16 matmul: parity at M≥128 (compute-bound), as expected; value is memory
-  footprint, not speed.
+1. **E1 — branchless float-code decoders** (`dequant.metal`): `tk_e4m3/e5m2/
+   e2m1/e3m2/e2m3_decode` now shift the code into the fp16 field positions and
+   rescale by a power-of-two constant instead of branch + `metal::exp2`.
+   Verified exact over every finite code in numpy before landing. Subnormal
+   codes (e==0) take a select computed in normal-half arithmetic — REQUIRED
+   because tk_torch's offline `xcrun metal -O2` build flushes subnormal
+   arithmetic (fast-math FTZ) while MLX's metallib does not; the pure-bit-trick
+   version silently broke ONLY torch-side nvfp4 (caught by parity tests).
+2. **E2 — block-major qgemv walk** (`qgemv.metal` template): each lane owns an
+   8-col contiguous span inside a block (no per-element div/mod, `half4` X
+   loads, scale reads CSE across the span).
+3. **E3 — `tk_dequant8<FMT>` span decoders** (`dequant.metal`): per-format
+   specializations unpack the block/sub-block scales ONCE per 8-col span
+   (q4_K/q5_K/q6_K/q2_K/q3_K/iq4_xs/iq4_nl/kU4B8/kU4/hqq/nvfp4/mxfp4/q4_1/
+   q5_0/q5_1). Every 8-span is provably inside one sub-block/nibble-half for
+   all these layouts.
+
+Results (ms, N=11008 K=4096 M=1; baseline = fp16 `mx.matmul` on the same run):
+| format | before | after | vs fp16 matmul | W-GB/s |
+|---|---:|---:|---:|---:|
+| q4_K | 0.391 | 0.090 | 2.4× faster | ~281 |
+| q5_K | 0.568* | 0.115 | 2.1× | ~271 |
+| q6_K | 0.411 | 0.116 | 1.9× | ~250 |
+| iq4_xs | 0.267* | 0.083 | 2.6× | ~281 |
+| kU4B8 | 0.279* | 0.071 | 3.1× | ~322 |
+| hqq | 0.220 | 0.070 | 3.1× | ~364 |
+| nvfp4 | 0.321 | 0.100 | 2.3× | ~254 |
+| mxfp4 | 0.288 | 0.098 | 2.5× | ~245 |
+| fp8_e4m3 | 0.262 | 0.103 | 2.0× | ~466 |
+| bitnet | 0.188 | 0.113 | 2.1× | ~125 |
+(*= measured mid-way, post-E2 pre-E3.) Every format now beats the fp16 GEMV
+2–3×; before, most LOST to it. At N=4096² all formats sit at 0.029–0.055 ms.
+
+- Hand-written q8_0/q4_0 fast paths: still ~15–25% ahead of the improved
+  template (measured by routing q8_0/q4_0 through the template) — KEPT.
+- Rejected/deferred: multi-row-per-simdgroup geometry (llama.cpp N_R0-style X
+  register reuse) — remaining headroom looks ≤10–30% and formats are now at
+  245–466 W-GB/s; revisit if decode becomes the bottleneck again.
+- Side effect of E1 on serving: **paged_attention_v2_fp8 0.859 → 0.487 ms**
+  (dequant-on-read penalty 2.3× → 1.25× vs the bf16 cache) — queue #6 done.
+- attn_q did NOT move (its cost is the per-element dequant_into_shared/register
+  structure, not decode ALU) — see attention section.
+- Also fixed: tk_torch metallib staleness check ignored `include/` substrate
+  changes (stale-metallib false-greens); now walks include/*.metal mtimes.
+
+### qgemm — status: baselined (no action needed)
+- The "M=512 q4_0 is 9× slower than qgemm_direct" queue item was a MEASUREMENT
+  ARTIFACT: `tk.qgemm` and `tk.qgemm_direct` construct the identical primitive
+  (both direct_=true) and measure at parity once the harness warms the GPU
+  clocks properly. Two harness fixes landed: a 1 s pre-run clock ramp, and
+  time-based (≥50 ms) per-thunk warmup — before these, whichever thunk was
+  timed first in a case read 1.5–5× slow.
+- Clean numbers: q4_0/q8_0 at parity with fp16 `mx.matmul` for M∈{32,128,512}
+  (compute-bound; the win is memory footprint). fp8_e4m3 M≥128 ~13% behind
+  q8_0 even after E1 — remaining gap is in the fragment-path decode; candidate:
+  span-decode (tk_dequant8) inside dequant_into_register/shared, shared with
+  the attn_q work.
 
 ### Elementwise/row family — status: baselining done
 - layernorm/rms_norm/softmax/gelu/add_norm all beat MLX fast ops — record and
