@@ -215,10 +215,15 @@ def test_apply_penalty_parity():
     T, V, L = 8, 300, 30
     logits = rng.standard_normal((T, V)).astype(np.float32)
     prev = rng.integers(-1, V, size=(T, L)).astype(np.int32)
-    kw = dict(temperature=0.8, repetition_penalty=1.3, presence_penalty=0.1, frequency_penalty=0.05)
-    om = tk.apply_penalty(_mk(logits, "mlx", "f32"), mx.array(prev), **kw)
-    ot = tk.apply_penalty(_mk(logits, "torch", "f32"), torch.from_numpy(prev).to("mps"), **kw)
-    _assert_parity(om, ot, atol=1e-5)
+    bias = rng.standard_normal(V).astype(np.float32)
+    kw = dict(temperature=0.8, repetition_penalty=1.3, presence_penalty=0.1, frequency_penalty=0.05,
+              eos_id=5, min_length=10, gen_len=3)
+    om = tk.apply_penalty(_mk(logits, "mlx", "f32"), mx.array(prev), bias=mx.array(bias), **kw)
+    ot = tk.apply_penalty(_mk(logits, "torch", "f32"), torch.from_numpy(prev).to("mps"),
+                          bias=torch.from_numpy(bias).to("mps"), **kw)
+    # eos_id=5 is -inf in both backends; compare the rest.
+    _assert_parity(om[:, :5], ot[:, :5], atol=1e-5)
+    _assert_parity(om[:, 6:], ot[:, 6:], atol=1e-5)
 
 
 @pytest.mark.parametrize("shape,temp", [((16, 256), 1.0), ((4, 1000), 0.7)])

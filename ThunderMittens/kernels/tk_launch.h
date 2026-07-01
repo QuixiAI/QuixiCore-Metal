@@ -345,11 +345,13 @@ void launch_penalty_histogram(E& e, typename E::in_t prev_tokens, typename E::ou
 //        grid (rows,1,1), 32 thr. temperature + repetition/presence/frequency penalties. -----
 template <class E>
 void launch_apply_penalty(E& e, typename E::in_t logits, typename E::in_t counts,
-                          typename E::out_t out, int rows, int V, float invtemp, float rep,
-                          float presence, float freq, const std::string& type_name) {
+                          typename E::out_t out, typename E::in_t bias, int rows, int V,
+                          float invtemp, float rep, float presence, float freq,
+                          int eos_id, int min_length, int gen_len, const std::string& type_name) {
   e.pipeline(apply_penalty_kernel_name(type_name));
   e.in(logits, 0); e.in(counts, 1); e.out(out, 2);
   e.bytes(V, 3); e.bytes(invtemp, 4); e.bytes(rep, 5); e.bytes(presence, 6); e.bytes(freq, 7);
+  e.in(bias, 8); e.bytes(eos_id, 9); e.bytes(min_length, 10); e.bytes(gen_len, 11);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 

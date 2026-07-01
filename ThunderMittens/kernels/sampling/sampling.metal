@@ -146,9 +146,14 @@ kernel void apply_penalty(device const T     *logits   [[buffer(0)]],
                           constant float &rep      [[buffer(5)]],
                           constant float &presence [[buffer(6)]],
                           constant float &freq     [[buffer(7)]],
+                          device const float *bias [[buffer(8)]],
+                          constant int   &eos_id     [[buffer(9)]],
+                          constant int   &min_length [[buffer(10)]],
+                          constant int   &gen_len    [[buffer(11)]],
                           uint row  [[threadgroup_position_in_grid]],
                           uint lane [[thread_index_in_simdgroup]]) {
     const long base = (long)row * V;
+    const bool mask_eos = (eos_id >= 0) && (gen_len < min_length);   // forbid EOS before min_length
     for (int v = (int)lane; v < V; v += 32) {
         float ls = float(logits[base + v]) * invtemp;
         const int c = counts[base + v];
@@ -156,6 +161,10 @@ kernel void apply_penalty(device const T     *logits   [[buffer(0)]],
             ls = (ls < 0.0f) ? (ls * rep) : (ls / rep);
             ls -= presence;
             ls -= freq * float(c);
+        }
+        ls += bias[v];                          // per-vocab logit bias
+        if (mask_eos && v == eos_id) {
+            ls = SMP_NEG_INF;
         }
         out[base + v] = T(ls);
     }
@@ -256,6 +265,10 @@ kernel void top_p_sample(device const T *logits  [[buffer(0)]],
                    constant float &rep [[buffer(5)]],                         \
                    constant float &presence [[buffer(6)]],                    \
                    constant float &freq [[buffer(7)]],                        \
+                   device const float *bias [[buffer(8)]],                    \
+                   constant int &eos_id [[buffer(9)]],                        \
+                   constant int &min_length [[buffer(10)]],                   \
+                   constant int &gen_len [[buffer(11)]],                      \
                    uint row [[threadgroup_position_in_grid]],                 \
                    uint lane [[thread_index_in_simdgroup]]);                  \
   template [[host_name("sample_categorical_" #type_name)]] [[kernel]] void     \

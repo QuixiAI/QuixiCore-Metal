@@ -345,14 +345,19 @@ NB_MODULE(_ext, m) {
       &apply_penalty,
       "logits"_a,
       "prev_tokens"_a,
+      "bias"_a,
       nb::kw_only(),
       "temperature"_a = 1.0f,
       "repetition_penalty"_a = 1.0f,
       "presence_penalty"_a = 0.0f,
       "frequency_penalty"_a = 0.0f,
+      "eos_id"_a = -1,
+      "min_length"_a = 0,
+      "gen_len"_a = 0,
       "stream"_a = nb::none(),
       R"(
-        temperature + repetition/presence/frequency penalties. Returns [penalized, counts]; use [0].
+        temperature + repetition/presence/frequency penalties + logit bias + min-length EOS mask
+        (forbids eos_id while gen_len < min_length). Returns [penalized, counts]; use [0].
       )");
 
     m.def(

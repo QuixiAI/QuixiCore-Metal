@@ -50,9 +50,10 @@ array top_p_sample(
  *  Returns [penalized (T,V), counts (T,V) int32 scratch]; callers use the first.
  **/
 std::vector<array> apply_penalty(
-    const array& logits, const array& prev_tokens, float temperature = 1.0f,
+    const array& logits, const array& prev_tokens, const array& bias, float temperature = 1.0f,
     float repetition_penalty = 1.0f, float presence_penalty = 0.0f,
-    float frequency_penalty = 0.0f, StreamOrDevice s = {});
+    float frequency_penalty = 0.0f, int eos_id = -1, int min_length = 0, int gen_len = 0,
+    StreamOrDevice s = {});
 
 class ArgmaxSample : public Primitive {
  public:
@@ -150,8 +151,10 @@ class TopPSample : public Primitive {
 
 class ApplyPenalty : public Primitive {
  public:
-  ApplyPenalty(Stream stream, float invtemp, float rep, float presence, float freq)
-      : Primitive(stream), invtemp_(invtemp), rep_(rep), presence_(presence), freq_(freq) {}
+  ApplyPenalty(Stream stream, float invtemp, float rep, float presence, float freq,
+               int eos_id, int min_length, int gen_len)
+      : Primitive(stream), invtemp_(invtemp), rep_(rep), presence_(presence), freq_(freq),
+        eos_id_(eos_id), min_length_(min_length), gen_len_(gen_len) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -165,11 +168,14 @@ class ApplyPenalty : public Primitive {
   void print(std::ostream& os) override { os << "ApplyPenalty"; }
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const ApplyPenalty&>(other);
-    return invtemp_ == o.invtemp_ && rep_ == o.rep_ && presence_ == o.presence_ && freq_ == o.freq_;
+    return invtemp_ == o.invtemp_ && rep_ == o.rep_ && presence_ == o.presence_ &&
+        freq_ == o.freq_ && eos_id_ == o.eos_id_ && min_length_ == o.min_length_ &&
+        gen_len_ == o.gen_len_;
   }
 
  private:
   float invtemp_, rep_, presence_, freq_;
+  int eos_id_, min_length_, gen_len_;
 };
 
 } // namespace mlx::core

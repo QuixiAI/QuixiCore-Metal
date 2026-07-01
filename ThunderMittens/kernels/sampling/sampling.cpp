@@ -238,9 +238,10 @@ std::pair<std::vector<array>, std::vector<int>> TopPSample::vmap(
 }
 
 std::vector<array> apply_penalty(
-    const array& logits, const array& prev_tokens, float temperature /* = 1.0f */,
+    const array& logits, const array& prev_tokens, const array& bias, float temperature /* = 1.0f */,
     float repetition_penalty /* = 1.0f */, float presence_penalty /* = 0.0f */,
-    float frequency_penalty /* = 0.0f */, StreamOrDevice s /* = {} */) {
+    float frequency_penalty /* = 0.0f */, int eos_id /* = -1 */, int min_length /* = 0 */,
+    int gen_len /* = 0 */, StreamOrDevice s /* = {} */) {
   if (logits.ndim() != 2) {
     throw std::invalid_argument("apply_penalty: logits must have shape (num_tokens, vocab)");
   }
@@ -255,14 +256,19 @@ std::vector<array> apply_penalty(
   }
   const int T = logits.shape(0);
   const int V = logits.shape(1);
+  if (bias.ndim() != 1 || bias.shape(0) != V) {
+    throw std::invalid_argument("apply_penalty: bias must have shape (vocab,)");
+  }
   auto x = contiguous(logits, false, s);
   auto prev = contiguous(astype(prev_tokens, int32, s), false, s);
+  auto bias_c = contiguous(astype(bias, float32, s), false, s);
   return array::make_arrays(
       {{T, V}, {T, V}},
       {logits.dtype(), int32},
       std::make_shared<ApplyPenalty>(
-          to_stream(s), 1.0f / temperature, repetition_penalty, presence_penalty, frequency_penalty),
-      {x, prev});
+          to_stream(s), 1.0f / temperature, repetition_penalty, presence_penalty, frequency_penalty,
+          eos_id, min_length, gen_len),
+      {x, prev, bias_c});
 }
 
 void ApplyPenalty::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -273,6 +279,7 @@ void ApplyPenalty::eval_gpu(
     const std::vector<array>& inputs, std::vector<array>& outputs) {
   auto& logits = inputs[0];
   auto& prev = inputs[1];
+  auto& bias = inputs[2];
   auto& out = outputs[0];
   auto& counts = outputs[1];
 
@@ -290,7 +297,8 @@ void ApplyPenalty::eval_gpu(
   tk::launch_moe_zero_i32(enc, counts, T * V);
   tk::launch_penalty_histogram(enc, prev, counts, V, L, T * L);
   tk::launch_apply_penalty(
-      enc, logits, counts, out, T, V, invtemp_, rep_, presence_, freq_, type_to_name(logits));
+      enc, logits, counts, out, bias, T, V, invtemp_, rep_, presence_, freq_,
+      eos_id_, min_length_, gen_len_, type_to_name(logits));
 }
 
 std::vector<array> ApplyPenalty::jvp(

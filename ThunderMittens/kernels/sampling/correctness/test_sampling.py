@@ -166,7 +166,8 @@ def test_top_p_sample_determinism():
     assert np.array_equal(np.array(a), np.array(b))
 
 
-def _ref_penalty(ld, prev, temp, rep, presence, freq):
+def _ref_penalty(ld, prev, temp, rep, presence, freq,
+                 bias=None, eos_id=-1, min_length=0, gen_len=0):
     T, V = ld.shape
     ref = ld / temp
     for t in range(T):
@@ -181,7 +182,34 @@ def _ref_penalty(ld, prev, temp, rep, presence, freq):
                 l -= presence
                 l -= freq * c[v]
                 ref[t, v] = l
+    if bias is not None:
+        ref = ref + bias[None, :]
+    if eos_id >= 0 and gen_len < min_length:
+        ref[:, eos_id] = -np.inf
     return ref
+
+
+def test_apply_penalty_bias_minlen():
+    rng = np.random.default_rng(3)
+    T, V, L = 8, 500, 40
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    prev = rng.integers(-1, V, size=(T, L)).astype(np.int32)
+    bias = rng.standard_normal(V).astype(np.float32)
+    kw = dict(temperature=0.8, repetition_penalty=1.3, presence_penalty=0.1, frequency_penalty=0.05)
+    eos_id = 7
+    # gen_len < min_length -> EOS forbidden
+    got = np.array(apply_penalty(mx.array(logits), mx.array(prev), bias=mx.array(bias),
+                                 eos_id=eos_id, min_length=10, gen_len=5, **kw))
+    ref = _ref_penalty(logits, prev, kw["temperature"], kw["repetition_penalty"],
+                       kw["presence_penalty"], kw["frequency_penalty"],
+                       bias=bias, eos_id=eos_id, min_length=10, gen_len=5)
+    m = np.arange(V) != eos_id
+    np.testing.assert_allclose(got[:, m], ref[:, m], atol=1e-4, rtol=2e-3)
+    assert np.all(got[:, eos_id] < -1e30)                 # EOS masked
+    # gen_len >= min_length -> EOS not masked
+    got2 = np.array(apply_penalty(mx.array(logits), mx.array(prev), bias=mx.array(bias),
+                                  eos_id=eos_id, min_length=10, gen_len=15, **kw))
+    assert got2[0, eos_id] > -1e30
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

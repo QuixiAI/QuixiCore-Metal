@@ -367,17 +367,24 @@ def top_p_sample(logits, p, temperature=1.0, seed=0):
 
 
 def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
-                  presence_penalty=0.0, frequency_penalty=0.0):
-    """Temperature + repetition/presence/frequency penalties. Returns penalized logits (T,V).
+                  presence_penalty=0.0, frequency_penalty=0.0, bias=None, eos_id=-1,
+                  min_length=0, gen_len=0):
+    """Temperature + rep/presence/freq penalties + logit bias + min-length EOS mask.
 
-    logits (T,V); prev_tokens (T,L) int (out-of-range = ignored padding). Accepts mlx/torch.
+    logits (T,V); prev_tokens (T,L) int (out-of-range = ignored padding); bias (V,) or None;
+    forbids eos_id while gen_len < min_length. Returns penalized logits (T,V). Accepts mlx/torch.
     """
     if _is_torch(logits):
         return _torch().apply_penalty(logits, prev_tokens, temperature, repetition_penalty,
-                                      presence_penalty, frequency_penalty)
+                                      presence_penalty, frequency_penalty, bias, eos_id,
+                                      min_length, gen_len)
+    import mlx.core as mx
+    if bias is None:
+        bias = mx.zeros((logits.shape[-1],), dtype=mx.float32)
     return _mlx().apply_penalty(
-        logits, prev_tokens, temperature=temperature, repetition_penalty=repetition_penalty,
-        presence_penalty=presence_penalty, frequency_penalty=frequency_penalty)[0]
+        logits, prev_tokens, bias, temperature=temperature, repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty, frequency_penalty=frequency_penalty, eos_id=eos_id,
+        min_length=min_length, gen_len=gen_len)[0]
 
 
 def quantize_per_token_fp8(x):

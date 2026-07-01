@@ -859,8 +859,10 @@ static at::Tensor top_k_sample_mps(const at::Tensor& logits_in, int64_t k, doubl
 
 // Temperature + repetition/presence/frequency penalties. Returns the penalized logits.
 static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
-                                    double temperature, double repetition_penalty,
-                                    double presence_penalty, double frequency_penalty) {
+                                    const at::Tensor& bias_in, double temperature,
+                                    double repetition_penalty, double presence_penalty,
+                                    double frequency_penalty, int64_t eos_id, int64_t min_length,
+                                    int64_t gen_len) {
   TORCH_CHECK(logits_in.device().is_mps(), "apply_penalty: logits must be an MPS tensor");
   TORCH_CHECK(logits_in.dim() == 2, "apply_penalty: logits must be (num_tokens, vocab)");
   TORCH_CHECK(tk_is_float_dtype(logits_in), "apply_penalty: logits must be float");
@@ -870,16 +872,20 @@ static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tenso
   auto logits = logits_in.contiguous();
   auto prev = prev_in.to(at::kInt).contiguous();
   const int T = logits.size(0), V = logits.size(1), L = prev.size(1);
+  TORCH_CHECK(bias_in.dim() == 1 && bias_in.size(0) == V, "apply_penalty: bias must be (vocab,)");
+  auto bias = bias_in.to(at::kFloat).contiguous();
   auto out = at::empty_like(logits);
   auto counts = at::empty({T, V}, logits.options().dtype(at::kInt));
   const float invtemp = 1.0f / static_cast<float>(temperature);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_moe_zero_i32(e, counts, T * V);
     tk::launch_penalty_histogram(e, prev, counts, V, L, T * L);
-    tk::launch_apply_penalty(e, logits, counts, out, T, V, invtemp,
+    tk::launch_apply_penalty(e, logits, counts, out, bias, T, V, invtemp,
                              static_cast<float>(repetition_penalty),
                              static_cast<float>(presence_penalty),
-                             static_cast<float>(frequency_penalty), tk_type_name(logits));
+                             static_cast<float>(frequency_penalty), static_cast<int>(eos_id),
+                             static_cast<int>(min_length), static_cast<int>(gen_len),
+                             tk_type_name(logits));
   });
   return out;
 }
