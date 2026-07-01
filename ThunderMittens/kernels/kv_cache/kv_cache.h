@@ -45,16 +45,17 @@ array paged_attention(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
-// fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales,
-// and decode-paged-attention that dequantizes on read. GQA/MQA aware.
+// fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-head scales
+// (k_scale/v_scale are (num_heads,)/(num_kv_heads,) arrays; a per-tensor caller passes a
+// broadcast array), and decode-paged-attention that dequantizes on read. GQA/MQA aware.
 std::vector<array> kv_cache_scatter_fp8(
     const array& key,
     const array& value,
     const array& slot_mapping,
     int num_blocks,
     int block_size,
-    float k_scale,
-    float v_scale,
+    const array& k_scale,
+    const array& v_scale,
     StreamOrDevice s = {});
 
 array paged_attention_fp8(
@@ -63,8 +64,8 @@ array paged_attention_fp8(
     const array& value_cache,
     const array& block_table,
     const array& context_lens,
-    float k_scale,
-    float v_scale,
+    const array& k_scale,
+    const array& v_scale,
     float scale = 0.0f,
     StreamOrDevice s = {});
 
@@ -178,8 +179,8 @@ class KvCacheScales : public Primitive {
 
 class KvCacheScatterFp8 : public Primitive {
  public:
-  KvCacheScatterFp8(Stream stream, int block_size, float k_scale, float v_scale)
-      : Primitive(stream), block_size_(block_size), k_scale_(k_scale), v_scale_(v_scale) {}
+  KvCacheScatterFp8(Stream stream, int block_size)
+      : Primitive(stream), block_size_(block_size) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -192,19 +193,16 @@ class KvCacheScatterFp8 : public Primitive {
   const char* name() const { return "KvCacheScatterFp8"; }
   void print(std::ostream& os) override { os << "KvCacheScatterFp8"; }
   bool is_equivalent(const Primitive& other) const override {
-    auto& o = static_cast<const KvCacheScatterFp8&>(other);
-    return block_size_ == o.block_size_ && k_scale_ == o.k_scale_ && v_scale_ == o.v_scale_;
+    return block_size_ == static_cast<const KvCacheScatterFp8&>(other).block_size_;
   }
 
  private:
   int block_size_;
-  float k_scale_, v_scale_;
 };
 
 class PagedAttentionFp8 : public Primitive {
  public:
-  PagedAttentionFp8(Stream stream, float scale, float k_scale, float v_scale)
-      : Primitive(stream), scale_(scale), k_scale_(k_scale), v_scale_(v_scale) {}
+  PagedAttentionFp8(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -217,12 +215,11 @@ class PagedAttentionFp8 : public Primitive {
   const char* name() const { return "PagedAttentionFp8"; }
   void print(std::ostream& os) override { os << "PagedAttentionFp8"; }
   bool is_equivalent(const Primitive& other) const override {
-    auto& o = static_cast<const PagedAttentionFp8&>(other);
-    return scale_ == o.scale_ && k_scale_ == o.k_scale_ && v_scale_ == o.v_scale_;
+    return scale_ == static_cast<const PagedAttentionFp8&>(other).scale_;
   }
 
  private:
-  float scale_, k_scale_, v_scale_;
+  float scale_;
 };
 
 class PagedAttention : public Primitive {

@@ -272,3 +272,37 @@ def test_fp8_kv_roundtrip(D, H, H_KV):
     q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
     ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (6, 3)])
+def test_fp8_kv_roundtrip_perhead(D, H, H_KV):
+    # Per-head K/V scales (a distinct scale per kv-head), the production fp8-KV granularity.
+    rng = np.random.default_rng(70 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 8, 4
+    total = num_blocks * block_size
+    # Give each head a different magnitude so a wrong (shared) scale would fail.
+    head_gain = (1.0 + np.arange(H_KV)).astype(np.float32)[None, :, None]
+    K = (0.2 * rng.normal(size=(total, H_KV, D)) * head_gain).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D)) * head_gain).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    block_table = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    context_lens = np.array([10, 16], dtype=np.int32)
+    k_scale = (np.abs(K).max(axis=(0, 2)) / 448.0).astype(np.float32)   # (H_KV,)
+    v_scale = (np.abs(V).max(axis=(0, 2)) / 448.0).astype(np.float32)
+    scale = 1.0 / math.sqrt(D)
+    slot_mapping = np.arange(total, dtype=np.int64)
+
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(slot_mapping), num_blocks, block_size, mx.array(k_scale), mx.array(v_scale))
+    got = paged_attention_fp8(
+        mx.array(q).astype(mx.bfloat16), kc, vc,
+        mx.array(block_table), mx.array(context_lens), mx.array(k_scale), mx.array(v_scale), scale=0.0)
+    mx.eval(kc, vc, got)
+
+    kc_deq = _e4m3_decode_arr(np.array(kc)) * k_scale[None, None, :, None]
+    vc_deq = _e4m3_decode_arr(np.array(vc)) * v_scale[None, None, :, None]
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)

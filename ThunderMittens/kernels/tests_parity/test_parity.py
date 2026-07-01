@@ -794,6 +794,35 @@ def test_paged_attention_fp8_parity(H, H_KV):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("H,H_KV", [(4, 2), (6, 3)])
+def test_paged_attention_fp8_perhead_parity(H, H_KV):
+    # Per-head scale arrays must match bit-for-bit across MLX and MPS (same metallib).
+    rng = np.random.default_rng(31)
+    B, D, num_blocks, block_size = 2, 64, 8, 4
+    total = num_blocks * block_size
+    gain = (1.0 + np.arange(H_KV)).astype(np.float32)[None, :, None]
+    K = (0.2 * rng.normal(size=(total, H_KV, D)) * gain).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D)) * gain).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    ks = (np.abs(K).max(axis=(0, 2)) / 448.0).astype(np.float32)   # (H_KV,)
+    vs = (np.abs(V).max(axis=(0, 2)) / 448.0).astype(np.float32)
+    slot = np.arange(total, dtype=np.int64)
+
+    kcm, vcm = tk.kv_cache_scatter_fp8(_mk(K, "mlx"), _mk(V, "mlx"), mx.array(slot),
+                                       num_blocks, block_size, mx.array(ks), mx.array(vs))
+    om = tk.paged_attention_fp8(_mk(q, "mlx"), kcm, vcm, mx.array(bt), mx.array(cl),
+                                mx.array(ks), mx.array(vs))
+    kct, vct = tk.kv_cache_scatter_fp8(_mk(K, "torch"), _mk(V, "torch"),
+                                       torch.from_numpy(slot).to("mps"), num_blocks, block_size,
+                                       torch.from_numpy(ks).to("mps"), torch.from_numpy(vs).to("mps"))
+    ot = tk.paged_attention_fp8(_mk(q, "torch"), kct, vct,
+                                torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                torch.from_numpy(ks).to("mps"), torch.from_numpy(vs).to("mps"))
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("H,H_KV", [(4, 2), (4, 1)])  # GQA group 2, MQA
 def test_paged_attention_gqa_parity(H, H_KV):
     rng = np.random.default_rng(2)

@@ -378,8 +378,8 @@ std::vector<array> kv_cache_scatter_fp8(
     const array& slot_mapping,
     int num_blocks,
     int block_size,
-    float k_scale,
-    float v_scale,
+    const array& k_scale,
+    const array& v_scale,
     StreamOrDevice s) {
   if (key.ndim() != 3 || value.ndim() != 3 || key.shape() != value.shape()) {
     throw std::invalid_argument("kv_cache_scatter_fp8: key/value must be (num_tokens, num_heads, head_size)");
@@ -390,18 +390,23 @@ std::vector<array> kv_cache_scatter_fp8(
   if (num_blocks <= 0 || block_size <= 0) {
     throw std::invalid_argument("kv_cache_scatter_fp8: num_blocks and block_size must be positive");
   }
+  const int H = key.shape(1);
+  const int D = key.shape(2);
+  if (k_scale.ndim() != 1 || k_scale.shape(0) != H || v_scale.shape() != k_scale.shape()) {
+    throw std::invalid_argument("kv_cache_scatter_fp8: k_scale/v_scale must be (num_heads,)");
+  }
   const auto dtype = promoted_float_dtype(key, value, "kv_cache_scatter_fp8");
   auto key_c = contiguous_cast(key, dtype, s);
   auto value_c = contiguous_cast(value, dtype, s);
   auto slot_c = contiguous(astype(slot_mapping, int64, s), false, s);
-  const int H = key.shape(1);
-  const int D = key.shape(2);
+  auto ks_c = contiguous(astype(k_scale, float32, s), false, s);
+  auto vs_c = contiguous(astype(v_scale, float32, s), false, s);
   std::vector<int> cache_shape = {num_blocks, block_size, H, D};
   return array::make_arrays(
       {cache_shape, cache_shape},
       {uint8, uint8},
-      std::make_shared<KvCacheScatterFp8>(to_stream(s), block_size, k_scale, v_scale),
-      {key_c, value_c, slot_c});
+      std::make_shared<KvCacheScatterFp8>(to_stream(s), block_size),
+      {key_c, value_c, slot_c, ks_c, vs_c});
 }
 
 array paged_attention_fp8(
@@ -410,8 +415,8 @@ array paged_attention_fp8(
     const array& value_cache,
     const array& block_table,
     const array& context_lens,
-    float k_scale,
-    float v_scale,
+    const array& k_scale,
+    const array& v_scale,
     float scale,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
@@ -436,16 +441,22 @@ array paged_attention_fp8(
   if (!(D == 64 || D == 128)) {
     throw std::invalid_argument("paged_attention_fp8: head_size must be 64 or 128");
   }
+  const int num_kv_heads = key_cache.shape(2);
+  if (k_scale.ndim() != 1 || k_scale.shape(0) != num_kv_heads || v_scale.shape() != k_scale.shape()) {
+    throw std::invalid_argument("paged_attention_fp8: k_scale/v_scale must be (num_kv_heads,)");
+  }
   auto q_c = contiguous(q, false, s);
   auto kc = contiguous(astype(key_cache, uint8, s), false, s);
   auto vc = contiguous(astype(value_cache, uint8, s), false, s);
   auto table_c = contiguous(astype(block_table, int32, s), false, s);
   auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  auto ks_c = contiguous(astype(k_scale, float32, s), false, s);
+  auto vs_c = contiguous(astype(v_scale, float32, s), false, s);
   return array(
       q.shape(),
       q.dtype(),
-      std::make_shared<PagedAttentionFp8>(to_stream(s), scale, k_scale, v_scale),
-      {q_c, kc, vc, table_c, lens_c});
+      std::make_shared<PagedAttentionFp8>(to_stream(s), scale),
+      {q_c, kc, vc, table_c, lens_c, ks_c, vs_c});
 }
 
 void KvCacheScatterFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -457,6 +468,8 @@ void KvCacheScatterFp8::eval_gpu(
   auto& key = inputs[0];
   auto& value = inputs[1];
   auto& slot = inputs[2];
+  auto& k_scale = inputs[3];
+  auto& v_scale = inputs[4];
   auto& key_cache = outputs[0];
   auto& value_cache = outputs[1];
 
@@ -471,7 +484,7 @@ void KvCacheScatterFp8::eval_gpu(
   tk::launch_kv_cache_zero_u8(enc, key_cache, value_cache, total);
   tk::launch_kv_cache_scatter_fp8(
       enc, key, value, slot, key_cache, value_cache,
-      key.shape(0), key.shape(1), key.shape(2), block_size_, k_scale_, v_scale_,
+      key.shape(0), key.shape(1), key.shape(2), block_size_, k_scale, v_scale,
       type_to_name(key));
 }
 
@@ -486,6 +499,8 @@ void PagedAttentionFp8::eval_gpu(
   auto& value_cache = inputs[2];
   auto& block_table = inputs[3];
   auto& context_lens = inputs[4];
+  auto& k_scale = inputs[5];
+  auto& v_scale = inputs[6];
   auto& out = outputs[0];
 
   auto& s = stream();
@@ -499,7 +514,7 @@ void PagedAttentionFp8::eval_gpu(
   tk::launch_paged_attention_fp8(
       enc, q, key_cache, value_cache, block_table, context_lens, out,
       q.shape(0), q.shape(1), key_cache.shape(2), D, key_cache.shape(1),
-      block_table.shape(1), scale, k_scale_, v_scale_, type_to_name(q));
+      block_table.shape(1), scale, k_scale, v_scale, type_to_name(q));
 }
 
 #define TK_KV_NO_AUTODIFF(CLASS, LABEL)                                      \

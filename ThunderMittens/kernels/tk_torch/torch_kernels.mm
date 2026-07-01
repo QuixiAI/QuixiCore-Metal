@@ -513,7 +513,8 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
 // fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales.
 static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
     const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& slot_in,
-    int64_t num_blocks, int64_t block_size, double k_scale, double v_scale) {
+    int64_t num_blocks, int64_t block_size, const at::Tensor& k_scale_in,
+    const at::Tensor& v_scale_in) {
   TORCH_CHECK(key_in.device().is_mps(), "kv_cache_scatter_fp8: key must be an MPS tensor");
   TORCH_CHECK(key_in.dim() == 3 && value_in.sizes() == key_in.sizes(),
               "kv_cache_scatter_fp8: key/value must be (num_tokens, num_heads, head_size)");
@@ -523,13 +524,15 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
   auto key = key_in.contiguous(), value = value_in.contiguous();
   auto slot = slot_in.to(at::kLong).contiguous();
   const int T = key.size(0), H = key.size(1), D = key.size(2);
+  TORCH_CHECK(k_scale_in.dim() == 1 && k_scale_in.size(0) == H && v_scale_in.sizes() == k_scale_in.sizes(),
+              "kv_cache_scatter_fp8: k_scale/v_scale must be (num_heads,)");
+  auto ks = k_scale_in.to(at::kFloat).contiguous(), vs = v_scale_in.to(at::kFloat).contiguous();
   auto kc = at::empty({num_blocks, block_size, H, D}, key.options().dtype(at::kByte));
   auto vc = at::empty({num_blocks, block_size, H, D}, key.options().dtype(at::kByte));
   tk_encode([&](TorchEncoder& e) {
     tk::launch_kv_cache_zero_u8(e, kc, vc, static_cast<uint64_t>(kc.numel()));
     tk::launch_kv_cache_scatter_fp8(e, key, value, slot, kc, vc, T, H, D,
-                                    static_cast<int>(block_size), static_cast<float>(k_scale),
-                                    static_cast<float>(v_scale), tk_type_name(key));
+                                    static_cast<int>(block_size), ks, vs, tk_type_name(key));
   });
   return {kc, vc};
 }
@@ -537,7 +540,7 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
 static at::Tensor paged_attention_fp8_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
-    double k_scale, double v_scale, double scale) {
+    const at::Tensor& k_scale_in, const at::Tensor& v_scale_in, double scale) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_fp8: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_fp8: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -552,16 +555,18 @@ static at::Tensor paged_attention_fp8_mps(
   const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
   const int H_KV = key_cache_in.size(2), block_size = key_cache_in.size(1);
   TORCH_CHECK(D == 64 || D == 128, "paged_attention_fp8: head_size must be 64 or 128");
+  TORCH_CHECK(k_scale_in.dim() == 1 && k_scale_in.size(0) == H_KV && v_scale_in.sizes() == k_scale_in.sizes(),
+              "paged_attention_fp8: k_scale/v_scale must be (num_kv_heads,)");
   auto q = q_in.contiguous();
   auto kc = key_cache_in.contiguous(), vc = value_cache_in.contiguous();
   auto bt = block_table_in.contiguous(), cl = context_lens_in.contiguous();
+  auto ks = k_scale_in.to(at::kFloat).contiguous(), vs = v_scale_in.to(at::kFloat).contiguous();
   auto out = at::empty_like(q);
   const float scale_f = scale > 0.0 ? static_cast<float>(scale)
                                     : 1.0f / std::sqrt(static_cast<float>(D));
   tk_encode([&](TorchEncoder& e) {
     tk::launch_paged_attention_fp8(e, q, kc, vc, bt, cl, out, B, H, H_KV, D, block_size,
-                                   static_cast<int>(bt.size(1)), scale_f, static_cast<float>(k_scale),
-                                   static_cast<float>(v_scale), tk_type_name(q));
+                                   static_cast<int>(bt.size(1)), scale_f, ks, vs, tk_type_name(q));
   });
   return out;
 }

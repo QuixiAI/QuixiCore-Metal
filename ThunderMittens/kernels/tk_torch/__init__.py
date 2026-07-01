@@ -247,17 +247,33 @@ def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch
     return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
 
 
+def _scale_vec_t(scale, num, ref):
+    """Broadcast a python scalar into a (num,) float32 tensor on ref's device; tensors pass through."""
+    if isinstance(scale, (int, float)):
+        return torch.full((num,), float(scale), dtype=torch.float32, device=ref.device)
+    return scale.to(dtype=torch.float32)
+
+
 def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_scale, v_scale):
-    """Scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales. Returns (kc, vc). MPS."""
+    """Scatter K/V into a uint8 (e4m3) paged cache. Returns (kc, vc). MPS.
+
+    k_scale/v_scale: plain float (per-tensor) or a (num_heads,) tensor (per-head).
+    """
+    H = key.shape[1]
     return _ext.kv_cache_scatter_fp8(key, value, slot_mapping, int(num_blocks), int(block_size),
-                                     float(k_scale), float(v_scale))
+                                     _scale_vec_t(k_scale, H, key), _scale_vec_t(v_scale, H, key))
 
 
 def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                         k_scale, v_scale, scale=0.0):
-    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware. MPS."""
+    """Decode paged attention over fp8 (uint8 e4m3) caches, dequantized on read. GQA aware. MPS.
+
+    k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) tensor (per-head).
+    """
+    H_KV = key_cache.shape[2]
     return _ext.paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                                    float(k_scale), float(v_scale), float(scale))
+                                    _scale_vec_t(k_scale, H_KV, q), _scale_vec_t(v_scale, H_KV, q),
+                                    float(scale))
 
 
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):

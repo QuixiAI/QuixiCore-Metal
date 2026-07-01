@@ -683,13 +683,13 @@ template <class E>
 void launch_kv_cache_scatter_fp8(E& e, typename E::in_t key, typename E::in_t value,
                                  typename E::in_t slot_mapping, typename E::out_t key_cache,
                                  typename E::out_t value_cache, int num_tokens, int num_heads,
-                                 int head_size, int block_size, float k_scale, float v_scale,
-                                 const std::string& type_name) {
+                                 int head_size, int block_size, typename E::in_t k_scale,
+                                 typename E::in_t v_scale, const std::string& type_name) {
   e.pipeline(kv_cache_scatter_fp8_kernel_name(type_name));
   e.in(key, 0); e.in(value, 1); e.in(slot_mapping, 2);
   e.out(key_cache, 3); e.out(value_cache, 4);
   e.bytes(num_heads, 5); e.bytes(head_size, 6); e.bytes(block_size, 7);
-  e.bytes(k_scale, 8); e.bytes(v_scale, 9);
+  e.in(k_scale, 8); e.in(v_scale, 9);
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
@@ -699,13 +699,14 @@ void launch_paged_attention_fp8(E& e, typename E::in_t q, typename E::in_t key_c
                                 typename E::in_t context_lens, typename E::out_t out,
                                 int batch, int num_heads, int num_kv_heads, int head_size,
                                 int block_size, int block_table_stride, float scale,
-                                float k_scale, float v_scale, const std::string& type_name) {
+                                typename E::in_t k_scale, typename E::in_t v_scale,
+                                const std::string& type_name) {
   e.pipeline(paged_attention_fp8_kernel_name(type_name, head_size));
   e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
   e.in(block_table, 3); e.in(context_lens, 4); e.out(out, 5);
   e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
   e.bytes(num_heads, 9); e.bytes(num_kv_heads, 10);
-  e.bytes(k_scale, 11); e.bytes(v_scale, 12);
+  e.in(k_scale, 11); e.in(v_scale, 12);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 

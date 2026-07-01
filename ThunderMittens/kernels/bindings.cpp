@@ -525,7 +525,7 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales. Returns (kc, vc).
+        scatter K/V into a uint8 (e4m3) paged cache with per-head (num_heads,) scales. Returns (kc, vc).
       )");
 
     m.def(
