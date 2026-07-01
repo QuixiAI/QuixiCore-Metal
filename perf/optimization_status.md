@@ -1,50 +1,115 @@
 # ThunderMittens — performance status
 
-Baselines and tuning conclusions from `perf/bench_kernels.py`. Numbers are median per-call
-latency (ms), Apple Silicon, one warm GPU. Regenerate with:
+Running notebook for the per-kernel optimization loop described in `perf/perf.md`.
+Numbers are throughput-style median per-call ms from `perf/bench_kernels.py`
+(adaptive batched timing, ≥2 ms per timed sample), Apple M4 Max 40-core
+(~546 GB/s DRAM), MLX backend unless noted. Baseline run:
+`perf/results/2026-07-01/172040-mlx-quick/` at `d902519`.
 
-```
-.venv/bin/python perf/bench_kernels.py --backend mlx   --preset quick
-.venv/bin/python perf/bench_kernels.py --backend torch --preset quick
-```
+**Timing-methodology note (2026-07-01):** the harness was rewritten. Earlier
+numbers in this file used one submit+sync per call, which adds a ~0.15–0.25 ms
+latency floor and swamped small kernels; conclusions drawn only from per-call-sync
+timing (notably "staged paged attention is slower") did NOT survive the fix —
+see the serving section.
 
-## Serving-kernel latencies (`quick` preset: B=8, H=32, H_KV=8, D=128, ctx=2048)
+## Baseline classification (2026-07-01, quick preset)
 
-| kernel | MLX (ms) | torch-MPS (ms) |
-|---|---:|---:|
-| paged_attention (v1 decode) | 1.13 | 1.78 |
-| paged_attention_staged (GQA KV-reuse) | 1.90 | 1.93 |
-| paged_attention_v2 (partition/reduce) | 0.51 | 0.50 |
-| layernorm (N=4096, D=1024) | 0.17 | 0.17 |
-| quantize_per_tensor_fp8 | 0.45 | 0.45 |
-| quantize_per_token_fp8 | 0.22 | 0.21 |
-| moe_grouped_gemm (E=8, H=2048, 2048 rows) | 1.32 | 1.33 |
-| mla_decode (DeepSeek MLA, 576-QK/512-AV MQA) | 1.17 | — |
+Speedup = best-baseline ms / tk ms (>1 means tk wins).
 
-## Tuning conclusions
+### Already ahead of the framework — protect, don't churn
+| kernel | shape | tk ms | vs | speedup |
+|---|---|---:|---|---:|
+| layernorm | 4096×1024 | 0.066 | mx.fast.layer_norm | 1.97 |
+| rms_norm | 4096×1024 | 0.035 | mx.fast.rms_norm | 1.93 |
+| softmax | 4096×1024 | 0.046 | mx.softmax | 1.57 |
+| gelu | 16384×1024 | 0.161 | mx.nn.gelu_approx | 2.62 |
+| add_norm (fused) | 4096×1024 | 0.093 | add + mx.fast.rms_norm | 1.97 |
+| attn_causal | 1×8×2048×128 | 0.795 | sdpa+mask | 3.87 |
+| attn_fwd D=128 | 1×8×2048×128 | 1.499 | sdpa | 1.11 |
+| attn_bwd | 1×8×1024×64 | 0.741 | mx.vjp naive | 2.46 |
+| lin_attn_causal | 2×8×4096×64 | 2.050 | masked naive | 6.36 |
+| matmul_custom | 2048³ bf16 | 1.233 | mx.matmul | 1.01 |
+| flux gate | 2048³ | 1.227 | matmul+epilogue | 1.08 |
+| cmplx_matmul | 1024³ | 0.663 | 4×mx.matmul | 1.22 |
+| moe grouped | E8 H2048 | 1.401 | per-expert loop | 1.45 |
+| paged_attention_v2 | 8×32 ctx2048 | 0.382 | v1 | 4.58 |
 
-### Long-context decode: **use `paged_attention_v2`**, not v1 or staged
-`paged_attention_v2` is ~2.2× faster than the v1 single-threadgroup decode at ctx=2048 and the
-gap widens with context, because it exposes the KV-sequence partitions as an extra grid axis
-(`grid.z = num_partitions`) — far more threadgroups in flight than v1's `num_heads × batch`.
+### Gaps — the optimization queue (worst first, weighted by real-model impact)
+| # | kernel | shape | tk ms | vs | speedup | first hypothesis |
+|---|---|---|---:|---|---:|---|
+| 1 | qgemm (staged route) | q4_0 M=512 | 11.88 | tk.qgemm_direct | 0.11 | routing bug: staged path collapses at large M; direct is 9× faster |
+| 2 | qgemv generic fmts | q4_K 4096² | 0.199 | fp16 matmul | 0.24 | per-element div/mod + branchy dequant in the generic template (fast paths exist only for q8_0/q4_0); W-GB/s 44–127 vs 200–430 for fast paths |
+| 3 | attn_q | q4_0 1×8×1024×128 | 1.225 | attn_fwd on dequant K/V | 0.32 | in-kernel dequant dominates; multiwarp already 1.2–1.65× better |
+| 4 | linear_attn (non-causal) | 2×8×4096×64 | 2.197 | Q@(KᵀV) via mx.matmul | 0.06 | grid is B·H simdgroups — no sequence parallelism; hedgehog same (0.38) |
+| 5 | rotary | 1×32×2048×128 | 0.187 | mx.fast.rope | 0.44 | mx computes trig in-kernel (no cos/sin table reads) + vectorized; ours reads tables scalar |
+| 6 | v2_fp8 paged decode | 8×32 ctx2048 | 0.859 | v2 bf16 cache | 0.44 | dequant-on-read costs 2.3× despite half the bytes |
+| 7 | glu (all modes) | 16384×4096 | 3.925 | silu(x)*gate composed | 0.60 | scalar loads; 103 GB/s vs 546 peak |
+| 8 | add_rt | 4096×1024 | 0.155 | mx add | 0.34 | 8×8 register-tile machinery for a pure elementwise op |
+| 9 | hadamard D≤128 | 16384×128 | 0.150 | matmul vs H | 0.35 | geometry: too little work per threadgroup at small D (D=512 wins 2.1×) |
+| 10 | qgemv q8_0/q4_0 | 4096×4096 | 0.087 | mlx_q4/q8 gemv | 0.63 | N=4096 → 4096 single-simdgroup TGs; occupancy. At N=11008 q4_0 BEATS mlx 1.73× |
+| 11 | qgemv_int w8a8 | 4096² | 0.147 | tk.qgemv q8_0 | 0.26 | same small-N geometry issue |
+| 12 | attn_fwd D=64 | 1×8×1024×64 | 0.238 | sdpa | 0.77 | D=64 tile geometry |
+| 13 | quantize_per_tensor_fp8 | 16384×1024 | 1.529 | (per_token: 0.274) | — | 33 GB/s; global atomic-max pass dominates |
+| 14 | flux gelu @1024³ | 1024³ | 0.348 | matmul+gelu | 0.65 | small-shape only (2048³ is 1.09) — low priority |
 
-### GQA KV-reuse staging (item 6): **measured slower on Apple — keep v1/v2 as default**
-`paged_attention_gqa_staged` is **1.7× slower** than plain `paged_attention` on MLX (1.08× on
-torch-MPS) despite staging each KV vector once and reusing it across the group. Two Apple-specific
-reasons: (1) it collapses the grid from `num_heads × batch` to `num_kv_heads × batch` threadgroups,
-cutting the parallelism the GPU needs to hide memory latency; (2) the per-token `threadgroup_barrier`
-pair serializes the group's simdgroups. The bandwidth saved (group_size× fewer KV reads) does not
-recover that on this hardware — the caches are small enough that occupancy, not KV bandwidth, is the
-bottleneck at decode batch sizes. This mirrors the earlier `gemm_staged.metal` finding that bigger
-multi-warp tiles were slower on Apple. **The kernel is kept** (bit-equivalent, selectable) for
-hardware/shapes where KV bandwidth dominates, but it is not the default.
+### Serving decode re-measurement (supersedes the 2026-06 table)
+With pipelined timing at 8×32×2048×128: v1 1.837 ms, **staged 0.981 ms (1.80×
+FASTER than v1)**, v2(p256) 0.382 ms. The earlier "staged 1.7× slower" was an
+artifact of per-call-sync timing. v2 remains the default and is still the right
+choice. TODO: sweep partition_size per context; re-check staged under real
+decode loops (one call per step, no pipelining) before changing any default.
 
-### MoE grouped GEMM (item 2): one segmented launch replaces the per-expert host loop
-`moe_grouped_gemm` runs all experts in a single dispatch (32×32 tiles, `expert_of_tile` lookup),
-avoiding E separate encoder round-trips. It scales with total padded rows × H, as expected.
+## Per-kernel log
 
-## Open items
-- Sweep `paged_attention_v2` `partition_size` (256 used here) per context length.
-- Benchmark the fp8 KV read paths (`paged_attention_fp8`, `paged_attention_v2_fp8`) vs the fp
-  caches to quantify the dequant-on-read cost.
-- MoE grouped GEMM vs the retained per-expert-dispatch fallback at small E / few rows per expert.
+### qgemv — status: experimenting (highest priority)
+- References: llama.cpp `ggml-metal` GEMV geometry (N rows/simdgroup, register-
+  cached activations, block-major iteration) — mirror not on disk, working from
+  structure knowledge + measurement.
+- Fast paths (hand-written q8_0/q4_0) hit 204–430 W-GB/s; generic template
+  (26 formats) does per-element `k/block_k`, `k%block_k`, re-reads the block
+  scale per element, branches per nibble, scalar X loads → 44–127 W-GB/s.
+- MLX quantized_matmul comparison: tk q4_0 wins 1.73× at N=11008 but loses
+  0.64× at N=4096 → geometry (one simdgroup per row, 32-thread TGs) starves the
+  GPU at moderate N; bigger TGs (multiple simdgroups) should fix small-N.
+- Plan: (a) restructure the generic template block-major (each lane owns
+  contiguous cols within a block; scale loaded once per block; no div/mod),
+  (b) 2–4 simdgroups per threadgroup, (c) vectorized X loads, then re-sweep all
+  formats; correctness gate `qgemv/correctness/`.
+
+### qgemm — status: experimenting
+- M=512 q4_0 via the default (staged) path is 9.2× slower than qgemm_direct.
+  Fix routing (M threshold or make direct the only path), then re-sweep BK.
+- vs fp16 matmul: parity at M≥128 (compute-bound), as expected; value is memory
+  footprint, not speed.
+
+### Elementwise/row family — status: baselining done
+- layernorm/rms_norm/softmax/gelu/add_norm all beat MLX fast ops — record and
+  keep; re-run after any substrate change.
+- glu/add_rt/rotary/hadamard need vectorization/geometry passes (queue #5/7/8/9).
+
+### Attention — status: baselining done
+- fwd D=128 & causal & bwd all ahead; fwd D=64 slightly behind (queue #12);
+  multiwarp confirmed ≈0.93× of single-warp fwd (unchanged conclusion).
+- attn_q needs its dequant restructured (queue #3) — likely shares the fix with
+  the qgemv generic template.
+
+### Linear-attention family — status: baselining done
+- Causal/scan kernels (lin_attn_causal, mamba2, based, lin_attn_decay) healthy.
+- Non-causal linear_attn and hedgehog lose massively to 2 composed matmuls
+  (queue #4): consider routing non-causal shapes to composition (φ in-kernel or
+  via mx ops), or a sequence-parallel two-phase kernel.
+- lin_attn_decay public wrapper rebuilds the decay ramp in numpy per call —
+  move to device ops (host-overhead fix independent of the kernel).
+
+### Complex — status: healthy
+- cmplx_matmul ≥ 4-matmul composition; fftconv ≈ mx.fft path. Low priority.
+
+### Serving — status: re-baselined (see table above)
+- v2_fp8 dequant-on-read (queue #6) and quantize_per_tensor_fp8 (queue #13) are
+  the actionable items; also re-examine staged-vs-v1 defaults under non-pipelined
+  decode conditions.
+
+## Decision log
+- 2026-07-01: harness rewritten (schema v1, all families, batched timing);
+  perf.md updated to match reality (reference mirrors, device context, timing
+  methodology, serving section).
