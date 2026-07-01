@@ -423,12 +423,15 @@ def top_p_sample(logits: torch.Tensor, p: float, temperature: float = 1.0, seed:
 def apply_penalty(logits: torch.Tensor, prev_tokens: torch.Tensor, temperature: float = 1.0,
                   repetition_penalty: float = 1.0, presence_penalty: float = 0.0,
                   frequency_penalty: float = 0.0, bias=None, eos_id: int = -1,
-                  min_length: int = 0, gen_len: int = 0):
+                  min_length: int = 0, gen_len: int = 0, parent_ids=None):
     """Temperature + rep/presence/freq penalties + logit bias + min-length EOS mask (forbids eos_id
-    while gen_len < min_length). bias is (V,) or None. Returns penalized logits (T,V). MPS."""
+    while gen_len < min_length). bias (V,) or None; parent_ids (T,) redirects each row's occurrence
+    history (beam search; None = identity). Returns penalized logits (T,V). MPS."""
     if bias is None:
         bias = torch.zeros(logits.shape[-1], dtype=torch.float32, device=logits.device)
-    return _ext.apply_penalty(logits, prev_tokens, bias, float(temperature),
+    if parent_ids is None:
+        parent_ids = torch.arange(logits.shape[0], dtype=torch.int32, device=logits.device)
+    return _ext.apply_penalty(logits, prev_tokens, bias, parent_ids, float(temperature),
                               float(repetition_penalty), float(presence_penalty),
                               float(frequency_penalty), int(eos_id), int(min_length), int(gen_len))
 

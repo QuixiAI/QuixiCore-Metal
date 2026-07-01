@@ -261,6 +261,19 @@ def test_apply_penalty_parity():
     _assert_parity(om[:, 6:], ot[:, 6:], atol=1e-5)
 
 
+def test_apply_penalty_beam_parity():
+    rng = np.random.default_rng(1)
+    T, V, L = 6, 300, 20
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    prev = rng.integers(0, V, size=(T, L)).astype(np.int32)
+    parent = np.array([0, 1, 0, 1, 2, 3], dtype=np.int32)
+    kw = dict(temperature=0.8, repetition_penalty=1.3, presence_penalty=0.1, frequency_penalty=0.05)
+    om = tk.apply_penalty(_mk(logits, "mlx", "f32"), mx.array(prev), parent_ids=mx.array(parent), **kw)
+    ot = tk.apply_penalty(_mk(logits, "torch", "f32"), torch.from_numpy(prev).to("mps"),
+                          parent_ids=torch.from_numpy(parent).to("mps"), **kw)
+    _assert_parity(om, ot, atol=1e-5)
+
+
 @pytest.mark.parametrize("shape,temp", [((16, 256), 1.0), ((4, 1000), 0.7)])
 def test_sample_categorical_parity(shape, temp):
     # Same metallib kernel + same seed -> identical RNG stream -> identical tokens.

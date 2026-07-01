@@ -1245,7 +1245,8 @@ static at::Tensor top_k_sample_mps(const at::Tensor& logits_in, int64_t k, doubl
 
 // Temperature + repetition/presence/frequency penalties. Returns the penalized logits.
 static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
-                                    const at::Tensor& bias_in, double temperature,
+                                    const at::Tensor& bias_in, const at::Tensor& parent_in,
+                                    double temperature,
                                     double repetition_penalty, double presence_penalty,
                                     double frequency_penalty, int64_t eos_id, int64_t min_length,
                                     int64_t gen_len) {
@@ -1259,13 +1260,15 @@ static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tenso
   auto prev = prev_in.to(at::kInt).contiguous();
   const int T = logits.size(0), V = logits.size(1), L = prev.size(1);
   TORCH_CHECK(bias_in.dim() == 1 && bias_in.size(0) == V, "apply_penalty: bias must be (vocab,)");
+  TORCH_CHECK(parent_in.dim() == 1 && parent_in.size(0) == T, "apply_penalty: parent_ids (num_tokens,)");
   auto bias = bias_in.to(at::kFloat).contiguous();
+  auto parent = parent_in.to(at::kInt).contiguous();
   auto out = at::empty_like(logits);
   auto counts = at::empty({T, V}, logits.options().dtype(at::kInt));
   const float invtemp = 1.0f / static_cast<float>(temperature);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_moe_zero_i32(e, counts, T * V);
-    tk::launch_penalty_histogram(e, prev, counts, V, L, T * L);
+    tk::launch_penalty_histogram(e, prev, counts, V, L, T * L, parent);
     tk::launch_apply_penalty(e, logits, counts, out, bias, T, V, invtemp,
                              static_cast<float>(repetition_penalty),
                              static_cast<float>(presence_penalty),

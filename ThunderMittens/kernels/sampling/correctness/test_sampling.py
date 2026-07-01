@@ -238,6 +238,27 @@ def test_apply_penalty_identity():
     np.testing.assert_allclose(got, logits, atol=1e-5)
 
 
+def test_apply_penalty_beam_parent():
+    # Beam search: each row's occurrence history is gathered from its parent beam (parent_ids).
+    rng = np.random.default_rng(4)
+    T, V, L = 6, 200, 12
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    prev = rng.integers(0, V, size=(T, L)).astype(np.int32)
+    parent = np.array([0, 1, 0, 1, 2, 3], dtype=np.int32)   # rows inherit from earlier rows
+    temp, rep, presence, freq = 0.8, 1.3, 0.1, 0.05
+    got = np.array(apply_penalty(mx.array(logits), mx.array(prev), temperature=temp,
+                                 repetition_penalty=rep, presence_penalty=presence,
+                                 frequency_penalty=freq, parent_ids=mx.array(parent)))
+    # Reference: each row t uses its OWN logits but the parent beam's history prev[parent[t]].
+    ref = _ref_penalty(logits, prev[parent], temp, rep, presence, freq)
+    np.testing.assert_allclose(got, ref, atol=1e-4, rtol=2e-3)
+    # Sanity: differs from the identity (non-beam) result on the redirected rows.
+    ident = np.array(apply_penalty(mx.array(logits), mx.array(prev), temperature=temp,
+                                   repetition_penalty=rep, presence_penalty=presence,
+                                   frequency_penalty=freq))
+    assert np.max(np.abs(got - ident)) > 1e-2
+
+
 if __name__ == "__main__":
     for shp in [(4, 1000), (8, 32000), (2, 3, 257)]:
         test_argmax_sample("float32", shp)

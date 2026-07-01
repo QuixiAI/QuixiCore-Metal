@@ -565,23 +565,31 @@ def top_p_sample(logits, p, temperature=1.0, seed=0):
 
 def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
                   presence_penalty=0.0, frequency_penalty=0.0, bias=None, eos_id=-1,
-                  min_length=0, gen_len=0):
+                  min_length=0, gen_len=0, parent_ids=None):
     """Temperature + rep/presence/freq penalties + logit bias + min-length EOS mask.
 
     logits (T,V); prev_tokens (T,L) int (out-of-range = ignored padding); bias (V,) or None;
-    forbids eos_id while gen_len < min_length. Returns penalized logits (T,V). Accepts mlx/torch.
+    forbids eos_id while gen_len < min_length. parent_ids (T,) int redirects each row's occurrence
+    history (beam search: beam inherits its parent beam's history; None = identity). Returns
+    penalized logits (T,V). Accepts mlx.array or torch.Tensor (MPS).
     """
+    T = logits.shape[0]
     if _is_torch(logits):
-        return _torch().apply_penalty(logits, prev_tokens, temperature, repetition_penalty,
-                                      presence_penalty, frequency_penalty, bias, eos_id,
-                                      min_length, gen_len)
+        return _torch().apply_penalty(logits, prev_tokens, temperature=temperature,
+                                      repetition_penalty=repetition_penalty,
+                                      presence_penalty=presence_penalty,
+                                      frequency_penalty=frequency_penalty, bias=bias, eos_id=eos_id,
+                                      min_length=min_length, gen_len=gen_len, parent_ids=parent_ids)
     import mlx.core as mx
     if bias is None:
         bias = mx.zeros((logits.shape[-1],), dtype=mx.float32)
+    if parent_ids is None:
+        parent_ids = mx.arange(T, dtype=mx.int32)
     return _mlx().apply_penalty(
-        logits, prev_tokens, bias, temperature=temperature, repetition_penalty=repetition_penalty,
-        presence_penalty=presence_penalty, frequency_penalty=frequency_penalty, eos_id=eos_id,
-        min_length=min_length, gen_len=gen_len)[0]
+        logits, prev_tokens, bias, parent_ids, temperature=temperature,
+        repetition_penalty=repetition_penalty, presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty, eos_id=eos_id, min_length=min_length,
+        gen_len=gen_len)[0]
 
 
 def quantize_per_tensor_fp8(x):

@@ -413,6 +413,7 @@ NB_MODULE(_ext, m) {
       "logits"_a,
       "prev_tokens"_a,
       "bias"_a,
+      "parent_ids"_a,
       nb::kw_only(),
       "temperature"_a = 1.0f,
       "repetition_penalty"_a = 1.0f,
@@ -423,8 +424,9 @@ NB_MODULE(_ext, m) {
       "gen_len"_a = 0,
       "stream"_a = nb::none(),
       R"(
-        temperature + repetition/presence/frequency penalties + logit bias + min-length EOS mask
-        (forbids eos_id while gen_len < min_length). Returns [penalized, counts]; use [0].
+        temperature + repetition/presence/frequency penalties + logit bias + min-length EOS mask.
+        parent_ids (num_tokens,) redirects each row's occurrence history (beam search: beam inherits
+        its parent beam's history). Returns [penalized, counts]; use [0].
       )");
 
     m.def(

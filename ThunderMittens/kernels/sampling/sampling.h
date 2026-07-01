@@ -50,7 +50,8 @@ array top_p_sample(
  *  Returns [penalized (T,V), counts (T,V) int32 scratch]; callers use the first.
  **/
 std::vector<array> apply_penalty(
-    const array& logits, const array& prev_tokens, const array& bias, float temperature = 1.0f,
+    const array& logits, const array& prev_tokens, const array& bias, const array& parent_ids,
+    float temperature = 1.0f,
     float repetition_penalty = 1.0f, float presence_penalty = 0.0f,
     float frequency_penalty = 0.0f, int eos_id = -1, int min_length = 0, int gen_len = 0,
     StreamOrDevice s = {});

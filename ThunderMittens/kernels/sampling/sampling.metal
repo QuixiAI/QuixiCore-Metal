@@ -128,10 +128,13 @@ kernel void penalty_histogram(device const int *prev_tokens [[buffer(0)]],
                               constant int &V  [[buffer(2)]],
                               constant int &L  [[buffer(3)]],
                               constant int &TL [[buffer(4)]],
+                              device const int *parent_ids   [[buffer(5)]],   // (T,) history-row map
                               uint tid [[thread_position_in_grid]]) {
     if ((int)tid >= TL) { return; }
     const int row = (int)tid / L;
-    const int tok = prev_tokens[tid];
+    const int col = (int)tid - row * L;
+    // Beam search: row's occurrence history comes from its parent beam's prev_tokens row.
+    const int tok = prev_tokens[(long)parent_ids[row] * L + col];
     if (tok >= 0 && tok < V) {
         atomic_add(counts, row * V + tok, 1);   // P3
     }
