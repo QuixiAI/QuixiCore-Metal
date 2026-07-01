@@ -10,6 +10,8 @@
 
 #pragma once
 
+#include <metal_stdlib>   // standalone compile (in the umbrella, utils.metal pulls this first)
+
 namespace mittens {
 
 /** Uniform in [0,1) from a Murmur3-style integer finalizer over a mixed counter. */

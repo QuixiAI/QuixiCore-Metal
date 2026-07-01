@@ -13,6 +13,10 @@
 
 #pragma once
 
+// SIMD_THREADS + <metal_stdlib> for standalone compile; pragma-once-safe in the umbrella
+// (utils.metal is already included by common.metal before this file).
+#include "../../common/utils.metal"
+
 namespace mittens {
 
 /**
