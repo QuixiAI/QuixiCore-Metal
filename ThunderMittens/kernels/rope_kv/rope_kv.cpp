@@ -51,22 +51,23 @@ std::vector<array> rope_kv_insert(
   if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != k.shape(0)) {
     throw std::invalid_argument("rope_kv_insert: slot_mapping must have shape (num_tokens,)");
   }
-  if (k.dtype() != bfloat16 || key_cache.dtype() != bfloat16) {
-    throw std::invalid_argument("rope_kv_insert: k/v/caches must be bfloat16");
+  auto dtype = k.dtype();
+  if (!(dtype == float32 || dtype == float16 || dtype == bfloat16)) {
+    throw std::invalid_argument("rope_kv_insert: k must be float32, float16, or bfloat16");
   }
 
-  auto k_c = contiguous(astype(k, bfloat16, s), false, s);
-  auto v_c = contiguous(astype(v, bfloat16, s), false, s);
-  auto cos_c = contiguous(astype(cos, bfloat16, s), false, s);
-  auto sin_c = contiguous(astype(sin, bfloat16, s), false, s);
+  auto k_c = contiguous(astype(k, dtype, s), false, s);
+  auto v_c = contiguous(astype(v, dtype, s), false, s);
+  auto cos_c = contiguous(astype(cos, dtype, s), false, s);
+  auto sin_c = contiguous(astype(sin, dtype, s), false, s);
   auto pos_c = contiguous(astype(positions, int32, s), false, s);
   auto slot_c = contiguous(astype(slot_mapping, int64, s), false, s);
-  auto kc_c = contiguous(key_cache, false, s);
-  auto vc_c = contiguous(value_cache, false, s);
+  auto kc_c = contiguous(astype(key_cache, dtype, s), false, s);
+  auto vc_c = contiguous(astype(value_cache, dtype, s), false, s);
 
   return array::make_arrays(
       {key_cache.shape(), value_cache.shape()},
-      {bfloat16, bfloat16},
+      {dtype, dtype},
       std::make_shared<RopeKvInsert>(to_stream(s)),
       {k_c, v_c, cos_c, sin_c, pos_c, slot_c, kc_c, vc_c});
 }
@@ -107,7 +108,7 @@ void RopeKvInsert::eval_gpu(
   tk::launch_kv_cache_clone(enc, key_cache_in, value_cache_in, key_out, value_out, total, tn);
   tk::launch_rope_kv_insert(
       enc, k, v, cos, sin, positions, slot_mapping, key_out, value_out,
-      num_tokens * num_kv_heads, num_kv_heads, block_size, D);
+      num_tokens * num_kv_heads, num_kv_heads, block_size, D, tn);
 }
 
 std::vector<array> RopeKvInsert::jvp(
@@ -147,22 +148,23 @@ std::vector<array> rope_kv_insert_norm(
   if (norm_weight.ndim() != 1 || norm_weight.shape(0) != D) {
     throw std::invalid_argument("rope_kv_insert_norm: norm_weight must be (D,)");
   }
-  if (k.dtype() != bfloat16 || key_cache.dtype() != bfloat16) {
-    throw std::invalid_argument("rope_kv_insert_norm: k/v/caches must be bfloat16");
+  auto dtype = k.dtype();
+  if (!(dtype == float32 || dtype == float16 || dtype == bfloat16)) {
+    throw std::invalid_argument("rope_kv_insert_norm: k must be float32, float16, or bfloat16");
   }
 
-  auto k_c = contiguous(astype(k, bfloat16, s), false, s);
-  auto v_c = contiguous(astype(v, bfloat16, s), false, s);
-  auto cos_c = contiguous(astype(cos, bfloat16, s), false, s);
-  auto sin_c = contiguous(astype(sin, bfloat16, s), false, s);
+  auto k_c = contiguous(astype(k, dtype, s), false, s);
+  auto v_c = contiguous(astype(v, dtype, s), false, s);
+  auto cos_c = contiguous(astype(cos, dtype, s), false, s);
+  auto sin_c = contiguous(astype(sin, dtype, s), false, s);
   auto pos_c = contiguous(astype(positions, int32, s), false, s);
   auto slot_c = contiguous(astype(slot_mapping, int64, s), false, s);
-  auto kc_c = contiguous(key_cache, false, s);
-  auto vc_c = contiguous(value_cache, false, s);
-  auto w_c = contiguous(astype(norm_weight, bfloat16, s), false, s);
+  auto kc_c = contiguous(astype(key_cache, dtype, s), false, s);
+  auto vc_c = contiguous(astype(value_cache, dtype, s), false, s);
+  auto w_c = contiguous(astype(norm_weight, dtype, s), false, s);
 
   return array::make_arrays(
-      {key_cache.shape(), value_cache.shape()}, {bfloat16, bfloat16},
+      {key_cache.shape(), value_cache.shape()}, {dtype, dtype},
       std::make_shared<RopeKvInsertNorm>(to_stream(s), eps, gemma),
       {k_c, v_c, cos_c, sin_c, pos_c, slot_c, kc_c, vc_c, w_c});
 }
@@ -202,7 +204,7 @@ void RopeKvInsertNorm::eval_gpu(
   tk::launch_kv_cache_clone(enc, key_cache_in, value_cache_in, key_out, value_out, total, tn);
   tk::launch_rope_kv_insert_norm(
       enc, k, v, cos, sin, positions, slot_mapping, key_out, value_out, norm_weight,
-      num_tokens * num_kv_heads, num_kv_heads, block_size, D, eps_, gemma_ ? 1 : 0);
+      num_tokens * num_kv_heads, num_kv_heads, block_size, D, eps_, gemma_ ? 1 : 0, tn);
 }
 
 std::vector<array> RopeKvInsertNorm::jvp(

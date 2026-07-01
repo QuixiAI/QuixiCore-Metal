@@ -26,14 +26,23 @@ def _rope_half(x, cos, sin):
     return np.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin], axis=-1)
 
 
+_MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
+
+
 def _bf(x):
     """Round a numpy array through bf16 (what the kernel sees on load)."""
     return np.array(mx.array(x.astype(np.float32)).astype(mx.bfloat16).astype(mx.float32))
 
 
+def _round(x, md):
+    return np.array(mx.array(x.astype(np.float32)).astype(md).astype(mx.float32))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H_KV", [1, 2])
-def test_rope_kv_insert(D, H_KV):
+def test_rope_kv_insert(dtype, D, H_KV):
+    md = _MX[dtype]
     rng = np.random.default_rng(3 + D + H_KV)
     num_blocks, block_size = 4, 4
     num_tokens = 5
@@ -48,19 +57,16 @@ def test_rope_kv_insert(D, H_KV):
     vc0 = (0.1 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
 
     kc, vc = rope_kv_insert(
-        mx.array(k).astype(mx.bfloat16),
-        mx.array(v).astype(mx.bfloat16),
-        mx.array(cos).astype(mx.bfloat16),
-        mx.array(sin).astype(mx.bfloat16),
-        mx.array(positions),
-        mx.array(slot_mapping),
-        mx.array(kc0).astype(mx.bfloat16),
-        mx.array(vc0).astype(mx.bfloat16),
+        mx.array(k).astype(md), mx.array(v).astype(md),
+        mx.array(cos).astype(md), mx.array(sin).astype(md),
+        mx.array(positions), mx.array(slot_mapping),
+        mx.array(kc0).astype(md), mx.array(vc0).astype(md),
     )
     mx.eval(kc, vc)
+    assert kc.dtype == md
 
-    kb, vb, cb, sb = _bf(k), _bf(v), _bf(cos), _bf(sin)
-    ref_k, ref_v = _bf(kc0), _bf(vc0)
+    kb, vb, cb, sb = _round(k, md), _round(v, md), _round(cos, md), _round(sin, md)
+    ref_k, ref_v = _round(kc0, md), _round(vc0, md)
     for t in range(num_tokens):
         slot = int(slot_mapping[t])
         if slot < 0:

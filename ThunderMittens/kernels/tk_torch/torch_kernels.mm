@@ -579,8 +579,8 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_norm_mps(
     const at::Tensor& sin_in, const at::Tensor& positions_in, const at::Tensor& slot_mapping_in,
     const at::Tensor& key_cache_in, const at::Tensor& value_cache_in, const at::Tensor& nw_in,
     double eps, bool gemma) {
-  TORCH_CHECK(k_in.device().is_mps() && k_in.scalar_type() == at::kBFloat16,
-              "rope_kv_insert_norm: k must be bf16 MPS");
+  TORCH_CHECK(k_in.device().is_mps() && tk_is_float_dtype(k_in),
+              "rope_kv_insert_norm: k must be float32/float16/bfloat16 MPS");
   TORCH_CHECK(k_in.dim() == 3 && v_in.sizes() == k_in.sizes(), "rope_kv_insert_norm: k/v (T,H,D)");
   const int num_tokens = k_in.size(0), num_kv_heads = k_in.size(1), D = k_in.size(2);
   TORCH_CHECK(D == 64 || D == 128, "rope_kv_insert_norm: D must be 64 or 128");
@@ -588,17 +588,18 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_norm_mps(
                   key_cache_in.size(3) == D, "rope_kv_insert_norm: cache mismatch");
   TORCH_CHECK(nw_in.dim() == 1 && nw_in.size(0) == D, "rope_kv_insert_norm: norm_weight (D,)");
   const int block_size = key_cache_in.size(1);
+  const auto dt = k_in.scalar_type();
   auto k = k_in.contiguous(), v = v_in.contiguous();
-  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto cos = cos_in.to(dt).contiguous(), sin = sin_in.to(dt).contiguous();
   auto positions = positions_in.to(at::kInt).contiguous();
   auto slot_mapping = slot_mapping_in.to(at::kLong).contiguous();
-  auto nw = nw_in.to(at::kBFloat16).contiguous();
-  auto key_out = key_cache_in.contiguous().clone();
-  auto value_out = value_cache_in.contiguous().clone();
+  auto nw = nw_in.to(dt).contiguous();
+  auto key_out = key_cache_in.to(dt).contiguous().clone();
+  auto value_out = value_cache_in.to(dt).contiguous().clone();
   tk_encode([&](TorchEncoder& e) {
     tk::launch_rope_kv_insert_norm(e, k, v, cos, sin, positions, slot_mapping, key_out, value_out,
                                    nw, num_tokens * num_kv_heads, num_kv_heads, block_size, D,
-                                   static_cast<float>(eps), gemma ? 1 : 0);
+                                   static_cast<float>(eps), gemma ? 1 : 0, tk_type_name(k));
   });
   return {key_out, value_out};
 }
@@ -924,24 +925,24 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_mps(
               "rope_kv_insert: k/v must be (num_tokens, num_kv_heads, D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
               "rope_kv_insert: caches must be (num_blocks, block_size, num_kv_heads, D)");
-  TORCH_CHECK(k_in.scalar_type() == at::kBFloat16 && key_cache_in.scalar_type() == at::kBFloat16,
-              "rope_kv_insert: k/v/caches must be bfloat16");
+  TORCH_CHECK(tk_is_float_dtype(k_in), "rope_kv_insert: k must be float32/float16/bfloat16");
   const int num_tokens = k_in.size(0), num_kv_heads = k_in.size(1), D = k_in.size(2);
   TORCH_CHECK(D == 64 || D == 128, "rope_kv_insert: D must be 64 or 128");
   TORCH_CHECK(key_cache_in.size(2) == num_kv_heads && key_cache_in.size(3) == D,
               "rope_kv_insert: cache heads/head_size must match k");
   const int block_size = key_cache_in.size(1);
+  const auto dt = k_in.scalar_type();
 
   auto k = k_in.contiguous(), v = v_in.contiguous();
-  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto cos = cos_in.to(dt).contiguous(), sin = sin_in.to(dt).contiguous();
   auto positions = positions_in.to(at::kInt).contiguous();
   auto slot_mapping = slot_mapping_in.to(at::kLong).contiguous();
   // Copy the existing caches through; the insert overwrites only the slot rows.
-  auto key_out = key_cache_in.contiguous().clone();
-  auto value_out = value_cache_in.contiguous().clone();
+  auto key_out = key_cache_in.to(dt).contiguous().clone();
+  auto value_out = value_cache_in.to(dt).contiguous().clone();
   tk_encode([&](TorchEncoder& e) {
     tk::launch_rope_kv_insert(e, k, v, cos, sin, positions, slot_mapping, key_out, value_out,
-                              num_tokens * num_kv_heads, num_kv_heads, block_size, D);
+                              num_tokens * num_kv_heads, num_kv_heads, block_size, D, tk_type_name(k));
   });
   return {key_out, value_out};
 }

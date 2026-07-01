@@ -27,15 +27,15 @@ namespace mittens {
 //
 // Ref: vLLM fused_*_qknorm_rope_kv_insert kernels (warp = one (token, head-slot)).
 // ---------------------------------------------------------------------------
-template <int D>
-kernel void rope_kv_insert(device   bf16 *k            [[buffer(0)]],
-                           device   bf16 *v            [[buffer(1)]],
-                           device   bf16 *cosb         [[buffer(2)]],
-                           device   bf16 *sinb         [[buffer(3)]],
+template <typename T, int D>
+kernel void rope_kv_insert(device   T    *k            [[buffer(0)]],
+                           device   T    *v            [[buffer(1)]],
+                           device   T    *cosb         [[buffer(2)]],
+                           device   T    *sinb         [[buffer(3)]],
                            device   const int  *positions    [[buffer(4)]],
                            device   const long *slot_mapping [[buffer(5)]],
-                           device   bf16 *key_cache    [[buffer(6)]],
-                           device   bf16 *value_cache  [[buffer(7)]],
+                           device   T    *key_cache    [[buffer(6)]],
+                           device   T    *value_cache  [[buffer(7)]],
                            constant int  &num_kv_heads [[buffer(8)]],
                            constant int  &block_size   [[buffer(9)]],
                            uint3 blockIdx [[threadgroup_position_in_grid]],
@@ -57,8 +57,8 @@ kernel void rope_kv_insert(device   bf16 *k            [[buffer(0)]],
         (block * block_size + block_offset) * (long)num_kv_heads + (long)kv_head;
     const int pos = positions[token];
 
-    using row_gl = gl<bf16, 1, 1, -1, D>;        // (M, D) source / (R, D) cache
-    using cs_gl  = gl<bf16, 1, 1, -1, D2>;       // (P, D/2)
+    using row_gl = gl<T, 1, 1, -1, D>;           // (M, D) source / (R, D) cache
+    using cs_gl  = gl<T, 1, 1, -1, D2>;          // (P, D/2)
     row_gl gl_k(k,           nullptr, nullptr, 1, nullptr);
     row_gl gl_v(v,           nullptr, nullptr, 1, nullptr);
     row_gl gl_kc(key_cache,  nullptr, nullptr, 1, nullptr);
@@ -96,16 +96,16 @@ kernel void rope_kv_insert(device   bf16 *k            [[buffer(0)]],
 // Same as rope_kv_insert, but RMSNorms K over the head dim before RoPE (fused
 // Q/K-norm + RoPE + insert, the reference pattern). norm over all D of the K row:
 // rms = rsqrt(mean(k^2)+eps); k = k*rms*w  (or k*rms*(1+w) for gemma=1). bf16.
-template <int D>
-kernel void rope_kv_insert_norm(device   bf16 *k            [[buffer(0)]],
-                                device   bf16 *v            [[buffer(1)]],
-                                device   bf16 *cosb         [[buffer(2)]],
-                                device   bf16 *sinb         [[buffer(3)]],
+template <typename T, int D>
+kernel void rope_kv_insert_norm(device   T    *k            [[buffer(0)]],
+                                device   T    *v            [[buffer(1)]],
+                                device   T    *cosb         [[buffer(2)]],
+                                device   T    *sinb         [[buffer(3)]],
                                 device   const int  *positions    [[buffer(4)]],
                                 device   const long *slot_mapping [[buffer(5)]],
-                                device   bf16 *key_cache    [[buffer(6)]],
-                                device   bf16 *value_cache  [[buffer(7)]],
-                                device   bf16 *norm_weight  [[buffer(8)]],
+                                device   T    *key_cache    [[buffer(6)]],
+                                device   T    *value_cache  [[buffer(7)]],
+                                device   T    *norm_weight  [[buffer(8)]],
                                 constant int  &num_kv_heads [[buffer(9)]],
                                 constant int  &block_size   [[buffer(10)]],
                                 constant float &eps         [[buffer(11)]],
@@ -125,8 +125,8 @@ kernel void rope_kv_insert_norm(device   bf16 *k            [[buffer(0)]],
         (block * block_size + block_offset) * (long)num_kv_heads + (long)kv_head;
     const int pos = positions[token];
 
-    using row_gl = gl<bf16, 1, 1, -1, D>;
-    using cs_gl  = gl<bf16, 1, 1, -1, D2>;
+    using row_gl = gl<T, 1, 1, -1, D>;
+    using cs_gl  = gl<T, 1, 1, -1, D2>;
     row_gl gl_k(k,            nullptr, nullptr, 1, nullptr);
     row_gl gl_v(v,            nullptr, nullptr, 1, nullptr);
     row_gl gl_kc(key_cache,   nullptr, nullptr, 1, nullptr);
@@ -165,17 +165,17 @@ kernel void rope_kv_insert_norm(device   bf16 *k            [[buffer(0)]],
     store(gl_vc, vv, {0, 0, (int)dst_row, 0}, laneId);
 }
 
-#define instantiate_rope_kv_insert_norm(DVAL)                                  \
-  template [[host_name("rope_kv_insert_norm_" #DVAL)]] [[kernel]] void         \
-  rope_kv_insert_norm<DVAL>(device bf16 *k [[buffer(0)]],                       \
-                            device bf16 *v [[buffer(1)]],                       \
-                            device bf16 *cosb [[buffer(2)]],                    \
-                            device bf16 *sinb [[buffer(3)]],                    \
+#define instantiate_rope_kv_insert_norm(type_name, T, DVAL)                    \
+  template [[host_name("rope_kv_insert_norm_" #type_name "_" #DVAL)]] [[kernel]] void \
+  rope_kv_insert_norm<T, DVAL>(device T *k [[buffer(0)]],                       \
+                            device T *v [[buffer(1)]],                          \
+                            device T *cosb [[buffer(2)]],                       \
+                            device T *sinb [[buffer(3)]],                       \
                             device const int *positions [[buffer(4)]],          \
                             device const long *slot_mapping [[buffer(5)]],      \
-                            device bf16 *key_cache [[buffer(6)]],               \
-                            device bf16 *value_cache [[buffer(7)]],             \
-                            device bf16 *norm_weight [[buffer(8)]],             \
+                            device T *key_cache [[buffer(6)]],                  \
+                            device T *value_cache [[buffer(7)]],                \
+                            device T *norm_weight [[buffer(8)]],                \
                             constant int &num_kv_heads [[buffer(9)]],           \
                             constant int &block_size [[buffer(10)]],            \
                             constant float &eps [[buffer(11)]],                 \
@@ -183,25 +183,29 @@ kernel void rope_kv_insert_norm(device   bf16 *k            [[buffer(0)]],
                             uint3 blockIdx [[threadgroup_position_in_grid]],    \
                             uint laneId [[thread_index_in_simdgroup]]);
 
-instantiate_rope_kv_insert_norm(64);
-instantiate_rope_kv_insert_norm(128);
-
-#define instantiate_rope_kv_insert(DVAL)                                       \
-  template [[host_name("rope_kv_insert_" #DVAL)]] [[kernel]] void              \
-  rope_kv_insert<DVAL>(device   bf16 *k            [[buffer(0)]],              \
-                       device   bf16 *v            [[buffer(1)]],              \
-                       device   bf16 *cosb         [[buffer(2)]],             \
-                       device   bf16 *sinb         [[buffer(3)]],             \
+#define instantiate_rope_kv_insert(type_name, T, DVAL)                         \
+  template [[host_name("rope_kv_insert_" #type_name "_" #DVAL)]] [[kernel]] void \
+  rope_kv_insert<T, DVAL>(device   T    *k            [[buffer(0)]],           \
+                       device   T    *v            [[buffer(1)]],              \
+                       device   T    *cosb         [[buffer(2)]],             \
+                       device   T    *sinb         [[buffer(3)]],             \
                        device   const int  *positions    [[buffer(4)]],       \
                        device   const long *slot_mapping [[buffer(5)]],       \
-                       device   bf16 *key_cache    [[buffer(6)]],             \
-                       device   bf16 *value_cache  [[buffer(7)]],             \
+                       device   T    *key_cache    [[buffer(6)]],             \
+                       device   T    *value_cache  [[buffer(7)]],             \
                        constant int  &num_kv_heads [[buffer(8)]],             \
                        constant int  &block_size   [[buffer(9)]],             \
                        uint3 blockIdx [[threadgroup_position_in_grid]],        \
                        uint  laneId   [[thread_index_in_simdgroup]]);
 
-instantiate_rope_kv_insert(64);
-instantiate_rope_kv_insert(128);
+#define instantiate_rope_kv_all(type_name, T)                                  \
+  instantiate_rope_kv_insert(type_name, T, 64)                                 \
+  instantiate_rope_kv_insert(type_name, T, 128)                               \
+  instantiate_rope_kv_insert_norm(type_name, T, 64)                            \
+  instantiate_rope_kv_insert_norm(type_name, T, 128)
+
+instantiate_rope_kv_all(float32, float)
+instantiate_rope_kv_all(float16, half)
+instantiate_rope_kv_all(bfloat16, bf16)
 
 }

@@ -460,8 +460,9 @@ def test_mla_kv_insert_fp8_parity():
     _assert_parity(sm_, st, atol=0)
 
 
+@pytest.mark.parametrize("dt", ["f32", "f16", "bf16"])
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
-def test_rope_kv_insert_parity(D, H_KV):
+def test_rope_kv_insert_parity(dt, D, H_KV):
     rng = np.random.default_rng(5)
     num_blocks, block_size, num_tokens = 4, 4, 5
     P = num_blocks * block_size
@@ -478,12 +479,12 @@ def test_rope_kv_insert_parity(D, H_KV):
     vc0 = (0.1 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
 
     km, vm = tk.rope_kv_insert(
-        _mk(k, "mlx"), _mk(v, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
-        mx.array(positions), mx.array(slot_mapping), _mk(kc0, "mlx"), _mk(vc0, "mlx"))
+        _mk(k, "mlx", dt), _mk(v, "mlx", dt), _mk(cos, "mlx", dt), _mk(sin, "mlx", dt),
+        mx.array(positions), mx.array(slot_mapping), _mk(kc0, "mlx", dt), _mk(vc0, "mlx", dt))
     kt, vt = tk.rope_kv_insert(
-        _mk(k, "torch"), _mk(v, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+        _mk(k, "torch", dt), _mk(v, "torch", dt), _mk(cos, "torch", dt), _mk(sin, "torch", dt),
         torch.from_numpy(positions).to("mps"), torch.from_numpy(slot_mapping).to("mps"),
-        _mk(kc0, "torch"), _mk(vc0, "torch"))
+        _mk(kc0, "torch", dt), _mk(vc0, "torch", dt))
     _assert_parity(km, kt, atol=2e-2)
     _assert_parity(vm, vt, atol=2e-2)
 

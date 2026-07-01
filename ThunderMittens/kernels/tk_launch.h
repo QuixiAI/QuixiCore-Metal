@@ -31,8 +31,12 @@ inline std::string matmul_custom_kernel_name(const std::string& t) { return "mat
 inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
 inline std::string rms_norm_add_kernel_name(int D) { return "rms_norm_add_" + std::to_string(D); }
 inline std::string layernorm_add_kernel_name(int D) { return "layernorm_add_" + std::to_string(D); }
-inline std::string rope_kv_insert_kernel_name(int D) { return "rope_kv_insert_" + std::to_string(D); }
-inline std::string rope_kv_insert_norm_kernel_name(int D) { return "rope_kv_insert_norm_" + std::to_string(D); }
+inline std::string rope_kv_insert_kernel_name(const std::string& t, int D) {
+  return "rope_kv_insert_" + t + "_" + std::to_string(D);
+}
+inline std::string rope_kv_insert_norm_kernel_name(const std::string& t, int D) {
+  return "rope_kv_insert_norm_" + t + "_" + std::to_string(D);
+}
 inline std::string rms_norm_add_fp8_kernel_name(int D) { return "rms_norm_add_fp8_" + std::to_string(D); }
 inline std::string rms_norm_add_fp8_dyn_kernel_name(int D) { return "rms_norm_add_fp8_dyn_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_kernel_name(int D) { return "layernorm_add_fp8_" + std::to_string(D); }
@@ -216,8 +220,9 @@ void launch_rope_kv_insert(E& e, typename E::in_t k, typename E::in_t v,
                            typename E::in_t cos, typename E::in_t sin,
                            typename E::in_t positions, typename E::in_t slot_mapping,
                            typename E::out_t key_cache, typename E::out_t value_cache,
-                           int M, int num_kv_heads, int block_size, int D) {
-  e.pipeline(rope_kv_insert_kernel_name(D));
+                           int M, int num_kv_heads, int block_size, int D,
+                           const std::string& type_name) {
+  e.pipeline(rope_kv_insert_kernel_name(type_name, D));
   e.in(k, 0); e.in(v, 1); e.in(cos, 2); e.in(sin, 3);
   e.in(positions, 4); e.in(slot_mapping, 5);
   e.out(key_cache, 6); e.out(value_cache, 7);
@@ -232,8 +237,9 @@ void launch_rope_kv_insert_norm(E& e, typename E::in_t k, typename E::in_t v,
                                 typename E::in_t positions, typename E::in_t slot_mapping,
                                 typename E::out_t key_cache, typename E::out_t value_cache,
                                 typename E::in_t norm_weight, int M, int num_kv_heads,
-                                int block_size, int D, float eps, int gemma) {
-  e.pipeline(rope_kv_insert_norm_kernel_name(D));
+                                int block_size, int D, float eps, int gemma,
+                                const std::string& type_name) {
+  e.pipeline(rope_kv_insert_norm_kernel_name(type_name, D));
   e.in(k, 0); e.in(v, 1); e.in(cos, 2); e.in(sin, 3);
   e.in(positions, 4); e.in(slot_mapping, 5);
   e.out(key_cache, 6); e.out(value_cache, 7); e.in(norm_weight, 8);
