@@ -166,6 +166,58 @@ void MoeFinalize::eval_gpu(
   tk::launch_moe_finalize(enc, expert_out, inv_idx, weights, out, T, k_, Hdim, type_to_name(out));
 }
 
+// ----------------------------- moe_grouped_gemm -----------------------------
+
+array moe_grouped_gemm(
+    const array& permuted_input, const array& W, const array& expert_of_tile, StreamOrDevice s) {
+  if (permuted_input.ndim() != 2) {
+    throw std::invalid_argument("moe_grouped_gemm: permuted_input must be (total_rows, H)");
+  }
+  if (W.ndim() != 3) {
+    throw std::invalid_argument("moe_grouped_gemm: W must be (num_experts, H, H)");
+  }
+  const int total_rows = permuted_input.shape(0);
+  const int H = permuted_input.shape(1);
+  if (total_rows % 32 != 0 || H % 32 != 0) {
+    throw std::invalid_argument("moe_grouped_gemm: total_rows and H must be multiples of 32");
+  }
+  if (W.shape(1) != H || W.shape(2) != H) {
+    throw std::invalid_argument("moe_grouped_gemm: W must be (E, H, H)");
+  }
+  if (expert_of_tile.ndim() != 1 || expert_of_tile.shape(0) != total_rows / 32) {
+    throw std::invalid_argument("moe_grouped_gemm: expert_of_tile must be (total_rows/32,)");
+  }
+  auto dtype = permuted_input.dtype();
+  if (!(dtype == float32 || dtype == bfloat16)) {
+    throw std::invalid_argument("moe_grouped_gemm: dtype must be float32 or bfloat16");
+  }
+  auto a = contiguous(permuted_input, false, s);
+  auto w = contiguous(astype(W, dtype, s), false, s);
+  auto eot = contiguous(astype(expert_of_tile, int32, s), false, s);
+  return array(
+      {total_rows, H}, dtype, std::make_shared<MoeGroupedGemm>(to_stream(s)), {a, w, eot});
+}
+
+void MoeGroupedGemm::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGroupedGemm has no CPU implementation.");
+}
+
+void MoeGroupedGemm::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& a = inputs[0];
+  auto& w = inputs[1];
+  auto& eot = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int total_rows = a.shape(0);
+  const int H = a.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_grouped_gemm(enc, out, a, w, eot, total_rows, H, type_to_name(a));
+}
+
 #define TK_MOE_NO_AUTODIFF(CLASS, LABEL)                                     \
   std::vector<array> CLASS::jvp(                                             \
       const std::vector<array>&, const std::vector<array>&,                  \
@@ -184,5 +236,6 @@ void MoeFinalize::eval_gpu(
 
 TK_MOE_NO_AUTODIFF(MoePermute, "MoePermute")
 TK_MOE_NO_AUTODIFF(MoeFinalize, "MoeFinalize")
+TK_MOE_NO_AUTODIFF(MoeGroupedGemm, "MoeGroupedGemm")
 
 } // namespace mlx::core

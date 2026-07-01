@@ -131,6 +131,25 @@ def test_rms_norm_add_parity(shape):
     _assert_parity(am, at, atol=1e-2)
 
 
+@pytest.mark.parametrize("H", [64, 128])
+def test_moe_grouped_gemm_parity(H):
+    rng = np.random.default_rng(5)
+    E = 4
+    counts = [40, 5, 70, 20]
+    padded = [((c + 31) // 32) * 32 for c in counts]
+    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    total = int(off_pad[-1])
+    tb = off_pad // 32
+    eot = np.zeros(total // 32, np.int32)
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    pi = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, H, H))).astype(np.float32)
+    om = tk.moe_grouped_gemm(_mk(pi, "mlx"), _mk(W, "mlx"), mx.array(eot))
+    ot = tk.moe_grouped_gemm(_mk(pi, "torch"), _mk(W, "torch"), torch.from_numpy(eot).to("mps"))
+    _assert_parity(om, ot, atol=6e-2)
+
+
 @pytest.mark.parametrize("E,K", [(8, 2), (64, 4)])
 def test_moe_route_topk_parity(E, K):
     rng = np.random.default_rng(0)

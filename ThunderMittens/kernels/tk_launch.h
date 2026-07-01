@@ -39,6 +39,7 @@ inline std::string layernorm_add_fp8_dyn_kernel_name(int D) { return "layernorm_
 inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" + t; }
 inline std::string moe_route_topk_kernel_name(const std::string& t) { return "moe_route_topk_" + t; }
 inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_finalize_" + t; }
+inline std::string moe_grouped_gemm_kernel_name(const std::string& t) { return "moe_grouped_gemm_" + t; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
 inline std::string top_k_sample_kernel_name(const std::string& t) { return "top_k_sample_" + t; }
 inline std::string top_p_sample_kernel_name(const std::string& t) { return "top_p_sample_" + t; }
@@ -239,6 +240,18 @@ void launch_moe_scatter(Enc& e, typename Enc::in_t topk_ids, typename Enc::out_t
   e.pipeline("moe_scatter");
   e.in(topk_ids, 0); e.out(cursor, 1); e.out(sorted_row_idx, 2); e.out(inv_idx, 3); e.bytes(TK, 4);
   e.dispatch((TK + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- moe_grouped_gemm: out@0 A@1(permuted_input) W@2(E,H,H) expert_of_tile@3(i32) ;
+//        total_rows@4 H@5 ; grid (H/32, total_rows/32, 1), 32 thr. out = A @ W[expert]. -----
+template <class Enc>
+void launch_moe_grouped_gemm(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
+                             typename Enc::in_t W, typename Enc::in_t expert_of_tile,
+                             int total_rows, int H, const std::string& type_name) {
+  e.pipeline(moe_grouped_gemm_kernel_name(type_name));
+  e.out(out, 0); e.in(A, 1); e.in(W, 2); e.in(expert_of_tile, 3);
+  e.bytes(total_rows, 4); e.bytes(H, 5);
+  e.dispatch(H / 32, total_rows / 32, 1, 32, 1, 1);
 }
 
 // ----- moe_finalize: expert_out@0 inv_idx@1(i32) topk_weights@2(f32) -> out@3 ; K@4 Hdim@5 ;

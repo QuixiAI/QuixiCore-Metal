@@ -292,6 +292,17 @@ def moe_permute(topk_ids, num_experts):
     return sorted_idx, offsets, inv_idx
 
 
+def moe_grouped_gemm(permuted_input, W, expert_of_tile):
+    """Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).
+
+    permuted_input (total_rows, H) grouped by expert (segments padded to 32); W (E, H, H);
+    expert_of_tile (total_rows/32,). Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(permuted_input):
+        return _torch().moe_grouped_gemm(permuted_input, W, expert_of_tile)
+    return _mlx().moe_grouped_gemm(permuted_input, W, expert_of_tile)
+
+
 def moe_finalize(expert_out, inv_idx, topk_weights, k):
     """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
 

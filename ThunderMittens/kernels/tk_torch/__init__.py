@@ -278,6 +278,11 @@ def moe_permute(topk_ids: torch.Tensor, num_experts: int):
     return _ext.moe_permute(topk_ids, int(num_experts))
 
 
+def moe_grouped_gemm(permuted_input, W, expert_of_tile):
+    """Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H). MPS."""
+    return _ext.moe_grouped_gemm(permuted_input, W, expert_of_tile)
+
+
 def moe_finalize(expert_out: torch.Tensor, inv_idx: torch.Tensor, topk_weights: torch.Tensor, k: int):
     """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim). MPS."""
     return _ext.moe_finalize(expert_out, inv_idx, topk_weights, int(k))

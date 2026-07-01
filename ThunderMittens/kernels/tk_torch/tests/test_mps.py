@@ -331,6 +331,34 @@ def test_moe_permute_and_finalize():
     np.testing.assert_allclose(y, ref, atol=1e-4)
 
 
+@pytest.mark.parametrize("H", [64, 128])
+def test_moe_grouped_gemm(H):
+    import numpy as np
+    rng = np.random.default_rng(5)
+    E = 4
+    counts = [40, 5, 70, 20]
+    padded = [((c + 31) // 32) * 32 for c in counts]
+    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    total = int(off_pad[-1])
+    tb = off_pad // 32
+    eot = np.zeros(total // 32, np.int32)
+    for e in range(E):
+        eot[tb[e]:tb[e + 1]] = e
+    pi = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, H, H))).astype(np.float32)
+    out = tk_torch.moe_grouped_gemm(
+        torch.from_numpy(pi).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(W).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(eot).to("mps")).float().cpu().numpy()
+    pir = torch.from_numpy(pi).to(torch.bfloat16).float().numpy()
+    Wr = torch.from_numpy(W).to(torch.bfloat16).float().numpy()
+    ref = np.zeros((total, H), np.float32)
+    for e in range(E):
+        s, en = int(off_pad[e]), int(off_pad[e + 1])
+        ref[s:en] = pir[s:en] @ Wr[e]
+    assert _maxdiff(torch.from_numpy(out).to("mps"), torch.from_numpy(ref).to("mps")) < 0.08
+
+
 def test_moe_forward_end_to_end():
     import numpy as np
     rng = np.random.default_rng(2)

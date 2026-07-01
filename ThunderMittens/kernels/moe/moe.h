@@ -33,6 +33,15 @@ array moe_finalize(
     const array& expert_out, const array& inv_idx, const array& topk_weights, int k,
     StreamOrDevice s = {});
 
+/**
+ *  Fused grouped expert GEMM: out = permuted_input @ W[expert]. permuted_input (total_rows, H)
+ *  with rows grouped by expert, each segment padded to a 32-multiple; W (E, H, H);
+ *  expert_of_tile (total_rows/32,) int32 gives the expert of each 32-row tile. Returns
+ *  (total_rows, H). float32/bfloat16; requires total_rows % 32 == 0 and H % 32 == 0.
+ **/
+array moe_grouped_gemm(
+    const array& permuted_input, const array& W, const array& expert_of_tile, StreamOrDevice s = {});
+
 class MoeRouteTopk : public Primitive {
  public:
   MoeRouteTopk(Stream stream, int k) : Primitive(stream), k_(k) {}
@@ -75,6 +84,23 @@ class MoePermute : public Primitive {
 
  private:
   int num_experts_;
+};
+
+class MoeGroupedGemm : public Primitive {
+ public:
+  explicit MoeGroupedGemm(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemm"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemm"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
 };
 
 class MoeFinalize : public Primitive {

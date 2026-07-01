@@ -734,6 +734,24 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> moe_permute_mps(
   return {sorted, offsets, inv};
 }
 
+// Fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).
+static at::Tensor moe_grouped_gemm_mps(const at::Tensor& pi_in, const at::Tensor& W_in,
+                                       const at::Tensor& eot_in) {
+  TORCH_CHECK(pi_in.device().is_mps(), "moe_grouped_gemm: permuted_input must be an MPS tensor");
+  TORCH_CHECK(pi_in.dim() == 2 && W_in.dim() == 3, "moe_grouped_gemm: shapes (total_rows,H) / (E,H,H)");
+  TORCH_CHECK(tk_is_float_dtype(pi_in), "moe_grouped_gemm: dtype must be float32/float16/bfloat16");
+  const int total_rows = pi_in.size(0), H = pi_in.size(1);
+  TORCH_CHECK(total_rows % 32 == 0 && H % 32 == 0, "moe_grouped_gemm: total_rows,H must be %32");
+  TORCH_CHECK(W_in.size(1) == H && W_in.size(2) == H, "moe_grouped_gemm: W must be (E,H,H)");
+  auto pi = pi_in.contiguous(), W = W_in.contiguous();
+  auto eot = eot_in.to(at::kInt).contiguous();
+  auto out = at::empty({total_rows, H}, pi.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_grouped_gemm(e, out, pi, W, eot, total_rows, H, tk_type_name(pi));
+  });
+  return out;
+}
+
 // MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
 static at::Tensor moe_finalize_mps(const at::Tensor& expert_out_in, const at::Tensor& inv_in,
                                    const at::Tensor& w_in, int64_t k) {
@@ -1334,6 +1352,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
+  m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_finalize", &moe_finalize_mps, "ThunderMittens MoE finalize reduce (MPS)");
   m.def("argmax_sample", &argmax_sample_mps, "ThunderMittens greedy argmax sampling (MPS)");
   m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");

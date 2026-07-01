@@ -169,6 +169,63 @@ kernel void moe_finalize(device const T     *expert_out   [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// Fused grouped (segmented) expert GEMM: out = permuted_input @ W[expert].
+// Rows are grouped by expert with each expert's segment padded to a 32-multiple
+// (moe_align pattern), so every 32-row output tile belongs to exactly one expert
+// and the unmasked full-tile load/store/mma apply verbatim. Copy of matmul_custom
+// (<4,2,4> -> 32x32 tile, K-step 16, fp32 accumulate) with a per-expert W base
+// pointer and an expert_of_tile lookup. permuted_input/out are (total_rows, H);
+// W is (E, H, H); expert_of_tile is (total_rows/32,). Requires H % 32 == 0.
+// ---------------------------------------------------------------------------
+template <typename T, unsigned N_BLOCK, unsigned K_BLOCK, unsigned M_BLOCK>
+kernel void moe_grouped_gemm(device T *out                       [[buffer(0)]],
+                             device T *A                         [[buffer(1)]],
+                             device T *W                         [[buffer(2)]],
+                             device const int *expert_of_tile    [[buffer(3)]],
+                             constant int &total_rows            [[buffer(4)]],
+                             constant int &H                     [[buffer(5)]],
+                             uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                             uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;   // global row-tile (32 rows)
+    const int OX = (int)threadgroup_id.x;   // output column-tile (in H)
+    const int e = expert_of_tile[OY];
+
+    using global_layout = gl<T, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, H);
+    global_layout gl_w(W + (long)e * H * H, nullptr, nullptr, H, H);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, H);
+
+    constexpr const int N_BE = N_BLOCK * TILE_DIM;   // 32
+    constexpr const int M_BE = M_BLOCK * TILE_DIM;   // 32
+    constexpr const int K_BE = K_BLOCK * TILE_DIM;   // 16
+    rt<T, N_BE, K_BE> a_reg;
+    rt<T, K_BE, M_BE> b_reg;
+    rt<float, N_BE, M_BE> d_reg;
+    zero(d_reg);
+    #pragma clang loop unroll(full)
+    for (int k = 0; k < H / K_BE; k++) {
+        load(a_reg, gl_a, {0, 0, OY, k}, simd_lane_id);
+        load(b_reg, gl_w, {0, 0, k, OX}, simd_lane_id);
+        mma_AB(d_reg, a_reg, b_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, OY, OX}, simd_lane_id);
+}
+
+#define instantiate_moe_grouped_gemm(type_name, T)                             \
+  template [[host_name("moe_grouped_gemm_" #type_name)]] [[kernel]] void        \
+  moe_grouped_gemm<T, 4, 2, 4>(device T *out [[buffer(0)]],                     \
+                               device T *A [[buffer(1)]],                       \
+                               device T *W [[buffer(2)]],                       \
+                               device const int *expert_of_tile [[buffer(3)]],  \
+                               constant int &total_rows [[buffer(4)]],          \
+                               constant int &H [[buffer(5)]],                   \
+                               uint3 threadgroup_id [[threadgroup_position_in_grid]], \
+                               uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+instantiate_moe_grouped_gemm(float32, float)
+instantiate_moe_grouped_gemm(bfloat16, bf16)
+
 #define instantiate_moe_finalize(type_name, T)                                 \
   template [[host_name("moe_finalize_" #type_name)]] [[kernel]] void           \
   moe_finalize<T>(device const T *expert_out [[buffer(0)]],                    \

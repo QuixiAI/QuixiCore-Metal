@@ -266,6 +266,13 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "moe_grouped_gemm",
+      &moe_grouped_gemm,
+      "permuted_input"_a, "W"_a, "expert_of_tile"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused grouped expert GEMM: out = permuted_input @ W[expert]. Returns (total_rows, H).)");
+
+    m.def(
       "moe_finalize",
       &moe_finalize,
       "expert_out"_a,

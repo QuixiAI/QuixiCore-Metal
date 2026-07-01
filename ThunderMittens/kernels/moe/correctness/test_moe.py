@@ -10,7 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import moe_route_topk, moe_permute, moe_finalize
+from tk import moe_route_topk, moe_permute, moe_finalize, moe_grouped_gemm
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -119,6 +119,39 @@ def test_moe_forward_end_to_end(E, K):
         for j in range(K):
             ref[t] += w[t, j] * (x[t] @ W[ids[t, j]])
     np.testing.assert_allclose(y, ref, atol=1e-3, rtol=1e-3)
+
+
+def _padded_schedule(counts):
+    padded = [((int(c) + 31) // 32) * 32 for c in counts]
+    off_pad = np.concatenate([[0], np.cumsum(padded)]).astype(np.int64)
+    total = int(off_pad[-1])
+    tile_base = (off_pad // 32).astype(np.int64)
+    eot = np.zeros(total // 32, np.int32)
+    for e in range(len(counts)):
+        eot[tile_base[e]:tile_base[e + 1]] = e
+    return off_pad, total, eot
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-4), ("bfloat16", 8e-2)])
+@pytest.mark.parametrize("H", [64, 128])
+def test_moe_grouped_gemm(dtype, atol, H):
+    rng = np.random.default_rng(5)
+    E = 4
+    counts = [40, 5, 70, 20]  # per-expert token counts -> padded [64,32,96,32], total 224
+    off_pad, total, eot = _padded_schedule(counts)
+    pi = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, H, H))).astype(np.float32)
+    md = {"float32": mx.float32, "bfloat16": mx.bfloat16}[dtype]
+    pim, Wm = mx.array(pi).astype(md), mx.array(W).astype(md)
+    out = moe_grouped_gemm(pim, Wm, mx.array(eot))
+    mx.eval(out)
+    pir = np.array(pim.astype(mx.float32))
+    Wr = np.array(Wm.astype(mx.float32))
+    ref = np.zeros((total, H), np.float32)
+    for e in range(E):
+        s, en = int(off_pad[e]), int(off_pad[e + 1])
+        ref[s:en] = pir[s:en] @ Wr[e]
+    np.testing.assert_allclose(np.array(out.astype(mx.float32)), ref, atol=atol, rtol=2e-2)
 
 
 if __name__ == "__main__":
