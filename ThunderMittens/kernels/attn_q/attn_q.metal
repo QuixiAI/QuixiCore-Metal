@@ -7,7 +7,9 @@ namespace mittens {
 // attn_fwd (online softmax, one simdgroup per 8-row Q tile); the only change is the K/V loads:
 //   - K (col-layout, B operand of mma_ABt) -> dequant_into_shared -> col load (the register
 //     dequant only emits row-layout, so K must go through the threadgroup tile).
-//   - V (row-layout, B operand of mma_AB)  -> dequant straight into the register fragment.
+//   - V (row-layout, B operand of mma_AB)  -> also dequant_into_shared -> row load. The gathered
+//     per-element dequant_into_register was measured 2.5-3x slower than staging: the fragment
+//     lane map only exposes 2-element spans, so every element re-unpacked its block scales.
 // Kq/Vq are uchar (B,H,N, D/block_k, block_bytes), each (b,h) slice an (N,D) matrix quantized along D.
 constant constexpr const int TNQ = 8;
 
@@ -37,7 +39,7 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
     device const uchar* Kbh = Kq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
     device const uchar* Vbh = Vq + (uint)((block * (int)H + head) * (int)N) * bpr * FMT::block_bytes;
 
-    threadgroup st<half, TNQ, D> sK;
+    threadgroup st<half, TNQ, D> sK, sV;
     rt_qkv q_reg; rt_k_t k_reg; rt_qkv v_reg; rt_att att_block; rt_o o_reg;
     rv_att max_vec_last, max_vec, norm_vec;
 
@@ -48,6 +50,7 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
 
     for (int kv_idx = 0; kv_idx <= kv_last; kv_idx++) {
         dequant_into_shared<FMT, TNQ, D>(sK, Kbh, (int)N, D, kv_idx, 0, 32, tid);   // K -> shared (half)
+        dequant_into_shared<FMT, TNQ, D>(sV, Vbh, (int)N, D, kv_idx, 0, 32, tid);   // V -> shared (half)
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);
         load(k_reg, sK, laneId);                                                    // shared -> col reg (K^T)
         zero(att_block);
@@ -60,9 +63,9 @@ kernel void attn_q(device   bf16     *q  [[buffer(0)]],
         mul(norm_vec, norm_vec, max_vec_last);
         row_sum(norm_vec, att_block, norm_vec, laneId);
         mul_row(o_reg, o_reg, max_vec_last);
-        dequant_into_register<FMT>(v_reg, Vbh, (int)N, D, kv_idx, 0, laneId);       // V -> row reg
+        load(v_reg, sV, laneId);                                                    // shared -> row reg
         mma_AB(o_reg, att_block, v_reg, o_reg);
-        threadgroup_barrier(metal::mem_flags::mem_threadgroup);                     // before sK reuse
+        threadgroup_barrier(metal::mem_flags::mem_threadgroup);                     // before sK/sV reuse
     }
     div_row(o_reg, o_reg, norm_vec);
     store(gl_o, o_reg, {block, head, q_seq, 0}, laneId);

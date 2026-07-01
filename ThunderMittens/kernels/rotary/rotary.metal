@@ -12,9 +12,12 @@ namespace mittens {
 //     o1 = x1*cos - x2*sin
 //     o2 = x2*cos + x1*sin
 //
-// cos/sin are precomputed and passed in (the kernel needs no trig op). One
-// simdgroup (32 lanes) processes one (b,h,n) row; x is flattened to (M, D) with
-// M = B*H*N, and the sequence position is n = row % N.
+// cos/sin are precomputed and passed in (the kernel needs no trig op).
+// Geometry: FLAT — one thread per 4 rotation pairs (vectorized bf16_4
+// loads/stores), 256-thread groups. The previous one-simdgroup-per-row layout
+// gave each threadgroup only D elements of work and scalar substrate loads,
+// measuring ~2.3x slower than mx.fast.rope; this shape matches it.
+// x is flattened to (M, D) with M = B*H*N; the sequence position is row % N.
 // ---------------------------------------------------------------------------
 template <int D>
 kernel void rotary(device   bf16 *x    [[buffer(0)]],
@@ -22,41 +25,23 @@ kernel void rotary(device   bf16 *x    [[buffer(0)]],
                    device   bf16 *sinb [[buffer(2)]],
                    device   bf16 *o    [[buffer(3)]],
                    constant uint &N    [[buffer(4)]],   // sequence length
-                   uint3 blockIdx [[threadgroup_position_in_grid]],
-                   uint  laneId   [[thread_index_in_simdgroup]]) {
+                   constant uint &M    [[buffer(5)]],   // rows = B*H*N
+                   uint tid [[thread_position_in_grid]]) {
     constexpr int D2 = D / 2;
-    static_assert(D2 % TILE_DIM == 0, "D/2 must be divisible by 8");
-    const int row = blockIdx.x;
-    const int n = row % (int)N;   // sequence position for this row
+    static_assert(D2 % 4 == 0, "D/2 must be divisible by 4");
+    constexpr int QPR = D2 / 4;                  // 4-pair quads per row
+    if (tid >= M * (uint)QPR) return;
+    const int row = (int)(tid / QPR);
+    const int p4  = (int)(tid % QPR) * 4;        // first pair index of this quad
+    const long xb = (long)row * D;
+    const long cs = (long)(row % (int)N) * D2 + p4;
 
-    // x/out are (M, D); the two halves are columns [0,D/2) and [D/2,D) selected
-    // by coord .c (get<VEC> offsets by c * VEC::length = c * D/2). rows is
-    // unused for indexing when b=d=0, so a dummy of 1 is fine.
-    using row_gl = gl<bf16, 1, 1, -1, D>;
-    using cs_gl  = gl<bf16, 1, 1, -1, D2>;   // (N, D/2)
-    row_gl gl_x(x, nullptr, nullptr, 1, nullptr);
-    row_gl gl_o(o, nullptr, nullptr, 1, nullptr);
-    cs_gl  gl_c(cosb, nullptr, nullptr, N, nullptr);
-    cs_gl  gl_s(sinb, nullptr, nullptr, N, nullptr);
-
-    using vecH = rv_fl<D2>;
-    vecH x1, x2, cv, sv, o1, o2, tmp;
-    load(x1, gl_x, {0, 0, row, 0}, laneId);   // first half
-    load(x2, gl_x, {0, 0, row, 1}, laneId);   // second half
-    load(cv, gl_c, {0, 0, n,   0}, laneId);
-    load(sv, gl_s, {0, 0, n,   0}, laneId);
-
-    // o1 = x1*cos - x2*sin
-    mul(o1, x1, cv);
-    mul(tmp, x2, sv);
-    sub(o1, o1, tmp);
-    // o2 = x2*cos + x1*sin
-    mul(o2, x2, cv);
-    mul(tmp, x1, sv);
-    add(o2, o2, tmp);
-
-    store(gl_o, o1, {0, 0, row, 0}, laneId);
-    store(gl_o, o2, {0, 0, row, 1}, laneId);
+    const float4 a = float4(((device const bf16_4*)(x + xb + p4))[0]);
+    const float4 b = float4(((device const bf16_4*)(x + xb + D2 + p4))[0]);
+    const float4 c = float4(((device const bf16_4*)(cosb + cs))[0]);
+    const float4 s = float4(((device const bf16_4*)(sinb + cs))[0]);
+    ((device bf16_4*)(o + xb + p4))[0]      = bf16_4(a * c - b * s);
+    ((device bf16_4*)(o + xb + D2 + p4))[0] = bf16_4(b * c + a * s);
 }
 
 #define instantiate_rotary(DVAL)                                              \
@@ -66,8 +51,8 @@ kernel void rotary(device   bf16 *x    [[buffer(0)]],
                device   bf16 *sinb [[buffer(2)]],                            \
                device   bf16 *o    [[buffer(3)]],                            \
                constant uint &N    [[buffer(4)]],                            \
-               uint3 blockIdx [[threadgroup_position_in_grid]],              \
-               uint  laneId   [[thread_index_in_simdgroup]]);
+               constant uint &M    [[buffer(5)]],                            \
+               uint tid [[thread_position_in_grid]]);
 
 instantiate_rotary(64);
 instantiate_rotary(128);
@@ -77,10 +62,8 @@ instantiate_rotary(128);
 // Rotates adjacent pairs (x[2p], x[2p+1]) rather than the two halves:
 //     o[2p]   = x[2p]*cos[p] - x[2p+1]*sin[p]
 //     o[2p+1] = x[2p]*sin[p] + x[2p+1]*cos[p]
-// cos/sin are (N, D/2) as before (one entry per pair). Instead of the strided
-// rv_fl load (whose column map w*32+lane splits an interleaved pair across two
-// lanes), each lane owns D/32 CONTIGUOUS elements = D/64 within-lane pairs, so a
-// pair is always resident in one lane — no cross-lane shuffle. Needs D%64==0.
+// cos/sin are (N, D/2) (one entry per pair). Same flat geometry: one thread
+// per 4 pairs = 8 contiguous elements (two bf16_4 loads), pairs stay in-lane.
 // ---------------------------------------------------------------------------
 template <int D>
 kernel void rotary_interleaved(device   bf16 *x    [[buffer(0)]],
@@ -88,24 +71,27 @@ kernel void rotary_interleaved(device   bf16 *x    [[buffer(0)]],
                                device   bf16 *sinb [[buffer(2)]],
                                device   bf16 *o    [[buffer(3)]],
                                constant uint &N    [[buffer(4)]],
-                               uint3 blockIdx [[threadgroup_position_in_grid]],
-                               uint  laneId   [[thread_index_in_simdgroup]]) {
-    static_assert(D % 64 == 0, "interleaved rotary needs D divisible by 64");
-    constexpr int PER_LANE = D / 32;        // contiguous elements owned by this lane
-    constexpr int PAIRS = PER_LANE / 2;     // within-lane pairs = D/64
-    const int row = blockIdx.x;
-    const int n = row % (int)N;
-    const long xbase = (long)row * D + (long)laneId * PER_LANE;
-    const long csbase = (long)n * (D / 2);
-    for (int j = 0; j < PAIRS; ++j) {
-        const int p = (int)laneId * PAIRS + j;      // global pair index
-        const float xe = float(x[xbase + 2 * j]);
-        const float xo = float(x[xbase + 2 * j + 1]);
-        const float c = float(cosb[csbase + p]);
-        const float s = float(sinb[csbase + p]);
-        o[xbase + 2 * j]     = bf16(xe * c - xo * s);
-        o[xbase + 2 * j + 1] = bf16(xe * s + xo * c);
-    }
+                               constant uint &M    [[buffer(5)]],
+                               uint tid [[thread_position_in_grid]]) {
+    constexpr int D2 = D / 2;
+    static_assert(D % 8 == 0, "interleaved rotary needs D divisible by 8");
+    constexpr int QPR = D2 / 4;
+    if (tid >= M * (uint)QPR) return;
+    const int row = (int)(tid / QPR);
+    const int p4  = (int)(tid % QPR) * 4;
+    const long xb = (long)row * D + 2 * p4;      // 8 contiguous elements
+    const long cs = (long)(row % (int)N) * D2 + p4;
+
+    const float4 e0 = float4(((device const bf16_4*)(x + xb))[0]);      // pairs p4, p4+1
+    const float4 e1 = float4(((device const bf16_4*)(x + xb + 4))[0]);  // pairs p4+2, p4+3
+    const float4 c = float4(((device const bf16_4*)(cosb + cs))[0]);
+    const float4 s = float4(((device const bf16_4*)(sinb + cs))[0]);
+    ((device bf16_4*)(o + xb))[0] = bf16_4(float4(
+        e0.x * c.x - e0.y * s.x, e0.x * s.x + e0.y * c.x,
+        e0.z * c.y - e0.w * s.y, e0.z * s.y + e0.w * c.y));
+    ((device bf16_4*)(o + xb + 4))[0] = bf16_4(float4(
+        e1.x * c.z - e1.y * s.z, e1.x * s.z + e1.y * c.z,
+        e1.z * c.w - e1.w * s.w, e1.z * s.w + e1.w * c.w));
 }
 
 #define instantiate_rotary_interleaved(DVAL)                                   \
@@ -115,8 +101,8 @@ kernel void rotary_interleaved(device   bf16 *x    [[buffer(0)]],
                            device   bf16 *sinb [[buffer(2)]],                  \
                            device   bf16 *o    [[buffer(3)]],                  \
                            constant uint &N    [[buffer(4)]],                  \
-                           uint3 blockIdx [[threadgroup_position_in_grid]],    \
-                           uint  laneId   [[thread_index_in_simdgroup]]);
+                           constant uint &M    [[buffer(5)]],                  \
+                           uint tid [[thread_position_in_grid]]);
 
 instantiate_rotary_interleaved(64);
 instantiate_rotary_interleaved(128);

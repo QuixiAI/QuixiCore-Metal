@@ -848,16 +848,23 @@ template<typename FMT, int BN, int BK>
 METAL_FUNC void dequant_into_shared(threadgroup st<half, BN, BK>& dst,
                                     device const uchar* Wq, int N, int K,
                                     int by, int kb, int group_threads, uint threadIdx) {
+    static_assert(BK % 8 == 0, "dequant_into_shared: BK must be a multiple of 8");
     const int blocks_per_row = K / FMT::block_k;
-    for (int e = (int)threadIdx; e < BN * BK; e += group_threads) {
-        const int row  = e / BK;
-        const int tcol = e % BK;
+    // one 8-col span per step: tk_dequant8 unpacks the block/sub-block scales once per span
+    // instead of once per element (a span never straddles a quant block: block_k % 8 == 0).
+    constexpr int SPANS_PER_ROW = BK / 8;
+    for (int s = (int)threadIdx; s < BN * SPANS_PER_ROW; s += group_threads) {
+        const int row  = s / SPANS_PER_ROW;
+        const int tcol = (s % SPANS_PER_ROW) * 8;
         const int grow = by * BN + row;
         const int gk   = kb * BK + tcol;                 // global K column
         const int blk  = gk / FMT::block_k;              // which quant block
         const int cib  = gk % FMT::block_k;              // column within that block
         device const uchar* base = Wq + (uint)(grow * blocks_per_row + blk) * FMT::block_bytes;
-        dst[int2(row, tcol)] = FMT::dequant(base, cib);
+        half w[8];
+        tk_dequant8<FMT>(base, cib, w);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) dst[int2(row, tcol + i)] = w[i];
     }
 }
 

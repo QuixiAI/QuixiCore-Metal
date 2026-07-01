@@ -131,14 +131,19 @@ void launch_layernorm(E& e, typename E::in_t x, typename E::in_t w, typename E::
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 
-// ----- add_rt: x@0 y@1 -> out@2 ; rows@3(i32) cols@4(i32) ; grid (cols/8, rows/8, 1) -----
+// ----- add_rt: x@0 y@1 -> out@2 ; rows@3(i32) cols@4(i32) ; flat, one thread per 4 elements
+// (vec4). The original 8x8-register-tile version measured 0.34x of mx add (64 elements per
+// 32-thread group, 2-element gathers); the rt load/add/store path stays covered by the Xcode
+// primitive tests and every MMA kernel. -----
 template <class E>
 void launch_add_rt(E& e, typename E::in_t x, typename E::in_t y, typename E::out_t o,
                    int rows, int cols, const std::string& type_name) {
   e.pipeline(add_rt_kernel_name(type_name));
   e.in(x, 0); e.in(y, 1); e.out(o, 2);
   e.bytes(rows, 3); e.bytes(cols, 4);
-  e.dispatch(cols / 8, rows / 8, 1, 32, 1, 1);
+  const long n = (long)rows * cols;
+  const long nthreads = (n + 7) / 8;
+  e.dispatch(static_cast<int>((nthreads + 255) / 256), 1, 1, 256, 1, 1);
 }
 
 // ----- matmul_custom: D(out)@0 A@1 B@2 ; N@3 K@4 M@5 (i32) ; grid (M/32, N/32, 1) -----
@@ -510,16 +515,17 @@ void launch_softmax(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, i
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 
-// ----- rotary (split-half RoPE): x@0 cos@1 sin@2 -> o@3 ; N@4(u32) ;
-//        grid (M,1,1) group (32,1,1). x is (M=B*H*N, D) flattened; cos/sin are
-//        (N, D/2); each row uses seq position n = row % N. -----
+// ----- rotary (split-half RoPE): x@0 cos@1 sin@2 -> o@3 ; N@4(u32) M@5(u32) ;
+//        FLAT grid: one thread per 4 rotation pairs (M*D/8 threads, 256/group).
+//        x is (M=B*H*N, D) flattened; cos/sin are (N, D/2); row n = row % N. -----
 template <class E>
 void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
                    typename E::out_t o, uint32_t M, unsigned N, int D, bool interleaved = false) {
   e.pipeline(interleaved ? rotary_interleaved_kernel_name(D) : rotary_kernel_name(D));
   e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.out(o, 3);
-  e.bytes(N, 4);
-  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+  e.bytes(N, 4); e.bytes(M, 5);
+  const uint32_t total = M * (uint32_t)(D / 8);       // threads = rows * quads-per-row
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
 }
 
 // ----- MLA Q-path: q@0 cos@1 sin@2 positions@3 -> out@4 ; num_heads@5 nope@6 rope@7 norm_mode@8
@@ -633,8 +639,9 @@ void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int 
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 
-// ----- glu family: x@0 gate@1 -> out@2 ; n@3(uint32) alpha@4 limit@5 ; flat elementwise. -----
-// Modes mirror llama.cpp's ReGLU/GEGLU/SwiGLU kernels. alpha/limit are only used by swiglu_oai.
+// ----- glu family: x@0 gate@1 -> out@2 ; n@3(uint32) alpha@4 limit@5 ; flat, one thread per
+// 4 elements (vec4). Modes mirror llama.cpp's ReGLU/GEGLU/SwiGLU kernels; alpha/limit are only
+// used by swiglu_oai. -----
 template <class E>
 void launch_glu(E& e, typename E::in_t x, typename E::in_t gate, typename E::out_t o,
                 uint32_t n, const std::string& mode, const std::string& type_name,
@@ -643,10 +650,12 @@ void launch_glu(E& e, typename E::in_t x, typename E::in_t gate, typename E::out
   e.in(x, 0); e.in(gate, 1); e.out(o, 2);
   e.bytes(n, 3); e.bytes(alpha, 4); e.bytes(limit, 5);
   constexpr int threads = 256;
-  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+  const uint32_t nthreads = (n + 3) / 4;
+  e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
 
-// ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2. D in {64,128,256,512}. -----
+// ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2. D in {64,128,256,512}.
+//        One simdgroup (32 lanes) per row: in-register + simd_shuffle_xor butterflies. -----
 template <class E>
 void launch_hadamard(
     E& e,
@@ -660,7 +669,7 @@ void launch_hadamard(
   e.in(x, 0);
   e.out(out, 1);
   e.bytes(scale, 2);
-  e.dispatch(rows, 1, 1, D, 1, 1);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- KV cache zero: key_cache@0 value_cache@1 ; n@2(ulong). Flat memset for fresh caches. -----

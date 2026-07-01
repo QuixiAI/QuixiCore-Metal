@@ -8,35 +8,28 @@ namespace mittens {
     device T* out [[buffer(2)]], \
     constant const int& ndim1 [[buffer(3)]], \
     constant const int& ndim2 [[buffer(4)]], \
-    ushort3 index [[thread_position_in_grid]], \
-    ushort3 num_threads [[threads_per_grid]], \
-    uint3 threadgroup_id [[threadgroup_position_in_grid]], \
-    ushort laneId [[thread_index_in_simdgroup]]
+    uint tid [[thread_position_in_grid]]
 
+// Elementwise out = x + y over a contiguous (ndim1, ndim2) buffer — flat, one thread per
+// 4 elements (vec4 loads/stores), last thread takes the scalar tail. This began life as the
+// 8x8-register-tile smoke test of the TK port; that layout measured 0.34x of mx add (64
+// elements per 32-thread group through 2-element fragment gathers). The register-tile
+// load/add/store path remains covered by the Xcode primitive tests and every MMA kernel.
 template <typename T>
 [[kernel]] void add_rt(PARAMS(T)) {
-    
-    // using global_layout = gl<T, 1, 1, 8, 8>;
-    // global_layout gl_x(x,   nullptr, nullptr, nullptr, nullptr);
-    // global_layout gl_y(y,   nullptr, nullptr, nullptr, nullptr);
-    // global_layout gl_o(out, nullptr, nullptr, nullptr, nullptr);
-
-    using global_layout = gl<T, 1, 1, -1, -1>;
-    global_layout gl_x(x,   nullptr, nullptr, ndim1, ndim2);
-    global_layout gl_y(y,   nullptr, nullptr, ndim1, ndim2);
-    global_layout gl_o(out, nullptr, nullptr, ndim1, ndim2);
-
-    rt<T,8, 8> reg_x, reg_y, reg_z;
-    int y_idx = threadgroup_id.y;
-    int x_idx = threadgroup_id.x;
-    // Elementwise add of two 8x8 register tiles: out = x + y.
-    // (Smoke test for the register-tile load/add/store path.)
-    load(reg_x, gl_x, {0,0, y_idx, x_idx}, laneId);
-    load(reg_y, gl_y, {0,0, y_idx, x_idx}, laneId);
-
-    add(reg_z, reg_x, reg_y);
-
-    store(gl_o, reg_z, {0,0,y_idx, x_idx}, laneId);
+    using T4 = metal::vec<T, 4>;
+    const ulong n = (ulong)ndim1 * (ulong)ndim2;
+    const ulong base = (ulong)tid * 8;           // two vec4s -> 16-byte transactions for half/bf16
+    if (base + 8 <= n) {
+        const T4 a0 = ((device const T4*)(x + base))[0];
+        const T4 a1 = ((device const T4*)(x + base))[1];
+        const T4 b0 = ((device const T4*)(y + base))[0];
+        const T4 b1 = ((device const T4*)(y + base))[1];
+        ((device T4*)(out + base))[0] = a0 + b0;
+        ((device T4*)(out + base))[1] = a1 + b1;
+    } else {
+        for (ulong i = base; i < n; ++i) out[i] = x[i] + y[i];
+    }
 }
 
 #define instantiate_add_custom(type_name, T)                           \
