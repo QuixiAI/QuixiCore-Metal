@@ -247,6 +247,12 @@ def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch
     return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
 
 
+def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
+    """GQA KV-reuse staged decode; bit-equivalent to paged_attention. MPS."""
+    return _ext.paged_attention_staged(q, key_cache, value_cache, block_table, context_lens,
+                                       float(scale))
+
+
 def _scale_vec_t(scale, num, ref):
     """Broadcast a python scalar into a (num,) float32 tensor on ref's device; tensors pass through."""
     if isinstance(scale, (int, float)):

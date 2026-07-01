@@ -63,6 +63,9 @@ inline std::string kv_cache_kernel_name(const std::string& op, const std::string
 inline std::string paged_attention_kernel_name(const std::string& t, int D) {
   return "paged_attention_" + t + "_" + std::to_string(D);
 }
+inline std::string paged_attention_gqa_staged_kernel_name(const std::string& t, int D) {
+  return "paged_attention_gqa_staged_" + t + "_" + std::to_string(D);
+}
 inline std::string kv_cache_scatter_fp8_kernel_name(const std::string& t) { return "kv_cache_scatter_fp8_" + t; }
 inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D) {
   return "paged_attention_fp8_" + t + "_" + std::to_string(D);
@@ -670,6 +673,23 @@ void launch_paged_attention(
   e.bytes(num_heads, 9);
   e.bytes(num_kv_heads, 10);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// GQA KV-reuse staged decode: grid (num_kv_heads, batch, 1), threadgroup (32, group_size, 1) —
+// group_size simdgroups share one staged KV vector. Same buffer ABI as launch_paged_attention.
+template <class E>
+void launch_paged_attention_gqa_staged(
+    E& e, typename E::in_t q, typename E::in_t key_cache, typename E::in_t value_cache,
+    typename E::in_t block_table, typename E::in_t context_lens, typename E::out_t out,
+    int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, const std::string& type_name) {
+  const int group_size = num_heads / num_kv_heads;
+  e.pipeline(paged_attention_gqa_staged_kernel_name(type_name, head_size));
+  e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
+  e.in(block_table, 3); e.in(context_lens, 4); e.out(out, 5);
+  e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
+  e.bytes(num_heads, 9); e.bytes(num_kv_heads, 10);
+  e.dispatch(num_kv_heads, batch, 1, 32, group_size, 1);
 }
 
 // ----- fp8 KV cache: zero (uint8), scatter-with-encode, and dequant-on-read paged attention. -----

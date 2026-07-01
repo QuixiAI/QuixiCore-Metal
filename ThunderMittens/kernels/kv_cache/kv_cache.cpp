@@ -203,6 +203,54 @@ array paged_attention(
       {q_c, key_c, value_c, table_c, lens_c});
 }
 
+array paged_attention_staged(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale,
+    StreamOrDevice s) {
+  // Same validation/contract as paged_attention; only the GPU kernel (KV-reuse staging) differs.
+  if (q.ndim() != 3) {
+    throw std::invalid_argument("paged_attention_staged: q must have shape (batch, num_heads, head_size)");
+  }
+  if (key_cache.ndim() != 4 || value_cache.ndim() != 4 || key_cache.shape() != value_cache.shape()) {
+    throw std::invalid_argument("paged_attention_staged: caches must have shape (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (key_cache.shape(3) != q.shape(2)) {
+    throw std::invalid_argument("paged_attention_staged: q head_size must match cache head_size");
+  }
+  if (key_cache.shape(2) <= 0 || q.shape(1) % key_cache.shape(2) != 0) {
+    throw std::invalid_argument("paged_attention_staged: num_q_heads must be a positive multiple of num_kv_heads (GQA/MQA)");
+  }
+  if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("paged_attention_staged: block_table must have shape (batch, max_blocks)");
+  }
+  if (context_lens.ndim() != 1 || context_lens.shape(0) != q.shape(0)) {
+    throw std::invalid_argument("paged_attention_staged: context_lens must have shape (batch,)");
+  }
+  const int D = q.shape(2);
+  if (!(D == 64 || D == 128)) {
+    throw std::invalid_argument("paged_attention_staged: head_size must be 64 or 128");
+  }
+  auto dtype = promote_types(q.dtype(), key_cache.dtype());
+  dtype = promote_types(dtype, value_cache.dtype());
+  if (!is_supported_float(dtype)) {
+    throw std::invalid_argument("paged_attention_staged: dtype must be float32, float16, or bfloat16");
+  }
+  auto q_c = contiguous_cast(q, dtype, s);
+  auto key_c = contiguous_cast(key_cache, dtype, s);
+  auto value_c = contiguous_cast(value_cache, dtype, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  return array(
+      q.shape(),
+      dtype,
+      std::make_shared<PagedAttentionStaged>(to_stream(s), scale),
+      {q_c, key_c, value_c, table_c, lens_c});
+}
+
 void KvCacheScatter::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("KvCacheScatter has no CPU implementation.");
 }
@@ -368,6 +416,33 @@ void PagedAttention::eval_gpu(
       block_table.shape(1),
       scale,
       type_to_name(q));
+}
+
+void PagedAttentionStaged::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("PagedAttentionStaged has no CPU implementation.");
+}
+
+void PagedAttentionStaged::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& key_cache = inputs[1];
+  auto& value_cache = inputs[2];
+  auto& block_table = inputs[3];
+  auto& context_lens = inputs[4];
+  auto& out = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+
+  const int D = q.shape(2);
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(D));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_paged_attention_gqa_staged(
+      enc, q, key_cache, value_cache, block_table, context_lens, out,
+      q.shape(0), q.shape(1), key_cache.shape(2), D, key_cache.shape(1),
+      block_table.shape(1), scale, type_to_name(q));
 }
 
 // --------------------------- fp8 KV cache ---------------------------
@@ -546,5 +621,6 @@ TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
 TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
 TK_KV_NO_AUTODIFF(KvCacheScales, "KvCacheScales")
 TK_KV_NO_AUTODIFF(PagedAttention, "PagedAttention")
+TK_KV_NO_AUTODIFF(PagedAttentionStaged, "PagedAttentionStaged")
 
 } // namespace mlx::core

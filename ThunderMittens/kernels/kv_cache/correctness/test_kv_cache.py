@@ -14,6 +14,7 @@ from tk import (
     kv_cache_scatter_fp8,
     paged_attention,
     paged_attention_fp8,
+    paged_attention_staged,
 )
 from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
@@ -238,6 +239,37 @@ def test_paged_attention_gqa(dtype, atol, D, H, H_KV):
         context_lens,
         scale,
     )
+    np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (8, 2), (4, 1)])  # MHA, GQA group 4, MQA
+def test_paged_attention_staged(dtype, atol, D, H, H_KV):
+    # KV-reuse staged decode must (a) match the softmax oracle and (b) be bit-for-bit identical
+    # to the non-staged paged_attention (same math, only a different memory-traffic shape).
+    rng = np.random.default_rng(60 + D + H + H_KV)
+    B, num_blocks, block_size = 2, 4, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    value_cache = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    block_table = np.array([[0, 1], [2, 3]], dtype=np.int32)
+    context_lens = np.array([6, 7], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+
+    qm = mx.array(q).astype(_mx_dtype(dtype))
+    km = mx.array(key_cache).astype(_mx_dtype(dtype))
+    vm = mx.array(value_cache).astype(_mx_dtype(dtype))
+    got = paged_attention_staged(qm, km, vm, mx.array(block_table), mx.array(context_lens), scale=0.0)
+    base = paged_attention(qm, km, vm, mx.array(block_table), mx.array(context_lens), scale=0.0)
+    mx.eval(got, base)
+
+    # (b) exact equivalence to the reference kernel
+    np.testing.assert_array_equal(_np(got), _np(base))
+    # (a) matches the numpy oracle
+    ref = _paged_ref_gqa(
+        _np(qm).astype(np.float32), _np(km).astype(np.float32), _np(vm).astype(np.float32),
+        block_table, context_lens, scale)
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
 
 

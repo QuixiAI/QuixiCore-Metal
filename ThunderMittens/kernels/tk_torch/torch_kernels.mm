@@ -648,6 +648,44 @@ static at::Tensor paged_attention_mps(
   return out;
 }
 
+// GQA KV-reuse staged decode (bit-equivalent to paged_attention_mps; different memory shape).
+static at::Tensor paged_attention_staged_mps(
+    const at::Tensor& q_in, const at::Tensor& key_cache_in,
+    const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
+    const at::Tensor& context_lens_in, double scale) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_staged: q must be float MPS");
+  TORCH_CHECK(q_in.dim() == 3, "paged_attention_staged: q must have shape (B,H,D)");
+  TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
+              "paged_attention_staged: caches must have shape (num_blocks, block_size, H, D)");
+  TORCH_CHECK(key_cache_in.size(3) == q_in.size(2), "paged_attention_staged: head_size mismatch");
+  TORCH_CHECK(key_cache_in.size(2) > 0 && q_in.size(1) % key_cache_in.size(2) == 0,
+              "paged_attention_staged: num_q_heads must be a positive multiple of num_kv_heads");
+  TORCH_CHECK(q_in.scalar_type() == key_cache_in.scalar_type() &&
+                  q_in.scalar_type() == value_cache_in.scalar_type(),
+              "paged_attention_staged: q/cache dtype must match");
+  TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
+              "paged_attention_staged: block_table and context_lens must be int32");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2);
+  TORCH_CHECK(D == 64 || D == 128, "paged_attention_staged: head_size must be 64 or 128");
+
+  auto q = q_in.contiguous();
+  auto key_cache = key_cache_in.contiguous();
+  auto value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.contiguous();
+  auto context_lens = context_lens_in.contiguous();
+  auto out = at::empty_like(q);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_gqa_staged(e, q, key_cache, value_cache, block_table, context_lens,
+                                          out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
+                                          static_cast<int>(block_table.size(1)), scale_f, tn);
+  });
+  return out;
+}
+
 // Fused RoPE on K + paged-KV insert. Returns the two updated caches.
 static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_mps(
     const at::Tensor& k_in, const at::Tensor& v_in, const at::Tensor& cos_in,
@@ -1466,6 +1504,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_cache_copy_blocks", &kv_cache_copy_blocks_mps, "ThunderMittens KV cache block copy (MPS)");
   m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
   m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
+  m.def("paged_attention_staged", &paged_attention_staged_mps, "ThunderMittens GQA KV-reuse staged decode (MPS)");
   m.def("kv_cache_scatter_fp8", &kv_cache_scatter_fp8_mps, "ThunderMittens fp8 KV cache scatter (MPS)");
   m.def("paged_attention_fp8", &paged_attention_fp8_mps, "ThunderMittens fp8 paged attention (MPS)");
   m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");

@@ -259,6 +259,15 @@ def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=
     return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
 
 
+def paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
+    """GQA KV-reuse staged decode: bit-equivalent to paged_attention, but stages each KV vector
+    once into threadgroup memory and reuses it across the query heads sharing that kv_head
+    (amortizes cache bandwidth by group_size). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale)
+    return _mlx().paged_attention_staged(q, key_cache, value_cache, block_table, context_lens, scale)
+
+
 def _fmt_code(fmt):
     """Map an fp8 format ('e4m3'/'e5m2' or 0/1) to the kernel's integer format code."""
     return {"e4m3": 0, "e5m2": 1}.get(fmt, fmt) if isinstance(fmt, str) else int(fmt)

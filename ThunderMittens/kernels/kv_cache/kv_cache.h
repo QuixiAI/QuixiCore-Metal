@@ -45,6 +45,17 @@ array paged_attention(
     float scale = 0.0f,
     StreamOrDevice s = {});
 
+// GQA KV-reuse staged decode: bit-equivalent to paged_attention but stages each KV vector
+// once into threadgroup memory and reuses it across the query heads sharing that kv_head.
+array paged_attention_staged(
+    const array& q,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    StreamOrDevice s = {});
+
 // fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-head scales
 // (k_scale/v_scale are (num_heads,)/(num_kv_heads,) arrays; a per-tensor caller passes a
 // broadcast array), and decode-paged-attention that dequantizes on read. GQA/MQA aware.
@@ -252,6 +263,29 @@ class PagedAttention : public Primitive {
   void print(std::ostream& os) override { os << "PagedAttention"; }
   bool is_equivalent(const Primitive& other) const override {
     return scale_ == static_cast<const PagedAttention&>(other).scale_;
+  }
+
+ private:
+  float scale_;
+};
+
+class PagedAttentionStaged : public Primitive {
+ public:
+  PagedAttentionStaged(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "PagedAttentionStaged"; }
+  void print(std::ostream& os) override { os << "PagedAttentionStaged"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return scale_ == static_cast<const PagedAttentionStaged&>(other).scale_;
   }
 
  private:

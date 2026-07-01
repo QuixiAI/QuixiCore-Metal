@@ -242,6 +242,87 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
     }
 }
 
+// GQA KV-reuse staged decode: one threadgroup per (kv_head, batch) with `group_size`
+// simdgroups (one query head each). Each KV token vector is staged into threadgroup memory
+// ONCE and reused by every query head sharing that kv_head, amortizing the cache bandwidth
+// by group_size (the flashinfer decode structure). Math is identical to paged_attention above,
+// so the output is bit-for-bit equal; the two kernels differ only in memory-traffic shape.
+template <typename T, int D>
+kernel void paged_attention_gqa_staged(
+    device const T *q [[buffer(0)]],
+    device const T *key_cache [[buffer(1)]],
+    device const T *value_cache [[buffer(2)]],
+    device const int *block_table [[buffer(3)]],
+    device const int *context_lens [[buffer(4)]],
+    device T *out [[buffer(5)]],
+    constant int &block_size [[buffer(6)]],
+    constant int &block_table_stride [[buffer(7)]],
+    constant float &scale [[buffer(8)]],
+    constant int &num_heads [[buffer(9)]],
+    constant int &num_kv_heads [[buffer(10)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_id [[simdgroup_index_in_threadgroup]],
+    uint3 ntg [[threads_per_threadgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+    threadgroup float sh_k[D];
+    threadgroup float sh_v[D];
+
+    const int kv_head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int group_size = num_heads / num_kv_heads;
+    const int head = kv_head * group_size + (int)simd_id;   // query head this simdgroup serves
+    const int context_len = context_lens[batch];
+    const long row_base = ((long)batch * num_heads + head) * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[row_base + d]);
+        acc[i] = 0.0f;
+    }
+    float m = -3.4028234663852886e38f, l = 0.0f;
+
+    const int tid_flat = (int)lane + 32 * (int)simd_id;
+    const int nthreads = (int)ntg.x * (int)ntg.y;
+
+    for (int t = 0; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int slot = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // prior iteration done reading sh_k/sh_v
+        if (block >= 0) {
+            const long cache_base =
+                (((long)block * block_size + slot) * num_kv_heads + kv_head) * D;
+            for (int idx = tid_flat; idx < D; idx += nthreads) {
+                sh_k[idx] = float(key_cache[cache_base + idx]);
+                sh_v[idx] = float(value_cache[cache_base + idx]);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);   // sh_k/sh_v populated
+        if (block < 0) { continue; }
+
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            partial += qv[i] * sh_k[(int)lane + 32 * i];
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            acc[i] = acc[i] * alpha + beta * sh_v[(int)lane + 32 * i];
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
+    }
+}
+
 // --- fp8 KV cache: store e4m3 codes (uint8) with per-tensor K/V scales. ---
 
 kernel void kv_cache_zero_u8(device uchar *key_cache [[buffer(0)]],
@@ -474,6 +555,25 @@ instantiate_paged_attention_fp8(bfloat16, bf16, 128)
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 
+#define instantiate_paged_attention_staged(type_name, T, DVAL)                \
+  template [[host_name("paged_attention_gqa_staged_" #type_name "_" #DVAL)]]  \
+  [[kernel]] void paged_attention_gqa_staged<T, DVAL>(                        \
+      device const T *q [[buffer(0)]],                                       \
+      device const T *key_cache [[buffer(1)]],                               \
+      device const T *value_cache [[buffer(2)]],                             \
+      device const int *block_table [[buffer(3)]],                           \
+      device const int *context_lens [[buffer(4)]],                          \
+      device T *out [[buffer(5)]],                                           \
+      constant int &block_size [[buffer(6)]],                                \
+      constant int &block_table_stride [[buffer(7)]],                        \
+      constant float &scale [[buffer(8)]],                                   \
+      constant int &num_heads [[buffer(9)]],                                 \
+      constant int &num_kv_heads [[buffer(10)]],                             \
+      uint3 tgid [[threadgroup_position_in_grid]],                           \
+      uint lane [[thread_index_in_simdgroup]],                               \
+      uint simd_id [[simdgroup_index_in_threadgroup]],                       \
+      uint3 ntg [[threads_per_threadgroup]]);
+
 instantiate_kv_cache_type(float32, float)
 instantiate_kv_cache_type(float16, half)
 instantiate_kv_cache_type(bfloat16, bf16)
@@ -484,3 +584,10 @@ instantiate_paged_attention_type(float16, half, 64)
 instantiate_paged_attention_type(float16, half, 128)
 instantiate_paged_attention_type(bfloat16, bf16, 64)
 instantiate_paged_attention_type(bfloat16, bf16, 128)
+
+instantiate_paged_attention_staged(float32, float, 64)
+instantiate_paged_attention_staged(float32, float, 128)
+instantiate_paged_attention_staged(float16, half, 64)
+instantiate_paged_attention_staged(float16, half, 128)
+instantiate_paged_attention_staged(bfloat16, bf16, 64)
+instantiate_paged_attention_staged(bfloat16, bf16, 128)
