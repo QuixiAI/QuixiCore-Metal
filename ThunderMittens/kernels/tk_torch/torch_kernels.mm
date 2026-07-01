@@ -630,6 +630,36 @@ static at::Tensor mla_q_norm_rope_mps(
   return out;
 }
 
+// DeepSeek MLA classic KV-insert (clone-then-insert into a paged bf16 cache).
+static at::Tensor mla_kv_insert_mps(
+    const at::Tensor& kv_c_in, const at::Tensor& k_pe_in, const at::Tensor& cos_in,
+    const at::Tensor& sin_in, const at::Tensor& positions_in, const at::Tensor& slot_in,
+    const at::Tensor& cache_in, const at::Tensor& nw_in, int64_t rope_dim, int64_t norm_mode,
+    double eps) {
+  TORCH_CHECK(kv_c_in.device().is_mps() && kv_c_in.scalar_type() == at::kBFloat16,
+              "mla_kv_insert: kv_c must be bf16 MPS");
+  const int latent = kv_c_in.size(-1);
+  TORCH_CHECK(latent % 64 == 0, "mla_kv_insert: LATENT must be %64==0");
+  TORCH_CHECK(k_pe_in.size(-1) == rope_dim && rope_dim % 2 == 0 && rope_dim / 2 <= 32,
+              "mla_kv_insert: k_pe last dim must be rope_dim (even, /2<=32)");
+  TORCH_CHECK(cache_in.dim() == 3 && cache_in.size(2) == latent + rope_dim,
+              "mla_kv_insert: kv_cache must be (nb, bs, LATENT+rope_dim)");
+  auto kv_c = kv_c_in.contiguous(), k_pe = k_pe_in.contiguous();
+  auto cos = cos_in.to(at::kBFloat16).contiguous(), sin = sin_in.to(at::kBFloat16).contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto slot = slot_in.to(at::kLong).contiguous();
+  auto nw = nw_in.to(at::kBFloat16).contiguous();
+  auto out = cache_in.contiguous().clone();
+  const int num_tokens = static_cast<int>(kv_c.numel() / latent);
+  const int block_size = cache_in.size(1);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mla_kv_insert(e, kv_c, k_pe, cos, sin, positions, slot, out, nw, num_tokens,
+                             block_size, static_cast<int>(rope_dim), static_cast<int>(norm_mode),
+                             static_cast<float>(eps), latent);
+  });
+  return out;
+}
+
 static at::Tensor paged_attention_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
@@ -1660,6 +1690,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rope_kv_insert", &rope_kv_insert_mps, "ThunderMittens fused RoPE + paged-KV insert (MPS)");
   m.def("rope_kv_insert_norm", &rope_kv_insert_norm_mps, "ThunderMittens fused K-norm + RoPE + KV insert (MPS)");
   m.def("mla_q_norm_rope", &mla_q_norm_rope_mps, "ThunderMittens DeepSeek MLA Q-path norm+interleaved-rope (MPS)");
+  m.def("mla_kv_insert", &mla_kv_insert_mps, "ThunderMittens DeepSeek MLA classic KV-insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");

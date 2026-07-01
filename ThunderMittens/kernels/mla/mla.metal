@@ -97,3 +97,94 @@ instantiate_mla_q_norm_rope(128);
 instantiate_mla_q_norm_rope(192);
 instantiate_mla_q_norm_rope(256);
 instantiate_mla_q_norm_rope(512);
+
+// ---------------------------------------------------------------------------
+// P2: mla_kv_insert — classic bf16 latent KV-insert (concat_and_cache_mla). One warp per token
+// writes into a paged cache kv_cache[num_blocks, block_size, LATENT + rope_dim] (MQA — one shared
+// latent per token, no head axis): the compressed latent kv_c (LATENT, optionally kv_a-RMSNormed)
+// at [0:LATENT], and interleaved-RoPE'd k_pe (rope_dim) at [LATENT:LATENT+rope_dim]. Clone-then-
+// insert: the caller pre-populates the cache; this kernel overwrites only the mapped slots.
+// LATENT % 64 == 0; rope_dim/2 <= 32 (one pair per lane).
+// ---------------------------------------------------------------------------
+template <int LATENT>
+kernel void mla_kv_insert(device const bf16 *kv_c        [[buffer(0)]],   // (T, LATENT)
+                          device const bf16 *k_pe        [[buffer(1)]],   // (T, rope_dim)
+                          device const bf16 *cosb        [[buffer(2)]],
+                          device const bf16 *sinb        [[buffer(3)]],
+                          device const int  *positions   [[buffer(4)]],
+                          device const long *slot_mapping [[buffer(5)]],
+                          device bf16       *kv_cache    [[buffer(6)]],    // (nb, bs, LATENT+rope)
+                          constant int &block_size       [[buffer(7)]],
+                          constant int &rope_dim         [[buffer(8)]],
+                          constant int &norm_mode        [[buffer(9)]],    // 0 none, 2 weighted
+                          constant float &eps            [[buffer(10)]],
+                          device const bf16 *norm_weight [[buffer(11)]],   // (LATENT,), mode 2
+                          uint3 blockIdx [[threadgroup_position_in_grid]],
+                          uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(LATENT % 64 == 0, "mla_kv_insert needs LATENT divisible by 64");
+    constexpr int LPL = LATENT / 32;                 // latent elements per lane (even)
+    const int token = blockIdx.x;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+    const long block = slot / block_size;
+    const long off = slot % block_size;
+    const int row_width = LATENT + rope_dim;
+    const long dst = ((block * block_size + off)) * (long)row_width;
+    const int pos = positions[token];
+    const int rope_half = rope_dim / 2;
+
+    // Latent: optional RMSNorm over LATENT, then write to [0:LATENT].
+    const long lbase = (long)token * LATENT + (long)laneId * LPL;
+    float rms = 1.0f;
+    if (norm_mode != 0) {
+        float ss = 0.0f;
+        for (int k = 0; k < LPL; ++k) { const float v = float(kv_c[lbase + k]); ss += v * v; }
+        ss = simd_sum(ss);
+        rms = metal::rsqrt(ss / (float)LATENT + eps);
+    }
+    for (int k = 0; k < LPL; ++k) {
+        float v = float(kv_c[lbase + k]) * rms;
+        if (norm_mode == 2) { v *= float(norm_weight[laneId * LPL + k]); }
+        kv_cache[dst + laneId * LPL + k] = bf16(v);
+    }
+
+    // RoPE key: interleaved rotate on rope_dim, write to [LATENT:LATENT+rope_dim].
+    if ((int)laneId < rope_half) {
+        const long rbase = (long)token * rope_dim + (long)laneId * 2;
+        const float e = float(k_pe[rbase]);
+        const float o = float(k_pe[rbase + 1]);
+        const float c = float(cosb[(long)pos * rope_half + laneId]);
+        const float s = float(sinb[(long)pos * rope_half + laneId]);
+        kv_cache[dst + LATENT + laneId * 2]     = bf16(e * c - o * s);
+        kv_cache[dst + LATENT + laneId * 2 + 1] = bf16(e * s + o * c);
+    }
+}
+
+#define instantiate_mla_kv_insert(LVAL)                                        \
+  template [[host_name("mla_kv_insert_" #LVAL)]] [[kernel]] void               \
+  mla_kv_insert<LVAL>(device const bf16 *kv_c [[buffer(0)]],                   \
+                      device const bf16 *k_pe [[buffer(1)]],                   \
+                      device const bf16 *cosb [[buffer(2)]],                   \
+                      device const bf16 *sinb [[buffer(3)]],                   \
+                      device const int  *positions [[buffer(4)]],              \
+                      device const long *slot_mapping [[buffer(5)]],           \
+                      device bf16       *kv_cache [[buffer(6)]],               \
+                      constant int &block_size [[buffer(7)]],                  \
+                      constant int &rope_dim [[buffer(8)]],                    \
+                      constant int &norm_mode [[buffer(9)]],                   \
+                      constant float &eps [[buffer(10)]],                      \
+                      device const bf16 *norm_weight [[buffer(11)]],           \
+                      uint3 blockIdx [[threadgroup_position_in_grid]],         \
+                      uint  laneId   [[thread_index_in_simdgroup]]);
+
+instantiate_mla_kv_insert(128);
+instantiate_mla_kv_insert(256);
+instantiate_mla_kv_insert(512);
+
+// Single-buffer bf16 copy (clone-then-insert prologue for the MLA cache).
+kernel void mla_cache_clone(device const bf16 *src [[buffer(0)]],
+                            device bf16       *dst [[buffer(1)]],
+                            constant ulong &n      [[buffer(2)]],
+                            uint tid [[thread_position_in_grid]]) {
+    if ((ulong)tid < n) { dst[tid] = src[tid]; }
+}

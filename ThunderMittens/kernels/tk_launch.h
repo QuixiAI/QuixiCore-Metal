@@ -54,6 +54,7 @@ inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_stri
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
 inline std::string mla_q_norm_rope_kernel_name(int D) { return "mla_q_norm_rope_" + std::to_string(D); }
+inline std::string mla_kv_insert_kernel_name(int L) { return "mla_kv_insert_" + std::to_string(L); }
 inline std::string gelu_kernel_name(int D) { return "gelu_" + std::to_string(D); }
 inline std::string glu_kernel_name(const std::string& mode, const std::string& t) { return "glu_" + mode + "_" + t; }
 inline std::string hadamard_kernel_name(const std::string& t, int D) {
@@ -483,6 +484,30 @@ void launch_mla_q_norm_rope(E& e, typename E::in_t q, typename E::in_t cos, type
   e.bytes(num_heads, 5); e.bytes(nope_dim, 6); e.bytes(rope_dim, 7); e.bytes(norm_mode, 8);
   e.bytes(eps, 9); e.in(norm_weight, 10);
   e.dispatch(M, 1, 1, 32, 1, 1);
+}
+
+// ----- MLA classic KV insert: kv_c@0 k_pe@1 cos@2 sin@3 positions@4 slot_mapping@5 -> kv_cache@6 ;
+//        block_size@7 rope_dim@8 norm_mode@9 eps@10 ; norm_weight@11 ; grid (T,1,1) group (32,1,1). -----
+template <class E>
+void launch_mla_cache_clone(E& e, typename E::in_t src, typename E::out_t dst, uint64_t n) {
+  e.pipeline("mla_cache_clone");
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_mla_kv_insert(E& e, typename E::in_t kv_c, typename E::in_t k_pe, typename E::in_t cos,
+                          typename E::in_t sin, typename E::in_t positions,
+                          typename E::in_t slot_mapping, typename E::out_t kv_cache,
+                          typename E::in_t norm_weight, int num_tokens, int block_size,
+                          int rope_dim, int norm_mode, float eps, int latent) {
+  e.pipeline(mla_kv_insert_kernel_name(latent));
+  e.in(kv_c, 0); e.in(k_pe, 1); e.in(cos, 2); e.in(sin, 3); e.in(positions, 4);
+  e.in(slot_mapping, 5); e.out(kv_cache, 6);
+  e.bytes(block_size, 7); e.bytes(rope_dim, 8); e.bytes(norm_mode, 9); e.bytes(eps, 10);
+  e.in(norm_weight, 11);
+  e.dispatch(num_tokens, 1, 1, 32, 1, 1);
 }
 
 // ----- gelu (elementwise, last axis): x@0 -> o@1 ; M@2(u32) ; grid (M,1,1) group (32,1,1) -----

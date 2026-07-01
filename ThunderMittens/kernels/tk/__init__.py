@@ -141,6 +141,30 @@ def mla_q_norm_rope(q, cos, sin, positions, num_heads, nope_dim, rope_dim,
                                   nope_dim, rope_dim, norm_mode, eps)
 
 
+def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
+                  rope_dim=None, norm_mode=0, eps=1e-6, norm_weight=None):
+    """DeepSeek MLA classic KV-insert: writes the (optionally kv_a-RMSNormed, norm_mode 0/2) latent
+    kv_c + interleaved-RoPE'd k_pe into a paged bf16 cache (num_blocks, block_size, LATENT+rope_dim).
+
+    Returns the updated kv_cache. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    latent = kv_c.shape[-1]
+    if rope_dim is None:
+        rope_dim = k_pe.shape[-1]
+    if norm_weight is None:   # dummy (unused unless norm_mode==2)
+        if _is_torch(kv_c):
+            import torch
+            norm_weight = torch.ones(latent, dtype=torch.bfloat16, device=kv_c.device)
+        else:
+            import mlx.core as mx
+            norm_weight = mx.ones((latent,), dtype=mx.bfloat16)
+    if _is_torch(kv_c):
+        return _torch().mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
+                                      norm_weight, rope_dim, norm_mode, eps)
+    return _mlx().mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
+                                norm_weight, rope_dim, norm_mode, eps)
+
+
 def rms_norm_add(x, residual, weight, eps=1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual).
 

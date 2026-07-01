@@ -364,6 +364,32 @@ def test_mla_q_norm_rope_parity(norm_mode, T, H, nope, rope):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("norm_mode", [0, 2])
+def test_mla_kv_insert_parity(norm_mode):
+    latent, rope = 512, 64
+    T, nb, bs = 5, 4, 4
+    W = latent + rope
+    rng = np.random.default_rng(22)
+    inv = 10000.0 ** (-(np.arange(0, rope, 2) / rope))
+    ang = np.arange(64)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    kv_c = (0.3 * rng.standard_normal((T, latent))).astype(np.float32)
+    k_pe = (0.3 * rng.standard_normal((T, rope))).astype(np.float32)
+    w = (0.5 + 0.1 * rng.standard_normal(latent)).astype(np.float32)
+    positions = np.array([0, 1, 2, 3, 4], dtype=np.int32)
+    slot = np.array([0, 5, -1, 6, 11], dtype=np.int64)
+    cache0 = (0.1 * rng.standard_normal((nb, bs, W))).astype(np.float32)
+    wm = _mk(w, "mlx") if norm_mode == 2 else None
+    wt = _mk(w, "torch") if norm_mode == 2 else None
+    om = tk.mla_kv_insert(_mk(kv_c, "mlx"), _mk(k_pe, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"),
+                          mx.array(positions), mx.array(slot), _mk(cache0, "mlx"),
+                          rope_dim=rope, norm_mode=norm_mode, norm_weight=wm)
+    ot = tk.mla_kv_insert(_mk(kv_c, "torch"), _mk(k_pe, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+                          torch.from_numpy(positions).to("mps"), torch.from_numpy(slot).to("mps"),
+                          _mk(cache0, "torch"), rope_dim=rope, norm_mode=norm_mode, norm_weight=wt)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("D,H_KV", [(64, 2), (128, 1)])
 def test_rope_kv_insert_parity(D, H_KV):
     rng = np.random.default_rng(5)

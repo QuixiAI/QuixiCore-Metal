@@ -243,6 +243,14 @@ NB_MODULE(_ext, m) {
          rope_dim dims. head_dim=nope_dim+rope_dim, %64==0; cos/sin (max_pos, rope_dim/2).)");
 
     m.def(
+      "mla_kv_insert", &mla_kv_insert,
+      "kv_c"_a, "k_pe"_a, "cos"_a, "sin"_a, "positions"_a, "slot_mapping"_a, "kv_cache"_a,
+      "norm_weight"_a, "rope_dim"_a, "norm_mode"_a, "eps"_a = 1e-6f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek MLA classic KV-insert: (optionally kv_a-normed) latent + interleaved-RoPE k_pe into
+         a paged bf16 cache (nb, bs, LATENT+rope_dim). Returns the updated kv_cache.)");
+
+    m.def(
       "paged_attention_v2",
       &paged_attention_v2,
       "q"_a,

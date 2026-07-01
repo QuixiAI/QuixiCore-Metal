@@ -187,6 +187,13 @@ def mla_q_norm_rope(q, cos, sin, positions, norm_weight, num_heads, nope_dim, ro
                                 int(nope_dim), int(rope_dim), int(norm_mode), float(eps))
 
 
+def mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache, norm_weight,
+                  rope_dim, norm_mode, eps):
+    """DeepSeek MLA classic KV-insert: latent + interleaved-RoPE k_pe into a paged bf16 cache. MPS."""
+    return _ext.mla_kv_insert(kv_c, k_pe, cos, sin, positions, slot_mapping, kv_cache,
+                              norm_weight, int(rope_dim), int(norm_mode), float(eps))
+
+
 def gelu(x: torch.Tensor):
     """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
     return _ext.gelu(x)
