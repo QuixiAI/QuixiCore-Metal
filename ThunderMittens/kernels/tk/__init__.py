@@ -876,6 +876,75 @@ def beam_advance(logits, cum_log_probs, beam_width):
     return out[0], out[1], out[2]
 
 
+def beam_reorder_kv(key_cache, value_cache, block_table, parent_beam, seq_lens):
+    """Reorder a paged KV cache after a beam step so each new beam's physical blocks hold its
+    parent beam's KV history. Returns (key_cache', value_cache') (new caches — the copy op clones
+    then applies src->dst, so it is a safe parallel scatter even for fan-out).
+
+    key_cache/value_cache (num_blocks, block_size, H_KV, D); block_table (B*BM, max_blocks) int
+    (row = global beam b*BM+i); parent_beam (B, BM) int32 from tk.beam_advance (per-batch-local
+    parent index in [0, BM)); seq_lens gives the current length per beam (scalar, (B*BM,), or
+    (B,BM)) to bound how many blocks are copied. Requires distinct physical blocks per beam (the
+    zero-copy block-table-remap alternative is a cache-manager concern, out of scope). Needs a host
+    readback of parent_beam/block_table (documented sync). Accepts mlx.array or torch.Tensor (MPS)."""
+    import numpy as np
+    is_t = _is_torch(key_cache)
+    block_size = key_cache.shape[1]
+
+    def _np_of(x):
+        if x is None:
+            return None
+        if hasattr(x, "cpu"):        # torch tensor
+            return x.cpu().numpy()
+        return np.array(x)
+
+    pb = _np_of(parent_beam)         # (B, BM)
+    bt = _np_of(block_table).astype(np.int64)   # (B*BM, max_blocks)
+    B, BM = pb.shape
+    if np.isscalar(seq_lens) or (hasattr(seq_lens, "ndim") and getattr(seq_lens, "ndim", 1) == 0):
+        sl = np.full(B * BM, int(seq_lens), np.int64)
+    else:
+        sl = _np_of(seq_lens).reshape(B * BM).astype(np.int64)
+
+    pairs = []
+    for b in range(B):
+        for k in range(BM):
+            p = int(pb[b, k])
+            if p == k:               # beam kept its own history -> no move
+                continue
+            child, parent = b * BM + k, b * BM + p
+            nblk = (int(sl[child]) + block_size - 1) // block_size
+            for c in range(nblk):
+                src, dst = int(bt[parent, c]), int(bt[child, c])
+                if src >= 0 and dst >= 0:
+                    pairs.append((src, dst))
+    if not pairs:
+        return key_cache, value_cache
+    mapping = np.array(pairs, dtype=np.int64)
+    if is_t:
+        import torch
+        return kv_cache_copy_blocks(key_cache, value_cache,
+                                    torch.from_numpy(mapping).to(key_cache.device))
+    import mlx.core as mx
+    return kv_cache_copy_blocks(key_cache, value_cache, mx.array(mapping))
+
+
+def beam_length_penalty(cum_log_probs, lengths, alpha=1.0):
+    """Length-penalized beam score (FasterTransformer rule): cum_log_probs / ((5+len)/6)^alpha.
+    lengths broadcasts against cum_log_probs (scalar or (B, BM)). Pure framework ops; the finished-
+    beam (CBA) / EOS bookkeeping stays host-side policy. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(cum_log_probs):
+        import torch
+        ln = lengths if torch.is_tensor(lengths) else torch.tensor(
+            float(lengths), dtype=cum_log_probs.dtype, device=cum_log_probs.device)
+        pen = ((5.0 + ln.to(cum_log_probs.dtype)) / 6.0) ** float(alpha)
+        return cum_log_probs / pen
+    import mlx.core as mx
+    ln = lengths if isinstance(lengths, mx.array) else mx.array(float(lengths))
+    pen = ((5.0 + ln.astype(cum_log_probs.dtype)) / 6.0) ** float(alpha)
+    return cum_log_probs / pen
+
+
 def apply_penalty(logits, prev_tokens, temperature=1.0, repetition_penalty=1.0,
                   presence_penalty=0.0, frequency_penalty=0.0, bias=None, eos_id=-1,
                   min_length=0, gen_len=0, parent_ids=None):

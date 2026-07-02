@@ -11,7 +11,46 @@ import numpy as np
 import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
-                beam_advance)
+                beam_advance, beam_reorder_kv, beam_length_penalty)
+
+
+@pytest.mark.parametrize("B,BM", [(2, 3), (1, 4), (3, 2)])
+def test_beam_reorder_kv(B, BM):
+    rng = np.random.default_rng(B + BM)
+    bs, H_KV, D, max_blocks = 4, 2, 32, 2
+    nbeams = B * BM
+    nb = nbeams * max_blocks
+    kc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    vc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    bt = np.arange(nb, dtype=np.int32).reshape(nbeams, max_blocks)  # beam g owns [2g, 2g+1]
+    # each new beam's parent is a random beam in its batch (allows fan-out / self-parent)
+    pb = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    seq_lens = np.full(nbeams, 7, np.int32)   # ceil(7/4) = 2 blocks
+    kc2, vc2 = beam_reorder_kv(mx.array(kc), mx.array(vc), mx.array(bt), mx.array(pb),
+                               mx.array(seq_lens))
+    mx.eval(kc2, vc2)
+    ref_k, ref_v = kc.copy(), vc.copy()
+    for b in range(B):
+        for k in range(BM):
+            p = pb[b, k]
+            if p == k:
+                continue
+            for c in range(2):
+                ref_k[bt[b * BM + k, c]] = kc[bt[b * BM + p, c]]
+                ref_v[bt[b * BM + k, c]] = vc[bt[b * BM + p, c]]
+    np.testing.assert_array_equal(np.array(kc2), ref_k)
+    np.testing.assert_array_equal(np.array(vc2), ref_v)
+
+
+def test_beam_length_penalty():
+    cum = mx.array(np.array([[-2.0, -3.0, -4.0], [-1.0, -5.0, -2.0]], np.float32))
+    lengths = mx.array(np.array([[5, 10, 3], [7, 7, 20]], np.float32))
+    got = np.array(beam_length_penalty(cum, lengths, alpha=1.0))
+    ref = np.array(cum) / (((5.0 + np.array(lengths)) / 6.0) ** 1.0)
+    np.testing.assert_allclose(got, ref, atol=1e-5)
+    # alpha=0 is a no-op (penalty == 1)
+    got0 = np.array(beam_length_penalty(cum, lengths, alpha=0.0))
+    np.testing.assert_allclose(got0, np.array(cum), atol=1e-5)
 
 
 def _beam_oracle(logits, cum, B, BM, V):

@@ -932,6 +932,38 @@ def test_cross_entropy(dtype, tol):
     assert np.abs(g.float().cpu().numpy() - lt.grad.numpy()).max() < tol
 
 
+def test_beam_reorder_kv():
+    import numpy as np
+    import tk
+    rng = np.random.default_rng(0)
+    B, BM, bs, H_KV, D, max_blocks = 2, 3, 4, 2, 32, 2
+    nbeams = B * BM
+    nb = nbeams * max_blocks
+    kc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    vc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    bt = np.arange(nb, dtype=np.int32).reshape(nbeams, max_blocks)
+    pb = np.array([[1, 1, 0], [0, 2, 1]], np.int32)
+    seq_lens = np.full(nbeams, 7, np.int32)
+    kc2, vc2 = tk.beam_reorder_kv(
+        torch.from_numpy(kc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(vc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(bt).to("mps"), torch.from_numpy(pb).to("mps"),
+        torch.from_numpy(seq_lens).to("mps"))
+    kb = torch.from_numpy(kc).to(torch.bfloat16).float().numpy()
+    vb = torch.from_numpy(vc).to(torch.bfloat16).float().numpy()
+    ref_k, ref_v = kb.copy(), vb.copy()
+    for b in range(B):
+        for k in range(BM):
+            p = pb[b, k]
+            if p == k:
+                continue
+            for c in range(2):
+                ref_k[bt[b * BM + k, c]] = kb[bt[b * BM + p, c]]
+                ref_v[bt[b * BM + k, c]] = vb[bt[b * BM + p, c]]
+    np.testing.assert_array_equal(kc2.float().cpu().numpy(), ref_k)
+    np.testing.assert_array_equal(vc2.float().cpu().numpy(), ref_v)
+
+
 @pytest.mark.parametrize("B,BM,V", [(2, 4, 4000), (3, 8, 4000)])
 def test_beam_advance(B, BM, V):
     import numpy as np
