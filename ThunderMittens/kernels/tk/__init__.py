@@ -520,53 +520,55 @@ def kv_cache_scatter_fp8(key, value, slot_mapping, num_blocks, block_size, k_sca
 
 
 def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                        k_scale, v_scale, scale=0.0, fmt="e4m3"):
+                        k_scale, v_scale, scale=0.0, fmt="e4m3", window=0):
     """Decode paged attention over fp8 (uint8) caches, dequantized on read. GQA aware.
 
     k_scale/v_scale may be a plain float (per-tensor) or a (num_kv_heads,) array (per-head).
     fmt: 'e4m3' (default) or 'e5m2' — must match the format the cache was written with.
-    Accepts mlx.array or torch.Tensor (MPS).
+    window > 0 restricts to the `window` most recent keys. Accepts mlx.array or torch.Tensor (MPS).
     """
     H_KV = key_cache.shape[2]
     k_scale, v_scale = _scale_vec(k_scale, H_KV, q), _scale_vec(v_scale, H_KV, q)
     if _is_torch(q):
         return _torch().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                                            k_scale, v_scale, scale, fmt)
+                                            k_scale, v_scale, scale, fmt, window)
     return _mlx().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
-                                      k_scale, v_scale, scale, _fmt_code(fmt))
+                                      k_scale, v_scale, scale, _fmt_code(fmt), window=window)
 
 
 def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
-                       scale=0.0, partition_size=256):
+                       scale=0.0, partition_size=256, window=0):
     """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
 
     q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D). Accepts
     mlx.array or torch.Tensor (MPS). partition_size must be a multiple of block_size.
+    window > 0 restricts to the `window` most recent keys.
     """
     if _is_torch(q):
         return _torch().paged_attention_v2(
-            q, key_cache, value_cache, block_table, context_lens, scale, partition_size)
+            q, key_cache, value_cache, block_table, context_lens, scale, partition_size, window)
     return _mlx().paged_attention_v2(
         q, key_cache, value_cache, block_table, context_lens,
-        scale=scale, partition_size=partition_size)
+        scale=scale, partition_size=partition_size, window=window)
 
 
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
-                           k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3"):
+                           k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3", window=0):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA/MQA aware.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) array (per-head).
-    fmt: 'e4m3' (default) or 'e5m2'. Accepts mlx.array or torch.Tensor (MPS).
+    fmt: 'e4m3' (default) or 'e5m2'. window > 0 restricts to the `window` most recent keys.
+    Accepts mlx.array or torch.Tensor (MPS).
     """
     H_KV = key_cache.shape[2]
     k_scale, v_scale = _scale_vec(k_scale, H_KV, q), _scale_vec(v_scale, H_KV, q)
     if _is_torch(q):
         return _torch().paged_attention_v2_fp8(
             q, key_cache, value_cache, block_table, context_lens, k_scale, v_scale,
-            scale, partition_size, fmt)
+            scale, partition_size, fmt, window)
     return _mlx().paged_attention_v2_fp8(
         q, key_cache, value_cache, block_table, context_lens, k_scale, v_scale,
-        scale=scale, partition_size=partition_size, fmt=_fmt_code(fmt))
+        scale=scale, partition_size=partition_size, fmt=_fmt_code(fmt), window=window)
 
 
 def moe_route_topk(logits, k):

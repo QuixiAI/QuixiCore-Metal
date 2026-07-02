@@ -485,6 +485,64 @@ def test_paged_attention_v2_fp8_parity(fmt, H, H_KV, ps):
     _assert_parity(om, ot, atol=2e-2)
 
 
+@pytest.mark.parametrize("window", [1, 5])
+def test_paged_attention_fp8_window_parity(window):
+    rng = np.random.default_rng(35)
+    B, H, H_KV, D, num_blocks, block_size = 2, 4, 2, 64, 8, 16
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    cl = np.array([64, 64], dtype=np.int32)
+    ks, vs = float(np.abs(K).max() / 448.0), float(np.abs(V).max() / 448.0)
+    slot = np.arange(total, dtype=np.int64)
+    kcm, vcm = tk.kv_cache_scatter_fp8(_mk(K, "mlx"), _mk(V, "mlx"), mx.array(slot), num_blocks,
+                                       block_size, ks, vs)
+    kct, vct = tk.kv_cache_scatter_fp8(_mk(K, "torch"), _mk(V, "torch"),
+                                       torch.from_numpy(slot).to("mps"), num_blocks, block_size,
+                                       ks, vs)
+    om = tk.paged_attention_fp8(_mk(q, "mlx"), kcm, vcm, mx.array(bt), mx.array(cl), ks, vs,
+                                window=window)
+    ot = tk.paged_attention_fp8(_mk(q, "torch"), kct, vct, torch.from_numpy(bt).to("mps"),
+                                torch.from_numpy(cl).to("mps"), ks, vs, window=window)
+    _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("window,fp8", [(1, False), (5, False), (16, True)])
+def test_paged_attention_v2_window_parity(window, fp8):
+    rng = np.random.default_rng(36 + window)
+    B, H, H_KV, D, num_blocks, block_size = 2, 4, 2, 64, 8, 16
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    cl = np.array([64, 64], dtype=np.int32)
+    if fp8:
+        total = num_blocks * block_size
+        K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+        V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+        ks, vs = float(np.abs(K).max() / 448.0), float(np.abs(V).max() / 448.0)
+        slot = np.arange(total, dtype=np.int64)
+        kcm, vcm = tk.kv_cache_scatter_fp8(_mk(K, "mlx"), _mk(V, "mlx"), mx.array(slot), num_blocks,
+                                           block_size, ks, vs)
+        kct, vct = tk.kv_cache_scatter_fp8(_mk(K, "torch"), _mk(V, "torch"),
+                                           torch.from_numpy(slot).to("mps"), num_blocks, block_size,
+                                           ks, vs)
+        om = tk.paged_attention_v2_fp8(_mk(q, "mlx"), kcm, vcm, mx.array(bt), mx.array(cl), ks, vs,
+                                       partition_size=32, window=window)
+        ot = tk.paged_attention_v2_fp8(_mk(q, "torch"), kct, vct, torch.from_numpy(bt).to("mps"),
+                                       torch.from_numpy(cl).to("mps"), ks, vs, partition_size=32,
+                                       window=window)
+    else:
+        kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+        vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+        om = tk.paged_attention_v2(_mk(q, "mlx"), _mk(kc, "mlx"), _mk(vc, "mlx"), mx.array(bt),
+                                   mx.array(cl), partition_size=32, window=window)
+        ot = tk.paged_attention_v2(_mk(q, "torch"), _mk(kc, "torch"), _mk(vc, "torch"),
+                                   torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                   partition_size=32, window=window)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("D,gemma", [(64, False), (128, True)])
 def test_rope_kv_insert_norm_parity(D, gemma):
     rng = np.random.default_rng(6)

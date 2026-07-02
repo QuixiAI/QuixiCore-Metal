@@ -541,7 +541,8 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
 static at::Tensor paged_attention_fp8_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
-    const at::Tensor& k_scale_in, const at::Tensor& v_scale_in, double scale, int64_t fmt) {
+    const at::Tensor& k_scale_in, const at::Tensor& v_scale_in, double scale, int64_t fmt,
+    int64_t window) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_fp8: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_fp8: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -568,7 +569,7 @@ static at::Tensor paged_attention_fp8_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_paged_attention_fp8(e, q, kc, vc, bt, cl, out, B, H, H_KV, D, block_size,
                                    static_cast<int>(bt.size(1)), scale_f, ks, vs,
-                                   static_cast<int>(fmt), tk_type_name(q));
+                                   static_cast<int>(fmt), static_cast<int>(window), tk_type_name(q));
   });
   return out;
 }
@@ -1066,7 +1067,7 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_mps(
 static at::Tensor paged_attention_v2_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
-    double scale, int64_t partition_size) {
+    double scale, int64_t partition_size, int64_t window) {
   TORCH_CHECK(q_in.device().is_mps(), "paged_attention_v2: q must be an MPS tensor");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -1106,7 +1107,7 @@ static at::Tensor paged_attention_v2_mps(
     tk::launch_paged_attention_partition(
         e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
         B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
-        num_partitions, static_cast<int>(partition_size), tn);
+        num_partitions, static_cast<int>(partition_size), static_cast<int>(window), tn);
     tk::launch_paged_attention_reduce(
         e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
   });
@@ -1118,7 +1119,7 @@ static at::Tensor paged_attention_v2_fp8_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
     const at::Tensor& k_scale_in, const at::Tensor& v_scale_in,
-    double scale, int64_t partition_size, int64_t fmt) {
+    double scale, int64_t partition_size, int64_t fmt, int64_t window) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_v2_fp8: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2_fp8: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -1159,7 +1160,8 @@ static at::Tensor paged_attention_v2_fp8_mps(
     tk::launch_paged_attention_partition_fp8(
         e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
         B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
-        num_partitions, static_cast<int>(partition_size), ks, vs, static_cast<int>(fmt), tn);
+        num_partitions, static_cast<int>(partition_size), ks, vs, static_cast<int>(fmt),
+        static_cast<int>(window), tn);
     tk::launch_paged_attention_reduce(
         e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
   });

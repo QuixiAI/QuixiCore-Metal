@@ -299,20 +299,23 @@ def test_paged_attention_gqa(dtype, atol, D, H, H_KV):
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
 
 
-def _paged_ref_gqa_alibi(q, key_cache, value_cache, block_table, context_lens, scale, slopes):
+def _paged_ref_gqa_alibi(q, key_cache, value_cache, block_table, context_lens, scale, slopes,
+                         window=0):
     B, H, D = q.shape
     H_KV = key_cache.shape[2]
     group = H // H_KV
     bs = key_cache.shape[1]
     out = np.zeros_like(q, np.float32)
     for b in range(B):
+        ctx = int(context_lens[b])
+        t0 = max(0, ctx - window) if window > 0 else 0
         for h in range(H):
             kvh = h // group
             sc, vs = [], []
-            for t in range(int(context_lens[b])):
+            for t in range(t0, ctx):
                 blk = block_table[b, t // bs]
                 slot = t % bs
-                bias = slopes[h] * (t - int(context_lens[b]) + 1)
+                bias = slopes[h] * (t - ctx + 1)
                 sc.append(float(np.dot(q[b, h], key_cache[blk, slot, kvh]) * scale + bias))
                 vs.append(value_cache[blk, slot, kvh])
             if not sc:
@@ -428,6 +431,70 @@ def test_paged_attention_block_sparse(dtype, atol, D, H, H_KV):
     np.testing.assert_allclose(_np(got).astype(np.float32), out, atol=atol, rtol=2e-3)
 
 
+@pytest.mark.parametrize("window", [3, 16, 640])
+def test_paged_attention_alibi_window(window):
+    # #12 composition: sliding window + per-head ALiBi bias together.
+    rng = np.random.default_rng(160 + window)
+    B, H, H_KV, D, bs, ctx = 2, 4, 2, 64, 16, 48
+    nblocks = (ctx + bs - 1) // bs
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(B * nblocks + 1, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(B * nblocks + 1, bs, H_KV, D))).astype(np.float32)
+    bt = np.full((B, nblocks), -1, np.int32)
+    blk = 1
+    for b in range(B):
+        for c in range(nblocks):
+            bt[b, c] = blk; blk += 1
+    cl = np.full((B,), ctx, np.int32)
+    slopes = (0.1 * (1.0 + np.arange(H))).astype(np.float32)
+    scale = 1.0 / math.sqrt(D)
+    got = paged_attention_alibi(mx.array(q).astype(mx.bfloat16), mx.array(kc).astype(mx.bfloat16),
+                                mx.array(vc).astype(mx.bfloat16), mx.array(bt), mx.array(cl),
+                                mx.array(slopes), scale=0.0, window=window)
+    mx.eval(got)
+    ref = _paged_ref_gqa_alibi(q, kc, vc, bt, cl, scale, slopes, window)
+    np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=2e-2, rtol=3e-3)
+
+
+@pytest.mark.parametrize("window", [5, 32, 640])
+def test_paged_attention_block_sparse_window(window):
+    # #12 composition: sliding window + block-sparse skip together.
+    rng = np.random.default_rng(170 + window)
+    B, H, H_KV, D, bs, ctx = 2, 4, 2, 64, 16, 64
+    nblocks = ctx // bs
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(B * nblocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(B * nblocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.arange(B * nblocks, dtype=np.int32).reshape(B, nblocks)
+    cl = np.full((B,), ctx, np.int32)
+    block_mask = np.ones((B, nblocks), np.int32)
+    block_mask[:, 1] = 0            # skip logical block 1
+    scale = 1.0 / math.sqrt(D)
+    got = paged_attention_block_sparse(mx.array(q).astype(mx.bfloat16),
+                                       mx.array(kc).astype(mx.bfloat16),
+                                       mx.array(vc).astype(mx.bfloat16), mx.array(bt), mx.array(cl),
+                                       mx.array(block_mask), scale=0.0, window=window)
+    mx.eval(got)
+    group = H // H_KV
+    t0 = max(0, ctx - window)
+    out = np.zeros_like(q, np.float32)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(t0, ctx):
+                bc = t // bs
+                if block_mask[b, bc] == 0:
+                    continue
+                blk = bt[b, bc]
+                sc.append(float(np.dot(q[b, h], kc[blk, t % bs, kvh]) * scale))
+                vs.append(vc[blk, t % bs, kvh])
+            s = np.array(sc, np.float32)
+            p = np.exp(s - s.max()); p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    np.testing.assert_allclose(_np(got).astype(np.float32), out, atol=2e-2, rtol=3e-3)
+
+
 @pytest.mark.parametrize("dtype,atol", [("float32", 3e-5), ("bfloat16", 2e-2)])
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H,H_KV", [(2, 2), (8, 2), (4, 1)])  # MHA, GQA group 4, MQA
@@ -490,6 +557,40 @@ def test_fp8_kv_roundtrip(D, H, H_KV):
     q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
     ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
+@pytest.mark.parametrize("window", [1, 16, 63, 640])
+def test_paged_attention_fp8_window(D, H, H_KV, window):
+    rng = np.random.default_rng(80 + D + H + window)
+    B, num_blocks, block_size = 2, 8, 16
+    total = num_blocks * block_size
+    K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    block_table = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)  # 4 blocks/seq
+    ctx = 64
+    context_lens = np.array([ctx, ctx], dtype=np.int32)
+    k_scale = float(np.abs(K).max() / 448.0)
+    v_scale = float(np.abs(V).max() / 448.0)
+    scale = 1.0 / math.sqrt(D)
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(np.arange(total, dtype=np.int64)), num_blocks, block_size, k_scale, v_scale)
+    got = paged_attention_fp8(mx.array(q).astype(mx.bfloat16), kc, vc, mx.array(block_table),
+                              mx.array(context_lens), k_scale, v_scale, scale=0.0, window=window)
+    mx.eval(kc, vc, got)
+    kc_deq = _e4m3_decode_arr(np.array(kc)) * k_scale
+    vc_deq = _e4m3_decode_arr(np.array(vc)) * v_scale
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    ref = _paged_ref_window(q_bf, kc_deq, vc_deq, block_table, context_lens, scale, window)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=3e-3)
+    if window >= ctx:
+        full = paged_attention_fp8(mx.array(q).astype(mx.bfloat16), kc, vc, mx.array(block_table),
+                                   mx.array(context_lens), k_scale, v_scale, scale=0.0, window=0)
+        mx.eval(full)
+        np.testing.assert_array_equal(np.array(got.astype(mx.float32)),
+                                      np.array(full.astype(mx.float32)))
 
 
 @pytest.mark.parametrize("D", [64, 128])

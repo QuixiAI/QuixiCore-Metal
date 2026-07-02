@@ -40,6 +40,7 @@ kernel void paged_attention_partition(
     constant int &num_kv_heads [[buffer(12)]],
     constant int &num_partitions [[buffer(13)]],
     constant int &partition_size [[buffer(14)]],
+    constant int &window [[buffer(15)]],      // >0 = sliding window
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -51,6 +52,8 @@ kernel void paged_attention_partition(
     const int context_len = context_lens[batch];
     const int start = part * partition_size;
     const int end = min(start + partition_size, context_len);
+    // Sliding window: raise this partition's lower bound to the window start (end unchanged).
+    const int t_start = (window > 0) ? max(start, context_len - window) : start;
 
     const long q_base = ((long)batch * num_heads + head) * D;
     const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
@@ -64,7 +67,7 @@ kernel void paged_attention_partition(
     }
 
     float m = NEG_INF, l = 0.0f;
-    for (int t = start; t < end; ++t) {
+    for (int t = t_start; t < end; ++t) {
         const int block_col = t / block_size;
         const int slot = t - block_col * block_size;
         const int block = block_table[batch * block_table_stride + block_col];
@@ -123,6 +126,7 @@ kernel void paged_attention_partition_fp8(
     device const float *k_scale [[buffer(15)]],
     device const float *v_scale [[buffer(16)]],
     constant int &fmt [[buffer(17)]],       // 0 = e4m3, 1 = e5m2
+    constant int &window [[buffer(18)]],    // >0 = sliding window
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -135,6 +139,7 @@ kernel void paged_attention_partition_fp8(
     const int context_len = context_lens[batch];
     const int start = part * partition_size;
     const int end = min(start + partition_size, context_len);
+    const int t_start = (window > 0) ? max(start, context_len - window) : start;
 
     const long q_base = ((long)batch * num_heads + head) * D;
     const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
@@ -148,7 +153,7 @@ kernel void paged_attention_partition_fp8(
     }
 
     float m = NEG_INF, l = 0.0f;
-    for (int t = start; t < end; ++t) {
+    for (int t = t_start; t < end; ++t) {
         const int block_col = t / block_size;
         const int slot = t - block_col * block_size;
         const int block = block_table[batch * block_table_stride + block_col];
@@ -259,6 +264,7 @@ kernel void paged_attention_reduce(
       constant int &num_kv_heads [[buffer(12)]],                              \
       constant int &num_partitions [[buffer(13)]],                            \
       constant int &partition_size [[buffer(14)]],                            \
+      constant int &window [[buffer(15)]],                                    \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
   template [[host_name("paged_attention_reduce_" #type_name "_" #DVAL)]]      \
@@ -293,6 +299,7 @@ kernel void paged_attention_reduce(
       device const float *k_scale [[buffer(15)]],                             \
       device const float *v_scale [[buffer(16)]],                             \
       constant int &fmt [[buffer(17)]],                                       \
+      constant int &window [[buffer(18)]],                                    \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);
 

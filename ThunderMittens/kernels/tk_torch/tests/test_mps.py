@@ -231,6 +231,52 @@ def test_paged_attention_v2(D, H, H_KV, partition_size):
     assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
 
 
+@pytest.mark.parametrize("window", [1, 16, 640])
+@pytest.mark.parametrize("fp8", [False, True])
+def test_paged_attention_v2_window(window, fp8):
+    import numpy as np
+    rng = np.random.default_rng(200 + window + int(fp8))
+    B, H, H_KV, D, num_blocks, block_size, ctx = 2, 4, 2, 64, 8, 16, 64
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    cl = np.array([ctx, ctx], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+    group = H // H_KV
+    qt = torch.from_numpy(q).to(torch.bfloat16).to("mps")
+    btt, clt = torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps")
+    if fp8:
+        total = num_blocks * block_size
+        K = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+        V = (0.2 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+        ks, vs = float(np.abs(K).max() / 448.0), float(np.abs(V).max() / 448.0)
+        kc, vc = tk_torch.kv_cache_scatter_fp8(
+            torch.from_numpy(K).to(torch.bfloat16).to("mps"),
+            torch.from_numpy(V).to(torch.bfloat16).to("mps"),
+            torch.from_numpy(np.arange(total, dtype=np.int64)).to("mps"), num_blocks, block_size,
+            ks, vs)
+        got = tk_torch.paged_attention_v2_fp8(qt, kc, vc, btt, clt, ks, vs, 0.0, 32, "e4m3", window)
+        from tk.quant import _e4m3_decode_arr
+        kcn = _e4m3_decode_arr(kc.cpu().numpy()) * ks
+        vcn = _e4m3_decode_arr(vc.cpu().numpy()) * vs
+    else:
+        kcn = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+        vcn = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+        got = tk_torch.paged_attention_v2(qt, torch.from_numpy(kcn).to(torch.bfloat16).to("mps"),
+                                          torch.from_numpy(vcn).to(torch.bfloat16).to("mps"),
+                                          btt, clt, 0.0, 32, window)
+    t0 = max(0, ctx - window)
+    ref = np.zeros_like(q)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group
+            sc = [float(np.dot(q[b, h], kcn[bt[b, t // block_size], t % block_size, kvh]) * scale)
+                  for t in range(t0, ctx)]
+            vs_ = [vcn[bt[b, t // block_size], t % block_size, kvh] for t in range(t0, ctx)]
+            s = np.array(sc, np.float32); p = np.exp(s - s.max()); p /= p.sum()
+            ref[b, h] = np.sum(p[:, None] * np.stack(vs_), axis=0)
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("gemma", [False, True])
 def test_rope_kv_insert_norm(D, gemma):

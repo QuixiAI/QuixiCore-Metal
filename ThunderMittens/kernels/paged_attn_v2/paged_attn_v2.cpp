@@ -35,6 +35,7 @@ array paged_attention_v2(
     const array& context_lens,
     float scale /* = 0.0f */,
     int partition_size /* = 512 */,
+    int window /* = 0 */,
     StreamOrDevice s /* = {} */) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_v2: q must have shape (batch, num_heads, head_size)");
@@ -85,7 +86,8 @@ array paged_attention_v2(
   auto parts = array::make_arrays(
       {{B, H, num_partitions, D}, {B, H, num_partitions}, {B, H, num_partitions}},
       {float32, float32, float32},
-      std::make_shared<PagedAttentionV2Partition>(to_stream(s), scale, num_partitions, partition_size),
+      std::make_shared<PagedAttentionV2Partition>(to_stream(s), scale, num_partitions,
+                                                  partition_size, window),
       {q_c, key_c, value_c, table_c, lens_c});
 
   return array(
@@ -106,6 +108,7 @@ array paged_attention_v2_fp8(
     float scale /* = 0.0f */,
     int partition_size /* = 512 */,
     int fmt /* = 0 */,
+    int window /* = 0 */,
     StreamOrDevice s /* = {} */) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_v2_fp8: q must have shape (batch, num_heads, head_size)");
@@ -163,7 +166,7 @@ array paged_attention_v2_fp8(
       {{B, H, num_partitions, D}, {B, H, num_partitions}, {B, H, num_partitions}},
       {float32, float32, float32},
       std::make_shared<PagedAttentionV2PartitionFp8>(
-          to_stream(s), scale, num_partitions, partition_size, fmt),
+          to_stream(s), scale, num_partitions, partition_size, fmt, window),
       {q_c, key_c, value_c, table_c, lens_c, ks_c, vs_c});
 
   return array(
@@ -210,7 +213,7 @@ void PagedAttentionV2PartitionFp8::eval_gpu(
       enc, q, key_cache, value_cache, block_table, context_lens,
       tmp_out, max_logits, exp_sums, B, H, num_kv_heads, D, block_size,
       block_table.shape(1), scale, num_partitions_, partition_size_,
-      k_scale, v_scale, fmt_, type_to_name(q));
+      k_scale, v_scale, fmt_, window_, type_to_name(q));
 }
 
 void PagedAttentionV2Partition::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -247,7 +250,7 @@ void PagedAttentionV2Partition::eval_gpu(
   tk::launch_paged_attention_partition(
       enc, q, key_cache, value_cache, block_table, context_lens,
       tmp_out, max_logits, exp_sums, B, H, num_kv_heads, D, block_size,
-      block_table.shape(1), scale, num_partitions_, partition_size_, type_to_name(q));
+      block_table.shape(1), scale, num_partitions_, partition_size_, window_, type_to_name(q));
 }
 
 void PagedAttentionV2Reduce::eval_cpu(const std::vector<array>&, std::vector<array>&) {

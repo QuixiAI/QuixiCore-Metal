@@ -121,6 +121,7 @@ array paged_attention_fp8(
     const array& v_scale,
     float scale = 0.0f,
     int fmt = 0,   // 0 = e4m3, 1 = e5m2
+    int window = 0,
     StreamOrDevice s = {});
 
 class KvCacheScatter : public Primitive {
@@ -258,8 +259,8 @@ class KvCacheScatterFp8 : public Primitive {
 
 class PagedAttentionFp8 : public Primitive {
  public:
-  PagedAttentionFp8(Stream stream, float scale, int fmt)
-      : Primitive(stream), scale_(scale), fmt_(fmt) {}
+  PagedAttentionFp8(Stream stream, float scale, int fmt, int window = 0)
+      : Primitive(stream), scale_(scale), fmt_(fmt), window_(window) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -273,12 +274,13 @@ class PagedAttentionFp8 : public Primitive {
   void print(std::ostream& os) override { os << "PagedAttentionFp8"; }
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttentionFp8&>(other);
-    return scale_ == o.scale_ && fmt_ == o.fmt_;
+    return scale_ == o.scale_ && fmt_ == o.fmt_ && window_ == o.window_;
   }
 
  private:
   float scale_;
   int fmt_;
+  int window_;
 };
 
 class PagedAttention : public Primitive {

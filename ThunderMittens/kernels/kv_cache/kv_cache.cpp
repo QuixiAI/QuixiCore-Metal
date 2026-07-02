@@ -686,6 +686,7 @@ array paged_attention_fp8(
     const array& v_scale,
     float scale,
     int fmt,
+    int window,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_fp8: q must be (batch, num_heads, head_size)");
@@ -723,7 +724,7 @@ array paged_attention_fp8(
   return array(
       q.shape(),
       q.dtype(),
-      std::make_shared<PagedAttentionFp8>(to_stream(s), scale, fmt),
+      std::make_shared<PagedAttentionFp8>(to_stream(s), scale, fmt, window),
       {q_c, kc, vc, table_c, lens_c, ks_c, vs_c});
 }
 
@@ -782,7 +783,7 @@ void PagedAttentionFp8::eval_gpu(
   tk::launch_paged_attention_fp8(
       enc, q, key_cache, value_cache, block_table, context_lens, out,
       q.shape(0), q.shape(1), key_cache.shape(2), D, key_cache.shape(1),
-      block_table.shape(1), scale, k_scale, v_scale, fmt_, type_to_name(q));
+      block_table.shape(1), scale, k_scale, v_scale, fmt_, window_, type_to_name(q));
 }
 
 #define TK_KV_NO_AUTODIFF(CLASS, LABEL)                                      \

@@ -299,9 +299,11 @@ NB_MODULE(_ext, m) {
       nb::kw_only(),
       "scale"_a = 0.0f,
       "partition_size"_a = 512,
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
         long-context paged decode attention (partition/reduce). GQA/MQA aware.
+        window > 0 restricts to the `window` most recent keys.
       )");
 
     m.def(
@@ -318,9 +320,11 @@ NB_MODULE(_ext, m) {
       "scale"_a = 0.0f,
       "partition_size"_a = 512,
       "fmt"_a = 0,
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
         long-context paged decode over an fp8 (uint8) cache, per-head scales; fmt 0=e4m3, 1=e5m2. GQA aware.
+        window > 0 restricts to the `window` most recent keys.
       )");
 
     m.def(
@@ -736,9 +740,11 @@ NB_MODULE(_ext, m) {
       "scale"_a = 0.0f,
       "fmt"_a = 0,
       nb::kw_only(),
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
         decode paged attention over fp8 (uint8) caches, dequantized on read; fmt 0=e4m3, 1=e5m2. GQA aware.
+        window > 0 restricts to the `window` most recent keys.
       )");
 
     m.def(

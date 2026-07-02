@@ -27,6 +27,7 @@ array paged_attention_v2(
     const array& context_lens,
     float scale = 0.0f,
     int partition_size = 512,
+    int window = 0,
     StreamOrDevice s = {});
 
 /**
@@ -45,17 +46,20 @@ array paged_attention_v2_fp8(
     float scale = 0.0f,
     int partition_size = 512,
     int fmt = 0,
+    int window = 0,
     StreamOrDevice s = {});
 
 // --- internal primitives (not bound directly) ---
 
 class PagedAttentionV2Partition : public Primitive {
  public:
-  PagedAttentionV2Partition(Stream stream, float scale, int num_partitions, int partition_size)
+  PagedAttentionV2Partition(Stream stream, float scale, int num_partitions, int partition_size,
+                            int window = 0)
       : Primitive(stream),
         scale_(scale),
         num_partitions_(num_partitions),
-        partition_size_(partition_size) {}
+        partition_size_(partition_size),
+        window_(window) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -71,24 +75,26 @@ class PagedAttentionV2Partition : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttentionV2Partition&>(other);
     return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
-        partition_size_ == o.partition_size_;
+        partition_size_ == o.partition_size_ && window_ == o.window_;
   }
 
  private:
   float scale_;
   int num_partitions_;
   int partition_size_;
+  int window_;
 };
 
 class PagedAttentionV2PartitionFp8 : public Primitive {
  public:
   PagedAttentionV2PartitionFp8(
-      Stream stream, float scale, int num_partitions, int partition_size, int fmt)
+      Stream stream, float scale, int num_partitions, int partition_size, int fmt, int window = 0)
       : Primitive(stream),
         scale_(scale),
         num_partitions_(num_partitions),
         partition_size_(partition_size),
-        fmt_(fmt) {}
+        fmt_(fmt),
+        window_(window) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -104,7 +110,7 @@ class PagedAttentionV2PartitionFp8 : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttentionV2PartitionFp8&>(other);
     return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
-        partition_size_ == o.partition_size_ && fmt_ == o.fmt_;
+        partition_size_ == o.partition_size_ && fmt_ == o.fmt_ && window_ == o.window_;
   }
 
  private:
@@ -112,6 +118,7 @@ class PagedAttentionV2PartitionFp8 : public Primitive {
   int num_partitions_;
   int partition_size_;
   int fmt_;
+  int window_;
 };
 
 class PagedAttentionV2Reduce : public Primitive {
