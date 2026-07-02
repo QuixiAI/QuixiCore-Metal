@@ -25,6 +25,10 @@ constant float LMH_NEG_INF = -3.4028234663852886e38f;
 constant int LMH_MAX_K = 64;
 
 // ---- argmax / categorical ----
+// Grid (num_vtiles, num_tok), one simdgroup per (vocab tile, token) — max parallelism (the GEMV is
+// compute-bound here, so parallelism beats W-reuse). Each lane owns the tile's vocab rows
+// v = v0 + lane + 32*r and computes <W[v], h[t]> with VEC4 loads (4x fewer load instructions than
+// the old scalar dot), then a cross-lane argmax. K % 4 == 0 -> the vec4 path; else a scalar tail.
 template <typename T>
 kernel void lm_head_argcat_partials(device const T     *h          [[buffer(0)]],   // (num_tok, K)
                                     device const T     *W          [[buffer(1)]],   // (V, K)
@@ -43,20 +47,21 @@ kernel void lm_head_argcat_partials(device const T     *h          [[buffer(0)]]
                                     uint  lane [[thread_index_in_simdgroup]]) {
     const int vtile = (int)tgid.x;
     const int t     = (int)tgid.y;
-    device const T *hrow = h + (long)t * K;
-
-    // Each lane owns the tile's vocab rows v = v0 + lane + 32*r and computes their full dots
-    // serially, then a single cross-lane argmax. (A cooperative-per-row + simd_sum variant was
-    // measured ~3x slower — the per-vocab reduction latency dominates GEMV.)
     const int v0 = vtile * TILE_V;
     const int v1 = min(v0 + TILE_V, V);
+    const int nk4 = (K % 4 == 0) ? K / 4 : 0;               // vec4 rows must be 4-element aligned
+    device const T *hrow = h + (long)t * K;
+    device const metal::vec<T, 4> *h4 = (device const metal::vec<T, 4>*)hrow;
+
     float best = LMH_NEG_INF;
     int   bi   = (v0 + (int)lane < v1) ? v0 + (int)lane : v0;
     for (int v = v0 + (int)lane; v < v1; v += 32) {
         device const T *wrow = W + (long)v * K;
-        float dot = 0.0f;
-        for (int i = 0; i < K; ++i) dot += float(wrow[i]) * float(hrow[i]);
-        float ls = dot * invtemp;
+        float dot_acc = 0.0f;
+        device const metal::vec<T, 4> *w4 = (device const metal::vec<T, 4>*)wrow;
+        for (int j = 0; j < nk4; ++j) dot_acc += dot(float4(w4[j]), float4(h4[j]));
+        for (int i = nk4 * 4; i < K; ++i) dot_acc += float(wrow[i]) * float(hrow[i]);
+        float ls = dot_acc * invtemp;
         if (use_bias) ls += bias[v];
         if (use_gumbel) ls += rng_gumbel(seed, (uint)t, (uint)v);
         if (ls > best || (ls == best && v < bi)) { best = ls; bi = v; }
@@ -107,6 +112,8 @@ kernel void lm_head_topk_partials(device const T     *h          [[buffer(0)]],
 
     const int v0 = vtile * TILE_V;
     const int v1 = min(v0 + TILE_V, V);
+    const int nk4 = (K % 4 == 0) ? K / 4 : 0;
+    device const metal::vec<T, 4> *h4 = (device const metal::vec<T, 4>*)hrow;
     constexpr int MAX_PER_LANE = 2048 / 32;   // TILE_V <= 2048
     float mine_val[MAX_PER_LANE];
     int   mine_id[MAX_PER_LANE];
@@ -114,9 +121,11 @@ kernel void lm_head_topk_partials(device const T     *h          [[buffer(0)]],
     int   nmine = 0;
     for (int v = v0 + (int)lane; v < v1; v += 32) {
         device const T *wrow = W + (long)v * K;
-        float dot = 0.0f;
-        for (int i = 0; i < K; ++i) dot += float(wrow[i]) * float(hrow[i]);
-        float ls = dot;
+        device const metal::vec<T, 4> *w4 = (device const metal::vec<T, 4>*)wrow;
+        float dot_acc = 0.0f;
+        for (int j = 0; j < nk4; ++j) dot_acc += dot(float4(w4[j]), float4(h4[j]));
+        for (int i = nk4 * 4; i < K; ++i) dot_acc += float(wrow[i]) * float(hrow[i]);
+        float ls = dot_acc;
         if (use_bias) ls += bias[v];
         mine_val[nmine] = ls;
         mine_id[nmine]  = v;

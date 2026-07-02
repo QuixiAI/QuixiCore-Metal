@@ -108,6 +108,26 @@ def test_matches_argmax_sample():
         assert fused[t] == unfused[t] or abs(Ln[t, fused[t]] - Ln[t, unfused[t]]) < 1e-3
 
 
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("mode,k", [("argmax", 0), ("categorical", 0), ("topk", 8)])
+@pytest.mark.parametrize("T,V,K", [(1, 32000, 2048), (8, 32000, 4096), (4, 32000, 2049)])
+def test_fused_kernel_vs_oracle(dtype, mode, k, T, V, K):
+    # The no-materialization fused=True kernel (vec4 path + a K%4!=0 scalar-tail case) must match the
+    # logits oracle just like the default matmul path (tie-tolerant; global-vocab Gumbel).
+    hm, Wm = _mk(T, V, K, dtype)
+    tok = np.array(tk.lm_head_sample(hm, Wm, mode=mode, k=k, temperature=0.8, seed=5, fused=True))
+    L = _logits(hm, Wm)
+    for t in range(T):
+        if mode == "argmax":
+            assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-3
+        elif mode == "categorical":
+            P = L[t] / 0.8 + np.array([_gumbel(5, t, v) for v in range(V)])
+            assert tok[t] == P.argmax() or (P.max() - P[tok[t]]) < 3e-3
+        else:
+            top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
+            assert tok[t] in top or (L[t].max() - L[t, tok[t]]) < 1e-3
+
+
 if __name__ == "__main__":
     test_argmax("bfloat16", 1, 32000, 2048)
     test_categorical("float32", 4, 32000, 2048)
