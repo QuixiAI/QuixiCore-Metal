@@ -1422,6 +1422,45 @@ void launch_ssd_chunk_out(E& e, typename E::in_t cq, typename E::in_t bm, typena
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- chunked SSD backward (D=64): reverse state (qkv -> qscan) + row/col output kernels. -----
+template <class E>
+void launch_ssd_bwd_qkv(E& e, typename E::in_t cq, typename E::in_t dy, typename E::in_t cl,
+                        typename E::out_t qkv, unsigned N, unsigned H, int B, int C, int D) {
+  e.pipeline("ssd_bwd_qkv_" + std::to_string(D));
+  e.in(cq, 0); e.in(dy, 1); e.in(cl, 2); e.out(qkv, 3);
+  e.bytes(N, 4); e.bytes(H, 5);
+  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_ssd_bwd_qscan(E& e, typename E::in_t qin, typename E::in_t cl, typename E::out_t qex,
+                          unsigned C, unsigned N, int BH, int D) {
+  e.pipeline("ssd_bwd_qscan_" + std::to_string(D));
+  e.in(qin, 0); e.in(cl, 1); e.out(qex, 2);
+  e.bytes(C, 3); e.bytes(N, 4);
+  e.dispatch(BH, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_ssd_bwd_out_row(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
+                            typename E::in_t cl, typename E::in_t dy, typename E::in_t p,
+                            typename E::out_t dc, typename E::out_t r, typename E::out_t ri,
+                            unsigned N, unsigned H, int B, int D) {
+  e.pipeline("ssd_bwd_out_row_" + std::to_string(D));
+  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(p, 5);
+  e.out(dc, 6); e.out(r, 7); e.out(ri, 8); e.bytes(N, 9); e.bytes(H, 10);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+template <class E>
+void launch_ssd_bwd_out_col(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
+                            typename E::in_t cl, typename E::in_t dy, typename E::in_t qex,
+                            typename E::in_t qtex, typename E::out_t db, typename E::out_t dx,
+                            typename E::out_t cc, typename E::out_t ci, unsigned N, unsigned H,
+                            int B, int D) {
+  e.pipeline("ssd_bwd_out_col_" + std::to_string(D));
+  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(qex, 5); e.in(qtex, 6);
+  e.out(db, 7); e.out(dx, 8); e.out(cc, 9); e.out(ci, 10); e.bytes(N, 11); e.bytes(H, 12);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
 // ----- attn backward family (FlashAttention-2 bwd). All grid (N/8, H, B) group (32,1,1). -----
 template <class E>
 void launch_attn_fwd_l(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,

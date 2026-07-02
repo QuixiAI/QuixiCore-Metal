@@ -966,9 +966,11 @@ NB_MODULE(_ext, m) {
       "cumlog"_a,
       "dY"_a,
       nb::kw_only(),
+      "force_quadratic"_a = false,
       "stream"_a = nb::none(),
       R"(
-        Mamba-2 / SSD backward: returns [dC, dB, dX, dcumlog] (dcumlog = rowsum(M) - colsum(M))
+        Mamba-2 / SSD backward: returns [dC, dB, dX, dcumlog] (dcumlog = rowsum(M) - colsum(M)).
+        force_quadratic bypasses the chunked linear-time route (for testing route agreement).
       )");
 
     m.def(

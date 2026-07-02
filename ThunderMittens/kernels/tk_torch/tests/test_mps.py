@@ -1141,7 +1141,9 @@ def test_mamba2(shape):
     assert diff / scale < 0.03
 
 
-@pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128)])
+@pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128),
+                                   # chunked linear-time route (D=64, N%64==0, N>=128):
+                                   (1, 2, 128, 64), (2, 2, 192, 64)])
 def test_mamba2_bwd(shape):
     import numpy as np
     Bh, H, N, D = shape

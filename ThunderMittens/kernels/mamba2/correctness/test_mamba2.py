@@ -38,7 +38,9 @@ def test_mamba2(shape):
 
 
 @pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 2, 128, 64), (2, 2, 64, 128),
-                                   (1, 1, 256, 128)])
+                                   (1, 1, 256, 128),
+                                   # chunked linear-time route (D=64, N%64==0, N>=128):
+                                   (1, 1, 128, 64), (2, 2, 192, 64), (1, 2, 256, 64)])
 def test_mamba2_bwd(shape):
     torch = pytest.importorskip("torch")
     Bh, H, N, D = shape
@@ -71,6 +73,58 @@ def test_mamba2_bwd(shape):
     assert rel(dB, Bt.grad.numpy()) < 0.06
     assert rel(dX, Xt.grad.numpy()) < 0.06
     assert rel(dcl, clt.grad.numpy()) < 0.08
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 128, 64), (2, 2, 192, 64), (1, 2, 256, 64)])
+def test_mamba2_bwd_chunked_matches_quadratic(shape):
+    """The chunked linear-time backward must agree bit-for-bit-ish with the O(N^2) quadratic route
+    on the same D=64/N%64==0 input (force_quadratic pins the fallback)."""
+    Bh, H, N, D = shape
+    rng = np.random.default_rng(100 + N)
+    C = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    Bn = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    X = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    a = rng.uniform(0.9, 1.0, (Bh, H, N)).astype(np.float32)
+    cl = np.cumsum(np.log(a), axis=2).astype(np.float32)
+    dY = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    args = (mx.array(C).astype(mx.bfloat16), mx.array(Bn).astype(mx.bfloat16),
+            mx.array(X).astype(mx.bfloat16), mx.array(cl), mx.array(dY).astype(mx.bfloat16))
+    ch = mamba2_bwd(*args)                          # chunked (auto)
+    qd = mamba2_bwd(*args, force_quadratic=True)     # quadratic fallback
+    mx.eval(*ch, *qd)
+    for g, h in zip(ch, qd):
+        g = np.array(g.astype(mx.float32)); h = np.array(h.astype(mx.float32))
+        assert np.abs(g - h).max() / (np.abs(h).max() + 1e-6) < 0.02
+
+
+def test_mamba2_bwd_all_ones_decay():
+    """Degenerate decay: a ≡ 1 so cumlog ≡ 0 and L ≡ 1 (S = tril(C·Bᵀ), no exponential taper), with
+    C = B = e0 so C_i·B_j ≡ 1 and S ≡ tril(1). M = dSt ∘ S is then the raw lower-triangular dY·Xᵀ,
+    so dcl = rowsum(M) − colsum(M) stresses the col_sum + row/col-vec store paths directly (the
+    less-trodden substrate route) with no decay masking. Must still match the autograd oracle."""
+    torch = pytest.importorskip("torch")
+    Bh, H, N, D = 1, 1, 128, 64
+    rng = np.random.default_rng(7)
+    # C = B = e0-like so that C_i . B_j == 1 for all i,j (first coord 1, rest 0).
+    C = np.zeros((Bh, H, N, D), np.float32); C[..., 0] = 1.0
+    Bn = np.zeros((Bh, H, N, D), np.float32); Bn[..., 0] = 1.0
+    X = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    cl = np.zeros((Bh, H, N), np.float32)             # a == 1 -> cumlog == 0 -> L ≡ 1
+    dY = (0.3 * rng.standard_normal((Bh, H, N, D))).astype(np.float32)
+    Ct = torch.tensor(C, requires_grad=True); Bt = torch.tensor(Bn, requires_grad=True)
+    Xt = torch.tensor(X, requires_grad=True); clt = torch.tensor(cl, requires_grad=True)
+    G = torch.einsum("bhid,bhjd->bhij", Ct, Bt)
+    Ld = torch.exp(clt[:, :, :, None] - clt[:, :, None, :])
+    Y = torch.einsum("bhij,bhjd->bhid", torch.tril(G * Ld), Xt)
+    Y.backward(torch.tensor(dY))
+    _, _, _, dcl = mamba2_bwd(mx.array(C).astype(mx.bfloat16), mx.array(Bn).astype(mx.bfloat16),
+                              mx.array(X).astype(mx.bfloat16), mx.array(cl),
+                              mx.array(dY).astype(mx.bfloat16))
+    mx.eval(dcl)
+    ref = clt.grad.numpy()
+    dcl = np.array(dcl.astype(mx.float32))
+    assert np.abs(dcl - ref).max() / (np.abs(ref).max() + 1e-6) < 0.02, \
+        f"dcl rel err {np.abs(dcl - ref).max() / (np.abs(ref).max() + 1e-6)}"
 
 
 def test_mamba2_dcl_to_da():

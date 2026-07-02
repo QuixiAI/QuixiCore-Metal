@@ -1138,13 +1138,15 @@ def mamba2(C, B, X, cumlog):
     return _mlx().mamba2(C, B, X, cumlog)
 
 
-def mamba2_bwd(C, B, X, cumlog, dY):
+def mamba2_bwd(C, B, X, cumlog, dY, force_quadratic=False):
     """Mamba-2 / SSD backward. Given dY, returns (dC, dB, dX, dcumlog) matching the forward shapes
-    (dcumlog = rowsum(M) - colsum(M), the gradient w.r.t. cumlog). D in {64,128}. Use
-    mamba2_dcl_to_da to turn dcumlog into d(log a) / da. Accepts mlx.array or torch.Tensor (MPS)."""
+    (dcumlog = rowsum(M) - colsum(M), the gradient w.r.t. cumlog). D in {64,128}. For D=64,
+    N%64==0, N>=128 a chunked linear-time route is used; force_quadratic pins the O(N^2) route
+    (MLX only, for testing route agreement). Use mamba2_dcl_to_da to turn dcumlog into d(log a) / da.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(C):
         return _torch().mamba2_bwd(C, B, X, cumlog, dY)
-    out = _mlx().mamba2_bwd(C, B, X, cumlog, dY)
+    out = _mlx().mamba2_bwd(C, B, X, cumlog, dY, force_quadratic=force_quadratic)
     return out[0], out[1], out[2], out[3]
 
 

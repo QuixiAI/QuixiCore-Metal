@@ -1887,6 +1887,29 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
   TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
   auto f32 = C.options().dtype(at::kFloat);
   auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
+  // Chunked linear-time backward, gated exactly like the forward (D=64 D x D state); else quadratic.
+  constexpr unsigned L = 64;   // must match SSD_CHUNK_L in the metal
+  if (D == 64 && N % L == 0 && N >= 2 * L) {
+    const int Cn = static_cast<int>(N / L);
+    auto st = [&] { return at::empty({Bsz, H, Cn, D, D}, f32); };
+    auto vec = [&] { return at::empty({Bsz, H, (long)N}, f32); };
+    // P (X_j B_j^T): forward ssd_chunk_kv with (X,B) swapped, then the exclusive prefix scan.
+    auto pkv = st(), P = st();
+    // Reverse states Q (C_i dY_i^T) and its transpose Qt (dY_i C_i^T, via (dY,C) swapped).
+    auto qkv = st(), qex = st(), qtkv = st(), qtex = st();
+    auto r = vec(), ri = vec(), cc = vec(), ci = vec();
+    tk_encode([&](TorchEncoder& e) {
+      tk::launch_ssd_chunk_kv(e, X, B, cl, pkv, N, H, Bsz, Cn, D);
+      tk::launch_ssd_chunk_scan(e, pkv, cl, P, static_cast<unsigned>(Cn), N, Bsz * H, D);
+      tk::launch_ssd_bwd_qkv(e, C, dY, cl, qkv, N, H, Bsz, Cn, D);
+      tk::launch_ssd_bwd_qscan(e, qkv, cl, qex, static_cast<unsigned>(Cn), N, Bsz * H, D);
+      tk::launch_ssd_bwd_qkv(e, dY, C, cl, qtkv, N, H, Bsz, Cn, D);
+      tk::launch_ssd_bwd_qscan(e, qtkv, cl, qtex, static_cast<unsigned>(Cn), N, Bsz * H, D);
+      tk::launch_ssd_bwd_out_row(e, C, B, X, cl, dY, P, dC, r, ri, N, H, Bsz, D);
+      tk::launch_ssd_bwd_out_col(e, C, B, X, cl, dY, qex, qtex, dB, dX, cc, ci, N, H, Bsz, D);
+    });
+    return {dC, dB, dX, (r + ri) - (cc + ci)};
+  }
   auto r = at::empty({Bsz, H, (long)N}, f32);
   auto cc = at::empty({Bsz, H, (long)N}, f32);
   tk_encode([&](TorchEncoder& e) {

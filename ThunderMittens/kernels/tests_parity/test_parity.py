@@ -1079,7 +1079,9 @@ def test_mamba2_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
-@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 1, 64, 128)])
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 1, 64, 128),
+                                   # chunked linear-time route (D=64, N%64==0, N>=128):
+                                   (1, 2, 128, 64), (2, 2, 192, 64)])
 def test_mamba2_bwd_parity(shape):
     B, H, N, D = shape
     rng = np.random.default_rng(1)
