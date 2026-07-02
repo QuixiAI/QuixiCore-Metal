@@ -485,6 +485,22 @@ NB_MODULE(_ext, m) {
         Returns [next_token (B,BM), parent_beam (B,BM), cum_log_probs' (B,BM)].
       )");
 
+  m.def(
+      "spec_verify_linear",
+      &spec_verify_linear,
+      "draft_tokens"_a,
+      "draft_probs"_a,
+      "target_probs"_a,
+      "bonus_tokens"_a,
+      "accept_u"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Speculative decoding linear rejection-sampling verification (vLLM contract). Returns
+        [out_tokens (B,S+1) int32 (-1 = placeholder), accepted_cnt (B,) int32].
+      )");
+
     m.def(
       "apply_penalty",
       &apply_penalty,

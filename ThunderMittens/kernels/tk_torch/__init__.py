@@ -293,6 +293,13 @@ def varlen_build_worklist(cu_seqlens: torch.Tensor, max_tiles: int):
     return tuple(_ext.varlen_build_worklist(cu_seqlens, int(max_tiles)))
 
 
+def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, accept_u, seed):
+    """Speculative decoding linear rejection-sampling verification (vLLM contract). Returns
+    (out_tokens (B,S+1) int32, accepted_cnt (B,) int32). MPS tensors."""
+    return tuple(_ext.spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens,
+                                         accept_u, int(seed)))
+
+
 def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
                           seq_lens: torch.Tensor, block_size: int):
     """Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).

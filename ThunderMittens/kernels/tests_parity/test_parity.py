@@ -187,6 +187,23 @@ def test_beam_advance_parity(B, BM, V):
     _assert_parity(om[2], ot[2], atol=1e-4)  # scores
 
 
+@pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 5, 200)])
+def test_spec_verify_linear_parity(B, S, V):
+    rng = np.random.default_rng(B + S + V)
+    dp = rng.dirichlet(np.ones(V), size=(B, S)).astype(np.float32)
+    tp = rng.dirichlet(np.ones(V), size=(B, S + 1)).astype(np.float32)
+    dt = rng.integers(0, V, size=(B, S)).astype(np.int32)
+    bonus = rng.integers(0, V, size=B).astype(np.int32)
+    au = rng.uniform(0.0, 1.0, size=(B, S)).astype(np.float32)   # mixed accept + rejections
+    om = tk.spec_verify_linear(mx.array(dt), mx.array(dp), mx.array(tp), mx.array(bonus),
+                               mx.array(au), 7)
+    ot = tk.spec_verify_linear(torch.from_numpy(dt).to("mps"), torch.from_numpy(dp).to("mps"),
+                               torch.from_numpy(tp).to("mps"), torch.from_numpy(bonus).to("mps"),
+                               torch.from_numpy(au).to("mps"), 7)
+    _assert_parity(om[0], ot[0], atol=0)     # out_tokens (incl. recovered Gumbel token): exact
+    _assert_parity(om[1], ot[1], atol=0)     # accepted_cnt: exact
+
+
 @pytest.mark.parametrize("B,BM", [(2, 3), (1, 4)])
 def test_beam_reorder_kv_parity(B, BM):
     rng = np.random.default_rng(B + BM)

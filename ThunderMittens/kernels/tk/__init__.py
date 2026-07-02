@@ -940,6 +940,21 @@ def beam_build_copy_pairs(parent_beam, block_table, seq_lens, block_size):
     return _mlx().beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
 
 
+def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, accept_u, seed):
+    """Speculative decoding: linear (non-tree) rejection-sampling verification (vLLM contract).
+    draft_tokens (B,S) int; draft_probs (B,S,V) f32; target_probs (B,S+1,V) f32; bonus_tokens (B,)
+    int; accept_u (B,S) f32 uniforms. Returns (out_tokens (B,S+1) int32, accepted_cnt (B,) int32):
+    draft dt is accepted iff accept_u <= p_target/p_draft; the first rejection emits a token sampled
+    from the residual (p_target-p_draft)+ (seed drives the Gumbel-max resample); all-accept appends
+    the bonus token; positions after the recovered token are -1. Accepts mlx.array / torch (MPS)."""
+    if _is_torch(draft_tokens):
+        return tuple(_torch().spec_verify_linear(
+            draft_tokens, draft_probs, target_probs, bonus_tokens, accept_u, int(seed)))
+    out = _mlx().spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens,
+                                    accept_u, int(seed))
+    return out[0], out[1]
+
+
 def beam_reorder_kv(key_cache, value_cache, block_table, parent_beam, seq_lens):
     """Reorder a paged KV cache after a beam step so each new beam's physical blocks hold its
     parent beam's KV history. Returns (key_cache', value_cache') (new caches — the copy op clones

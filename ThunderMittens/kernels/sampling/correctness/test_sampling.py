@@ -11,7 +11,8 @@ import numpy as np
 import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
-                beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty)
+                beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
+                spec_verify_linear)
 
 
 @pytest.mark.parametrize("B,BM", [(2, 3), (1, 4), (3, 2)])
@@ -84,6 +85,92 @@ def test_beam_build_copy_pairs(B, BM):
             for c in range((int(sl[b * BM + k]) + block_size - 1) // block_size):
                 want.add((int(bt[b * BM + p, c]), int(bt[b * BM + k, c])))
     assert got == want
+
+
+def _spec_inputs(B, S, V, seed=0):
+    rng = np.random.default_rng(seed)
+    dp = rng.dirichlet(np.ones(V), size=(B, S)).astype(np.float32)
+    tp = rng.dirichlet(np.ones(V), size=(B, S + 1)).astype(np.float32)
+    dt = rng.integers(0, V, size=(B, S)).astype(np.int32)
+    bonus = rng.integers(0, V, size=B).astype(np.int32)
+    return dp, tp, dt, bonus
+
+
+def _accept_oracle(dt, dp, tp, au):
+    B, S = dt.shape
+    cnt = np.zeros(B, np.int32)
+    for b in range(B):
+        c = S
+        for i in range(S):
+            pt = tp[b, i, dt[b, i]]; pd = dp[b, i, dt[b, i]]
+            if not (au[b, i] * pd <= pt):
+                c = i; break
+        cnt[b] = c
+    return cnt
+
+
+@pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 1, 128), (4, 6, 33)])
+def test_spec_verify_accept_reject(B, S, V):
+    """Deterministic accept path: accepted_cnt + accepted tokens + bonus + placeholder fill."""
+    dp, tp, dt, bonus = _spec_inputs(B, S, V, seed=B + S + V)
+    # all-accept (u ~ 0): every draft accepted, bonus appended at position S.
+    au0 = np.full((B, S), 1e-9, np.float32)
+    o, cnt = spec_verify_linear(mx.array(dt), mx.array(dp), mx.array(tp), mx.array(bonus),
+                                mx.array(au0), seed=1)
+    mx.eval(o, cnt); o = np.array(o); cnt = np.array(cnt)
+    assert (cnt == S).all()
+    np.testing.assert_array_equal(o[:, :S], dt)
+    np.testing.assert_array_equal(o[:, S], bonus)
+    # mixed accept (u = 0.99): accepted_cnt matches the u <= p_t/p_d oracle; tail is placeholder.
+    au1 = np.full((B, S), 0.99, np.float32)
+    o, cnt = spec_verify_linear(mx.array(dt), mx.array(dp), mx.array(tp), mx.array(bonus),
+                                mx.array(au1), seed=1)
+    mx.eval(o, cnt); o = np.array(o); cnt = np.array(cnt)
+    np.testing.assert_array_equal(cnt, _accept_oracle(dt, dp, tp, au1))
+    for b in range(B):
+        np.testing.assert_array_equal(o[b, :cnt[b]], dt[b, :cnt[b]])   # accepted prefix
+        if cnt[b] < S:
+            assert (o[b, cnt[b] + 1:] == -1).all()                     # placeholder tail
+
+
+def test_spec_verify_recovered_single_support():
+    """When the residual (p_t - p_d)+ has a single positive token, the recovered token is that
+    token for any seed (the Gumbel-max degenerates)."""
+    V = 20
+    dp = np.full((1, 1, V), 1.0 / V, np.float32)
+    tp = np.full((1, 2, V), 1.0 / V, np.float32)
+    tp[0, 0, 7] += 0.5           # token 7 is the only one with p_t > p_d at position 0
+    dp[0, 0, 3] += 0.5           # draft token 3 has p_d > p_t -> forced reject at u=1
+    dt = np.array([[3]], np.int32)
+    bonus = np.array([0], np.int32)
+    au = np.array([[1.0]], np.float32)
+    for seed in (1, 2, 99):
+        o, cnt = spec_verify_linear(mx.array(dt), mx.array(dp), mx.array(tp), mx.array(bonus),
+                                    mx.array(au), seed=seed)
+        mx.eval(o, cnt)
+        assert int(np.array(cnt)[0]) == 0 and int(np.array(o)[0, 0]) == 7
+
+
+def test_spec_verify_recovered_distribution():
+    """Over many seeds, the recovered token is distributed as the normalized residual."""
+    rng = np.random.default_rng(5)
+    V = 40
+    dp = rng.dirichlet(np.ones(V)).astype(np.float32)
+    tp = rng.dirichlet(np.ones(V)).astype(np.float32)
+    dt = int(np.argmax(dp - tp))            # p_t < p_d here -> reject at u=1
+    resid = np.maximum(0, tp - dp); resid /= resid.sum()
+    DT = mx.array(np.array([[dt]], np.int32)); DP = mx.array(dp[None, None])
+    TP = mx.array(np.concatenate([tp[None, None], tp[None, None]], 1))
+    BO = mx.array(np.array([0], np.int32)); AU = mx.array(np.array([[1.0]], np.float32))
+    N = 6000
+    cnt = np.zeros(V)
+    for seed in range(N):
+        o, _ = spec_verify_linear(DT, DP, TP, BO, AU, seed=seed)
+        mx.eval(o); cnt[int(np.array(o)[0, 0])] += 1
+    assert (cnt[resid == 0] == 0).all()      # never samples outside the support
+    freq = cnt / N
+    mask = resid > 0.01
+    assert np.abs(freq[mask] - resid[mask]).max() < 0.03
 
 
 def test_beam_length_penalty():

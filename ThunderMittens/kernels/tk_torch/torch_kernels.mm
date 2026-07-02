@@ -1488,6 +1488,32 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> beam_advance_mps(
   return {next_token, parent_beam, new_cum};
 }
 
+static std::vector<at::Tensor> spec_verify_linear_mps(
+    const at::Tensor& draft_tokens_in, const at::Tensor& draft_probs_in,
+    const at::Tensor& target_probs_in, const at::Tensor& bonus_tokens_in,
+    const at::Tensor& accept_u_in, int64_t seed) {
+  TORCH_CHECK(draft_tokens_in.device().is_mps() && draft_tokens_in.dim() == 2,
+              "spec_verify_linear: draft_tokens must be (B,S) MPS");
+  TORCH_CHECK(draft_probs_in.dim() == 3 && target_probs_in.dim() == 3,
+              "spec_verify_linear: draft_probs (B,S,V), target_probs (B,S+1,V)");
+  const int B = draft_tokens_in.size(0), S = draft_tokens_in.size(1), V = draft_probs_in.size(2);
+  TORCH_CHECK(target_probs_in.size(1) == S + 1 && target_probs_in.size(2) == V,
+              "spec_verify_linear: target_probs must be (B,S+1,V)");
+  auto dt = draft_tokens_in.to(at::kInt).contiguous();
+  auto dp = draft_probs_in.to(at::kFloat).contiguous();
+  auto tp = target_probs_in.to(at::kFloat).contiguous();
+  auto bt = bonus_tokens_in.to(at::kInt).contiguous();
+  auto au = accept_u_in.to(at::kFloat).contiguous();
+  auto i32 = dt.options();
+  auto out_tokens = at::empty({B, S + 1}, i32);
+  auto accepted_cnt = at::empty({B}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_spec_verify_linear(e, dt, dp, tp, bt, au, out_tokens, accepted_cnt, B, S, V,
+                                  static_cast<unsigned>(seed));
+  });
+  return {out_tokens, accepted_cnt};
+}
+
 static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
                                     const at::Tensor& bias_in, const at::Tensor& parent_in,
                                     double temperature,
@@ -2439,6 +2465,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
+  m.def("spec_verify_linear", &spec_verify_linear_mps,
+        "ThunderMittens speculative linear rejection-sampling verification (MPS)");
   m.def("apply_penalty", &apply_penalty_mps, "ThunderMittens logit penalties (MPS)");
   m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8_mps, "ThunderMittens per-tensor fp8 quant (MPS)");
   m.def("quantize_per_tensor_int8", &quantize_per_tensor_int8_mps, "ThunderMittens per-tensor int8 quant (MPS)");

@@ -453,6 +453,19 @@ void launch_beam_select(E& e, typename E::in_t cand_score, typename E::in_t cand
   e.dispatch(B, 1, 1, 32, 1, 1);
 }
 
+// Speculative decoding: linear rejection-sampling verification. One simdgroup per request.
+template <class E>
+void launch_spec_verify_linear(E& e, typename E::in_t draft_tokens, typename E::in_t draft_probs,
+                               typename E::in_t target_probs, typename E::in_t bonus_tokens,
+                               typename E::in_t accept_u, typename E::out_t out_tokens,
+                               typename E::out_t accepted_cnt, int B, int S, int V, unsigned seed) {
+  e.pipeline("spec_verify_linear");
+  e.in(draft_tokens, 0); e.in(draft_probs, 1); e.in(target_probs, 2); e.in(bonus_tokens, 3);
+  e.in(accept_u, 4); e.out(out_tokens, 5); e.out(accepted_cnt, 6);
+  e.bytes(S, 7); e.bytes(V, 8); e.bytes(seed, 9);
+  e.dispatch(B, 1, 1, 32, 1, 1);
+}
+
 // ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
 //        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----
 template <class E>

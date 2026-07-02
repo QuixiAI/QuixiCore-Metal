@@ -191,6 +191,44 @@ std::vector<array> beam_advance(
     int beam_width,
     StreamOrDevice s = {});
 
+/**
+ *  Speculative decoding: linear (non-tree) rejection-sampling verification (the vLLM contract).
+ *  Given draft_tokens (B,S) int, draft_probs (B,S,V) f32, target_probs (B,S+1,V) f32, bonus_tokens
+ *  (B,) int, and accept_u (B,S) f32 uniforms, returns [out_tokens (B,S+1) int32, accepted_cnt (B,)
+ *  int32]. Draft dt is accepted iff u <= p_target/p_draft; the first rejection emits a token sampled
+ *  from the residual (p_target-p_draft)+, and all-accept appends the bonus token. Positions after
+ *  the recovered token are -1 (PLACEHOLDER). seed drives the residual Gumbel-max resample.
+ **/
+std::vector<array> spec_verify_linear(
+    const array& draft_tokens,
+    const array& draft_probs,
+    const array& target_probs,
+    const array& bonus_tokens,
+    const array& accept_u,
+    uint32_t seed,
+    StreamOrDevice s = {});
+
+class SpecVerifyLinear : public Primitive {
+ public:
+  SpecVerifyLinear(Stream stream, uint32_t seed) : Primitive(stream), seed_(seed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SpecVerifyLinear"; }
+  void print(std::ostream& os) override { os << "SpecVerifyLinear"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return seed_ == static_cast<const SpecVerifyLinear&>(other).seed_;
+  }
+
+ private:
+  uint32_t seed_;
+};
+
 class BeamTopkPartials : public Primitive {
  public:
   BeamTopkPartials(Stream stream, int two_bm) : Primitive(stream), two_bm_(two_bm) {}

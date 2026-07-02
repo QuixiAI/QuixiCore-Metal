@@ -335,6 +335,68 @@ kernel void beam_select(device const float *cand_score   [[buffer(0)]],  // (B*B
     }
 }
 
+// ---------------------------------------------------------------------------
+// Speculative decoding: linear (non-tree) rejection-sampling verification, the vLLM contract.
+// For each request b, walk the S draft tokens in order. Draft token dt=draft_tokens[b,i] is
+// ACCEPTED iff u <= p_target/p_draft (u = accept_u[b,i]); on the first rejection, emit a "recovered"
+// token sampled from the residual distribution (p_target - p_draft)+ and stop. If ALL S drafts are
+// accepted, append the bonus token. out_tokens[b] = [accepted..., recovered | bonus, PLACEHOLDER...];
+// accepted_cnt[b] = number of accepted drafts. The residual sample uses the same Gumbel-max trick as
+// sample_categorical (argmax over log((p_t-p_d)+) + Gumbel), which draws proportional to the residual.
+// One simdgroup per request; the accept decision is simdgroup-uniform so the Gumbel-max is convergent.
+// Ref: vLLM v1/sample/rejection_sampler.py.
+// ---------------------------------------------------------------------------
+constant int SPEC_PLACEHOLDER = -1;
+
+kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  // (B, S)
+                               device const float *draft_probs  [[buffer(1)]],  // (B, S, V)
+                               device const float *target_probs [[buffer(2)]],  // (B, S+1, V)
+                               device const int   *bonus_tokens [[buffer(3)]],  // (B,)
+                               device const float *accept_u     [[buffer(4)]],  // (B, S)
+                               device int         *out_tokens   [[buffer(5)]],  // (B, S+1)
+                               device int         *accepted_cnt [[buffer(6)]],  // (B,)
+                               constant int  &S    [[buffer(7)]],
+                               constant int  &V    [[buffer(8)]],
+                               constant uint &seed [[buffer(9)]],
+                               uint bidx [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const int b = (int)bidx;
+    int rejected_at = S;                              // stays S == all drafts accepted
+    for (int i = 0; i < S; ++i) {
+        const int dt = draft_tokens[b * S + i];
+        const long tbase = ((long)b * (S + 1) + i) * V;
+        const long dbase = ((long)b * S + i) * V;
+        const float p_t = target_probs[tbase + dt];
+        const float p_d = draft_probs[dbase + dt];
+        const float u = accept_u[b * S + i];
+        const bool accept = (p_d <= 0.0f) ? true : (u * p_d <= p_t);   // u <= p_t/p_d
+        if (accept) {
+            if (lane == 0) out_tokens[b * (S + 1) + i] = dt;
+            continue;
+        }
+        // recovered token ~ (p_t - p_d)+  via Gumbel-max (== sample_categorical over log residual)
+        float best = SMP_NEG_INF;
+        int bi = 0;
+        for (int v = (int)lane; v < V; v += 32) {
+            const float r = max(0.0f, target_probs[tbase + v] - draft_probs[dbase + v]);
+            const float logit = (r > 0.0f) ? metal::log(r) : SMP_NEG_INF;
+            const float g = logit + rng_gumbel(seed, (uint)(b * S + i), (uint)v);
+            if (g > best || (g == best && v < bi)) { best = g; bi = v; }
+        }
+        simd_argmax(best, bi);
+        if (lane == 0) out_tokens[b * (S + 1) + i] = bi;
+        rejected_at = i;
+        break;
+    }
+    if (rejected_at == S) {                            // all accepted -> bonus at position S
+        if (lane == 0) out_tokens[b * (S + 1) + S] = bonus_tokens[b];
+    } else {                                           // positions after the recovered token: empty
+        for (int i = rejected_at + 1; i <= S; ++i)
+            if (lane == 0) out_tokens[b * (S + 1) + i] = SPEC_PLACEHOLDER;
+    }
+    if (lane == 0) accepted_cnt[b] = rejected_at;
+}
+
 #define instantiate_beam(type_name, T)                                          \
   template [[host_name("beam_topk_partials_" #type_name)]] [[kernel]] void       \
   beam_topk_partials<T>(device const T *logits [[buffer(0)]],                    \

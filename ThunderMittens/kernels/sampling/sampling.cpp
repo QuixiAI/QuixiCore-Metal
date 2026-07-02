@@ -421,4 +421,66 @@ void BeamSelect::eval_gpu(const std::vector<array>& inputs, std::vector<array>& 
 TK_BEAM_NO_AUTODIFF(BeamTopkPartials, "BeamTopkPartials")
 TK_BEAM_NO_AUTODIFF(BeamSelect, "BeamSelect")
 
+// ----------------------------- spec_verify_linear -----------------------------
+
+std::vector<array> spec_verify_linear(
+    const array& draft_tokens,
+    const array& draft_probs,
+    const array& target_probs,
+    const array& bonus_tokens,
+    const array& accept_u,
+    uint32_t seed,
+    StreamOrDevice s /* = {} */) {
+  if (draft_tokens.ndim() != 2) {
+    throw std::invalid_argument("spec_verify_linear: draft_tokens must be (B, S)");
+  }
+  if (draft_probs.ndim() != 3 || target_probs.ndim() != 3) {
+    throw std::invalid_argument("spec_verify_linear: draft_probs (B,S,V) / target_probs (B,S+1,V)");
+  }
+  const int B = draft_tokens.shape(0);
+  const int S = draft_tokens.shape(1);
+  const int V = draft_probs.shape(2);
+  if (target_probs.shape(1) != S + 1 || target_probs.shape(2) != V || draft_probs.shape(0) != B ||
+      draft_probs.shape(1) != S) {
+    throw std::invalid_argument(
+        "spec_verify_linear: shapes must be draft_probs (B,S,V), target_probs (B,S+1,V)");
+  }
+  auto dt_c = contiguous(astype(draft_tokens, int32, s), false, s);
+  auto dp_c = contiguous(astype(draft_probs, float32, s), false, s);
+  auto tp_c = contiguous(astype(target_probs, float32, s), false, s);
+  auto bt_c = contiguous(astype(bonus_tokens, int32, s), false, s);
+  auto au_c = contiguous(astype(accept_u, float32, s), false, s);
+  return array::make_arrays(
+      {{B, S + 1}, {B}}, {int32, int32},
+      std::make_shared<SpecVerifyLinear>(to_stream(s), seed),
+      {dt_c, dp_c, tp_c, bt_c, au_c});
+}
+
+void SpecVerifyLinear::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("SpecVerifyLinear has no CPU implementation.");
+}
+void SpecVerifyLinear::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& draft_tokens = inputs[0];
+  auto& draft_probs = inputs[1];
+  auto& target_probs = inputs[2];
+  auto& bonus_tokens = inputs[3];
+  auto& accept_u = inputs[4];
+  auto& out_tokens = outputs[0];
+  auto& accepted_cnt = outputs[1];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out_tokens.set_data(allocator::malloc_or_wait(out_tokens.nbytes()));
+  accepted_cnt.set_data(allocator::malloc_or_wait(accepted_cnt.nbytes()));
+
+  const int B = draft_tokens.shape(0);
+  const int S = draft_tokens.shape(1);
+  const int V = draft_probs.shape(2);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_spec_verify_linear(enc, draft_tokens, draft_probs, target_probs, bonus_tokens,
+                                accept_u, out_tokens, accepted_cnt, B, S, V, seed_);
+}
+TK_BEAM_NO_AUTODIFF(SpecVerifyLinear, "SpecVerifyLinear")
+
 } // namespace mlx::core

@@ -1065,6 +1065,36 @@ def test_beam_build_copy_pairs(B, BM):
     assert got == want
 
 
+@pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 1, 128)])
+def test_spec_verify_linear(B, S, V):
+    import numpy as np
+    rng = np.random.default_rng(B + S + V)
+    dp = rng.dirichlet(np.ones(V), size=(B, S)).astype(np.float32)
+    tp = rng.dirichlet(np.ones(V), size=(B, S + 1)).astype(np.float32)
+    dt = rng.integers(0, V, size=(B, S)).astype(np.int32)
+    bonus = rng.integers(0, V, size=B).astype(np.int32)
+    mps = lambda a: torch.from_numpy(a).to("mps")
+    # all-accept -> drafts + bonus
+    au0 = np.full((B, S), 1e-9, np.float32)
+    o, cnt = tk_torch.spec_verify_linear(mps(dt), mps(dp), mps(tp), mps(bonus), mps(au0), 1)
+    o = o.cpu().numpy(); cnt = cnt.cpu().numpy()
+    assert (cnt == S).all()
+    np.testing.assert_array_equal(o[:, :S], dt)
+    np.testing.assert_array_equal(o[:, S], bonus)
+    # mixed accept -> accepted_cnt matches the u <= p_t/p_d oracle
+    au1 = np.full((B, S), 0.99, np.float32)
+    o, cnt = tk_torch.spec_verify_linear(mps(dt), mps(dp), mps(tp), mps(bonus), mps(au1), 1)
+    o = o.cpu().numpy(); cnt = cnt.cpu().numpy()
+    ref = np.zeros(B, np.int32)
+    for b in range(B):
+        c = S
+        for i in range(S):
+            if not (au1[b, i] * dp[b, i, dt[b, i]] <= tp[b, i, dt[b, i]]):
+                c = i; break
+        ref[b] = c
+    np.testing.assert_array_equal(cnt, ref)
+
+
 @pytest.mark.parametrize("B,BM,V", [(2, 4, 4000), (3, 8, 4000)])
 def test_beam_advance(B, BM, V):
     import numpy as np
