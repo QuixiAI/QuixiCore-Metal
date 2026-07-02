@@ -187,6 +187,34 @@ def test_beam_advance_parity(B, BM, V):
     _assert_parity(om[2], ot[2], atol=1e-4)  # scores
 
 
+@pytest.mark.parametrize("min_p", [0.2, 0.5])
+def test_min_p_sample_parity(min_p):
+    rng = np.random.default_rng(int(min_p * 100))
+    logits = (rng.standard_normal((4, 500)) * 2).astype(np.float32)
+    om = tk.min_p_sample(_mk(logits, "mlx", "f32"), min_p, seed=9)
+    ot = tk.min_p_sample(_mk(logits, "torch", "f32"), min_p, seed=9)
+    _assert_parity(om, ot, atol=0)           # token ids: exact (same Gumbel)
+
+
+@pytest.mark.parametrize("V", [40, 200])
+def test_apply_token_bitmask_parity(V):
+    rng = np.random.default_rng(V)
+    T = 3
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    allow = rng.integers(0, 2, size=(T, V)).astype(bool)
+    allow[:, 0] = True
+    nw = (V + 31) // 32
+    m = np.zeros((T, nw), np.uint32)
+    for t in range(T):
+        for v in range(V):
+            if allow[t, v]:
+                m[t, v >> 5] |= np.uint32(1) << np.uint32(v & 31)
+    mi = m.view(np.int32)
+    om = tk.apply_token_bitmask(_mk(logits, "mlx", "f32"), mx.array(mi))
+    ot = tk.apply_token_bitmask(_mk(logits, "torch", "f32"), torch.from_numpy(mi).to("mps"))
+    _assert_parity(om, ot, atol=0)           # masked logits: bit-identical
+
+
 @pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 5, 200)])
 def test_spec_verify_linear_parity(B, S, V):
     rng = np.random.default_rng(B + S + V)

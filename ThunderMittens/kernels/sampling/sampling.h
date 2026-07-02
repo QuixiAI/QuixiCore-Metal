@@ -41,6 +41,17 @@ array top_p_sample(
     const array& logits, float p, float temperature = 1.0f, uint32_t seed = 0,
     StreamOrDevice s = {});
 
+/** min-p sampling: keep tokens with (tempered) prob >= min_p * max_prob, Gumbel-max sample among
+ *  them. logits (..., V); returns the token index per row (..., ). min_p in (0, 1]. */
+array min_p_sample(
+    const array& logits, float min_p, float temperature = 1.0f, uint32_t seed = 0,
+    StreamOrDevice s = {});
+
+/** Grammar / structured-output masking: logits[v] = -inf where the packed allow-bitmask bit for v
+ *  is 0. logits (T, V); bitmask (T, ceil(V/32)) uint32. Returns masked logits (T, V), same dtype. */
+array apply_token_bitmask(
+    const array& logits, const array& bitmask, StreamOrDevice s = {});
+
 /**
  *  Apply temperature + repetition/presence/frequency penalties to logits given the
  *  generated token history. logits (T, V); prev_tokens (T, L) int (out-of-range entries,
@@ -148,6 +159,49 @@ class TopPSample : public Primitive {
   float p_;
   float invtemp_;
   uint32_t seed_;
+};
+
+class MinPSample : public Primitive {
+ public:
+  MinPSample(Stream stream, float min_p, float invtemp, uint32_t seed)
+      : Primitive(stream), min_p_(min_p), invtemp_(invtemp), seed_(seed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MinPSample"; }
+  void print(std::ostream& os) override { os << "MinPSample"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MinPSample&>(other);
+    return min_p_ == o.min_p_ && invtemp_ == o.invtemp_ && seed_ == o.seed_;
+  }
+
+ private:
+  float min_p_;
+  float invtemp_;
+  uint32_t seed_;
+};
+
+class ApplyTokenBitmask : public Primitive {
+ public:
+  explicit ApplyTokenBitmask(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "ApplyTokenBitmask"; }
+  void print(std::ostream& os) override { os << "ApplyTokenBitmask"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
 };
 
 class ApplyPenalty : public Primitive {

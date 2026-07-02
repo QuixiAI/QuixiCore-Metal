@@ -234,6 +234,60 @@ kernel void top_p_sample(device const T *logits  [[buffer(0)]],
     }
 }
 
+// min-p sampling: keep only tokens whose (tempered) softmax prob >= min_p * max_prob, then
+// Gumbel-max sample among them. In logit space the keep test is exactly
+//   logits[v]*invtemp >= max_v(logits*invtemp) + log(min_p)
+// (the softmax normalizer cancels), so it is a single max-reduce + one masked Gumbel-max pass.
+// Ref: flashinfer MinPOp (mask probs >= min_p*max(probs), renormalize).
+template <typename T>
+kernel void min_p_sample(device const T *logits  [[buffer(0)]],
+                         device int     *out_idx [[buffer(1)]],
+                         constant int   &V       [[buffer(2)]],
+                         constant float &min_p   [[buffer(3)]],
+                         constant uint  &seed    [[buffer(4)]],
+                         constant float &invtemp [[buffer(5)]],
+                         uint row  [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * V;
+    float m = SMP_NEG_INF;
+    for (int i = (int)lane; i < V; i += 32) {
+        m = max(m, float(logits[base + i]) * invtemp);
+    }
+    m = simd_max(m);                                    // row max of the tempered logits
+    const float thresh = m + metal::log(min_p);
+    float best = SMP_NEG_INF;
+    int bi = (int)lane < V ? (int)lane : 0;
+    for (int i = (int)lane; i < V; i += 32) {
+        const float ls = float(logits[base + i]) * invtemp;
+        if (ls < thresh) { continue; }
+        const float pert = ls + rng_gumbel(seed, (uint)row, (uint)i);
+        if (pert > best || (pert == best && i < bi)) { best = pert; bi = i; }
+    }
+    simd_argmax(best, bi);
+    if (lane == 0) { out_idx[row] = bi; }
+}
+
+// Grammar / structured-output masking: set logits[v] = -inf wherever the packed allow-bitmask bit
+// for token v is 0 (word = bitmask[v>>5]; bit = (word >> (v&31)) & 1). One simdgroup per row; the
+// bitmask is (num_tokens, ceil(V/32)) uint32. Composes before any sampler (like apply_penalty).
+// Ref: sglang apply_token_bitmask_inplace_cuda.cu.
+template <typename T>
+kernel void apply_token_bitmask(device const T    *logits    [[buffer(0)]],   // (num_tokens, V)
+                                device const uint *bitmask   [[buffer(1)]],   // (num_tokens, num_words)
+                                device T          *out       [[buffer(2)]],
+                                constant int      &V         [[buffer(3)]],
+                                constant int      &num_words [[buffer(4)]],
+                                uint row  [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const long lbase = (long)row * V;
+    const long mbase = (long)row * num_words;
+    for (int v = (int)lane; v < V; v += 32) {
+        const uint word = bitmask[mbase + (v >> 5)];
+        const bool allowed = ((word >> (v & 31)) & 1u) != 0u;
+        out[lbase + v] = allowed ? logits[lbase + v] : T(SMP_NEG_INF);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Beam-search advance (two stages, the TRT-LLM / FasterTransformer recipe):
 //   beam_topk_partials : grid (B*BM,), one simdgroup per beam row. Computes the row's
@@ -452,7 +506,24 @@ kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  
                         constant uint &seed [[buffer(3)]],                    \
                         constant float &invtemp [[buffer(4)]],                \
                         uint row [[threadgroup_position_in_grid]],            \
-                        uint lane [[thread_index_in_simdgroup]]);
+                        uint lane [[thread_index_in_simdgroup]]);            \
+  template [[host_name("min_p_sample_" #type_name)]] [[kernel]] void           \
+  min_p_sample<T>(device const T *logits [[buffer(0)]],                       \
+                  device int *out_idx [[buffer(1)]],                          \
+                  constant int &V [[buffer(2)]],                              \
+                  constant float &min_p [[buffer(3)]],                        \
+                  constant uint &seed [[buffer(4)]],                          \
+                  constant float &invtemp [[buffer(5)]],                      \
+                  uint row [[threadgroup_position_in_grid]],                  \
+                  uint lane [[thread_index_in_simdgroup]]);                   \
+  template [[host_name("apply_token_bitmask_" #type_name)]] [[kernel]] void    \
+  apply_token_bitmask<T>(device const T *logits [[buffer(0)]],                \
+                         device const uint *bitmask [[buffer(1)]],            \
+                         device T *out [[buffer(2)]],                         \
+                         constant int &V [[buffer(3)]],                       \
+                         constant int &num_words [[buffer(4)]],               \
+                         uint row [[threadgroup_position_in_grid]],           \
+                         uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_sampling(float32, float)
 instantiate_sampling(float16, half)

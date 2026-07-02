@@ -536,6 +536,17 @@ def top_p_sample(logits: torch.Tensor, p: float, temperature: float = 1.0, seed:
     return _ext.top_p_sample(logits, float(p), float(temperature), int(seed))
 
 
+def min_p_sample(logits: torch.Tensor, min_p: float, temperature: float = 1.0, seed: int = 0):
+    """min-p sampling: Gumbel-max over tokens with prob >= min_p * max_prob. int32. MPS."""
+    return _ext.min_p_sample(logits, float(min_p), float(temperature), int(seed))
+
+
+def apply_token_bitmask(logits: torch.Tensor, bitmask: torch.Tensor):
+    """Grammar / structured-output masking: logits[v] = -inf where the packed allow-bitmask bit for
+    token v is 0. bitmask (T, ceil(V/32)) int32. Returns masked logits, same dtype. MPS."""
+    return _ext.apply_token_bitmask(logits, bitmask)
+
+
 def beam_advance(logits, cum_log_probs, beam_width):
     """Beam-search advance: fused log-softmax + cumulative score + top-beam_width with parent
     tracking. logits (B*BM, V), cum_log_probs (B, BM). Returns (next_token, parent_beam,

@@ -742,6 +742,24 @@ def top_p_sample(logits, p, temperature=1.0, seed=0):
     return _mlx().top_p_sample(logits, p, temperature=temperature, seed=seed)
 
 
+def min_p_sample(logits, min_p, temperature=1.0, seed=0):
+    """min-p sampling: Gumbel-max over tokens with (tempered) prob >= min_p * max_prob. Returns the
+    token index per row (int32). min_p in (0, 1]. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().min_p_sample(logits, min_p, temperature, seed)
+    return _mlx().min_p_sample(logits, min_p, temperature=temperature, seed=seed)
+
+
+def apply_token_bitmask(logits, bitmask):
+    """Grammar / structured-output masking: set logits[v] = -inf where the packed allow-bitmask bit
+    for token v is 0. logits (T, V); bitmask (T, ceil(V/32)) int32 packed words (bit v of row t
+    allows token t*32-block... i.e. word[v>>5] bit (v&31)). Returns masked logits, same dtype.
+    Composes before any sampler. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().apply_token_bitmask(logits, bitmask)
+    return _mlx().apply_token_bitmask(logits, bitmask)
+
+
 def cross_entropy(logits, targets, ignore_index=-100, reduction="mean", label_smoothing=0.0,
                   z_loss=0.0, softcap=0.0, return_lse=False):
     """Fused cross-entropy over the vocab axis WITHOUT storing the (T, V) probabilities.

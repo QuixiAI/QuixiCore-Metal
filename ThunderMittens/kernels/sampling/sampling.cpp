@@ -421,6 +421,93 @@ void BeamSelect::eval_gpu(const std::vector<array>& inputs, std::vector<array>& 
 TK_BEAM_NO_AUTODIFF(BeamTopkPartials, "BeamTopkPartials")
 TK_BEAM_NO_AUTODIFF(BeamSelect, "BeamSelect")
 
+// ----------------------------- min_p_sample / apply_token_bitmask -----------------------------
+
+array min_p_sample(
+    const array& logits, float min_p, float temperature /* = 1.0f */, uint32_t seed /* = 0 */,
+    StreamOrDevice s /* = {} */) {
+  if (logits.ndim() < 1) {
+    throw std::invalid_argument("min_p_sample: logits must have at least 1 dimension");
+  }
+  if (!(logits.dtype() == float32 || logits.dtype() == float16 || logits.dtype() == bfloat16)) {
+    throw std::invalid_argument("min_p_sample: logits must be float32, float16, or bfloat16");
+  }
+  if (temperature <= 0.0f) {
+    throw std::invalid_argument("min_p_sample: temperature must be > 0");
+  }
+  if (!(min_p > 0.0f && min_p <= 1.0f)) {
+    throw std::invalid_argument("min_p_sample: min_p must be in (0, 1]");
+  }
+  auto x = contiguous(logits, false, s);
+  std::vector<int> out_shape(logits.shape().begin(), logits.shape().end() - 1);
+  if (out_shape.empty()) {
+    out_shape.push_back(1);
+  }
+  return array(
+      out_shape, int32,
+      std::make_shared<MinPSample>(to_stream(s), min_p, 1.0f / temperature, seed),
+      {x});
+}
+
+void MinPSample::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MinPSample has no CPU implementation.");
+}
+void MinPSample::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int V = logits.shape(-1);
+  const int rows = static_cast<int>(logits.size() / V);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_min_p_sample(enc, logits, out, rows, V, min_p_, seed_, invtemp_, type_to_name(logits));
+}
+
+array apply_token_bitmask(const array& logits, const array& bitmask, StreamOrDevice s /* = {} */) {
+  if (logits.ndim() < 1) {
+    throw std::invalid_argument("apply_token_bitmask: logits must have at least 1 dimension");
+  }
+  if (!(logits.dtype() == float32 || logits.dtype() == float16 || logits.dtype() == bfloat16)) {
+    throw std::invalid_argument("apply_token_bitmask: logits must be float32, float16, or bfloat16");
+  }
+  const int V = logits.shape(-1);
+  const int num_words = (V + 31) / 32;
+  if (bitmask.shape(-1) != num_words) {
+    throw std::invalid_argument("apply_token_bitmask: bitmask last dim must be ceil(V/32)");
+  }
+  auto x = contiguous(logits, false, s);
+  // packed as int32 words on both backends; the kernel reads the raw bytes as uint (bit-exact).
+  auto m = contiguous(astype(bitmask, int32, s), false, s);
+  return array(
+      logits.shape(), logits.dtype(),
+      std::make_shared<ApplyTokenBitmask>(to_stream(s)),
+      {x, m});
+}
+
+void ApplyTokenBitmask::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("ApplyTokenBitmask has no CPU implementation.");
+}
+void ApplyTokenBitmask::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& bitmask = inputs[1];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int V = logits.shape(-1);
+  const int num_words = (V + 31) / 32;
+  const int rows = static_cast<int>(logits.size() / V);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_apply_token_bitmask(enc, logits, bitmask, out, rows, V, num_words,
+                                 type_to_name(logits));
+}
+
+TK_BEAM_NO_AUTODIFF(MinPSample, "MinPSample")
+TK_BEAM_NO_AUTODIFF(ApplyTokenBitmask, "ApplyTokenBitmask")
+
 // ----------------------------- spec_verify_linear -----------------------------
 
 std::vector<array> spec_verify_linear(

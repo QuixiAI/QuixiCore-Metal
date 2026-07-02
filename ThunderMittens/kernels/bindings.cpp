@@ -472,6 +472,31 @@ NB_MODULE(_ext, m) {
         top-p (nucleus) sampling: Gumbel-max from the smallest top-prob set with mass >= p. Returns int32.
       )");
 
+  m.def(
+      "min_p_sample",
+      &min_p_sample,
+      "logits"_a,
+      "min_p"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "seed"_a = 0u,
+      "stream"_a = nb::none(),
+      R"(
+        min-p sampling: Gumbel-max over tokens with prob >= min_p * max_prob. Returns int32.
+      )");
+
+  m.def(
+      "apply_token_bitmask",
+      &apply_token_bitmask,
+      "logits"_a,
+      "bitmask"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Grammar / structured-output masking: logits[v] = -inf where the packed allow-bitmask bit
+        (bitmask (T, ceil(V/32)) uint32) for token v is 0. Returns masked logits, same dtype.
+      )");
+
     m.def(
       "beam_advance",
       &beam_advance,

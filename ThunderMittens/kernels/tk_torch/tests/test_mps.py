@@ -1065,6 +1065,41 @@ def test_beam_build_copy_pairs(B, BM):
     assert got == want
 
 
+@pytest.mark.parametrize("min_p", [0.2, 0.6])
+def test_min_p_sample(min_p):
+    import numpy as np
+    rng = np.random.default_rng(int(min_p * 100))
+    V = 60
+    logits = (rng.standard_normal(V) * 2).astype(np.float32)
+    p = np.exp(logits - logits.max()); p /= p.sum()
+    kept = set(np.where(p >= min_p * p.max())[0].tolist())
+    x = torch.from_numpy(logits[None]).to("mps")
+    seen = set()
+    for s in range(1500):
+        seen.add(int(tk_torch.min_p_sample(x, min_p, 1.0, s).cpu().numpy()[0]))
+    assert seen <= kept
+
+
+@pytest.mark.parametrize("V", [40, 70])
+def test_apply_token_bitmask(V):
+    import numpy as np
+    rng = np.random.default_rng(V)
+    T = 4
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    allow = rng.integers(0, 2, size=(T, V)).astype(bool)
+    allow[:, 0] = True
+    nw = (V + 31) // 32
+    m = np.zeros((T, nw), np.uint32)
+    for t in range(T):
+        for v in range(V):
+            if allow[t, v]:
+                m[t, v >> 5] |= np.uint32(1) << np.uint32(v & 31)
+    out = tk_torch.apply_token_bitmask(torch.from_numpy(logits).to("mps"),
+                                       torch.from_numpy(m.view(np.int32)).to("mps")).cpu().numpy()
+    np.testing.assert_array_equal(out[allow], logits[allow])
+    assert (out[~allow] < -1e30).all()
+
+
 @pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 1, 128)])
 def test_spec_verify_linear(B, S, V):
     import numpy as np

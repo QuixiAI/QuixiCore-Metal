@@ -12,7 +12,19 @@ import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
-                spec_verify_linear)
+                spec_verify_linear, min_p_sample, apply_token_bitmask)
+
+
+def _pack_bitmask(allow):
+    """Pack a boolean (T, V) allow-mask into (T, ceil(V/32)) int32 words."""
+    T, V = allow.shape
+    nw = (V + 31) // 32
+    m = np.zeros((T, nw), np.uint32)
+    for t in range(T):
+        for v in range(V):
+            if allow[t, v]:
+                m[t, v >> 5] |= np.uint32(1) << np.uint32(v & 31)
+    return m.view(np.int32)
 
 
 @pytest.mark.parametrize("B,BM", [(2, 3), (1, 4), (3, 2)])
@@ -85,6 +97,49 @@ def test_beam_build_copy_pairs(B, BM):
             for c in range((int(sl[b * BM + k]) + block_size - 1) // block_size):
                 want.add((int(bt[b * BM + p, c]), int(bt[b * BM + k, c])))
     assert got == want
+
+
+@pytest.mark.parametrize("min_p", [0.1, 0.3, 0.7])
+def test_min_p_sample(min_p):
+    """Over many seeds, min-p only ever samples tokens with prob >= min_p * max_prob."""
+    rng = np.random.default_rng(int(min_p * 100))
+    V = 60
+    logits = (rng.standard_normal(V) * 2).astype(np.float32)
+    p = np.exp(logits - logits.max()); p /= p.sum()
+    kept = set(np.where(p >= min_p * p.max())[0].tolist())
+    x = mx.array(logits[None])
+    seen = set()
+    for s in range(2500):
+        o = min_p_sample(x, min_p, seed=s)
+        mx.eval(o)
+        seen.add(int(np.array(o)[0]))
+    assert seen <= kept
+    assert int(np.argmax(logits)) in seen        # the top token is always kept
+
+
+@pytest.mark.parametrize("V", [40, 70, 200])
+def test_apply_token_bitmask(V):
+    rng = np.random.default_rng(V)
+    T = 4
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    allow = rng.integers(0, 2, size=(T, V)).astype(bool)
+    allow[:, 0] = True                            # keep at least one token per row
+    out = np.array(apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow))))
+    np.testing.assert_array_equal(out[allow], logits[allow])   # allowed logits untouched
+    assert (out[~allow] < -1e30).all()                         # masked -> -inf sentinel
+
+
+def test_apply_token_bitmask_then_sample():
+    """A grammar mask composed before argmax always yields an allowed token."""
+    rng = np.random.default_rng(0)
+    T, V = 5, 100
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    allow = rng.integers(0, 2, size=(T, V)).astype(bool)
+    allow[:, 3] = True
+    masked = apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow)))
+    tok = np.array(argmax_sample(masked)).reshape(-1)
+    for t in range(T):
+        assert allow[t, tok[t]]
 
 
 def _spec_inputs(B, S, V, seed=0):

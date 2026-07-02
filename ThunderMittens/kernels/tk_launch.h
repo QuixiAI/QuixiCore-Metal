@@ -477,6 +477,23 @@ void launch_top_p_sample(E& e, typename E::in_t logits, typename E::out_t out_id
   e.bytes(V, 2); e.bytes(p, 3); e.bytes(seed, 4); e.bytes(invtemp, 5);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
+template <class E>
+void launch_min_p_sample(E& e, typename E::in_t logits, typename E::out_t out_idx, int rows, int V,
+                         float min_p, uint32_t seed, float invtemp, const std::string& type_name) {
+  e.pipeline("min_p_sample_" + type_name);
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2); e.bytes(min_p, 3); e.bytes(seed, 4); e.bytes(invtemp, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_apply_token_bitmask(E& e, typename E::in_t logits, typename E::in_t bitmask,
+                                typename E::out_t out, int rows, int V, int num_words,
+                                const std::string& type_name) {
+  e.pipeline("apply_token_bitmask_" + type_name);
+  e.in(logits, 0); e.in(bitmask, 1); e.out(out, 2);
+  e.bytes(V, 3); e.bytes(num_words, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
 
 // ----- penalty_histogram: prev_tokens@0(i32) -> counts@1(atomic i32) ; V@2 L@3 TL@4 ; grid (TL).
 //        counts[(row,tok)] += 1 for each valid history token. Zero counts first. -----

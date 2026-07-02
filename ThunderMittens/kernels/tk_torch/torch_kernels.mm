@@ -1571,6 +1571,43 @@ static at::Tensor top_p_sample_mps(const at::Tensor& logits_in, double p, double
   return out;
 }
 
+static at::Tensor min_p_sample_mps(const at::Tensor& logits_in, double min_p, double temperature,
+                                   int64_t seed) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "min_p_sample: logits must be a float MPS tensor");
+  TORCH_CHECK(temperature > 0.0, "min_p_sample: temperature must be > 0");
+  TORCH_CHECK(min_p > 0.0 && min_p <= 1.0, "min_p_sample: min_p must be in (0, 1]");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_min_p_sample(e, logits, out, rows, V, static_cast<float>(min_p),
+                            static_cast<uint32_t>(seed), 1.0f / static_cast<float>(temperature),
+                            tk_type_name(logits));
+  });
+  return out;
+}
+
+static at::Tensor apply_token_bitmask_mps(const at::Tensor& logits_in, const at::Tensor& bitmask_in) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "apply_token_bitmask: logits must be a float MPS tensor");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int num_words = (V + 31) / 32;
+  TORCH_CHECK(bitmask_in.size(-1) == num_words,
+              "apply_token_bitmask: bitmask last dim must be ceil(V/32)");
+  auto bitmask = bitmask_in.to(at::kInt).contiguous();   // raw bytes read as uint in the kernel
+  const int rows = static_cast<int>(logits.numel() / V);
+  auto out = at::empty_like(logits);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_apply_token_bitmask(e, logits, bitmask, out, rows, V, num_words, tk_type_name(logits));
+  });
+  return out;
+}
+
 // Per-tensor (global) dynamic quant via atomic-max. Returns (codes, scale scalar).
 static std::tuple<at::Tensor, at::Tensor> quantize_per_tensor_mps(const at::Tensor& x_in,
                                                                   bool is_int8) {
@@ -2464,6 +2501,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");
   m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
+  m.def("min_p_sample", &min_p_sample_mps, "ThunderMittens min-p sampling (MPS)");
+  m.def("apply_token_bitmask", &apply_token_bitmask_mps, "ThunderMittens grammar bitmask masking (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,
         "ThunderMittens speculative linear rejection-sampling verification (MPS)");
