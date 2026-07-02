@@ -9,6 +9,53 @@ ThunderMittens is an Apple Metal Shading Language (MSL) port for the [ThunderKit
 <br>
 <br>
 
+## Performance highlights
+
+Hand-tuned tile kernels that **beat Apple's own optimized primitives** — and, where the algorithm
+allows, change the complexity class entirely. All numbers are measured median per-call latency on an
+**Apple M4 Max** (40-core GPU, ~546 GB/s), MLX backend, `speedup = baseline_ms / tk_ms`, reproducible
+via `perf/bench_kernels.py`. ~40 kernel families ship on **two backends** (MLX + PyTorch/MPS) from one
+metallib, cross-checked by 1,798 correctness + parity tests.
+
+### Faster than the framework's own tuned kernels
+
+| kernel | shape | vs | speedup |
+|---|---|---|--:|
+| **cross-entropy** (fused-linear) | T2048 × V128256 | framework CE composition | **13.6×** |
+| **layernorm** | 16384 × 768 | `mx.fast.layer_norm` | **3.1×** |
+| **rms_norm** | 16384 × 768 | `mx.fast.rms_norm` | **3.1×** |
+| **gelu** (tanh) | 16384 × 256 | `mx.nn.gelu_approx` | **3.1×** |
+| **softmax** | 16384 × 768 | `mx.softmax` | **2.9×** |
+| **causal attention** | 1×8×2048×128 | `scaled_dot_product_attention` | **3.9×** |
+| **fused add + rms_norm** | 4096 × 1024 | `add` + `mx.fast.rms_norm` | **1.9×** |
+| **matmul** | 4096×4096×32 (thin-K) | `mx.matmul` | **1.8×** |
+
+### Algorithmic & serving wins
+
+| kernel | shape | vs | speedup |
+|---|---|---|--:|
+| **linear attention** (chunked, causal) | 2×8×4096×64 | masked O(N²) reference | **6.4×** |
+| **Mamba-2 / SSD backward** (linear-time chunked) | 1×8×8192×64 | O(N²) quadratic backward | **15.9×** |
+| **MLA decode** (paged, partitioned) | 8×16, ctx 8192 | single-partition v1 | **6.3×** |
+| **attention backward** (FlashAttention-2) | 1×8×2048×64 | naive VJP | **5.4×** |
+| **beam-search advance** (single-pass top-M) | 16 beams × V128256 | framework top-k | **5.2×** |
+| **paged attention v2** (partitioned decode) | 8×32, ctx 2048 | v1 decode | **4.6×** |
+| **Mamba-2 / SSD forward** (chunked) | 2×16×4096×64 | O(N²) quadratic | **4.7×** |
+| **Hadamard transform** | 16384 × 512 | matmul-with-H | **9.4×** |
+| **weight-only quantized GEMV** | 32000 × 4096 (BitNet) | fp16 matmul | **3.8×** |
+| **grouped MoE** (schedule + gather) | E8, H2048 | per-expert loop | **1.5×** |
+
+Weight-only quant covers **~29 formats** (GGUF k-/i-quants, fp8, NVFP4, AWQ, GPTQ act-order, BitNet
+ternary, …), and **every format now beats the fp16 GEMV baseline**. Sliding-window, ALiBi, and
+block-sparse masks compose on the paged-decode path; the Mamba-2/linear-attention families auto-route
+between an O(N²) kernel (small N) and a linear-time chunked pipeline (D∈{64,128}) at measured
+crossovers.
+
+> Honesty note: not every kernel wins at every shape — a few match the framework or trade off in
+> niche regimes (small-D Hadamard, square GEMM, some quant geometries). The full per-kernel ledger,
+> including the accepted losses and rejected experiments, lives in
+> [`perf/optimization_status.md`](perf/optimization_status.md).
+
 ## Prerequisites (all paths)
 
 - Apple Silicon Mac.
