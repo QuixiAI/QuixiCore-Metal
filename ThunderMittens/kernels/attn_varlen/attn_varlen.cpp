@@ -45,6 +45,61 @@ array attn_varlen_prefill(
        contiguous(astype(seq_qlen, int32, s), false, s)});
 }
 
+std::vector<array> varlen_build_worklist(
+    const array& cu_seqlens,
+    int max_tiles,
+    StreamOrDevice s /* = {} */) {
+  assert(cu_seqlens.ndim() == 1);
+  const int B = cu_seqlens.shape(0) - 1;
+  assert(B >= 1 && B <= 256 && "varlen_build_worklist: B in [1,256] (single-threadgroup scan)");
+  auto cu_c = contiguous(astype(cu_seqlens, int32, s), false, s);
+  auto out = array::make_arrays(
+      {{B}, {B + 1}, {max_tiles}, {max_tiles}, {1}},
+      {int32, int32, int32, int32, int32},
+      std::make_shared<VarlenBuildWorklist>(to_stream(s), max_tiles),
+      {cu_c});
+  return out;
+}
+
+void VarlenBuildWorklist::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("VarlenBuildWorklist has no CPU implementation.");
+}
+
+void VarlenBuildWorklist::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& cu_seqlens = inputs[0];
+  auto& qlens = outputs[0];
+  auto& pad_off = outputs[1];
+  auto& tile_seq = outputs[2];
+  auto& tile_local0 = outputs[3];
+  auto& n_tiles = outputs[4];
+  for (auto* o : {&qlens, &pad_off, &tile_seq, &tile_local0, &n_tiles}) {
+    o->set_data(allocator::malloc_or_wait(o->nbytes()));
+  }
+  const int B = cu_seqlens.shape(0) - 1;
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_varlen_build_worklist(enc, cu_seqlens, qlens, pad_off, tile_seq, tile_local0, n_tiles,
+                                   B, max_tiles_);
+}
+
+std::vector<array> VarlenBuildWorklist::jvp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("VarlenBuildWorklist has no jvp implementation.");
+}
+std::vector<array> VarlenBuildWorklist::vjp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("VarlenBuildWorklist has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> VarlenBuildWorklist::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("VarlenBuildWorklist has no vmap implementation.");
+}
+
 void AttnVarlenPrefill::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("AttnVarlenPrefill has no CPU implementation.");
 }

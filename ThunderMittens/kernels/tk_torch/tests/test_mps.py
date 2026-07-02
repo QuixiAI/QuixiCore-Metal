@@ -837,6 +837,26 @@ def test_attn_window(shape, window):
     assert torch.equal(full, causal), "window >= N must match attn_causal exactly"
 
 
+@pytest.mark.parametrize("cu", [[0, 5, 5, 20, 37], [0, 8, 24], [0, 64]])
+def test_varlen_build_worklist(cu):
+    import numpy as np
+    import tk
+    cu = np.asarray(cu, np.int32)
+    B = len(cu) - 1
+    ql, _padded, poff, ts, tl = tk._varlen_worklist(cu)
+    max_tiles = int((cu[-1] + 7 * B) // 8 + B)
+    q2, po2, ts2, tl2, nt2 = tk_torch.varlen_build_worklist(
+        torch.from_numpy(cu).to("mps"), max_tiles)
+    q2, po2, ts2, tl2, nt2 = (x.cpu().numpy() for x in (q2, po2, ts2, tl2, nt2))
+    n = len(ts)
+    assert int(nt2[0]) == n
+    np.testing.assert_array_equal(q2, ql)
+    np.testing.assert_array_equal(po2, poff.astype(np.int32))
+    np.testing.assert_array_equal(ts2[:n], ts)
+    np.testing.assert_array_equal(tl2[:n], tl)
+    assert (ts2[n:] == -1).all()
+
+
 @pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
 def test_attn_varlen_prefill(D, H, H_KV):
     import numpy as np

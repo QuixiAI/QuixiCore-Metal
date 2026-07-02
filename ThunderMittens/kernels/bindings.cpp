@@ -806,6 +806,18 @@ NB_MODULE(_ext, m) {
         padded per sequence to a multiple of 8) reading K/V from the paged cache
       )");
 
+  m.def(
+      "varlen_build_worklist",
+      &varlen_build_worklist,
+      "cu_seqlens"_a,
+      "max_tiles"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        On-device varlen prefill scheduler: cu_seqlens (B+1) -> [qlens, pad_off, tile_seq,
+        tile_local0, n_tiles] (tile_seq is -1 past n_tiles). max_tiles is a host upper bound.
+      )");
+
     m.def(
       "lm_head_sample",
       &lm_head_sample,

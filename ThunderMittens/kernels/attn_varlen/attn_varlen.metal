@@ -126,4 +126,49 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
 instantiate_attn_varlen(64);
 instantiate_attn_varlen(128);
 
+// On-device varlen prefill scheduler: from a device cu_seqlens (B+1) build the per-8-row-tile
+// worklist that attn_varlen_prefill consumes, with no host loop. One threadgroup (B <= 256); a
+// threadgroup exclusive prefix-sum turns per-seq tile counts and padded lengths into tile offsets
+// and pad offsets. Emits qlens (B), pad_off (B+1, exclusive over padded), tile_seq/tile_local0
+// (max_tiles; sentinel -1 past n_tiles so the attn kernel skips unused tiles), and n_tiles (1).
+// max_tiles is a host upper bound (>= sum ceil(qlen/8)); Metal cannot size a grid from device data.
+[[host_name("varlen_build_worklist")]]
+kernel void varlen_build_worklist(device const int *cu_seqlens [[buffer(0)]],   // (B+1,)
+                                  device int *qlens       [[buffer(1)]],         // (B,)
+                                  device int *pad_off     [[buffer(2)]],         // (B+1,)
+                                  device int *tile_seq    [[buffer(3)]],         // (max_tiles,)
+                                  device int *tile_local0 [[buffer(4)]],         // (max_tiles,)
+                                  device int *n_tiles     [[buffer(5)]],         // (1,)
+                                  constant int &B         [[buffer(6)]],
+                                  constant int &max_tiles [[buffer(7)]],
+                                  uint tid [[thread_index_in_threadgroup]],
+                                  uint nthreads [[threads_per_threadgroup]]) {
+    threadgroup int sg_sums[8];    // nthreads / 32 <= 8 (nthreads <= 256)
+    int qlen = 0, ntile = 0, padded = 0;
+    if ((int)tid < B) {
+        qlen = cu_seqlens[tid + 1] - cu_seqlens[tid];
+        ntile = (qlen + 7) / 8;
+        padded = ntile * 8;
+        qlens[tid] = qlen;
+    }
+    int total_tiles = 0;
+    const int tile_off = mittens::threadgroup_exclusive_scan_i32(ntile, tid, nthreads, sg_sums,
+                                                                 total_tiles);
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);   // reuse sg_sums for scan #2
+    int total_padded = 0;
+    const int poff = mittens::threadgroup_exclusive_scan_i32(padded, tid, nthreads, sg_sums,
+                                                            total_padded);
+    if ((int)tid < B) pad_off[tid] = poff;
+    if (tid == 0) { pad_off[B] = total_padded; n_tiles[0] = total_tiles; }
+    // emit this seq's tiles into [tile_off, tile_off + ntile)  (all < total_tiles)
+    for (int t = 0; t < ntile; ++t) {
+        tile_seq[tile_off + t] = (int)tid;
+        tile_local0[tile_off + t] = t * 8;
+    }
+    // sentinel-fill unused slots [total_tiles, max_tiles) (disjoint from the emit ranges above)
+    for (int i = (int)tid; i < max_tiles; i += (int)nthreads) {
+        if (i >= total_tiles) { tile_seq[i] = -1; tile_local0[i] = 0; }
+    }
+}
+
 }

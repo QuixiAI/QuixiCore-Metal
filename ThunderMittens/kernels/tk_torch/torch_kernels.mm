@@ -1615,6 +1615,26 @@ static at::Tensor attn_varlen_prefill_mps(
   return out;
 }
 
+static std::vector<at::Tensor> varlen_build_worklist_mps(
+    const at::Tensor& cu_seqlens_in, int64_t max_tiles) {
+  TORCH_CHECK(cu_seqlens_in.device().is_mps() && cu_seqlens_in.dim() == 1,
+              "varlen_build_worklist: cu_seqlens must be a 1-D MPS tensor (B+1,)");
+  auto cu = cu_seqlens_in.to(at::kInt).contiguous();
+  const int B = static_cast<int>(cu.size(0)) - 1;
+  TORCH_CHECK(B >= 1 && B <= 256, "varlen_build_worklist: B in [1,256]");
+  auto i32 = cu.options().dtype(at::kInt);
+  auto qlens = at::empty({(long)B}, i32);
+  auto pad_off = at::empty({(long)(B + 1)}, i32);
+  auto tile_seq = at::empty({max_tiles}, i32);
+  auto tile_local0 = at::empty({max_tiles}, i32);
+  auto n_tiles = at::empty({1}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_varlen_build_worklist(e, cu, qlens, pad_off, tile_seq, tile_local0, n_tiles,
+                                     B, static_cast<int>(max_tiles));
+  });
+  return {qlens, pad_off, tile_seq, tile_local0, n_tiles};
+}
+
 // Fused LM-head + sampling: token id per row of h without materializing the (T, V) logits.
 static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W_in,
                                      const at::Tensor& bias_in, int64_t mode, int64_t k,
@@ -2373,6 +2393,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
+  m.def("varlen_build_worklist", &varlen_build_worklist_mps,
+        "ThunderMittens on-device varlen prefill worklist builder (MPS)");
   m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");
   m.def("lm_head_sample_q", &lm_head_sample_q_mps,
         "ThunderMittens fused LM-head + sampling over quantized weights (MPS)");

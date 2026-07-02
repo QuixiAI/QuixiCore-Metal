@@ -28,6 +28,39 @@ array attn_varlen_prefill(
     float scale,
     StreamOrDevice s = {});
 
+/**
+ *  On-device varlen prefill scheduler: from cu_seqlens (B+1,) int32 build the tile worklist that
+ *  attn_varlen_prefill consumes, with no host loop. Returns [qlens (B,), pad_off (B+1,),
+ *  tile_seq (max_tiles,), tile_local0 (max_tiles,), n_tiles (1,)], all int32; tile_seq is -1 past
+ *  n_tiles. max_tiles is a host upper bound on sum(ceil(qlen/8)) (Metal can't size a grid from
+ *  device data); n_tiles/pad_off[-1] give the true tile count / total padded length.
+ **/
+std::vector<array> varlen_build_worklist(
+    const array& cu_seqlens,
+    int max_tiles,
+    StreamOrDevice s = {});
+
+class VarlenBuildWorklist : public Primitive {
+ public:
+  VarlenBuildWorklist(Stream stream, int max_tiles) : Primitive(stream), max_tiles_(max_tiles) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "VarlenBuildWorklist"; }
+  void print(std::ostream& os) override { os << "VarlenBuildWorklist"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return max_tiles_ == static_cast<const VarlenBuildWorklist&>(other).max_tiles_;
+  }
+
+ private:
+  int max_tiles_;
+};
+
 class AttnVarlenPrefill : public Primitive {
  public:
   explicit AttnVarlenPrefill(Stream stream, float scale) : Primitive(stream), scale_(scale) {}

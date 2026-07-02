@@ -125,6 +125,27 @@ def test_matches_attn_causal():
     np.testing.assert_array_equal(np.array(o.astype(mx.float32)), od)
 
 
+@pytest.mark.parametrize("cu", [[0, 5, 5, 20, 37], [0, 8, 24], [0, 1, 2, 3, 4, 5, 6, 7],
+                                [0, 64], [0, 3, 3, 3]])
+def test_varlen_build_worklist(cu):
+    """The on-device scheduler matches the numpy host worklist builder exactly (qlens, pad_off,
+    tile_seq, tile_local0, n_tiles), and sentinel-fills unused tiles with -1."""
+    cu = np.asarray(cu, np.int32)
+    B = len(cu) - 1
+    ql, _padded, poff, ts, tl = tk._varlen_worklist(cu)
+    max_tiles = int((cu[-1] + 7 * B) // 8 + B)     # host upper bound
+    q2, po2, ts2, tl2, nt2 = tk.varlen_build_worklist(mx.array(cu), max_tiles)
+    mx.eval(q2, po2, ts2, tl2, nt2)
+    q2, po2, ts2, tl2, nt2 = (np.array(x) for x in (q2, po2, ts2, tl2, nt2))
+    n = len(ts)
+    assert int(nt2[0]) == n
+    np.testing.assert_array_equal(q2, ql)
+    np.testing.assert_array_equal(po2, poff.astype(np.int32))
+    np.testing.assert_array_equal(ts2[:n], ts)
+    np.testing.assert_array_equal(tl2[:n], tl)
+    assert (ts2[n:] == -1).all()
+
+
 if __name__ == "__main__":
     test_equal_lengths(64)
     test_ragged(64)

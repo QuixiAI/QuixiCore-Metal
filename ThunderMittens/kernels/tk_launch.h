@@ -1165,6 +1165,21 @@ void launch_attn_varlen_prefill(E& e, typename E::in_t q_hm, typename E::in_t ke
   e.dispatch(n_tiles, H, 1, 32, 1, 1);
 }
 
+// Build the varlen prefill worklist on-device from cu_seqlens. One threadgroup, round32(B) threads.
+template <class E>
+void launch_varlen_build_worklist(E& e, typename E::in_t cu_seqlens, typename E::out_t qlens,
+                                  typename E::out_t pad_off, typename E::out_t tile_seq,
+                                  typename E::out_t tile_local0, typename E::out_t n_tiles,
+                                  int B, int max_tiles) {
+  e.pipeline("varlen_build_worklist");
+  e.in(cu_seqlens, 0); e.out(qlens, 1); e.out(pad_off, 2); e.out(tile_seq, 3);
+  e.out(tile_local0, 4); e.out(n_tiles, 5); e.bytes(B, 6); e.bytes(max_tiles, 7);
+  int nthreads = ((B + 31) / 32) * 32;
+  if (nthreads < 32) nthreads = 32;
+  if (nthreads > 256) nthreads = 256;
+  e.dispatch(1, 1, 1, nthreads, 1, 1);
+}
+
 // ----- lm_head fused LM-head + sampling (two-stage partition/reduce) -----
 // argcat partials: h@0 W@1 -> part_val@2 part_id@3 ; bias@4 ; V@5 K@6 TILE_V@7 num_vtiles@8 (i32)
 //   invtemp@9 (f32) seed@10 (u32) use_gumbel@11 use_bias@12 (i32) ; grid (num_vtiles, T) × 32.

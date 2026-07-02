@@ -112,6 +112,19 @@ def _varlen_worklist(cu_seqlens_q):
             np.asarray(tile_seq, np.int32), np.asarray(tile_local0, np.int32))
 
 
+def varlen_build_worklist(cu_seqlens, max_tiles):
+    """On-device version of the varlen prefill scheduler: builds the tile worklist from a DEVICE
+    cu_seqlens (B+1,) int with no host loop. Returns (qlens (B,), pad_off (B+1,), tile_seq
+    (max_tiles,), tile_local0 (max_tiles,), n_tiles (1,)); tile_seq is -1 past n_tiles. max_tiles is
+    a host upper bound on sum(ceil(qlen/8)) — Metal cannot size a grid from device data, so the
+    caller provides the bound and reads n_tiles / pad_off[-1] to drive the downstream dispatch.
+    B <= 256 (single-threadgroup scan). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(cu_seqlens):
+        return tuple(_torch().varlen_build_worklist(cu_seqlens, int(max_tiles)))
+    out = _mlx().varlen_build_worklist(cu_seqlens, int(max_tiles))
+    return out[0], out[1], out[2], out[3], out[4]
+
+
 def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_lens,
                         cu_seqlens_q, scale=0.0):
     """Varlen / paged-prefill causal attention: ragged packed queries reading K/V from the paged

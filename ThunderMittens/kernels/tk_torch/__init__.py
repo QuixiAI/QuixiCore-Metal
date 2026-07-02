@@ -286,6 +286,13 @@ def kv_cache_copy_blocks(key_cache: torch.Tensor, value_cache: torch.Tensor,
     return _ext.kv_cache_copy_blocks(key_cache, value_cache, block_mapping)
 
 
+def varlen_build_worklist(cu_seqlens: torch.Tensor, max_tiles: int):
+    """On-device varlen prefill worklist builder from cu_seqlens (B+1,). Returns
+    (qlens, pad_off, tile_seq, tile_local0, n_tiles); tile_seq is -1 past n_tiles. max_tiles is a
+    host upper bound on the tile count. MPS tensors."""
+    return tuple(_ext.varlen_build_worklist(cu_seqlens, int(max_tiles)))
+
+
 def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
                           seq_lens: torch.Tensor, block_size: int):
     """Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).

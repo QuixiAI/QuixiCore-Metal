@@ -208,6 +208,17 @@ def test_beam_reorder_kv_parity(B, BM):
     _assert_parity(vm, vt, atol=0)
 
 
+@pytest.mark.parametrize("cu", [[0, 5, 5, 20, 37], [0, 8, 24], [0, 64]])
+def test_varlen_build_worklist_parity(cu):
+    cu = np.asarray(cu, np.int32)
+    B = len(cu) - 1
+    max_tiles = int((cu[-1] + 7 * B) // 8 + B)
+    om = tk.varlen_build_worklist(mx.array(cu), max_tiles)
+    ot = tk.varlen_build_worklist(torch.from_numpy(cu).to("mps"), max_tiles)
+    for a, b in zip(om, ot):                 # qlens, pad_off, tile_seq, tile_local0, n_tiles: exact
+        _assert_parity(a, b, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]
