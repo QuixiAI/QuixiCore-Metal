@@ -584,13 +584,35 @@ def lin_attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
 
 
 def mamba2(C: torch.Tensor, B: torch.Tensor, X: torch.Tensor, cumlog: torch.Tensor):
-    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}, N%8."""
+    """Mamba-2 / SSD forward. C,B,X bf16 (B,H,N,D); cumlog fp32 (B,H,N). MPS; D in {64,128}, N%8.
+    Auto-routed between the quadratic kernel and the chunked linear-time pipeline at the
+    MEASURED crossovers: N>=2048 for D=64, N>=4096 for D=128 (chunked needs N%64==0)."""
     return _ext.mamba2(C, B, X, cumlog)
 
 
+def mamba2_chunked(C, B, X, cumlog):
+    """The chunked linear-time forward, forced (tests/benchmarks). N%64==0, N>=128."""
+    return _ext.mamba2_chunked(C, B, X, cumlog)
+
+
 def mamba2_bwd(C, B, X, cumlog, dY):
-    """Mamba-2 / SSD backward. Returns (dC, dB, dX, dcumlog) matching the forward shapes. MPS."""
+    """Mamba-2 / SSD backward. Returns (dC, dB, dX, dcumlog) matching the forward shapes. MPS.
+    Auto-routed like the forward (chunked linear-time above the measured crossovers)."""
     return _ext.mamba2_bwd(C, B, X, cumlog, dY)
+
+
+def mamba2_bwd_chunked(C, B, X, cumlog, dY):
+    """The chunked linear-time backward, forced (tests/benchmarks). N%64==0, N>=128."""
+    return _ext.mamba2_bwd_chunked(C, B, X, cumlog, dY)
+
+
+def ssd_decode(S, alpha, x, k, q):
+    """Single-token SSD decode step: S <- alpha*S + x⊗k ; y = S·q (readout after the write).
+
+    S (B,H,D,D) fp32 is updated IN PLACE; alpha (B,H), x/k/q (B,H,D) fp32. MPS; D in {64,128}.
+    Returns (y (B,H,D), S). The O(D^2) generation step for mamba2 / lin_attn_decay
+    (q=C_t, k=B_t, x=X_t; alpha=1 for undecayed linear attention)."""
+    return _ext.ssd_decode(S, alpha, x, k, q)
 
 
 def lin_attn_decay(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, cl: torch.Tensor):

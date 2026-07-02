@@ -1121,7 +1121,21 @@ def test_lin_attn_causal(shape):
     assert diff / scale < 0.03
 
 
-@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64)])
+# NOTE the mamba2 oracles mask the decay EXPONENT (with -inf) before exp: exp(cl_i - cl_j)
+# overflows to inf in the upper triangle once N*|log a| exceeds ~88, and inf * 0 = NaN (forward)
+# / 0 * inf = NaN (through tril's backward) would poison the reference. The kernels never form
+# the upper triangle, so they are unaffected.
+def _mamba2_fwd_ref(C, Bm, X, cumlog, N):
+    scores = C.float() @ Bm.float().transpose(-1, -2)
+    expo = cumlog[..., :, None] - cumlog[..., None, :]
+    causal = torch.tril(torch.ones(N, N, dtype=torch.bool, device=C.device))
+    expo = expo.masked_fill(~causal, float("-inf"))
+    return (scores * torch.exp(expo)) @ X.float()
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64),
+                                   # auto-routed chunked (N >= threshold, N%64==0):
+                                   (1, 1, 2048, 64)])
 def test_mamba2(shape):
     B, H, N, D = shape
     torch.manual_seed(0)
@@ -1131,37 +1145,69 @@ def test_mamba2(shape):
     a = torch.sigmoid(torch.randn(B, H, N, device="mps")) * 0.5 + 0.5
     cumlog = torch.cumsum(torch.log(a), dim=-1).float()
     got = tk_torch.mamba2(C, Bm, X, cumlog)
-    scores = C.float() @ Bm.float().transpose(-1, -2)
-    decay = torch.exp(cumlog[..., :, None] - cumlog[..., None, :])
-    mask = torch.tril(torch.ones(N, N, device="mps"))
-    exp = (scores * decay * mask) @ X.float()
+    exp = _mamba2_fwd_ref(C, Bm, X, cumlog, N)
     torch.mps.synchronize()
     diff = (got.float() - exp).abs().max().item()
     scale = exp.abs().max().item() + 1e-9
     assert diff / scale < 0.03
 
 
-@pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128),
-                                   # chunked linear-time route (D=64, N%64==0, N>=128):
-                                   (1, 2, 128, 64), (2, 2, 192, 64)])
-def test_mamba2_bwd(shape):
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 192, 64),
+                                   (1, 2, 128, 128), (1, 1, 256, 128)])
+def test_mamba2_chunked_forced(shape):
+    """The forced chunked route at small N (below the auto thresholds), both head dims."""
+    B, H, N, D = shape
+    torch.manual_seed(N + D)
+    C = torch.randn(shape, dtype=torch.bfloat16, device="mps") * 0.5
+    Bm = torch.randn(shape, dtype=torch.bfloat16, device="mps") * 0.5
+    X = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    a = torch.sigmoid(torch.randn(B, H, N, device="mps")) * 0.5 + 0.5
+    cumlog = torch.cumsum(torch.log(a), dim=-1).float()
+    got = tk_torch.mamba2_chunked(C, Bm, X, cumlog)
+    exp = _mamba2_fwd_ref(C, Bm, X, cumlog, N)
+    torch.mps.synchronize()
+    diff = (got.float() - exp).abs().max().item()
+    scale = exp.abs().max().item() + 1e-9
+    assert diff / scale < 0.03
+
+
+def _mamba2_bwd_oracle(C, Bn, X, cl, dY):
+    import numpy as np  # noqa: F401
+    Ct = torch.tensor(C, requires_grad=True)
+    Bt = torch.tensor(Bn, requires_grad=True)
+    Xt = torch.tensor(X, requires_grad=True)
+    clt = torch.tensor(cl, requires_grad=True)
+    N = C.shape[2]
+    G = torch.einsum("bhid,bhjd->bhij", Ct, Bt)
+    expo = clt[:, :, :, None] - clt[:, :, None, :]
+    causal = torch.arange(N)[None, :] <= torch.arange(N)[:, None]
+    expo = expo.masked_fill(~causal, float("-inf"))
+    Y = torch.einsum("bhij,bhjd->bhid", G * torch.exp(expo), Xt)
+    Y.backward(torch.tensor(dY))
+    return Ct.grad.numpy(), Bt.grad.numpy(), Xt.grad.numpy(), clt.grad.numpy()
+
+
+def _mamba2_bwd_inputs(shape, seed):
     import numpy as np
     Bh, H, N, D = shape
-    rng = np.random.default_rng(Bh + N + D)
+    rng = np.random.default_rng(seed)
     C = (0.3 * rng.standard_normal(shape)).astype(np.float32)
     Bn = (0.3 * rng.standard_normal(shape)).astype(np.float32)
     X = (0.3 * rng.standard_normal(shape)).astype(np.float32)
     dY = (0.3 * rng.standard_normal(shape)).astype(np.float32)
     a = rng.uniform(0.9, 1.0, (Bh, H, N)).astype(np.float32)
     cl = np.cumsum(np.log(a), axis=2).astype(np.float32)
-    Ct = torch.tensor(C, requires_grad=True)
-    Bt = torch.tensor(Bn, requires_grad=True)
-    Xt = torch.tensor(X, requires_grad=True)
-    clt = torch.tensor(cl, requires_grad=True)
-    G = torch.einsum("bhid,bhjd->bhij", Ct, Bt)
-    L = torch.exp(clt[:, :, :, None] - clt[:, :, None, :])
-    Y = torch.einsum("bhij,bhjd->bhid", torch.tril(G * L), Xt)
-    Y.backward(torch.tensor(dY))
+    return C, Bn, X, cl, dY
+
+
+@pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128), (1, 2, 128, 64),
+                                   # auto-routed chunked (N >= threshold, N%64==0):
+                                   (1, 1, 2048, 64)])
+def test_mamba2_bwd(shape):
+    import numpy as np
+    Bh, H, N, D = shape
+    C, Bn, X, cl, dY = _mamba2_bwd_inputs(shape, Bh + N + D)
+    rC, rB, rX, rcl = _mamba2_bwd_oracle(C, Bn, X, cl, dY)
     dC, dB, dX, dcl = tk_torch.mamba2_bwd(
         torch.tensor(C).to(torch.bfloat16).to("mps"), torch.tensor(Bn).to(torch.bfloat16).to("mps"),
         torch.tensor(X).to(torch.bfloat16).to("mps"), torch.tensor(cl).to("mps"),
@@ -1169,10 +1215,57 @@ def test_mamba2_bwd(shape):
 
     def rel(g, ref):
         return np.abs(g.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-6)
-    assert rel(dC, Ct.grad.numpy()) < 0.06
-    assert rel(dB, Bt.grad.numpy()) < 0.06
-    assert rel(dX, Xt.grad.numpy()) < 0.06
-    assert rel(dcl, clt.grad.numpy()) < 0.08
+    assert rel(dC, rC) < 0.06
+    assert rel(dB, rB) < 0.06
+    assert rel(dX, rX) < 0.06
+    assert rel(dcl, rcl) < 0.08
+
+
+@pytest.mark.parametrize("shape", [(1, 1, 128, 64), (2, 2, 192, 64),
+                                   (1, 2, 128, 128), (1, 1, 256, 128)])
+def test_mamba2_bwd_chunked_forced(shape):
+    """The forced chunked linear-time backward at small N, both head dims, vs autograd."""
+    import numpy as np
+    Bh, H, N, D = shape
+    C, Bn, X, cl, dY = _mamba2_bwd_inputs(shape, 10 + N + D)
+    rC, rB, rX, rcl = _mamba2_bwd_oracle(C, Bn, X, cl, dY)
+    dC, dB, dX, dcl = tk_torch.mamba2_bwd_chunked(
+        torch.tensor(C).to(torch.bfloat16).to("mps"), torch.tensor(Bn).to(torch.bfloat16).to("mps"),
+        torch.tensor(X).to(torch.bfloat16).to("mps"), torch.tensor(cl).to("mps"),
+        torch.tensor(dY).to(torch.bfloat16).to("mps"))
+
+    def rel(g, ref):
+        return np.abs(g.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-6)
+    assert rel(dC, rC) < 0.06
+    assert rel(dB, rB) < 0.06
+    assert rel(dX, rX) < 0.06
+    assert rel(dcl, rcl) < 0.08
+
+
+@pytest.mark.parametrize("D", [64, 128])
+def test_ssd_decode(D):
+    """T iterated decode steps == the fp32 recurrence oracle; the state updates IN PLACE."""
+    import numpy as np
+    B, H, T = 2, 2, 5
+    rng = np.random.default_rng(3 + D)
+    S_ref = np.zeros((B, H, D, D), np.float32)
+    S = torch.zeros(B, H, D, D, device="mps")
+    for t in range(T):
+        alpha = rng.uniform(0.9, 1.0, (B, H)).astype(np.float32)
+        x = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+        k = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+        q = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+        y, S_out = tk_torch.ssd_decode(S, torch.tensor(alpha, device="mps"),
+                                       torch.tensor(x, device="mps"),
+                                       torch.tensor(k, device="mps"),
+                                       torch.tensor(q, device="mps"))
+        torch.mps.synchronize()
+        assert S_out.data_ptr() == S.data_ptr()      # in-place state update
+        S_ref = alpha[..., None, None] * S_ref + np.einsum("bhp,bhn->bhpn", x, k)
+        ref = np.einsum("bhpn,bhn->bhp", S_ref, q)
+        scale = np.abs(ref).max() + 1e-6
+        assert np.abs(y.cpu().numpy() - ref).max() / scale < 1e-4, f"step {t}"
+        assert np.abs(S.cpu().numpy() - S_ref).max() / (np.abs(S_ref).max() + 1e-6) < 1e-4
 
 
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64), (128, 64, 128)])

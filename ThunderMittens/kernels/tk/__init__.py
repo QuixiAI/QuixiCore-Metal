@@ -1132,22 +1132,53 @@ def lin_attn_causal(q, k, v):
 
 
 def mamba2(C, B, X, cumlog):
-    """Mamba-2 / SSD forward. cumlog = cumsum(log a). Accepts mlx.array or torch.Tensor (MPS)."""
+    """Mamba-2 / SSD forward. cumlog = cumsum(log a). Accepts mlx.array or torch.Tensor (MPS).
+    D in {64,128}; auto-routed between the quadratic kernel and the chunked linear-time pipeline
+    at the MEASURED crossovers (N>=2048 for D=64, N>=4096 for D=128; chunked needs N%64==0)."""
     if _is_torch(C):
         return _torch().mamba2(C, B, X, cumlog)
     return _mlx().mamba2(C, B, X, cumlog)
 
 
+def mamba2_chunked(C, B, X, cumlog):
+    """Mamba-2 / SSD forward, forced chunked linear-time route (tests/benchmarks). N%64==0,
+    N>=128, D in {64,128}. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(C):
+        return _torch().mamba2_chunked(C, B, X, cumlog)
+    return _mlx().mamba2_chunked(C, B, X, cumlog)
+
+
 def mamba2_bwd(C, B, X, cumlog, dY, force_quadratic=False):
     """Mamba-2 / SSD backward. Given dY, returns (dC, dB, dX, dcumlog) matching the forward shapes
-    (dcumlog = rowsum(M) - colsum(M), the gradient w.r.t. cumlog). D in {64,128}. For D=64,
-    N%64==0, N>=128 a chunked linear-time route is used; force_quadratic pins the O(N^2) route
-    (MLX only, for testing route agreement). Use mamba2_dcl_to_da to turn dcumlog into d(log a) / da.
-    Accepts mlx.array or torch.Tensor (MPS)."""
+    (dcumlog = rowsum(M) - colsum(M), the gradient w.r.t. cumlog). D in {64,128}. Auto-routed like
+    the forward (chunked linear-time above the measured crossovers); force_quadratic pins the
+    O(N^2) route (MLX only, for testing route agreement). Use mamba2_dcl_to_da to turn dcumlog
+    into d(log a) / da. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(C):
         return _torch().mamba2_bwd(C, B, X, cumlog, dY)
     out = _mlx().mamba2_bwd(C, B, X, cumlog, dY, force_quadratic=force_quadratic)
     return out[0], out[1], out[2], out[3]
+
+
+def mamba2_bwd_chunked(C, B, X, cumlog, dY):
+    """Mamba-2 / SSD backward, forced chunked linear-time route (tests/benchmarks). N%64==0,
+    N>=128, D in {64,128}. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(C):
+        return _torch().mamba2_bwd_chunked(C, B, X, cumlog, dY)
+    out = _mlx().mamba2_bwd_chunked(C, B, X, cumlog, dY)
+    return out[0], out[1], out[2], out[3]
+
+
+def ssd_decode(S, alpha, x, k, q):
+    """Single-token SSD decode step: S' = alpha*S + x⊗k ; y = S'·q (readout after the write) —
+    the O(D^2) generation step for mamba2 / lin_attn_decay (q=C_t, k=B_t, x=X_t; alpha=1 for
+    undecayed linear attention). S (B,H,D,D) fp32, alpha (B,H), x/k/q (B,H,D); D in {64,128}.
+    Returns (y, S'). On torch (MPS) the state is updated IN PLACE (S' is S); on MLX the update
+    is functional (S' is a fresh array). Accepts mlx.array or torch.Tensor."""
+    if _is_torch(S):
+        return _torch().ssd_decode(S, alpha, x, k, q)
+    out = _mlx().ssd_decode(S, alpha, x, k, q)
+    return out[0], out[1]
 
 
 def mamba2_dcl_to_da(dcumlog, a):

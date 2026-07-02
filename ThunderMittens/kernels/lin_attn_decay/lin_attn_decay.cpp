@@ -31,7 +31,7 @@ array lin_attn_decay(const array& q, const array& k, const array& v, const array
   const int N = q.shape(2), D = q.shape(3);
   assert(D == 64 && "lin_attn_decay currently supports D=64");
   assert(N % 8 == 0 && "lin_attn_decay: N must be a multiple of 8");
-  if (N % 64 == 0 && N >= 128) {
+  if (N % 64 == 0 && N >= 2048) {   // measured crossover, same gate as mamba2 at D=64
     // same math as mamba2 with cl = -slope*position: use the chunked linear-time pipeline
     return ssd_chunked(q, k, v, cl, s);
   }

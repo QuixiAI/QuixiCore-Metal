@@ -974,6 +974,46 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "mamba2_chunked",
+      &ssd_chunked,
+      "C"_a,
+      "B"_a,
+      "X"_a,
+      "cumlog"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Mamba-2 / SSD forward, forced chunked linear-time route (tests/benchmarks). N%64==0, N>=128.
+      )");
+
+    m.def(
+      "mamba2_bwd_chunked",
+      &ssd_chunked_bwd,
+      "C"_a,
+      "B"_a,
+      "X"_a,
+      "cumlog"_a,
+      "dY"_a,
+      "stream"_a = nb::none(),
+      R"(
+        Mamba-2 / SSD backward, forced chunked linear-time route (tests/benchmarks). N%64==0, N>=128.
+      )");
+
+    m.def(
+      "ssd_decode",
+      &ssd_decode,
+      "S"_a,
+      "alpha"_a,
+      "x"_a,
+      "k"_a,
+      "q"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Single-token SSD decode step: S' = alpha*S + x(outer)k ; y = S'.q. Returns [y, S'].
+      )");
+
+    m.def(
       "lin_attn_decay",
       &lin_attn_decay,
       "q"_a, "k"_a, "v"_a, "cl"_a,

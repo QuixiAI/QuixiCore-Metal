@@ -28,7 +28,9 @@ array ssd_chunked(const array& Cq, const array& Bm, const array& X, const array&
   const int C = N / 64;   // chunk L = 64 (must match SSD_CHUNK_L in the metal)
   auto kv = array({B, H, C, D, D}, float32,
                   std::make_shared<SsdChunkKV>(to_stream(s)), {Bm, X, cl});
-  auto sex = array({B, H, C, D, D}, float32,
+  // The scanned state is stored BF16: the out mma consumes bf16 anyway, so results are
+  // identical and the dominant state-read traffic halves.
+  auto sex = array({B, H, C, D, D}, bfloat16,
                    std::make_shared<SsdChunkScan>(to_stream(s)), {kv, cl});
   return array(Cq.shape(), bfloat16,
                std::make_shared<SsdChunkOut>(to_stream(s)), {Cq, Bm, X, cl, sex});
@@ -42,9 +44,11 @@ array mamba2(const array& C, const array& B, const array& X, const array& cumlog
   const int N = C.shape(2), D = C.shape(3);
   assert((D == 64 || D == 128) && "mamba2 supports D in {64, 128}");
   assert(N % 8 == 0 && "mamba2: N must be a multiple of 8");
-  // The chunked pipeline holds a D x D state quadrant per simdgroup (rt_fl<D,D>), which is only
-  // register-feasible at D=64; D=128 uses the quadratic materialized kernel.
-  if (D == 64 && N % 64 == 0 && N >= 128) {
+  // The chunked D x D state is 64x64 quadrant-tiled (QB = D/64), so both head dims run chunked.
+  // Route thresholds are MEASURED (M-series, cooperative out kernel): the quadratic kernel wins
+  // below N=2048 at D=64 and below N=4096 at D=128.
+  const int chunk_min = (D == 64) ? 2048 : 4096;
+  if (N % 64 == 0 && N >= chunk_min) {
     return ssd_chunked(C, B, X, cumlog, s);   // linear-time chunked pipeline
   }
   return array(C.shape(), bfloat16,
@@ -133,7 +137,7 @@ std::pair<std::vector<array>, std::vector<int>> SsdChunkOut::vmap(
 bool SsdChunkOut::is_equivalent(const Primitive&) const { return true; }
 
 // ---------- chunked linear-time backward ----------
-void SsdBwdQkv::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+void SsdChunkGstate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
   auto& cq = inputs[0]; auto& dy = inputs[1]; auto& cl = inputs[2];
   auto& out = outputs[0];
   auto& s = stream(); auto& d = metal::device(s.device);
@@ -142,24 +146,24 @@ void SsdBwdQkv::eval_gpu(const std::vector<array>& inputs, std::vector<array>& o
   const int C = out.shape(2);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_ssd_bwd_qkv(enc, cq, dy, cl, out, static_cast<unsigned>(N), static_cast<unsigned>(H),
-                         B, C, D);
+  tk::launch_ssd_chunk_gstate(enc, cq, dy, cl, out, static_cast<unsigned>(N),
+                              static_cast<unsigned>(H), B, C, D);
 }
-void SsdBwdQscan::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
-  auto& qin = inputs[0]; auto& cl = inputs[1];
+void SsdChunkRscan::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& gin = inputs[0]; auto& cl = inputs[1];
   auto& out = outputs[0];
   auto& s = stream(); auto& d = metal::device(s.device);
   out.set_data(allocator::malloc_or_wait(out.nbytes()));
-  const int B = qin.shape(0), H = qin.shape(1), C = qin.shape(2), D = qin.shape(3);
+  const int B = gin.shape(0), H = gin.shape(1), C = gin.shape(2), D = gin.shape(3);
   const int N = cl.shape(2);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_ssd_bwd_qscan(enc, qin, cl, out, static_cast<unsigned>(C), static_cast<unsigned>(N),
-                           B * H, D);
+  tk::launch_ssd_chunk_rscan(enc, gin, cl, out, static_cast<unsigned>(C),
+                             static_cast<unsigned>(N), B * H, D);
 }
-void SsdBwdOutRow::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+void SsdChunkBwdRow::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
   auto& cq = inputs[0]; auto& bm = inputs[1]; auto& x = inputs[2];
-  auto& cl = inputs[3]; auto& dy = inputs[4]; auto& p = inputs[5];
+  auto& cl = inputs[3]; auto& dy = inputs[4]; auto& sex = inputs[5];
   auto& dC = outputs[0]; auto& r = outputs[1]; auto& ri = outputs[2];
   auto& s = stream(); auto& d = metal::device(s.device);
   dC.set_data(allocator::malloc_or_wait(dC.nbytes()));
@@ -168,12 +172,12 @@ void SsdBwdOutRow::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   const int B = cq.shape(0), H = cq.shape(1), N = cq.shape(2), D = cq.shape(3);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_ssd_bwd_out_row(enc, cq, bm, x, cl, dy, p, dC, r, ri, static_cast<unsigned>(N),
-                             static_cast<unsigned>(H), B, D);
+  tk::launch_ssd_chunk_bwd_row(enc, cq, bm, x, cl, dy, sex, dC, r, ri, static_cast<unsigned>(N),
+                               static_cast<unsigned>(H), B, D);
 }
-void SsdBwdOutCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+void SsdChunkBwdCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
   auto& cq = inputs[0]; auto& bm = inputs[1]; auto& x = inputs[2];
-  auto& cl = inputs[3]; auto& dy = inputs[4]; auto& qex = inputs[5]; auto& qtex = inputs[6];
+  auto& cl = inputs[3]; auto& dy = inputs[4]; auto& dkv = inputs[5];
   auto& dB = outputs[0]; auto& dX = outputs[1]; auto& cc = outputs[2]; auto& ci = outputs[3];
   auto& s = stream(); auto& d = metal::device(s.device);
   dB.set_data(allocator::malloc_or_wait(dB.nbytes()));
@@ -183,8 +187,8 @@ void SsdBwdOutCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   const int B = cq.shape(0), H = cq.shape(1), N = cq.shape(2), D = cq.shape(3);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_ssd_bwd_out_col(enc, cq, bm, x, cl, dy, qex, qtex, dB, dX, cc, ci,
-                             static_cast<unsigned>(N), static_cast<unsigned>(H), B, D);
+  tk::launch_ssd_chunk_bwd_col(enc, cq, bm, x, cl, dy, dkv, dB, dX, cc, ci,
+                               static_cast<unsigned>(N), static_cast<unsigned>(H), B, D);
 }
 #define TK_SSD_BWD_NO_AD(CLASS)                                                      \
   void CLASS::eval_cpu(const std::vector<array>&, std::vector<array>&) { assert(false); } \
@@ -197,10 +201,10 @@ void SsdBwdOutCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>
   std::pair<std::vector<array>, std::vector<int>> CLASS::vmap(                       \
       const std::vector<array>&, const std::vector<int>&) {                          \
     throw std::runtime_error(#CLASS " has no vmap."); }
-TK_SSD_BWD_NO_AD(SsdBwdQkv)
-TK_SSD_BWD_NO_AD(SsdBwdQscan)
-TK_SSD_BWD_NO_AD(SsdBwdOutRow)
-TK_SSD_BWD_NO_AD(SsdBwdOutCol)
+TK_SSD_BWD_NO_AD(SsdChunkGstate)
+TK_SSD_BWD_NO_AD(SsdChunkRscan)
+TK_SSD_BWD_NO_AD(SsdChunkBwdRow)
+TK_SSD_BWD_NO_AD(SsdChunkBwdCol)
 
 std::vector<array> ssd_chunked_bwd(const array& C, const array& B, const array& X,
                                    const array& cumlog, const array& dY, StreamOrDevice s) {
@@ -208,33 +212,28 @@ std::vector<array> ssd_chunked_bwd(const array& C, const array& B, const array& 
   const int Cn = N / 64;
   auto C_c = contiguous(C, false, s), B_c = contiguous(B, false, s), X_c = contiguous(X, false, s);
   auto cl_c = contiguous(cumlog, false, s), dY_c = contiguous(dY, false, s);
-  // Forward state P_c = sum_{j<chunk c} exp(cl[r_{c-1}]-cl_j) X_j B_j^T (X rows, B cols): the
-  // forward ssd_chunk_kv builds B_j X_j^T, so feed (X,B) SWAPPED to get X_j B_j^T directly (then
-  // the row inter term is mma_AB(dY_i, P), no transpose-on-read).
-  auto pkv = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdChunkKV>(to_stream(s)),
-                   {X_c, B_c, cl_c});
-  auto P = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdChunkScan>(to_stream(s)),
-                 {pkv, cl_c});
-  // Reverse state Q_c = sum_{i>chunk c} exp(cl_i-cl[r_c]) C_i dY_i^T (C rows, dY cols) for dX, and
-  // its transpose Qt_c (dY rows, C cols) for dB — built by SWAPPING (C,dY). Qt_c = Q_c^T EXACTLY
-  // (the reverse scan applies element-independent decay), so Qt could be a transpose of qex instead
-  // of a second qkv MMA + scan — but MEASURED: the general (…,D,D) transpose is scatter-bound and
-  // regressed the common seq-2048 shape ~30% (only ~4.5% faster at 4096), so the two-pass wins.
-  auto qkv = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQkv>(to_stream(s)),
-                   {C_c, dY_c, cl_c});
-  auto qex = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQscan>(to_stream(s)),
-                   {qkv, cl_c});
-  auto qtkv = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQkv>(to_stream(s)),
-                    {dY_c, C_c, cl_c});
-  auto qtex = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQscan>(to_stream(s)),
-                    {qtkv, cl_c});
-  // Row-owned: dC, r_intra (rowsum), r_inter. Col-owned: dB, dX, c_intra (colsum), c_inter.
+  // Forward chunk states Sex (recomputed exactly as in the forward: kv -> exclusive scan, bf16).
+  // bwd_row consumes Sex directly — its inter term loads dY row-layout and Sex col-layout, so no
+  // transposed copy of the state is ever materialized.
+  auto kv = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdChunkKV>(to_stream(s)),
+                  {B_c, X_c, cl_c});
+  auto sex = array({Bsz, H, Cn, D, D}, bfloat16, std::make_shared<SsdChunkScan>(to_stream(s)),
+                   {kv, cl_c});
+  // ONE reverse chain: gradient states G_c = sum_{t in c} exp(cl_t - cl[r_{c-1}]) C_t^T dY_t,
+  // then the reverse decayed suffix dKV_c = G_{c+1} + lam_{c+1} dKV_{c+1} (bf16). bwd_col loads
+  // dKV in both row and col register layouts, so the old second (transposed) chain is gone.
+  auto g = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdChunkGstate>(to_stream(s)),
+                 {C_c, dY_c, cl_c});
+  auto dkv = array({Bsz, H, Cn, D, D}, bfloat16, std::make_shared<SsdChunkRscan>(to_stream(s)),
+                   {g, cl_c});
+  // Row-owned: dC, r_intra (rowsum), r_inter = <dC_inter, C_i>. Col-owned: dB, dX, cc_intra
+  // (colsum), ci_inter = <dX_inter, X_j>. dcl = (r + ri) - (cc + ci), all in-kernel.
   auto row = array::make_arrays(
       {C.shape(), {Bsz, H, N}, {Bsz, H, N}}, {bfloat16, float32, float32},
-      std::make_shared<SsdBwdOutRow>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c, P});
+      std::make_shared<SsdChunkBwdRow>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c, sex});
   auto col = array::make_arrays(
       {C.shape(), C.shape(), {Bsz, H, N}, {Bsz, H, N}}, {bfloat16, bfloat16, float32, float32},
-      std::make_shared<SsdBwdOutCol>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c, qex, qtex});
+      std::make_shared<SsdChunkBwdCol>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c, dkv});
   auto dcl = subtract(add(row[1], row[2], s), add(col[2], col[3], s), s);
   return {row[0], col[0], col[1], dcl};
 }
@@ -281,9 +280,10 @@ std::vector<array> mamba2_bwd(const array& C, const array& B, const array& X, co
   const int Bsz = C.shape(0), H = C.shape(1), N = C.shape(2), D = C.shape(3);
   assert((D == 64 || D == 128) && "mamba2_bwd supports D in {64, 128}");
   assert(N % 8 == 0 && "mamba2_bwd: N must be a multiple of 8");
-  // Chunked linear-time backward, gated exactly like the forward chunked route (the chunked
-  // kernels hold a D x D state, register-feasible only at D=64); else the quadratic backward.
-  if (!force_quadratic && D == 64 && N % 64 == 0 && N >= 128) {
+  // Chunked linear-time backward above the same measured crossovers as the forward (both head
+  // dims, via 64x64 state quadrants); else the quadratic backward (in-kernel fp32 dcumlog).
+  const int chunk_min = (D == 64) ? 2048 : 4096;
+  if (!force_quadratic && N % 64 == 0 && N >= chunk_min) {
     return ssd_chunked_bwd(C, B, X, cumlog, dY, s);
   }
   auto C_c = contiguous(C, false, s);
@@ -356,5 +356,39 @@ void Mamba2BwdCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>
 
 TK_MAMBA_BWD_NO_AUTODIFF(Mamba2BwdRow, "Mamba2BwdRow")
 TK_MAMBA_BWD_NO_AUTODIFF(Mamba2BwdCol, "Mamba2BwdCol")
+
+// ----------------------------- ssd_decode -----------------------------
+// Single-token SSD decode step: S' = alpha*S + x⊗k ; y = S'·q (readout after the write) — the
+// O(D^2) generation step for mamba2 / lin_attn_decay. MLX arrays are immutable, so the update is
+// FUNCTIONAL: the kernel reads Sin and writes a fresh Sout (row-owned, alias-safe by design).
+std::vector<array> ssd_decode(const array& S, const array& alpha, const array& x,
+                              const array& k, const array& q, StreamOrDevice s) {
+  assert(S.dtype() == float32 && alpha.dtype() == float32 && x.dtype() == float32 &&
+         k.dtype() == float32 && q.dtype() == float32);
+  const int B = S.shape(0), H = S.shape(1), D = S.shape(2);
+  assert(S.shape(3) == D && "ssd_decode: S must be square (B,H,D,D)");
+  assert((D == 64 || D == 128) && "ssd_decode supports D in {64, 128}");
+  (void)B; (void)H;
+  return array::make_arrays(
+      {{B, H, D}, S.shape()}, {float32, float32},
+      std::make_shared<SsdDecode>(to_stream(s)), {S, alpha, x, k, q});
+}
+
+void SsdDecode::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& S = inputs[0]; auto& alpha = inputs[1]; auto& x = inputs[2];
+  auto& k = inputs[3]; auto& q = inputs[4];
+  auto& y = outputs[0]; auto& Sout = outputs[1];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  y.set_data(allocator::malloc_or_wait(y.nbytes()));
+  Sout.set_data(allocator::malloc_or_wait(Sout.nbytes()));
+  const int B = S.shape(0), H = S.shape(1), D = S.shape(2);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_ssd_decode(enc, S, alpha, x, k, q, Sout, y, static_cast<unsigned>(H), B, D);
+}
+TK_MAMBA_BWD_NO_AUTODIFF(SsdDecode, "SsdDecode")
+void SsdDecode::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("SsdDecode has no CPU implementation.");
+}
 
 } // namespace mlx::core

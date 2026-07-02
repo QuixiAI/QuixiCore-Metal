@@ -1842,27 +1842,23 @@ static at::Tensor lin_attn_causal_mps(const at::Tensor& q_in, const at::Tensor& 
 }
 
 // Shared SSD dispatch (mamba2 / lin_attn_decay — identical math): the quadratic materialized
-// kernel for small/ragged N, the chunked linear-time 3-kernel pipeline otherwise.
-static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
-                               const at::Tensor& cl, int Bsz, int H, unsigned N, int D,
-                               bool decay_kernel_name) {
+// kernel for small/ragged N, the chunked linear-time 3-kernel pipeline otherwise. The chunked
+// D x D state is 64x64 quadrant-tiled (QB = D/64), so both head dims run chunked; the scanned
+// state is stored BF16 (the out mma consumes bf16 anyway — identical results, half the state-
+// read traffic) and the out kernel is COOPERATIVE (one threadgroup per chunk shares the staged
+// state across its 8 query tiles). Route thresholds are MEASURED (M-series): the quadratic
+// kernel wins below N=2048 at D=64 and below N=4096 at D=128.
+static constexpr unsigned kSsdChunkL = 64;   // must match SSD_CHUNK_L in the metal
+static inline unsigned ssd_chunk_min(int D) { return (D == 64) ? 2048 : 4096; }
+
+static at::Tensor ssd_chunked(const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+                              const at::Tensor& cl, int Bsz, int H, unsigned N, int D) {
+  TORCH_CHECK(N % kSsdChunkL == 0 && N >= 2 * kSsdChunkL,
+              "ssd_chunked: N must be a multiple of 64 and >= 128");
+  const int Cn = static_cast<int>(N / kSsdChunkL);
   auto out = at::empty_like(C);
-  constexpr unsigned L = 64;   // must match SSD_CHUNK_L in the metal
-  // The chunked kernels hold a D x D state quadrant (register-feasible only at D=64); D=128 uses
-  // the quadratic materialized kernel.
-  if (D != 64 || N % L != 0 || N < 2 * L) {
-    tk_encode([&](TorchEncoder& e) {
-      if (decay_kernel_name)
-        tk::launch_lin_attn_decay(e, C, B, X, cl, out, N, H, Bsz, D);
-      else
-        tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D);
-    });
-    return out;
-  }
-  const int Cn = static_cast<int>(N / L);
-  auto f32 = C.options().dtype(at::kFloat);
-  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
-  auto s_ex = at::empty({Bsz, H, Cn, D, D}, f32);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, C.options().dtype(at::kFloat));
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, C.options());   // bf16 (see routing note above)
   tk_encode([&](TorchEncoder& e) {
     tk::launch_ssd_chunk_kv(e, B, X, cl, s_raw, N, H, Bsz, Cn, D);
     tk::launch_ssd_chunk_scan(e, s_raw, cl, s_ex, static_cast<unsigned>(Cn), N, Bsz * H, D);
@@ -1871,7 +1867,55 @@ static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const a
   return out;
 }
 
-// Mamba-2 / SSD backward: [dC, dB, dX, dcumlog]. dcumlog = rowsum(M) - colsum(M).
+static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+                               const at::Tensor& cl, int Bsz, int H, unsigned N, int D,
+                               bool decay_kernel_name) {
+  if (N % kSsdChunkL != 0 || N < ssd_chunk_min(D)) {
+    auto out = at::empty_like(C);
+    tk_encode([&](TorchEncoder& e) {
+      if (decay_kernel_name)
+        tk::launch_lin_attn_decay(e, C, B, X, cl, out, N, H, Bsz, D);
+      else
+        tk::launch_mamba2(e, C, B, X, cl, out, N, H, Bsz, D);
+    });
+    return out;
+  }
+  return ssd_chunked(C, B, X, cl, Bsz, H, N, D);
+}
+
+// Mamba-2 / SSD backward: [dC, dB, dX, dcumlog]. dcumlog = rowsum(M) - colsum(M), M = dSt∘S.
+// Chunked (linear-time): recompute the forward chunk states (kv -> scan), build the gradient
+// states G_c and reverse-scan dKV (gstate -> rscan, ONE reverse chain — bwd_col loads dKV in
+// both row and col register layouts instead of materializing a transposed copy), then the
+// cooperative chunk-bounded row/col kernels. dcl comes out in-kernel, split into intra + inter
+// halves: rowsum(M) = r + ri and colsum(M) = cc + ci, so the host just combines.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> ssd_chunked_bwd(
+    const at::Tensor& C, const at::Tensor& B, const at::Tensor& X,
+    const at::Tensor& cl, const at::Tensor& dY) {
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = static_cast<unsigned>(C.size(2));
+  TORCH_CHECK(N % kSsdChunkL == 0 && N >= 2 * kSsdChunkL,
+              "ssd_chunked_bwd: N must be a multiple of 64 and >= 128");
+  const int Cn = static_cast<int>(N / kSsdChunkL);
+  auto f32 = C.options().dtype(at::kFloat);
+  auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
+  auto s_raw = at::empty({Bsz, H, Cn, D, D}, f32);
+  auto s_ex = at::empty({Bsz, H, Cn, D, D}, C.options());          // bf16
+  auto dkv = at::empty({Bsz, H, Cn, D, D}, C.options());           // bf16
+  auto r = at::empty({Bsz, H, (long)N}, f32), ri = at::empty({Bsz, H, (long)N}, f32);
+  auto cc = at::empty({Bsz, H, (long)N}, f32), ci = at::empty({Bsz, H, (long)N}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    // forward chunk states (recompute), then G_c reuses s_raw (dead after the scan)
+    tk::launch_ssd_chunk_kv(e, B, X, cl, s_raw, N, H, Bsz, Cn, D);
+    tk::launch_ssd_chunk_scan(e, s_raw, cl, s_ex, static_cast<unsigned>(Cn), N, Bsz * H, D);
+    tk::launch_ssd_chunk_gstate(e, C, dY, cl, s_raw, N, H, Bsz, Cn, D);
+    tk::launch_ssd_chunk_rscan(e, s_raw, cl, dkv, static_cast<unsigned>(Cn), N, Bsz * H, D);
+    tk::launch_ssd_chunk_bwd_row(e, C, B, X, cl, dY, s_ex, dC, r, ri, N, H, Bsz, D);
+    tk::launch_ssd_chunk_bwd_col(e, C, B, X, cl, dY, dkv, dB, dX, cc, ci, N, H, Bsz, D);
+  });
+  return {dC, dB, dX, (r + ri) - (cc + ci)};
+}
+
 static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
     const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
     const at::Tensor& cl_in, const at::Tensor& dY_in) {
@@ -1885,33 +1929,13 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
   const unsigned N = static_cast<unsigned>(C.size(2));
   TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
+  // Chunked linear-time backward above the same measured crossovers as the forward; quadratic
+  // (in-kernel fp32 dcumlog) below.
+  if (N % kSsdChunkL == 0 && N >= ssd_chunk_min(D)) {
+    return ssd_chunked_bwd(C, B, X, cl, dY);
+  }
   auto f32 = C.options().dtype(at::kFloat);
   auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
-  // Chunked linear-time backward, gated exactly like the forward (D=64 D x D state); else quadratic.
-  constexpr unsigned L = 64;   // must match SSD_CHUNK_L in the metal
-  if (D == 64 && N % L == 0 && N >= 2 * L) {
-    const int Cn = static_cast<int>(N / L);
-    auto st = [&] { return at::empty({Bsz, H, Cn, D, D}, f32); };
-    auto vec = [&] { return at::empty({Bsz, H, (long)N}, f32); };
-    // P (X_j B_j^T): forward ssd_chunk_kv with (X,B) swapped, then the exclusive prefix scan.
-    auto pkv = st(), P = st();
-    // Reverse states Q (C_i dY_i^T) and its transpose Qt (dY_i C_i^T, via (dY,C) swapped). Qt = Q^T
-    // exactly, but materializing it via a general (…,D,D) transpose regresses the common seq-2048
-    // shape ~30% (scatter-bound) — the cheap qkv MMA + scan wins, so keep the two-pass build.
-    auto qkv = st(), qex = st(), qtkv = st(), qtex = st();
-    auto r = vec(), ri = vec(), cc = vec(), ci = vec();
-    tk_encode([&](TorchEncoder& e) {
-      tk::launch_ssd_chunk_kv(e, X, B, cl, pkv, N, H, Bsz, Cn, D);
-      tk::launch_ssd_chunk_scan(e, pkv, cl, P, static_cast<unsigned>(Cn), N, Bsz * H, D);
-      tk::launch_ssd_bwd_qkv(e, C, dY, cl, qkv, N, H, Bsz, Cn, D);
-      tk::launch_ssd_bwd_qscan(e, qkv, cl, qex, static_cast<unsigned>(Cn), N, Bsz * H, D);
-      tk::launch_ssd_bwd_qkv(e, dY, C, cl, qtkv, N, H, Bsz, Cn, D);
-      tk::launch_ssd_bwd_qscan(e, qtkv, cl, qtex, static_cast<unsigned>(Cn), N, Bsz * H, D);
-      tk::launch_ssd_bwd_out_row(e, C, B, X, cl, dY, P, dC, r, ri, N, H, Bsz, D);
-      tk::launch_ssd_bwd_out_col(e, C, B, X, cl, dY, qex, qtex, dB, dX, cc, ci, N, H, Bsz, D);
-    });
-    return {dC, dB, dX, (r + ri) - (cc + ci)};
-  }
   auto r = at::empty({Bsz, H, (long)N}, f32);
   auto cc = at::empty({Bsz, H, (long)N}, f32);
   tk_encode([&](TorchEncoder& e) {
@@ -1919,6 +1943,56 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
     tk::launch_mamba2_bwd_col(e, C, B, X, cl, dY, dB, dX, cc, N, H, Bsz, D);
   });
   return {dC, dB, dX, r - cc};
+}
+
+// Forced chunked routes (tests / benchmarks): same math as the auto route, no threshold gate.
+static at::Tensor mamba2_chunked_mps(const at::Tensor& C_in, const at::Tensor& B_in,
+                                     const at::Tensor& X_in, const at::Tensor& cl_in) {
+  TORCH_CHECK(C_in.device().is_mps() && C_in.scalar_type() == at::kBFloat16,
+              "mamba2_chunked: C,B,X must be bfloat16 MPS");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_chunked: cumlog must be float32");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous(), cl = cl_in.contiguous();
+  TORCH_CHECK(C.dim() == 4, "mamba2_chunked: C,B,X expect (B,H,N,D)");
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = static_cast<unsigned>(C.size(2));
+  TORCH_CHECK(D == 64 || D == 128, "mamba2_chunked: D must be 64 or 128");
+  return ssd_chunked(C, B, X, cl, Bsz, H, N, D);
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_chunked_mps(
+    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
+    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+  TORCH_CHECK(C_in.device().is_mps() && C_in.scalar_type() == at::kBFloat16,
+              "mamba2_bwd_chunked: C,B,X,dY must be bfloat16 MPS");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_bwd_chunked: cumlog must be float32");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous();
+  auto cl = cl_in.contiguous(), dY = dY_in.contiguous();
+  TORCH_CHECK(C.dim() == 4, "mamba2_bwd_chunked: C,B,X,dY expect (B,H,N,D)");
+  const int D = C.size(3);
+  TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd_chunked: D must be 64 or 128");
+  return ssd_chunked_bwd(C, B, X, cl, dY);
+}
+
+// ssd_decode: single-token SSD decode step. S is updated IN PLACE (Sin aliases Sout) and
+// returned alongside y — the O(D^2) generation step for mamba2 / lin_attn_decay.
+static std::tuple<at::Tensor, at::Tensor> ssd_decode_mps(
+    const at::Tensor& S_in, const at::Tensor& a_in, const at::Tensor& x_in,
+    const at::Tensor& k_in, const at::Tensor& q_in) {
+  TORCH_CHECK(S_in.device().is_mps(), "ssd_decode: tensors must be MPS");
+  TORCH_CHECK(S_in.scalar_type() == at::kFloat && a_in.scalar_type() == at::kFloat &&
+              x_in.scalar_type() == at::kFloat && k_in.scalar_type() == at::kFloat &&
+              q_in.scalar_type() == at::kFloat, "ssd_decode: all inputs must be float32");
+  auto S = S_in.contiguous(), a = a_in.contiguous(), x = x_in.contiguous(),
+       k = k_in.contiguous(), q = q_in.contiguous();
+  TORCH_CHECK(S.dim() == 4, "ssd_decode: S expects (B,H,D,D)");
+  const int Bsz = S.size(0), H = S.size(1), D = S.size(2);
+  TORCH_CHECK(S.size(3) == D, "ssd_decode: S must be square");
+  TORCH_CHECK(D == 64 || D == 128, "ssd_decode: D must be 64 or 128");
+  auto y = at::empty({Bsz, H, D}, S.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_ssd_decode(e, S, a, x, k, q, S, y, static_cast<unsigned>(H), Bsz, D);
+  });
+  return {y, S};
 }
 
 static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
@@ -2291,6 +2365,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
   m.def("mamba2_bwd", &mamba2_bwd_mps, "ThunderMittens Mamba-2 / SSD backward (MPS)");
+  m.def("mamba2_chunked", &mamba2_chunked_mps,
+        "ThunderMittens Mamba-2 / SSD forward, forced chunked route (MPS)");
+  m.def("mamba2_bwd_chunked", &mamba2_bwd_chunked_mps,
+        "ThunderMittens Mamba-2 / SSD backward, forced chunked route (MPS)");
+  m.def("ssd_decode", &ssd_decode_mps,
+        "ThunderMittens SSD single-token decode step (MPS, in-place state)");
   m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
   m.def("based", &based_mps, "ThunderMittens Based Taylor-map linear attention (MPS)");
   m.def("attn_fwd_l", &attn_fwd_l_mps, "ThunderMittens flash-attn forward + L (MPS)");

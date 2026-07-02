@@ -53,9 +53,13 @@ class Mamba2BwdCol : public Primitive {
 
 // Chunked linear-time SSD pipeline primitives (used automatically for N % 64 == 0,
 // N >= 128; shared by mamba2 and lin_attn_decay): SsdChunkKV -> SsdChunkScan -> SsdChunkOut.
+// The D x D chunk state is 64x64 quadrant-tiled (QB = D/64, so D in {64,128}); the scanned state
+// is bf16; the out kernel is cooperative (one threadgroup per chunk). Auto-routing kicks in at
+// the MEASURED thresholds N >= 2048 (D=64) / N >= 4096 (D=128).
 
-// Chunked linear-time backward pipeline (D=64, N%64==0, N>=128): reuses the forward Sex (P=Sex^T)
-// and adds a reverse state Q (SsdBwdQkv -> SsdBwdQscan) + row/col output kernels.
+// Chunked linear-time backward pipeline (same shapes): recomputes the forward Sex (kv -> scan)
+// and adds ONE reverse gradient-state chain (SsdChunkGstate -> SsdChunkRscan) + cooperative
+// row/col output kernels with the in-kernel dcl split: rowsum(M) = r + ri, colsum(M) = cc + ci.
 std::vector<array> ssd_chunked_bwd(const array& C, const array& B, const array& X,
                                    const array& cumlog, const array& dY, StreamOrDevice s);
 
@@ -75,11 +79,19 @@ std::vector<array> ssd_chunked_bwd(const array& C, const array& B, const array& 
     void print(std::ostream& os) override { os << #CLASS; }                         \
     bool is_equivalent(const Primitive&) const override { return true; }            \
   };
-TK_SSD_BWD_PRIM(SsdBwdQkv)
-TK_SSD_BWD_PRIM(SsdBwdQscan)
-TK_SSD_BWD_PRIM(SsdBwdOutRow)
-TK_SSD_BWD_PRIM(SsdBwdOutCol)
+TK_SSD_BWD_PRIM(SsdChunkGstate)
+TK_SSD_BWD_PRIM(SsdChunkRscan)
+TK_SSD_BWD_PRIM(SsdChunkBwdRow)
+TK_SSD_BWD_PRIM(SsdChunkBwdCol)
+TK_SSD_BWD_PRIM(SsdDecode)
 #undef TK_SSD_BWD_PRIM
+
+/** Single-token SSD decode step: S' = alpha*S + x⊗k ; y = S'·q (readout after the write) — the
+ *  O(D^2) generation step for mamba2 / lin_attn_decay (q=C_t, k=B_t, x=X_t; alpha=1 for
+ *  undecayed linear attention). S (B,H,D,D), alpha (B,H), x/k/q (B,H,D), all fp32; D in
+ *  {64,128}. Functional: returns [y (B,H,D), S' (B,H,D,D)]. */
+std::vector<array> ssd_decode(const array& S, const array& alpha, const array& x,
+                              const array& k, const array& q, StreamOrDevice s = {});
 
 class SsdChunkKV : public Primitive {
  public:

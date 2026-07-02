@@ -1393,16 +1393,21 @@ void launch_mamba2_bwd_col(E& e, typename E::in_t C, typename E::in_t Bm, typena
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
-// ----- chunked linear-time SSD (3 kernels; shared by mamba2 and lin_attn_decay, chunk L=64).
-//        Scratch S is (B,H,C,D,D) fp32, C = N/64. K1 per-chunk decayed KV; K2 decayed exclusive
-//        chunk prefix; K3 intra(decay tiles) + inter(state) per query tile. -----
+// ----- chunked linear-time SSD (3 kernels; shared by mamba2 and lin_attn_decay, chunk L=64;
+//        D in {64,128} via 64x64 state QUADRANTS, QB = D/64). Scratch: s_raw (B,H,C,D,D) fp32,
+//        s_ex (B,H,C,D,D) BF16 (the out mma consumes bf16 anyway — identical results, half the
+//        state-read traffic), C = N/64. K1 per-chunk decayed KV (one simdgroup per quadrant);
+//        K2 decayed exclusive chunk prefix; K3 intra(decay tiles) + inter(state), COOPERATIVE —
+//        one threadgroup per chunk (256 threads), state quadrants staged once into threadgroup
+//        memory and shared by the chunk's 8 query tiles. -----
 template <class E>
 void launch_ssd_chunk_kv(E& e, typename E::in_t bm, typename E::in_t x, typename E::in_t cl,
                          typename E::out_t s, unsigned N, unsigned H, int B, int C, int D) {
   e.pipeline("ssd_chunk_kv_" + std::to_string(D));
   e.in(bm, 0); e.in(x, 1); e.in(cl, 2); e.out(s, 3);
   e.bytes(N, 4); e.bytes(H, 5);
-  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+  const int QB = D / 64;                       // 64x64 state quadrants per side
+  e.dispatch(C * QB * QB, static_cast<int>(H), B, 32, 1, 1);
 }
 template <class E>
 void launch_ssd_chunk_scan(E& e, typename E::in_t sin, typename E::in_t cl,
@@ -1419,46 +1424,64 @@ void launch_ssd_chunk_out(E& e, typename E::in_t cq, typename E::in_t bm, typena
   e.pipeline("ssd_chunk_out_" + std::to_string(D));
   e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(sex, 4); e.out(y, 5);
   e.bytes(N, 6); e.bytes(H, 7);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+  e.dispatch(static_cast<int>(N) / 64, static_cast<int>(H), B, 256, 1, 1);   // coop: tg per chunk
 }
 
-// ----- chunked SSD backward (D=64): reverse state (qkv -> qscan) + row/col output kernels. -----
+// ----- chunked SSD backward (D in {64,128}): recompute the forward Sex (kv -> scan), build the
+//        gradient states (gstate -> rscan, ONE reverse chain — bwd_col loads dKV in both row and
+//        col register layouts instead of materializing a transposed copy), then cooperative
+//        row/col output kernels. dcl comes out in-kernel, split into intra + inter halves:
+//        rowsum(M) = r + ri, colsum(M) = cc + ci; host combines (r+ri)-(cc+ci). -----
 template <class E>
-void launch_ssd_bwd_qkv(E& e, typename E::in_t cq, typename E::in_t dy, typename E::in_t cl,
-                        typename E::out_t qkv, unsigned N, unsigned H, int B, int C, int D) {
-  e.pipeline("ssd_bwd_qkv_" + std::to_string(D));
-  e.in(cq, 0); e.in(dy, 1); e.in(cl, 2); e.out(qkv, 3);
+void launch_ssd_chunk_gstate(E& e, typename E::in_t cq, typename E::in_t dy, typename E::in_t cl,
+                             typename E::out_t g, unsigned N, unsigned H, int B, int C, int D) {
+  e.pipeline("ssd_chunk_gstate_" + std::to_string(D));
+  e.in(cq, 0); e.in(dy, 1); e.in(cl, 2); e.out(g, 3);
   e.bytes(N, 4); e.bytes(H, 5);
-  e.dispatch(C, static_cast<int>(H), B, 32, 1, 1);
+  const int QB = D / 64;
+  e.dispatch(C * QB * QB, static_cast<int>(H), B, 32, 1, 1);
 }
 template <class E>
-void launch_ssd_bwd_qscan(E& e, typename E::in_t qin, typename E::in_t cl, typename E::out_t qex,
-                          unsigned C, unsigned N, int BH, int D) {
-  e.pipeline("ssd_bwd_qscan_" + std::to_string(D));
-  e.in(qin, 0); e.in(cl, 1); e.out(qex, 2);
+void launch_ssd_chunk_rscan(E& e, typename E::in_t gin, typename E::in_t cl,
+                            typename E::out_t dkv, unsigned C, unsigned N, int BH, int D) {
+  e.pipeline("ssd_chunk_rscan_" + std::to_string(D));
+  e.in(gin, 0); e.in(cl, 1); e.out(dkv, 2);
   e.bytes(C, 3); e.bytes(N, 4);
   e.dispatch(BH, 1, 1, 256, 1, 1);
 }
 template <class E>
-void launch_ssd_bwd_out_row(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
-                            typename E::in_t cl, typename E::in_t dy, typename E::in_t p,
-                            typename E::out_t dc, typename E::out_t r, typename E::out_t ri,
-                            unsigned N, unsigned H, int B, int D) {
-  e.pipeline("ssd_bwd_out_row_" + std::to_string(D));
-  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(p, 5);
+void launch_ssd_chunk_bwd_row(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
+                              typename E::in_t cl, typename E::in_t dy, typename E::in_t sex,
+                              typename E::out_t dc, typename E::out_t r, typename E::out_t ri,
+                              unsigned N, unsigned H, int B, int D) {
+  e.pipeline("ssd_chunk_bwd_row_" + std::to_string(D));
+  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(sex, 5);
   e.out(dc, 6); e.out(r, 7); e.out(ri, 8); e.bytes(N, 9); e.bytes(H, 10);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+  e.dispatch(static_cast<int>(N) / 64, static_cast<int>(H), B, 256, 1, 1);   // cooperative
 }
 template <class E>
-void launch_ssd_bwd_out_col(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
-                            typename E::in_t cl, typename E::in_t dy, typename E::in_t qex,
-                            typename E::in_t qtex, typename E::out_t db, typename E::out_t dx,
-                            typename E::out_t cc, typename E::out_t ci, unsigned N, unsigned H,
-                            int B, int D) {
-  e.pipeline("ssd_bwd_out_col_" + std::to_string(D));
-  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(qex, 5); e.in(qtex, 6);
-  e.out(db, 7); e.out(dx, 8); e.out(cc, 9); e.out(ci, 10); e.bytes(N, 11); e.bytes(H, 12);
-  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+void launch_ssd_chunk_bwd_col(E& e, typename E::in_t cq, typename E::in_t bm, typename E::in_t x,
+                              typename E::in_t cl, typename E::in_t dy, typename E::in_t dkv,
+                              typename E::out_t db, typename E::out_t dx, typename E::out_t cc,
+                              typename E::out_t ci, unsigned N, unsigned H, int B, int D) {
+  e.pipeline("ssd_chunk_bwd_col_" + std::to_string(D));
+  e.in(cq, 0); e.in(bm, 1); e.in(x, 2); e.in(cl, 3); e.in(dy, 4); e.in(dkv, 5);
+  e.out(db, 6); e.out(dx, 7); e.out(cc, 8); e.out(ci, 9); e.bytes(N, 10); e.bytes(H, 11);
+  e.dispatch(static_cast<int>(N) / 64, static_cast<int>(H), B, 256, 1, 1);   // cooperative
+}
+
+// ----- ssd_decode: single-token SSD decode step, S' = alpha*S + x⊗k ; y = S'·q.
+//        Sin/Sout (B,H,D,D) fp32 (may alias for in-place); alpha (B,H); x/k/q/y (B,H,D).
+//        One threadgroup per (batch, head), D threads (one per state row). -----
+template <class E>
+void launch_ssd_decode(E& e, typename E::in_t sin, typename E::in_t alpha, typename E::in_t x,
+                       typename E::in_t k, typename E::in_t q, typename E::out_t sout,
+                       typename E::out_t y, unsigned H, int B, int D) {
+  e.pipeline("ssd_decode_" + std::to_string(D));
+  e.in(sin, 0); e.in(alpha, 1); e.in(x, 2); e.in(k, 3); e.in(q, 4);
+  e.out(sout, 5); e.out(y, 6);
+  e.bytes(H, 7);
+  e.dispatch(1, static_cast<int>(H), B, D, 1, 1);
 }
 
 // ----- attn backward family (FlashAttention-2 bwd). All grid (N/8, H, B) group (32,1,1). -----

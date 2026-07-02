@@ -1079,8 +1079,24 @@ def test_mamba2_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (1, 1, 128, 128)])
+def test_mamba2_chunked_parity(shape):
+    """Forced chunked linear-time route (both head dims) — same metallib kernels on both hosts."""
+    B, H, N, D = shape
+    rng = np.random.default_rng(2)
+    C = rng.standard_normal(shape).astype(np.float32) * 0.5
+    Bm = rng.standard_normal(shape).astype(np.float32) * 0.5
+    X = rng.standard_normal(shape).astype(np.float32)
+    a = 1.0 / (1.0 + np.exp(-rng.standard_normal((B, H, N)))) * 0.5 + 0.5
+    cumlog = np.cumsum(np.log(a), axis=-1).astype(np.float32)
+    om = tk.mamba2_chunked(_mk(C, "mlx"), _mk(Bm, "mlx"), _mk(X, "mlx"),
+                           _mk(cumlog, "mlx", "f32"))
+    ot = tk.mamba2_chunked(_mk(C, "torch"), _mk(Bm, "torch"), _mk(X, "torch"),
+                           _mk(cumlog, "torch", "f32"))
+    _assert_parity(om, ot, atol=1.0)
+
+
 @pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 1, 64, 128),
-                                   # chunked linear-time route (D=64, N%64==0, N>=128):
                                    (1, 2, 128, 64), (2, 2, 192, 64)])
 def test_mamba2_bwd_parity(shape):
     B, H, N, D = shape
@@ -1097,6 +1113,43 @@ def test_mamba2_bwd_parity(shape):
                        _mk(cumlog, "torch", "f32"), _mk(dY, "torch"))
     for a_, b_ in zip(om, ot):
         _assert_parity(a_, b_, atol=6e-2)
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 192, 64), (1, 1, 128, 128)])
+def test_mamba2_bwd_chunked_parity(shape):
+    """Forced chunked linear-time backward (both head dims)."""
+    B, H, N, D = shape
+    rng = np.random.default_rng(3)
+    C = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    Bm = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    X = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    dY = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    a = rng.uniform(0.9, 1.0, (B, H, N)).astype(np.float32)
+    cumlog = np.cumsum(np.log(a), axis=-1).astype(np.float32)
+    om = tk.mamba2_bwd_chunked(_mk(C, "mlx"), _mk(Bm, "mlx"), _mk(X, "mlx"),
+                               _mk(cumlog, "mlx", "f32"), _mk(dY, "mlx"))
+    ot = tk.mamba2_bwd_chunked(_mk(C, "torch"), _mk(Bm, "torch"), _mk(X, "torch"),
+                               _mk(cumlog, "torch", "f32"), _mk(dY, "torch"))
+    for a_, b_ in zip(om, ot):
+        _assert_parity(a_, b_, atol=6e-2)
+
+
+@pytest.mark.parametrize("D", [64, 128])
+def test_ssd_decode_parity(D):
+    """One decode step: same kernel, functional (MLX) vs in-place (torch) state update."""
+    B, H = 2, 2
+    rng = np.random.default_rng(4 + D)
+    S = (0.1 * rng.standard_normal((B, H, D, D))).astype(np.float32)
+    alpha = rng.uniform(0.9, 1.0, (B, H)).astype(np.float32)
+    x = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+    k = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+    q = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
+    ym, Sm = tk.ssd_decode(_mk(S, "mlx", "f32"), _mk(alpha, "mlx", "f32"), _mk(x, "mlx", "f32"),
+                           _mk(k, "mlx", "f32"), _mk(q, "mlx", "f32"))
+    yt, St = tk.ssd_decode(_mk(S, "torch", "f32"), _mk(alpha, "torch", "f32"),
+                           _mk(x, "torch", "f32"), _mk(k, "torch", "f32"), _mk(q, "torch", "f32"))
+    _assert_parity(ym, yt, atol=1e-4)
+    _assert_parity(Sm, St, atol=1e-4)
 
 
 @pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 256, 64)])

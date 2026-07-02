@@ -11,7 +11,9 @@ import pytest
 
 from tk import lin_attn_decay
 
-SHAPES = [(1, 2, 64, 64), (2, 4, 128, 64), (1, 1, 256, 64)]
+SHAPES = [(1, 2, 64, 64), (2, 4, 128, 64), (1, 1, 256, 64),
+          # auto-routed chunked linear-time pipeline (N >= 2048, N%64==0):
+          (1, 2, 2048, 64)]
 
 
 @pytest.mark.parametrize("shape", SHAPES)
@@ -33,7 +35,11 @@ def test_lin_attn_decay(shape):
     causal = dist >= 0
     ref = np.zeros((B, H, N, D), np.float32)
     for h in range(H):
-        lam = np.where(causal, np.exp(-slopes[h] * dist), 0.0)     # Λ[i,j]
+        # mask the exponent BEFORE exp: exp(-slope*dist) overflows to inf in the upper
+        # triangle (dist < 0) at large N, and np.where would still evaluate it. Flush
+        # subnormal decays to exact 0 — Accelerate's matmul raises spurious FP flags on them.
+        lam = np.exp(np.where(causal, -slopes[h] * dist, -np.inf))  # Λ[i,j]
+        lam[lam < 1e-30] = 0.0
         scores = q[:, h] @ np.swapaxes(k[:, h], -1, -2)            # (B,N,N)
         ref[:, h] = (scores * lam[None]) @ v[:, h]
 
