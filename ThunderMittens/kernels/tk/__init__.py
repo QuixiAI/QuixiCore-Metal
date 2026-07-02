@@ -1027,6 +1027,30 @@ def mamba2(C, B, X, cumlog):
     return _mlx().mamba2(C, B, X, cumlog)
 
 
+def mamba2_bwd(C, B, X, cumlog, dY):
+    """Mamba-2 / SSD backward. Given dY, returns (dC, dB, dX, dcumlog) matching the forward shapes
+    (dcumlog = rowsum(M) - colsum(M), the gradient w.r.t. cumlog). D in {64,128}. Use
+    mamba2_dcl_to_da to turn dcumlog into d(log a) / da. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(C):
+        return _torch().mamba2_bwd(C, B, X, cumlog, dY)
+    out = _mlx().mamba2_bwd(C, B, X, cumlog, dY)
+    return out[0], out[1], out[2], out[3]
+
+
+def mamba2_dcl_to_da(dcumlog, a):
+    """Convert the gradient w.r.t. cumlog into the gradient w.r.t. the decay a. Since
+    cumlog = cumsum(log a) along the sequence, d(log a)_t = reverse_cumsum(dcumlog)_t and
+    da = d(log a) / a. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(dcumlog):
+        import torch
+        dloga = torch.flip(torch.cumsum(torch.flip(dcumlog, [-1]), dim=-1), [-1])
+        return dloga / a
+    import mlx.core as mx
+    rev = dcumlog[..., ::-1]
+    dloga = mx.cumsum(rev, axis=-1)[..., ::-1]
+    return dloga / a
+
+
 def lin_attn_decay(q, k, v, slopes):
     """Decay / retention linear attention (RetNet / Lightning-Attention-2):
     out_i = sum_{j<=i} exp(-slope_h*(i-j)) * (q_i.k_j) * v_j. q,k,v (B,H,N,D) bf16, D=64; `slopes`

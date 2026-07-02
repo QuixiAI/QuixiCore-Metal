@@ -1810,7 +1810,9 @@ static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const a
                                bool decay_kernel_name) {
   auto out = at::empty_like(C);
   constexpr unsigned L = 64;   // must match SSD_CHUNK_L in the metal
-  if (N % L != 0 || N < 2 * L) {
+  // The chunked kernels hold a D x D state quadrant (register-feasible only at D=64); D=128 uses
+  // the quadratic materialized kernel.
+  if (D != 64 || N % L != 0 || N < 2 * L) {
     tk_encode([&](TorchEncoder& e) {
       if (decay_kernel_name)
         tk::launch_lin_attn_decay(e, C, B, X, cl, out, N, H, Bsz, D);
@@ -1831,6 +1833,31 @@ static at::Tensor ssd_dispatch(const at::Tensor& C, const at::Tensor& B, const a
   return out;
 }
 
+// Mamba-2 / SSD backward: [dC, dB, dX, dcumlog]. dcumlog = rowsum(M) - colsum(M).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
+    const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
+    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+  TORCH_CHECK(C_in.device().is_mps() && C_in.scalar_type() == at::kBFloat16,
+              "mamba2_bwd: C,B,X,dY must be bfloat16 MPS");
+  TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_bwd: cumlog must be float32");
+  auto C = C_in.contiguous(), B = B_in.contiguous(), X = X_in.contiguous();
+  auto cl = cl_in.contiguous(), dY = dY_in.contiguous();
+  TORCH_CHECK(C.dim() == 4, "mamba2_bwd: C,B,X,dY expect (B,H,N,D)");
+  const int Bsz = C.size(0), H = C.size(1), D = C.size(3);
+  const unsigned N = static_cast<unsigned>(C.size(2));
+  TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
+  TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
+  auto f32 = C.options().dtype(at::kFloat);
+  auto dC = at::empty_like(C), dB = at::empty_like(C), dX = at::empty_like(C);
+  auto r = at::empty({Bsz, H, (long)N}, f32);
+  auto cc = at::empty({Bsz, H, (long)N}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mamba2_bwd_row(e, C, B, X, cl, dY, dC, r, N, H, Bsz, D);
+    tk::launch_mamba2_bwd_col(e, C, B, X, cl, dY, dB, dX, cc, N, H, Bsz, D);
+  });
+  return {dC, dB, dX, r - cc};
+}
+
 static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
                              const at::Tensor& X_in, const at::Tensor& cl_in) {
   TORCH_CHECK(C_in.device().is_mps(), "mamba2: C must be an MPS tensor");
@@ -1841,7 +1868,7 @@ static at::Tensor mamba2_mps(const at::Tensor& C_in, const at::Tensor& B_in,
   const int Bsz = C.size(0), H = C.size(1);
   const unsigned N = static_cast<unsigned>(C.size(2));
   const int D = C.size(3);
-  TORCH_CHECK(D == 64, "mamba2: D must be 64");
+  TORCH_CHECK(D == 64 || D == 128, "mamba2: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2: N must be a multiple of 8");
   return ssd_dispatch(C, B, X, cl, Bsz, H, N, D, /*decay_kernel_name=*/false);
 }
@@ -2198,6 +2225,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
+  m.def("mamba2_bwd", &mamba2_bwd_mps, "ThunderMittens Mamba-2 / SSD backward (MPS)");
   m.def("lin_attn_decay", &lin_attn_decay_mps, "ThunderMittens decay/retention linear attention (MPS)");
   m.def("based", &based_mps, "ThunderMittens Based Taylor-map linear attention (MPS)");
   m.def("attn_fwd_l", &attn_fwd_l_mps, "ThunderMittens flash-attn forward + L (MPS)");

@@ -1347,6 +1347,32 @@ void launch_mamba2(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- mamba2_bwd_row: C@0 Bm@1 X@2 cl@3(f32) dY@4 -> dC@5 r@6(f32) ; N@7 H@8 (u32) ;
+//        grid (N/8, H, B) × 32. Row-owned dC + rowsum(M). -----
+template <class E>
+void launch_mamba2_bwd_row(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
+                           typename E::in_t cl, typename E::in_t dY, typename E::out_t dC,
+                           typename E::out_t r, unsigned N, unsigned H, int B, int D) {
+  e.pipeline("mamba2_bwd_row_" + std::to_string(D));
+  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4); e.out(dC, 5); e.out(r, 6);
+  e.bytes(N, 7); e.bytes(H, 8);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
+// ----- mamba2_bwd_col: C@0 Bm@1 X@2 cl@3(f32) dY@4 -> dB@5 dX@6 cc@7(f32) ; N@8 H@9 (u32) ;
+//        grid (N/8, H, B) × 32. Col-owned dB, dX + colsum(M). -----
+template <class E>
+void launch_mamba2_bwd_col(E& e, typename E::in_t C, typename E::in_t Bm, typename E::in_t X,
+                           typename E::in_t cl, typename E::in_t dY, typename E::out_t dB,
+                           typename E::out_t dX, typename E::out_t cc, unsigned N, unsigned H,
+                           int B, int D) {
+  e.pipeline("mamba2_bwd_col_" + std::to_string(D));
+  e.in(C, 0); e.in(Bm, 1); e.in(X, 2); e.in(cl, 3); e.in(dY, 4);
+  e.out(dB, 5); e.out(dX, 6); e.out(cc, 7);
+  e.bytes(N, 8); e.bytes(H, 9);
+  e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
+}
+
 // ----- chunked linear-time SSD (3 kernels; shared by mamba2 and lin_attn_decay, chunk L=64).
 //        Scratch S is (B,H,C,D,D) fp32, C = N/64. K1 per-chunk decayed KV; K2 decayed exclusive
 //        chunk prefix; K3 intra(decay tiles) + inter(state) per query tile. -----

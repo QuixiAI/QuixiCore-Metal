@@ -932,6 +932,20 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "mamba2_bwd",
+      &mamba2_bwd,
+      "C"_a,
+      "B"_a,
+      "X"_a,
+      "cumlog"_a,
+      "dY"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Mamba-2 / SSD backward: returns [dC, dB, dX, dcumlog] (dcumlog = rowsum(M) - colsum(M))
+      )");
+
+    m.def(
       "lin_attn_decay",
       &lin_attn_decay,
       "q"_a, "k"_a, "v"_a, "cl"_a,

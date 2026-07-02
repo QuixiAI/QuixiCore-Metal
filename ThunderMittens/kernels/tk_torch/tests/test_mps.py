@@ -1044,6 +1044,38 @@ def test_mamba2(shape):
     assert diff / scale < 0.03
 
 
+@pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128)])
+def test_mamba2_bwd(shape):
+    import numpy as np
+    Bh, H, N, D = shape
+    rng = np.random.default_rng(Bh + N + D)
+    C = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    Bn = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    X = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    dY = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    a = rng.uniform(0.9, 1.0, (Bh, H, N)).astype(np.float32)
+    cl = np.cumsum(np.log(a), axis=2).astype(np.float32)
+    Ct = torch.tensor(C, requires_grad=True)
+    Bt = torch.tensor(Bn, requires_grad=True)
+    Xt = torch.tensor(X, requires_grad=True)
+    clt = torch.tensor(cl, requires_grad=True)
+    G = torch.einsum("bhid,bhjd->bhij", Ct, Bt)
+    L = torch.exp(clt[:, :, :, None] - clt[:, :, None, :])
+    Y = torch.einsum("bhij,bhjd->bhid", torch.tril(G * L), Xt)
+    Y.backward(torch.tensor(dY))
+    dC, dB, dX, dcl = tk_torch.mamba2_bwd(
+        torch.tensor(C).to(torch.bfloat16).to("mps"), torch.tensor(Bn).to(torch.bfloat16).to("mps"),
+        torch.tensor(X).to(torch.bfloat16).to("mps"), torch.tensor(cl).to("mps"),
+        torch.tensor(dY).to(torch.bfloat16).to("mps"))
+
+    def rel(g, ref):
+        return np.abs(g.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-6)
+    assert rel(dC, Ct.grad.numpy()) < 0.06
+    assert rel(dB, Bt.grad.numpy()) < 0.06
+    assert rel(dX, Xt.grad.numpy()) < 0.06
+    assert rel(dcl, clt.grad.numpy()) < 0.08
+
+
 @pytest.mark.parametrize("nkm", [(32, 16, 32), (64, 32, 64), (128, 64, 128)])
 def test_cmplx_matmul(nkm):
     N, K, M = nkm

@@ -20,7 +20,7 @@ kernel void mamba2(device   bf16     *C  [[buffer(0)]],
                    constant unsigned &H  [[buffer(6)]],
                    uint3 blockIdx [[threadgroup_position_in_grid]],
                    uint  laneId   [[thread_index_in_simdgroup]]) {
-    static_assert(D == 64, "mamba2 currently supports D=64");
+    static_assert(D == 64 || D == 128, "mamba2 supports D in {64, 128}");
     using gl_t  = gl<bfloat, 1, -1, -1, D>;           // C, B, X, Y : (B,H,N,D)
     using gl_cl = gl<float, 1, -1, 1, -1>;            // cumlog (B,H,N) viewed sequence-along-cols
     gl_t  gC(C, nullptr, H, N, nullptr);
@@ -85,6 +85,7 @@ kernel void mamba2(device   bf16     *C  [[buffer(0)]],
     uint laneId [[thread_index_in_simdgroup]]);
 
 instantiate_mamba2(64);
+instantiate_mamba2(128);
 
 // ---------------------------------------------------------------------------
 // Chunked linear-time SSD (3 kernels), shared by mamba2 AND lin_attn_decay
@@ -282,5 +283,185 @@ kernel void ssd_chunk_out(device   bf16       *Cq [[buffer(0)]],
     uint laneId [[thread_index_in_simdgroup]]);
 
 instantiate_ssd_chunk(64);
+
+// ---------------------------------------------------------------------------
+// Mamba-2 / SSD BACKWARD (quadratic, no atomics), D in {64,128}. The forward is the
+// attention-equivalent G = C·Bᵀ, S = tril(G∘L), Y = S·X (C↔Q, B↔K, X↔V, S↔P; no softmax).
+// Both kernels recompute S and dSt = dY·Xᵀ from C,B,X,cl (like attn_bwd recomputes P), per-tile:
+//   dSt[i,j] = dY_i·X_j ;  dG = tril(dSt∘L) ;  M = tril(dSt∘S)
+//   mamba2_bwd_row (fix row tile i, loop j<=i): dC_i = Σ_j dG[i,j]·B_j ,  r_i = rowsum_i(M)
+//   mamba2_bwd_col (fix col tile j, loop i>=j): dB_j = Σ_i dG[i,j]·C_i , dX_j = Σ_i S[i,j]·dY_i ,
+//                                               c_j = colsum_j(M)
+// Then (host) dcl = r - c, dloga = reverse_cumsum(dcl), da = dloga / a.
+// ---------------------------------------------------------------------------
+template <int D>
+kernel void mamba2_bwd_row(device   bf16     *C  [[buffer(0)]],
+                           device   bf16     *Bm [[buffer(1)]],
+                           device   bf16     *X  [[buffer(2)]],
+                           device   float    *cl [[buffer(3)]],
+                           device   bf16     *dY [[buffer(4)]],
+                           device   bf16     *dC [[buffer(5)]],
+                           device   float    *r  [[buffer(6)]],   // rowsum(M), (B,H,N)
+                           constant unsigned &N  [[buffer(7)]],
+                           constant unsigned &H  [[buffer(8)]],
+                           uint3 blockIdx [[threadgroup_position_in_grid]],
+                           uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "mamba2_bwd_row supports D in {64,128}");
+    using gl_t  = gl<bfloat, 1, -1, -1, D>;
+    using gl_cl = gl<float, 1, -1, 1, -1>;
+    gl_t  gC(C, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
+    gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr), gdC(dC, nullptr, H, N, nullptr);
+    gl_cl gcl(cl, nullptr, H, nullptr, N), gr(r, nullptr, H, nullptr, N);
+
+    const int i = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    rt_bf<8, D> c_i, dy_i;
+    load(c_i, gC, {batch, head, i, 0}, laneId);
+    load(dy_i, gdY, {batch, head, i, 0}, laneId);
+    typename rt_fl<8, 8>::col_vec cumlog_i;
+    load(cumlog_i, gcl, {batch, head, 0, i}, laneId);
+
+    rt_fl<8, D> dc_acc;
+    zero(dc_acc);
+    typename rt_fl<8, 8>::col_vec r_acc;
+    zero(r_acc);
+
+    for (int j = 0; j <= i; ++j) {
+        rt_bf<8, D> b_row;
+        rt_bf<8, D, ducks::rt_layout::col> b_col, x_col;
+        load(b_row, gB, {batch, head, j, 0}, laneId);
+        swap_layout(b_col, b_row, laneId);
+        load(x_col, gX, {batch, head, j, 0}, laneId);
+        typename rt_fl<8, 8>::row_vec cumlog_j;
+        load(cumlog_j, gcl, {batch, head, 0, j}, laneId);
+
+        rt_fl<8, 8> G;
+        zero(G);
+        mma_ABt(G, c_i, b_col, G);                 // C_i·Bᵀ_j
+        rt_fl<8, 8> Ld;
+        zero(Ld);
+        add_row(Ld, Ld, cumlog_i);
+        sub_col(Ld, Ld, cumlog_j);
+        exp(Ld, Ld);                               // L[i,j] = exp(cl_i - cl_j)
+        rt_fl<8, 8> S;
+        mul(S, G, Ld);                             // S = G ∘ L
+        rt_fl<8, 8> dSt;
+        zero(dSt);
+        mma_ABt(dSt, dy_i, x_col, dSt);            // dY_i·Xᵀ_j
+        rt_fl<8, 8> dG;
+        mul(dG, dSt, Ld);                          // dG = dSt ∘ L
+        if (j == i) {
+            float zf = 0.0f;
+            make_causal(S, S, laneId, zf);
+            make_causal(dG, dG, laneId, zf);
+        }
+        rt_fl<8, 8> M;
+        mul(M, dSt, S);                            // M = dSt ∘ S (S already tril-masked)
+        row_sum(r_acc, M, r_acc, laneId);
+        rt_bf<8, 8> dG_bf;
+        copy(dG_bf, dG);
+        mma_AB(dc_acc, dG_bf, b_row, dc_acc);      // dC_i += dG·B_j
+    }
+    store(gdC, dc_acc, {batch, head, i, 0}, laneId);
+    store(gr, r_acc, {batch, head, 0, i}, laneId);
+}
+
+template <int D>
+kernel void mamba2_bwd_col(device   bf16     *C  [[buffer(0)]],
+                           device   bf16     *Bm [[buffer(1)]],
+                           device   bf16     *X  [[buffer(2)]],
+                           device   float    *cl [[buffer(3)]],
+                           device   bf16     *dY [[buffer(4)]],
+                           device   bf16     *dB [[buffer(5)]],
+                           device   bf16     *dX [[buffer(6)]],
+                           device   float    *cc [[buffer(7)]],   // colsum(M), (B,H,N)
+                           constant unsigned &N  [[buffer(8)]],
+                           constant unsigned &H  [[buffer(9)]],
+                           uint3 blockIdx [[threadgroup_position_in_grid]],
+                           uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D == 64 || D == 128, "mamba2_bwd_col supports D in {64,128}");
+    using gl_t  = gl<bfloat, 1, -1, -1, D>;
+    using gl_cl = gl<float, 1, -1, 1, -1>;
+    gl_t  gC(C, nullptr, H, N, nullptr), gB(Bm, nullptr, H, N, nullptr);
+    gl_t  gX(X, nullptr, H, N, nullptr), gdY(dY, nullptr, H, N, nullptr);
+    gl_t  gdB(dB, nullptr, H, N, nullptr), gdX(dX, nullptr, H, N, nullptr);
+    gl_cl gcl(cl, nullptr, H, nullptr, N), gcc(cc, nullptr, H, nullptr, N);
+
+    const int j = blockIdx.x, head = blockIdx.y, batch = blockIdx.z;
+    rt_bf<8, D, ducks::rt_layout::col> b_col, x_col;
+    load(b_col, gB, {batch, head, j, 0}, laneId);
+    load(x_col, gX, {batch, head, j, 0}, laneId);
+    typename rt_fl<8, 8>::row_vec cumlog_j;
+    load(cumlog_j, gcl, {batch, head, 0, j}, laneId);
+
+    rt_fl<8, D> db_acc, dx_acc;
+    zero(db_acc); zero(dx_acc);
+    typename rt_fl<8, 8>::row_vec c_acc;
+    zero(c_acc);
+
+    const int q_blocks = (int)N / 8;
+    for (int i = j; i < q_blocks; ++i) {
+        rt_bf<8, D> c_i, dy_i;
+        load(c_i, gC, {batch, head, i, 0}, laneId);
+        load(dy_i, gdY, {batch, head, i, 0}, laneId);
+        typename rt_fl<8, 8>::col_vec cumlog_i;
+        load(cumlog_i, gcl, {batch, head, 0, i}, laneId);
+
+        rt_fl<8, 8> G;
+        zero(G);
+        mma_ABt(G, c_i, b_col, G);
+        rt_fl<8, 8> Ld;
+        zero(Ld);
+        add_row(Ld, Ld, cumlog_i);
+        sub_col(Ld, Ld, cumlog_j);
+        exp(Ld, Ld);
+        rt_fl<8, 8> S;
+        mul(S, G, Ld);
+        rt_fl<8, 8> dSt;
+        zero(dSt);
+        mma_ABt(dSt, dy_i, x_col, dSt);
+        rt_fl<8, 8> dG;
+        mul(dG, dSt, Ld);
+        if (i == j) {
+            float zf = 0.0f;
+            make_causal(S, S, laneId, zf);
+            make_causal(dG, dG, laneId, zf);
+        }
+        rt_fl<8, 8> M;
+        mul(M, dSt, S);
+        col_sum(c_acc, M, c_acc, laneId);
+        // dX_j += Sᵀ·dY_i  (contract over i -> swap to col layout, mma_AtB)
+        rt_bf<8, 8> S_bf;
+        copy(S_bf, S);
+        rt_bf<8, 8, ducks::rt_layout::col> S_col;
+        swap_layout(S_col, S_bf, laneId);
+        mma_AtB(dx_acc, S_col, dy_i, dx_acc);
+        // dB_j += dGᵀ·C_i
+        rt_bf<8, 8> dG_bf;
+        copy(dG_bf, dG);
+        rt_bf<8, 8, ducks::rt_layout::col> dG_col;
+        swap_layout(dG_col, dG_bf, laneId);
+        mma_AtB(db_acc, dG_col, c_i, db_acc);
+    }
+    store(gdB, db_acc, {batch, head, j, 0}, laneId);
+    store(gdX, dx_acc, {batch, head, j, 0}, laneId);
+    store(gcc, c_acc, {batch, head, 0, j}, laneId);
+}
+
+#define instantiate_mamba2_bwd(D)                                                    \
+  template [[host_name("mamba2_bwd_row_" #D)]] [[kernel]] void mamba2_bwd_row<D>(     \
+    device bf16 *C [[buffer(0)]], device bf16 *Bm [[buffer(1)]], device bf16 *X [[buffer(2)]], \
+    device float *cl [[buffer(3)]], device bf16 *dY [[buffer(4)]], device bf16 *dC [[buffer(5)]], \
+    device float *r [[buffer(6)]], constant unsigned &N [[buffer(7)]],               \
+    constant unsigned &H [[buffer(8)]], uint3 blockIdx [[threadgroup_position_in_grid]], \
+    uint laneId [[thread_index_in_simdgroup]]);                                      \
+  template [[host_name("mamba2_bwd_col_" #D)]] [[kernel]] void mamba2_bwd_col<D>(     \
+    device bf16 *C [[buffer(0)]], device bf16 *Bm [[buffer(1)]], device bf16 *X [[buffer(2)]], \
+    device float *cl [[buffer(3)]], device bf16 *dY [[buffer(4)]], device bf16 *dB [[buffer(5)]], \
+    device bf16 *dX [[buffer(6)]], device float *cc [[buffer(7)]],                   \
+    constant unsigned &N [[buffer(8)]], constant unsigned &H [[buffer(9)]],          \
+    uint3 blockIdx [[threadgroup_position_in_grid]], uint laneId [[thread_index_in_simdgroup]]);
+
+instantiate_mamba2_bwd(64);
+instantiate_mamba2_bwd(128);
 
 }

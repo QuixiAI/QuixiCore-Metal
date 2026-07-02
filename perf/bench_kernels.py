@@ -1028,6 +1028,11 @@ def mamba2_cases(be, preset, formats):
                    target=lambda C_d=C_d, B_d=B_d, X_d=X_d, cl_d=cl_d:
                        tk.mamba2(C_d, B_d, X_d, cl_d),
                    baselines={}, ref=None, flops=4.0 * B * H * N * D * D)
+        dY_d = be.array(rng.standard_normal((B, H, N, D)).astype(np.float32), "bf16")
+        yield Case("mamba2", f"bwd_B{B}H{H}N{N}D{D}", {"B": B, "H": H, "N": N, "D": D}, "bf16",
+                   target=lambda C_d=C_d, B_d=B_d, X_d=X_d, cl_d=cl_d, dY_d=dY_d:
+                       tk.mamba2_bwd(C_d, B_d, X_d, cl_d, dY_d),
+                   baselines={}, ref=None, flops=12.0 * B * H * N * N * D)
 
 
 # --------------------------------------------------------------------------- quantized

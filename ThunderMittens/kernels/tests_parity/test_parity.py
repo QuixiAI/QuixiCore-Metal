@@ -1018,6 +1018,24 @@ def test_mamba2_parity(shape):
     _assert_parity(om, ot, atol=1.0)
 
 
+@pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 1, 64, 128)])
+def test_mamba2_bwd_parity(shape):
+    B, H, N, D = shape
+    rng = np.random.default_rng(1)
+    C = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    Bm = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    X = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    dY = (0.3 * rng.standard_normal(shape)).astype(np.float32)
+    a = rng.uniform(0.9, 1.0, (B, H, N)).astype(np.float32)
+    cumlog = np.cumsum(np.log(a), axis=-1).astype(np.float32)
+    om = tk.mamba2_bwd(_mk(C, "mlx"), _mk(Bm, "mlx"), _mk(X, "mlx"), _mk(cumlog, "mlx", "f32"),
+                       _mk(dY, "mlx"))
+    ot = tk.mamba2_bwd(_mk(C, "torch"), _mk(Bm, "torch"), _mk(X, "torch"),
+                       _mk(cumlog, "torch", "f32"), _mk(dY, "torch"))
+    for a_, b_ in zip(om, ot):
+        _assert_parity(a_, b_, atol=6e-2)
+
+
 @pytest.mark.parametrize("shape", [(1, 2, 128, 64), (2, 2, 256, 64)])
 def test_hedgehog_parity(shape):
     rng = np.random.default_rng(0)

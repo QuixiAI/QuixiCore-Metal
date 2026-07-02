@@ -40,9 +40,11 @@ array mamba2(const array& C, const array& B, const array& X, const array& cumlog
   assert(cumlog.dtype() == float32);
   assert(C.shape() == B.shape() && B.shape() == X.shape());
   const int N = C.shape(2), D = C.shape(3);
-  assert(D == 64 && "mamba2 currently supports D=64");
+  assert((D == 64 || D == 128) && "mamba2 supports D in {64, 128}");
   assert(N % 8 == 0 && "mamba2: N must be a multiple of 8");
-  if (N % 64 == 0 && N >= 128) {
+  // The chunked pipeline holds a D x D state quadrant per simdgroup (rt_fl<D,D>), which is only
+  // register-feasible at D=64; D=128 uses the quadratic materialized kernel.
+  if (D == 64 && N % 64 == 0 && N >= 128) {
     return ssd_chunked(C, B, X, cumlog, s);   // linear-time chunked pipeline
   }
   return array(C.shape(), bfloat16,
@@ -159,5 +161,87 @@ std::pair<std::vector<array>, std::vector<int>> Mamba2::vmap(
   throw std::runtime_error("Mamba2 has no vmap implementation.");
 }
 bool Mamba2::is_equivalent(const Primitive&) const { return true; }
+
+// ----------------------------- mamba2_bwd -----------------------------
+
+std::vector<array> mamba2_bwd(const array& C, const array& B, const array& X, const array& cumlog,
+                              const array& dY, StreamOrDevice s /* = {} */) {
+  assert(C.dtype() == bfloat16 && B.dtype() == bfloat16 && X.dtype() == bfloat16 &&
+         dY.dtype() == bfloat16);
+  assert(cumlog.dtype() == float32);
+  assert(C.shape() == B.shape() && B.shape() == X.shape() && X.shape() == dY.shape());
+  const int Bsz = C.shape(0), H = C.shape(1), N = C.shape(2), D = C.shape(3);
+  assert((D == 64 || D == 128) && "mamba2_bwd supports D in {64, 128}");
+  assert(N % 8 == 0 && "mamba2_bwd: N must be a multiple of 8");
+  auto C_c = contiguous(C, false, s);
+  auto B_c = contiguous(B, false, s);
+  auto X_c = contiguous(X, false, s);
+  auto cl_c = contiguous(cumlog, false, s);
+  auto dY_c = contiguous(dY, false, s);
+
+  auto row = array::make_arrays(
+      {C.shape(), {Bsz, H, N}}, {bfloat16, float32},
+      std::make_shared<Mamba2BwdRow>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c});
+  auto col = array::make_arrays(
+      {C.shape(), C.shape(), {Bsz, H, N}}, {bfloat16, bfloat16, float32},
+      std::make_shared<Mamba2BwdCol>(to_stream(s)), {C_c, B_c, X_c, cl_c, dY_c});
+  // dcumlog = rowsum(M) - colsum(M)
+  auto dcl = subtract(row[1], col[2], s);
+  return {row[0], col[0], col[1], dcl};
+}
+
+void Mamba2BwdRow::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("Mamba2BwdRow has no CPU implementation.");
+}
+void Mamba2BwdRow::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& C = inputs[0]; auto& B = inputs[1]; auto& X = inputs[2];
+  auto& cl = inputs[3]; auto& dY = inputs[4];
+  auto& dC = outputs[0]; auto& r = outputs[1];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  dC.set_data(allocator::malloc_or_wait(dC.nbytes()));
+  r.set_data(allocator::malloc_or_wait(r.nbytes()));
+  const int Bsz = C.shape(0), H = C.shape(1), N = C.shape(2), D = C.shape(3);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mamba2_bwd_row(enc, C, B, X, cl, dY, dC, r, static_cast<unsigned>(N),
+                            static_cast<unsigned>(H), Bsz, D);
+}
+
+void Mamba2BwdCol::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("Mamba2BwdCol has no CPU implementation.");
+}
+void Mamba2BwdCol::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& C = inputs[0]; auto& B = inputs[1]; auto& X = inputs[2];
+  auto& cl = inputs[3]; auto& dY = inputs[4];
+  auto& dB = outputs[0]; auto& dX = outputs[1]; auto& cc = outputs[2];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  dB.set_data(allocator::malloc_or_wait(dB.nbytes()));
+  dX.set_data(allocator::malloc_or_wait(dX.nbytes()));
+  cc.set_data(allocator::malloc_or_wait(cc.nbytes()));
+  const int Bsz = C.shape(0), H = C.shape(1), N = C.shape(2), D = C.shape(3);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_mamba2_bwd_col(enc, C, B, X, cl, dY, dB, dX, cc, static_cast<unsigned>(N),
+                            static_cast<unsigned>(H), Bsz, D);
+}
+
+#define TK_MAMBA_BWD_NO_AUTODIFF(CLASS, LABEL)                               \
+  std::vector<array> CLASS::jvp(                                             \
+      const std::vector<array>&, const std::vector<array>&,                  \
+      const std::vector<int>&) {                                             \
+    throw std::runtime_error(LABEL " has no jvp implementation.");           \
+  }                                                                          \
+  std::vector<array> CLASS::vjp(                                             \
+      const std::vector<array>&, const std::vector<array>&,                  \
+      const std::vector<int>&, const std::vector<array>&) {                  \
+    throw std::runtime_error(LABEL " has no vjp implementation.");           \
+  }                                                                          \
+  std::pair<std::vector<array>, std::vector<int>> CLASS::vmap(               \
+      const std::vector<array>&, const std::vector<int>&) {                  \
+    throw std::runtime_error(LABEL " has no vmap implementation.");          \
+  }
+
+TK_MAMBA_BWD_NO_AUTODIFF(Mamba2BwdRow, "Mamba2BwdRow")
+TK_MAMBA_BWD_NO_AUTODIFF(Mamba2BwdCol, "Mamba2BwdCol")
 
 } // namespace mlx::core
