@@ -26,6 +26,7 @@ std::vector<array> cross_entropy_fwd(
     int ignore_index,
     float label_smoothing,
     float z_loss,
+    float softcap,
     StreamOrDevice s /* = {} */) {
   if (logits.ndim() != 2) {
     throw std::invalid_argument("cross_entropy_fwd: logits must be (T, V)");
@@ -41,7 +42,8 @@ std::vector<array> cross_entropy_fwd(
   auto targets_c = contiguous(astype(targets, int32, s), false, s);
   return array::make_arrays(
       {{T}, {T}}, {float32, float32},
-      std::make_shared<CrossEntropyFwd>(to_stream(s), ignore_index, label_smoothing, z_loss),
+      std::make_shared<CrossEntropyFwd>(to_stream(s), ignore_index, label_smoothing, z_loss,
+                                        softcap),
       {logits_c, targets_c});
 }
 
@@ -53,6 +55,7 @@ array cross_entropy_bwd(
     int ignore_index,
     float label_smoothing,
     float z_loss,
+    float softcap,
     StreamOrDevice s /* = {} */) {
   if (logits.ndim() != 2) {
     throw std::invalid_argument("cross_entropy_bwd: logits must be (T, V)");
@@ -64,7 +67,8 @@ array cross_entropy_bwd(
   auto grad_c = contiguous(astype(grad_out, float32, s), false, s);
   return array(
       logits.shape(), logits.dtype(),
-      std::make_shared<CrossEntropyBwd>(to_stream(s), ignore_index, label_smoothing, z_loss),
+      std::make_shared<CrossEntropyBwd>(to_stream(s), ignore_index, label_smoothing, z_loss,
+                                        softcap),
       {logits_c, targets_c, lse_c, grad_c});
 }
 
@@ -87,7 +91,7 @@ void CrossEntropyFwd::eval_gpu(const std::vector<array>& inputs, std::vector<arr
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_cross_entropy_fwd(enc, logits, targets, loss, lse, V, ignore_index_,
-                               label_smoothing_, z_loss_, T, type_to_name(logits));
+                               label_smoothing_, z_loss_, softcap_, T, type_to_name(logits));
 }
 
 void CrossEntropyBwd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -109,7 +113,7 @@ void CrossEntropyBwd::eval_gpu(const std::vector<array>& inputs, std::vector<arr
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_cross_entropy_bwd(enc, logits, targets, lse, grad_out, grad_logits, V, ignore_index_,
-                               label_smoothing_, z_loss_, T, type_to_name(logits));
+                               label_smoothing_, z_loss_, softcap_, T, type_to_name(logits));
 }
 
 #define TK_CE_NO_AUTODIFF(CLASS, LABEL)                                      \

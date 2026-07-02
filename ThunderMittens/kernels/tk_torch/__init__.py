@@ -396,16 +396,17 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
 
 
-def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss):
+def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss, softcap=0.0):
     """Fused cross-entropy forward. Returns (loss (T,), lse (T,)) f32. MPS."""
     return _ext.cross_entropy_fwd(logits, targets, int(ignore_index),
-                                  float(label_smoothing), float(z_loss))
+                                  float(label_smoothing), float(z_loss), float(softcap))
 
 
-def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index, label_smoothing, z_loss):
+def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index, label_smoothing, z_loss,
+                      softcap=0.0):
     """Fused cross-entropy backward -> grad_logits (T,V), out-of-place. MPS."""
     return _ext.cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
-                                  float(label_smoothing), float(z_loss))
+                                  float(label_smoothing), float(z_loss), float(softcap))
 
 
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,

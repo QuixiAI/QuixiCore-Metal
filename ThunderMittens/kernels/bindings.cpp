@@ -817,6 +817,7 @@ NB_MODULE(_ext, m) {
       "ignore_index"_a,
       "label_smoothing"_a,
       "z_loss"_a,
+      "softcap"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
@@ -833,6 +834,7 @@ NB_MODULE(_ext, m) {
       "ignore_index"_a,
       "label_smoothing"_a,
       "z_loss"_a,
+      "softcap"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(

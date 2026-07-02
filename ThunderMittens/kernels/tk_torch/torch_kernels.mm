@@ -1645,7 +1645,7 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
 // Fused cross-entropy forward: per-row [loss, lse] without storing (T, V) probabilities.
 static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
     const at::Tensor& logits_in, const at::Tensor& targets_in, int64_t ignore_index,
-    double label_smoothing, double z_loss) {
+    double label_smoothing, double z_loss, double softcap) {
   TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
               "cross_entropy_fwd: logits must be a float MPS tensor");
   TORCH_CHECK(logits_in.dim() == 2, "cross_entropy_fwd: logits must be (T, V)");
@@ -1658,7 +1658,7 @@ static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_cross_entropy_fwd(e, logits, targets, loss, lse, V, static_cast<int>(ignore_index),
                                  static_cast<float>(label_smoothing), static_cast<float>(z_loss),
-                                 T, tk_type_name(logits));
+                                 static_cast<float>(softcap), T, tk_type_name(logits));
   });
   return {loss, lse};
 }
@@ -1666,7 +1666,8 @@ static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
 // Fused cross-entropy backward: grad_logits (T, V), out-of-place.
 static at::Tensor cross_entropy_bwd_mps(
     const at::Tensor& logits_in, const at::Tensor& targets_in, const at::Tensor& lse_in,
-    const at::Tensor& grad_out_in, int64_t ignore_index, double label_smoothing, double z_loss) {
+    const at::Tensor& grad_out_in, int64_t ignore_index, double label_smoothing, double z_loss,
+    double softcap) {
   TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
               "cross_entropy_bwd: logits must be a float MPS tensor");
   TORCH_CHECK(logits_in.dim() == 2, "cross_entropy_bwd: logits must be (T, V)");
@@ -1679,7 +1680,8 @@ static at::Tensor cross_entropy_bwd_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_cross_entropy_bwd(e, logits, targets, lse, grad_out, grad_logits, V,
                                  static_cast<int>(ignore_index), static_cast<float>(label_smoothing),
-                                 static_cast<float>(z_loss), T, tk_type_name(logits));
+                                 static_cast<float>(z_loss), static_cast<float>(softcap), T,
+                                 tk_type_name(logits));
   });
   return grad_logits;
 }

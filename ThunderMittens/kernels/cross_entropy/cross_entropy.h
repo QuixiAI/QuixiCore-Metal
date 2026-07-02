@@ -18,6 +18,7 @@ std::vector<array> cross_entropy_fwd(
     int ignore_index,
     float label_smoothing,
     float z_loss,
+    float softcap,
     StreamOrDevice s = {});
 
 /**
@@ -32,13 +33,15 @@ array cross_entropy_bwd(
     int ignore_index,
     float label_smoothing,
     float z_loss,
+    float softcap,
     StreamOrDevice s = {});
 
 class CrossEntropyFwd : public Primitive {
  public:
-  CrossEntropyFwd(Stream stream, int ignore_index, float label_smoothing, float z_loss)
+  CrossEntropyFwd(Stream stream, int ignore_index, float label_smoothing, float z_loss,
+                  float softcap)
       : Primitive(stream), ignore_index_(ignore_index), label_smoothing_(label_smoothing),
-        z_loss_(z_loss) {}
+        z_loss_(z_loss), softcap_(softcap) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
@@ -52,20 +55,22 @@ class CrossEntropyFwd : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const CrossEntropyFwd&>(other);
     return ignore_index_ == o.ignore_index_ && label_smoothing_ == o.label_smoothing_ &&
-           z_loss_ == o.z_loss_;
+           z_loss_ == o.z_loss_ && softcap_ == o.softcap_;
   }
 
  private:
   int ignore_index_;
   float label_smoothing_;
   float z_loss_;
+  float softcap_;
 };
 
 class CrossEntropyBwd : public Primitive {
  public:
-  CrossEntropyBwd(Stream stream, int ignore_index, float label_smoothing, float z_loss)
+  CrossEntropyBwd(Stream stream, int ignore_index, float label_smoothing, float z_loss,
+                  float softcap)
       : Primitive(stream), ignore_index_(ignore_index), label_smoothing_(label_smoothing),
-        z_loss_(z_loss) {}
+        z_loss_(z_loss), softcap_(softcap) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
@@ -79,13 +84,14 @@ class CrossEntropyBwd : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const CrossEntropyBwd&>(other);
     return ignore_index_ == o.ignore_index_ && label_smoothing_ == o.label_smoothing_ &&
-           z_loss_ == o.z_loss_;
+           z_loss_ == o.z_loss_ && softcap_ == o.softcap_;
   }
 
  private:
   int ignore_index_;
   float label_smoothing_;
   float z_loss_;
+  float softcap_;
 };
 
 } // namespace mlx::core

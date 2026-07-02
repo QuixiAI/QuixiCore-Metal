@@ -101,6 +101,50 @@ def test_backward(dtype, tol, eps):
     assert np.abs(np.array(g.astype(mx.float32)) - lt.grad.numpy()).max() < tol
 
 
+@pytest.mark.parametrize("dtype,tol", [("float32", 3e-3), ("bfloat16", 8e-2)])
+@pytest.mark.parametrize("softcap", [30.0, 50.0])
+def test_softcap(dtype, tol, softcap):
+    # Gemma-2 logit softcap: z -> softcap*tanh(z/softcap) before the softmax; grad flows through tanh.
+    T, V = 8, 4000
+    logits, tgt = _mk(T, V, seed=6, n_ignore=2)
+    logits = logits * 3.0   # widen so the cap actually bites
+    lm = mx.array(logits).astype(_MX[dtype])
+    loss, lse = tk.cross_entropy(lm, mx.array(tgt), reduction="none", softcap=softcap,
+                                 return_lse=True)
+    mx.eval(loss, lse)
+    lt = torch.tensor(np.array(lm.astype(mx.float32)), requires_grad=True)
+    z = softcap * torch.tanh(lt / softcap)
+    ref = F.cross_entropy(z, torch.tensor(tgt.astype(np.int64)), ignore_index=-100,
+                          reduction="none")
+    assert np.abs(np.array(loss) - ref.detach().numpy()).max() < tol
+    n = max(int((tgt != -100).sum()), 1)
+    g = tk.cross_entropy_grad(lm, mx.array(tgt), lse, mx.full((T,), 1.0 / n, dtype=mx.float32),
+                              softcap=softcap)
+    mx.eval(g)
+    F.cross_entropy(z, torch.tensor(tgt.astype(np.int64)), ignore_index=-100,
+                    reduction="mean").backward()
+    assert np.abs(np.array(g.astype(mx.float32)) - lt.grad.numpy()).max() < tol
+
+
+def test_fused_linear_cross_entropy_softcap():
+    T, K, V, softcap = 40, 256, 2000, 30.0
+    rng = np.random.default_rng(7)
+    h = (0.2 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.2 * rng.standard_normal((V, K))).astype(np.float32)
+    tgt = rng.integers(0, V, size=(T,)).astype(np.int32)
+    loss, dh, dW = tk.fused_linear_cross_entropy(mx.array(h), mx.array(W), mx.array(tgt),
+                                                 chunk_size=16, softcap=softcap)
+    mx.eval(loss, dh, dW)
+    ht = torch.tensor(h, requires_grad=True)
+    Wt = torch.tensor(W, requires_grad=True)
+    z = softcap * torch.tanh((ht @ Wt.T) / softcap)
+    L = F.cross_entropy(z, torch.tensor(tgt.astype(np.int64)), reduction="mean")
+    L.backward()
+    assert abs(float(loss) - float(L)) < 1e-3
+    assert np.abs(np.array(dh) - ht.grad.numpy()).max() < 1e-3
+    assert np.abs(np.array(dW) - Wt.grad.numpy()).max() < 1e-3
+
+
 @pytest.mark.parametrize("chunk", [8, 16, 64])
 def test_fused_linear_cross_entropy(chunk):
     T, K, V = 40, 256, 2000

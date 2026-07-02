@@ -1204,11 +1204,12 @@ void launch_lm_head_topk_reduce(E& e, typename E::in_t part_val, typename E::in_
 template <class E>
 void launch_cross_entropy_fwd(E& e, typename E::in_t logits, typename E::in_t targets,
                               typename E::out_t loss, typename E::out_t lse, int V,
-                              int ignore_index, float label_smoothing, float z_loss, int T,
-                              const std::string& t) {
+                              int ignore_index, float label_smoothing, float z_loss, float softcap,
+                              int T, const std::string& t) {
   e.pipeline("cross_entropy_fwd_" + t);
   e.in(logits, 0); e.in(targets, 1); e.out(loss, 2); e.out(lse, 3);
   e.bytes(V, 4); e.bytes(ignore_index, 5); e.bytes(label_smoothing, 6); e.bytes(z_loss, 7);
+  e.bytes(softcap, 8);
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
@@ -1218,10 +1219,12 @@ template <class E>
 void launch_cross_entropy_bwd(E& e, typename E::in_t logits, typename E::in_t targets,
                               typename E::in_t lse, typename E::in_t grad_out,
                               typename E::out_t grad_logits, int V, int ignore_index,
-                              float label_smoothing, float z_loss, int T, const std::string& t) {
+                              float label_smoothing, float z_loss, float softcap, int T,
+                              const std::string& t) {
   e.pipeline("cross_entropy_bwd_" + t);
   e.in(logits, 0); e.in(targets, 1); e.in(lse, 2); e.in(grad_out, 3); e.out(grad_logits, 4);
   e.bytes(V, 5); e.bytes(ignore_index, 6); e.bytes(label_smoothing, 7); e.bytes(z_loss, 8);
+  e.bytes(softcap, 9);
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
