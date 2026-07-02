@@ -900,6 +900,16 @@ def beam_advance(logits, cum_log_probs, beam_width):
     return out[0], out[1], out[2]
 
 
+def beam_build_copy_pairs(parent_beam, block_table, seq_lens, block_size):
+    """Build the (src,dst) block-copy pairs for a beam KV reorder ON-DEVICE — no host readback.
+    Returns a fixed (B*BM*max_blocks, 2) int64 buffer of pairs (sentinel (-1,-1) for empty slots),
+    ready to feed kv_cache_copy_blocks. parent_beam (B,BM) int, block_table (B*BM,max_blocks) int,
+    seq_lens (B*BM,) int. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(parent_beam):
+        return _torch().beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
+    return _mlx().beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
+
+
 def beam_reorder_kv(key_cache, value_cache, block_table, parent_beam, seq_lens):
     """Reorder a paged KV cache after a beam step so each new beam's physical blocks hold its
     parent beam's KV history. Returns (key_cache', value_cache') (new caches — the copy op clones
@@ -909,48 +919,38 @@ def beam_reorder_kv(key_cache, value_cache, block_table, parent_beam, seq_lens):
     (row = global beam b*BM+i); parent_beam (B, BM) int32 from tk.beam_advance (per-batch-local
     parent index in [0, BM)); seq_lens gives the current length per beam (scalar, (B*BM,), or
     (B,BM)) to bound how many blocks are copied. Requires distinct physical blocks per beam (the
-    zero-copy block-table-remap alternative is a cache-manager concern, out of scope). Needs a host
-    readback of parent_beam/block_table (documented sync). Accepts mlx.array or torch.Tensor (MPS)."""
-    import numpy as np
-    is_t = _is_torch(key_cache)
+    zero-copy block-table-remap alternative is a cache-manager concern, out of scope). Fully
+    GPU-resident: the copy pairs are built on-device (no parent_beam/block_table readback, so no
+    per-step decode sync). Accepts mlx.array or torch.Tensor (MPS)."""
     block_size = key_cache.shape[1]
+    B, BM = int(parent_beam.shape[0]), int(parent_beam.shape[1])
+    is_t = _is_torch(key_cache)
 
-    def _np_of(x):
-        if x is None:
-            return None
-        if hasattr(x, "cpu"):        # torch tensor
-            return x.cpu().numpy()
-        return np.array(x)
-
-    pb = _np_of(parent_beam)         # (B, BM)
-    bt = _np_of(block_table).astype(np.int64)   # (B*BM, max_blocks)
-    B, BM = pb.shape
-    if np.isscalar(seq_lens) or (hasattr(seq_lens, "ndim") and getattr(seq_lens, "ndim", 1) == 0):
-        sl = np.full(B * BM, int(seq_lens), np.int64)
+    # Normalize seq_lens to a device (B*BM,) int array with NO host sync.
+    if isinstance(seq_lens, (int, float)):
+        if is_t:
+            import torch
+            sl = torch.full((B * BM,), int(seq_lens), dtype=torch.int32, device=key_cache.device)
+        else:
+            import mlx.core as mx
+            sl = mx.full((B * BM,), int(seq_lens), dtype=mx.int32)
+    elif getattr(seq_lens, "ndim", 1) == 0:      # 0-dim tensor: broadcast on-device (no readback)
+        if is_t:
+            import torch
+            sl = seq_lens.reshape(1).expand(B * BM).to(torch.int32)
+        else:
+            import mlx.core as mx
+            sl = mx.broadcast_to(mx.reshape(seq_lens, (1,)), (B * BM,)).astype(mx.int32)
     else:
-        sl = _np_of(seq_lens).reshape(B * BM).astype(np.int64)
+        if is_t:
+            import torch
+            sl = seq_lens.reshape(B * BM).to(torch.int32)
+        else:
+            import mlx.core as mx
+            sl = mx.reshape(seq_lens, (B * BM,)).astype(mx.int32)
 
-    pairs = []
-    for b in range(B):
-        for k in range(BM):
-            p = int(pb[b, k])
-            if p == k:               # beam kept its own history -> no move
-                continue
-            child, parent = b * BM + k, b * BM + p
-            nblk = (int(sl[child]) + block_size - 1) // block_size
-            for c in range(nblk):
-                src, dst = int(bt[parent, c]), int(bt[child, c])
-                if src >= 0 and dst >= 0:
-                    pairs.append((src, dst))
-    if not pairs:
-        return key_cache, value_cache
-    mapping = np.array(pairs, dtype=np.int64)
-    if is_t:
-        import torch
-        return kv_cache_copy_blocks(key_cache, value_cache,
-                                    torch.from_numpy(mapping).to(key_cache.device))
-    import mlx.core as mx
-    return kv_cache_copy_blocks(key_cache, value_cache, mx.array(mapping))
+    pairs = beam_build_copy_pairs(parent_beam, block_table, sl, block_size)
+    return kv_cache_copy_blocks(key_cache, value_cache, pairs)
 
 
 def beam_length_penalty(cum_log_probs, lengths, alpha=1.0):

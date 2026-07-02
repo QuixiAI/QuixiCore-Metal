@@ -286,6 +286,14 @@ def kv_cache_copy_blocks(key_cache: torch.Tensor, value_cache: torch.Tensor,
     return _ext.kv_cache_copy_blocks(key_cache, value_cache, block_mapping)
 
 
+def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
+                          seq_lens: torch.Tensor, block_size: int):
+    """Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).
+    Returns a fixed (B*BM*max_blocks, 2) int64 tensor of pairs (sentinel (-1,-1) for empty slots)
+    for kv_cache_copy_blocks. MPS tensors."""
+    return _ext.beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
+
+
 def kv_cache_scales(key: torch.Tensor, value: torch.Tensor):
     """Return fp8 KV-cache scales `(key_scale, value_scale)` as absmax / 240. MPS tensors."""
     return _ext.kv_cache_scales(key, value)

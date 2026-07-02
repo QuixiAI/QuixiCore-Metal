@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
-                beam_advance, beam_reorder_kv, beam_length_penalty)
+                beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty)
 
 
 @pytest.mark.parametrize("B,BM", [(2, 3), (1, 4), (3, 2)])
@@ -40,6 +40,50 @@ def test_beam_reorder_kv(B, BM):
                 ref_v[bt[b * BM + k, c]] = vc[bt[b * BM + p, c]]
     np.testing.assert_array_equal(np.array(kc2), ref_k)
     np.testing.assert_array_equal(np.array(vc2), ref_v)
+
+
+def test_beam_reorder_kv_chain():
+    """Reorder CHAIN: beam0<-beam1, beam1<-beam2 (a parent block that is also a copy destination).
+    Correct semantics reads the ORIGINAL cache, so beam0 must get beam2's blocks, not the reordered
+    beam1. Pins the read-from-original (race-free) copy against the read-from-clone hazard."""
+    B, BM, bs, H_KV, D, max_blocks = 1, 3, 4, 1, 8, 1
+    nbeams = B * BM
+    rng = np.random.default_rng(0)
+    kc = rng.standard_normal((nbeams, bs, H_KV, D)).astype(np.float32)
+    vc = rng.standard_normal((nbeams, bs, H_KV, D)).astype(np.float32)
+    bt = np.arange(nbeams, dtype=np.int32).reshape(nbeams, max_blocks)   # beam g owns block g
+    pb = np.array([[1, 2, 2]], np.int32)     # 0<-1, 1<-2, 2 keeps itself
+    seq_lens = np.full(nbeams, 3, np.int32)  # 1 block
+    kc2, vc2 = beam_reorder_kv(mx.array(kc), mx.array(vc), mx.array(bt), mx.array(pb),
+                               mx.array(seq_lens))
+    mx.eval(kc2, vc2)
+    ref_k, ref_v = kc.copy(), vc.copy()
+    ref_k[0] = kc[1]; ref_k[1] = kc[2]       # both read the ORIGINAL cache
+    ref_v[0] = vc[1]; ref_v[1] = vc[2]
+    np.testing.assert_array_equal(np.array(kc2), ref_k)
+    np.testing.assert_array_equal(np.array(vc2), ref_v)
+
+
+@pytest.mark.parametrize("B,BM", [(2, 3), (3, 2)])
+def test_beam_build_copy_pairs(B, BM):
+    """The device pair builder emits the same (src,dst) set as the reference host loop."""
+    max_blocks, block_size = 3, 4
+    nbeams = B * BM
+    rng = np.random.default_rng(B * 7 + BM)
+    bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+    pb = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    sl = rng.integers(1, max_blocks * block_size, size=nbeams).astype(np.int32)
+    pairs = np.array(beam_build_copy_pairs(mx.array(pb), mx.array(bt), mx.array(sl), block_size))
+    got = {(int(s), int(d)) for s, d in pairs if s >= 0 and d >= 0}
+    want = set()
+    for b in range(B):
+        for k in range(BM):
+            p = int(pb[b, k])
+            if p == k:
+                continue
+            for c in range((int(sl[b * BM + k]) + block_size - 1) // block_size):
+                want.add((int(bt[b * BM + p, c]), int(bt[b * BM + k, c])))
+    assert got == want
 
 
 def test_beam_length_penalty():

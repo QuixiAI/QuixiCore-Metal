@@ -616,6 +616,20 @@ NB_MODULE(_ext, m) {
         copy KV cache blocks according to (src, dst) block pairs
       )");
 
+  m.def(
+      "beam_build_copy_pairs",
+      &beam_build_copy_pairs,
+      "parent_beam"_a,
+      "block_table"_a,
+      "seq_lens"_a,
+      "block_size"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).
+        Returns a fixed (B*BM*max_blocks, 2) int64 buffer for kv_cache_copy_blocks.
+      )");
+
     m.def(
       "kv_cache_scales",
       &kv_cache_scales,

@@ -31,6 +31,17 @@ std::vector<array> kv_cache_copy_blocks(
     const array& block_mapping,
     StreamOrDevice s = {});
 
+// Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback). Returns a
+// fixed (B*BM*max_blocks, 2) int64 buffer of pairs (sentinel (-1,-1) for empty slots) that feeds
+// kv_cache_copy_blocks. parent_beam (B,BM) int32, block_table (B*BM,max_blocks) int32, seq_lens
+// (B*BM,) int32.
+array beam_build_copy_pairs(
+    const array& parent_beam,
+    const array& block_table,
+    const array& seq_lens,
+    int block_size,
+    StreamOrDevice s = {});
+
 std::vector<array> kv_cache_scales(
     const array& key,
     const array& value,
@@ -206,6 +217,36 @@ class KvCacheCopyBlocks : public Primitive {
 
   void print(std::ostream& os) override { os << "KvCacheCopyBlocks"; }
   bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class BeamBuildCopyPairs : public Primitive {
+ public:
+  BeamBuildCopyPairs(Stream stream, int block_size)
+      : Primitive(stream), block_size_(block_size) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&,
+      const std::vector<array>&,
+      const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&,
+      const std::vector<array>&,
+      const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&,
+      const std::vector<int>&) override;
+  const char* name() const { return "BeamBuildCopyPairs"; }
+
+  void print(std::ostream& os) override { os << "BeamBuildCopyPairs"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return block_size_ == static_cast<const BeamBuildCopyPairs&>(other).block_size_;
+  }
+
+ private:
+  int block_size_;
 };
 
 class KvCacheScales : public Primitive {

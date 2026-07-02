@@ -898,18 +898,35 @@ void launch_kv_cache_clone(
 template <class E>
 void launch_kv_cache_copy_blocks(
     E& e,
-    typename E::out_t key_cache,
-    typename E::out_t value_cache,
+    typename E::in_t key_src,
+    typename E::in_t value_src,
+    typename E::out_t key_dst,
+    typename E::out_t value_dst,
     typename E::in_t block_mapping,
     int num_pairs,
     int numel_per_block,
     const std::string& type_name) {
   e.pipeline(kv_cache_kernel_name("copy_blocks", type_name));
-  e.out(key_cache, 0);
-  e.out(value_cache, 1);
-  e.in(block_mapping, 2);
-  e.bytes(numel_per_block, 3);
+  e.in(key_src, 0);
+  e.in(value_src, 1);
+  e.out(key_dst, 2);
+  e.out(value_dst, 3);
+  e.in(block_mapping, 4);
+  e.bytes(numel_per_block, 5);
   e.dispatch(num_pairs, 1, 1, 256, 1, 1);
+}
+
+// Beam KV reorder: build the (src,dst) copy pairs on-device (removes the host readback). Emits a
+// fixed (B*BM*max_blocks, 2) long buffer of pairs/sentinels for kv_cache_copy_blocks to consume.
+template <class E>
+void launch_beam_build_copy_pairs(E& e, typename E::in_t parent_beam, typename E::in_t block_table,
+                                  typename E::in_t seq_lens, typename E::out_t pairs, int BM,
+                                  int max_blocks, int block_size, int n_slots) {
+  e.pipeline("beam_build_copy_pairs");
+  e.in(parent_beam, 0); e.in(block_table, 1); e.in(seq_lens, 2); e.out(pairs, 3);
+  e.bytes(BM, 4); e.bytes(max_blocks, 5); e.bytes(block_size, 6); e.bytes(n_slots, 7);
+  constexpr int threads = 256;
+  e.dispatch((n_slots + threads - 1) / threads, 1, 1, threads, 1, 1);
 }
 
 // ----- KV cache scales: key@0 value@1 -> key_scale@2 value_scale@3 ; n@4.

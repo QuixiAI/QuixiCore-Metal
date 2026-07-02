@@ -484,11 +484,32 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_copy_blocks_mps(
   const int numel_per_block = key_cache.size(1) * key_cache.size(2) * key_cache.size(3);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_kv_cache_clone(e, key_cache, value_cache, key_out, value_out, total, tn);
-    tk::launch_kv_cache_copy_blocks(e, key_out, value_out, block_mapping,
+    tk::launch_kv_cache_copy_blocks(e, key_cache, value_cache, key_out, value_out, block_mapping,
                                     static_cast<int>(block_mapping.size(0)),
                                     numel_per_block, tn);
   });
   return {key_out, value_out};
+}
+
+static at::Tensor beam_build_copy_pairs_mps(
+    const at::Tensor& parent_beam_in, const at::Tensor& block_table_in,
+    const at::Tensor& seq_lens_in, int64_t block_size) {
+  TORCH_CHECK(parent_beam_in.device().is_mps() && block_table_in.device().is_mps() &&
+              seq_lens_in.device().is_mps(), "beam_build_copy_pairs: all inputs must be MPS tensors");
+  TORCH_CHECK(parent_beam_in.dim() == 2, "beam_build_copy_pairs: parent_beam must be (B, BM)");
+  TORCH_CHECK(block_table_in.dim() == 2, "beam_build_copy_pairs: block_table must be (B*BM, max_blocks)");
+  auto parent_beam = parent_beam_in.to(at::kInt).contiguous();
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  const int B = parent_beam.size(0), BM = parent_beam.size(1);
+  const int max_blocks = block_table.size(1);
+  auto seq_lens = seq_lens_in.reshape({(long)(B * BM)}).to(at::kInt).contiguous();
+  const int n_slots = B * BM * max_blocks;
+  auto pairs = at::empty({(long)n_slots, 2}, parent_beam.options().dtype(at::kLong));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_beam_build_copy_pairs(e, parent_beam, block_table, seq_lens, pairs,
+                                     BM, max_blocks, static_cast<int>(block_size), n_slots);
+  });
+  return pairs;
 }
 
 static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
@@ -2310,6 +2331,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_cache_scatter", &kv_cache_scatter_mps, "ThunderMittens KV cache scatter (MPS)");
   m.def("kv_cache_gather", &kv_cache_gather_mps, "ThunderMittens KV cache gather (MPS)");
   m.def("kv_cache_copy_blocks", &kv_cache_copy_blocks_mps, "ThunderMittens KV cache block copy (MPS)");
+  m.def("beam_build_copy_pairs", &beam_build_copy_pairs_mps, "ThunderMittens beam KV reorder copy-pair builder (MPS)");
   m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
   m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
   m.def("paged_attention_alibi", &paged_attention_alibi_mps, "ThunderMittens paged decode with ALiBi (MPS)");

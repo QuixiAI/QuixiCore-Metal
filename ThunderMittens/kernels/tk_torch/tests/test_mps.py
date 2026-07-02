@@ -964,6 +964,53 @@ def test_beam_reorder_kv():
     np.testing.assert_array_equal(vc2.float().cpu().numpy(), ref_v)
 
 
+def test_beam_reorder_kv_chain():
+    """Reorder chain beam0<-beam1<-beam2: read-from-original must give beam0 the ORIGINAL beam1
+    (not the reordered one). Race-free copy pin, matching the MLX chain test."""
+    import numpy as np
+    import tk
+    rng = np.random.default_rng(0)
+    nbeams, bs, H_KV, D = 3, 4, 1, 8
+    kc = rng.standard_normal((nbeams, bs, H_KV, D)).astype(np.float32)
+    vc = rng.standard_normal((nbeams, bs, H_KV, D)).astype(np.float32)
+    bt = np.arange(nbeams, dtype=np.int32).reshape(nbeams, 1)
+    pb = np.array([[1, 2, 2]], np.int32)
+    sl = np.full(nbeams, 3, np.int32)
+    kc2, vc2 = tk.beam_reorder_kv(torch.from_numpy(kc).to("mps"), torch.from_numpy(vc).to("mps"),
+                                  torch.from_numpy(bt).to("mps"), torch.from_numpy(pb).to("mps"),
+                                  torch.from_numpy(sl).to("mps"))
+    ref_k, ref_v = kc.copy(), vc.copy()
+    ref_k[0] = kc[1]; ref_k[1] = kc[2]
+    ref_v[0] = vc[1]; ref_v[1] = vc[2]
+    np.testing.assert_array_equal(kc2.float().cpu().numpy(), ref_k)
+    np.testing.assert_array_equal(vc2.float().cpu().numpy(), ref_v)
+
+
+@pytest.mark.parametrize("B,BM", [(2, 3), (3, 2)])
+def test_beam_build_copy_pairs(B, BM):
+    import numpy as np
+    import tk_torch
+    max_blocks, block_size = 3, 4
+    nbeams = B * BM
+    rng = np.random.default_rng(B * 7 + BM)
+    bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+    pb = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    sl = rng.integers(1, max_blocks * block_size, size=nbeams).astype(np.int32)
+    pairs = tk_torch.beam_build_copy_pairs(torch.from_numpy(pb).to("mps"),
+                                           torch.from_numpy(bt).to("mps"),
+                                           torch.from_numpy(sl).to("mps"), block_size).cpu().numpy()
+    got = {(int(s), int(d)) for s, d in pairs if s >= 0 and d >= 0}
+    want = set()
+    for b in range(B):
+        for k in range(BM):
+            p = int(pb[b, k])
+            if p == k:
+                continue
+            for c in range((int(sl[b * BM + k]) + block_size - 1) // block_size):
+                want.add((int(bt[b * BM + p, c]), int(bt[b * BM + k, c])))
+    assert got == want
+
+
 @pytest.mark.parametrize("B,BM,V", [(2, 4, 4000), (3, 8, 4000)])
 def test_beam_advance(B, BM, V):
     import numpy as np

@@ -133,6 +133,29 @@ std::vector<array> kv_cache_copy_blocks(
       {key_c, value_c, map_c});
 }
 
+array beam_build_copy_pairs(
+    const array& parent_beam,
+    const array& block_table,
+    const array& seq_lens,
+    int block_size,
+    StreamOrDevice s) {
+  if (parent_beam.ndim() != 2) {
+    throw std::invalid_argument("beam_build_copy_pairs: parent_beam must have shape (B, BM)");
+  }
+  if (block_table.ndim() != 2) {
+    throw std::invalid_argument("beam_build_copy_pairs: block_table must have shape (B*BM, max_blocks)");
+  }
+  const int B = parent_beam.shape(0), BM = parent_beam.shape(1);
+  const int max_blocks = block_table.shape(1);
+  auto pb_c = contiguous(astype(parent_beam, int32, s), false, s);
+  auto bt_c = contiguous(astype(block_table, int32, s), false, s);
+  auto sl_c = contiguous(astype(reshape(seq_lens, {B * BM}, s), int32, s), false, s);
+  return array(
+      {B * BM * max_blocks, 2}, int64,
+      std::make_shared<BeamBuildCopyPairs>(to_stream(s), block_size),
+      {pb_c, bt_c, sl_c});
+}
+
 std::vector<array> kv_cache_scales(
     const array& key,
     const array& value,
@@ -536,7 +559,33 @@ void KvCacheCopyBlocks::eval_gpu(
       key_cache.shape(1) * key_cache.shape(2) * key_cache.shape(3);
   tk::launch_kv_cache_clone(enc, key_cache, value_cache, key_out, value_out, total, tn);
   tk::launch_kv_cache_copy_blocks(
-      enc, key_out, value_out, mapping, mapping.shape(0), numel_per_block, tn);
+      enc, key_cache, value_cache, key_out, value_out, mapping, mapping.shape(0),
+      numel_per_block, tn);
+}
+
+void BeamBuildCopyPairs::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BeamBuildCopyPairs has no CPU implementation.");
+}
+
+void BeamBuildCopyPairs::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& parent_beam = inputs[0];
+  auto& block_table = inputs[1];
+  auto& seq_lens = inputs[2];
+  auto& pairs = outputs[0];
+
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  pairs.set_data(allocator::malloc_or_wait(pairs.nbytes()));
+
+  const int BM = parent_beam.shape(1);
+  const int max_blocks = block_table.shape(1);
+  const int n_slots = static_cast<int>(pairs.shape(0));   // B*BM*max_blocks
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_beam_build_copy_pairs(enc, parent_beam, block_table, seq_lens, pairs,
+                                   BM, max_blocks, block_size_, n_slots);
 }
 
 void KvCacheScales::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -811,6 +860,7 @@ TK_KV_NO_AUTODIFF(KvCacheScatterFp8, "KvCacheScatterFp8")
 TK_KV_NO_AUTODIFF(PagedAttentionFp8, "PagedAttentionFp8")
 TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
 TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
+TK_KV_NO_AUTODIFF(BeamBuildCopyPairs, "BeamBuildCopyPairs")
 TK_KV_NO_AUTODIFF(KvCacheScales, "KvCacheScales")
 TK_KV_NO_AUTODIFF(PagedAttention, "PagedAttention")
 TK_KV_NO_AUTODIFF(PagedAttentionStaged, "PagedAttentionStaged")

@@ -187,6 +187,27 @@ def test_beam_advance_parity(B, BM, V):
     _assert_parity(om[2], ot[2], atol=1e-4)  # scores
 
 
+@pytest.mark.parametrize("B,BM", [(2, 3), (1, 4)])
+def test_beam_reorder_kv_parity(B, BM):
+    rng = np.random.default_rng(B + BM)
+    bs, H_KV, D, max_blocks = 4, 2, 16, 2
+    nbeams = B * BM
+    nb = nbeams * max_blocks
+    kc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    vc = rng.standard_normal((nb, bs, H_KV, D)).astype(np.float32)
+    bt = np.arange(nb, dtype=np.int32).reshape(nbeams, max_blocks)
+    pb = rng.integers(0, BM, size=(B, BM)).astype(np.int32)   # random parents -> fan-out + chains
+    sl = np.full(nbeams, 7, np.int32)
+    km, vm = tk.beam_reorder_kv(mx.array(kc).astype(mx.bfloat16), mx.array(vc).astype(mx.bfloat16),
+                                mx.array(bt), mx.array(pb), mx.array(sl))
+    kt, vt = tk.beam_reorder_kv(torch.from_numpy(kc).to(torch.bfloat16).to("mps"),
+                                torch.from_numpy(vc).to(torch.bfloat16).to("mps"),
+                                torch.from_numpy(bt).to("mps"), torch.from_numpy(pb).to("mps"),
+                                torch.from_numpy(sl).to("mps"))
+    _assert_parity(km, kt, atol=0)           # same metallib -> bit-identical reorder
+    _assert_parity(vm, vt, atol=0)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

@@ -115,11 +115,16 @@ kernel void kv_cache_clone(device const T *key_cache [[buffer(0)]],
     value_out[tid] = value_cache[tid];
 }
 
+// Copy KV blocks src->dst. Reads from the ORIGINAL cache (key_src/value_src) and writes the CLONE
+// (key_dst/value_dst) so a block that is simultaneously a source and a destination (a beam-reorder
+// chain) always reads the pre-reorder value — deterministic and race-free regardless of pair order.
 template <typename T>
-kernel void kv_cache_copy_blocks(device T *key_cache [[buffer(0)]],
-                                 device T *value_cache [[buffer(1)]],
-                                 device const long *block_mapping [[buffer(2)]],
-                                 constant int &numel_per_block [[buffer(3)]],
+kernel void kv_cache_copy_blocks(device const T *key_src [[buffer(0)]],
+                                 device const T *value_src [[buffer(1)]],
+                                 device T *key_dst [[buffer(2)]],
+                                 device T *value_dst [[buffer(3)]],
+                                 device const long *block_mapping [[buffer(4)]],
+                                 constant int &numel_per_block [[buffer(5)]],
                                  uint pair [[threadgroup_position_in_grid]],
                                  uint tid [[thread_position_in_threadgroup]],
                                  uint tptg [[threads_per_threadgroup]]) {
@@ -132,9 +137,44 @@ kernel void kv_cache_copy_blocks(device T *key_cache [[buffer(0)]],
     const long src_base = src_block * numel_per_block;
     const long dst_base = dst_block * numel_per_block;
     for (int i = (int)tid; i < numel_per_block; i += (int)tptg) {
-        key_cache[dst_base + i] = key_cache[src_base + i];
-        value_cache[dst_base + i] = value_cache[src_base + i];
+        key_dst[dst_base + i] = key_src[src_base + i];
+        value_dst[dst_base + i] = value_src[src_base + i];
     }
+}
+
+// Build the (src,dst) block-copy pairs for a beam KV reorder ON-DEVICE — removes the host readback
+// of parent_beam/block_table that the pure-Python builder needed (a per-step decode sync). Emits a
+// FIXED-SIZE, deterministic pairs buffer (no atomics/scan): slot gid = gb*max_blocks + c holds the
+// copy for global beam gb (= b*BM + k) at block column c, or the sentinel (-1,-1) which the
+// downstream kv_cache_copy_blocks kernel already skips. A child beam k with parent p (== per-batch-
+// local parent_beam[b,k]) copies parent block bt[b*BM+p, c] -> bt[gb, c] for c < ceil(sl/block_size);
+// p == k (kept its own history) or an out-of-range/negative slot -> sentinel. One thread per slot.
+kernel void beam_build_copy_pairs(device const int  *parent_beam [[buffer(0)]],   // (B, BM)
+                                  device const int  *block_table [[buffer(1)]],   // (B*BM, max_blocks)
+                                  device const int  *seq_lens    [[buffer(2)]],   // (B*BM,)
+                                  device long       *pairs       [[buffer(3)]],   // (B*BM*max_blocks, 2)
+                                  constant int      &BM          [[buffer(4)]],
+                                  constant int      &max_blocks  [[buffer(5)]],
+                                  constant int      &block_size  [[buffer(6)]],
+                                  constant int      &n_slots     [[buffer(7)]],
+                                  uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n_slots) return;
+    const int gb = (int)gid / max_blocks;             // global beam = b*BM + k
+    const int c  = (int)gid % max_blocks;             // block column
+    const int b  = gb / BM;
+    const int k  = gb % BM;
+    long src = -1, dst = -1;
+    const int p = parent_beam[b * BM + k];
+    if (p != k) {                                     // p == k -> beam kept its own history, no move
+        const int nblk = (seq_lens[gb] + block_size - 1) / block_size;
+        if (c < nblk) {
+            const int s = block_table[(b * BM + p) * max_blocks + c];
+            const int d = block_table[gb * max_blocks + c];
+            if (s >= 0 && d >= 0) { src = (long)s; dst = (long)d; }
+        }
+    }
+    pairs[2 * (long)gid]     = src;
+    pairs[2 * (long)gid + 1] = dst;
 }
 
 template <typename T>
@@ -614,10 +654,12 @@ instantiate_paged_attention_fp8(bfloat16, bf16, 128)
                     constant ulong &n [[buffer(4)]],                          \
                     uint tid [[thread_position_in_grid]]);                    \
   template [[host_name("kv_cache_copy_blocks_" #type_name)]] [[kernel]] void \
-  kv_cache_copy_blocks<T>(device T *key_cache [[buffer(0)]],                  \
-                          device T *value_cache [[buffer(1)]],                \
-                          device const long *block_mapping [[buffer(2)]],     \
-                          constant int &numel_per_block [[buffer(3)]],        \
+  kv_cache_copy_blocks<T>(device const T *key_src [[buffer(0)]],             \
+                          device const T *value_src [[buffer(1)]],           \
+                          device T *key_dst [[buffer(2)]],                    \
+                          device T *value_dst [[buffer(3)]],                  \
+                          device const long *block_mapping [[buffer(4)]],     \
+                          constant int &numel_per_block [[buffer(5)]],        \
                           uint pair [[threadgroup_position_in_grid]],         \
                           uint tid [[thread_position_in_threadgroup]],        \
                           uint tptg [[threads_per_threadgroup]]);             \
