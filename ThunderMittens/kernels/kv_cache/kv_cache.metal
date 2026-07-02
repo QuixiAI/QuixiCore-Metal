@@ -188,6 +188,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
                             constant int &use_alibi [[buffer(12)]],            // 0 = off
                             device const int *block_mask [[buffer(13)]],       // (batch, max_blocks)
                             constant int &use_mask [[buffer(14)]],             // 0 = dense
+                            constant int &window [[buffer(15)]],               // >0 = sliding window
                             uint3 tgid [[threadgroup_position_in_grid]],
                             uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -199,6 +200,9 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
     const int kv_head = head / (num_heads / num_kv_heads);
     const int context_len = context_lens[batch];
     const long row_base = ((long)batch * num_heads + head) * D;
+    // Sliding window: the decode query (at position context_len) attends the `window` most recent
+    // keys [context_len-window, context_len). window <= 0 disables it (attend all).
+    const int t_start = (window > 0) ? max(0, context_len - window) : 0;
 
     float qv[VALUES_PER_LANE];
     float acc[VALUES_PER_LANE];
@@ -211,7 +215,7 @@ kernel void paged_attention(device const T *q [[buffer(0)]],
     float m = -3.4028234663852886e38f;
     float l = 0.0f;
 
-    for (int t = 0; t < context_len; ++t) {
+    for (int t = t_start; t < context_len; ++t) {
         const int block_col = t / block_size;
         const int slot = t - block_col * block_size;
         const int block = block_table[batch * block_table_stride + block_col];
@@ -639,6 +643,7 @@ instantiate_paged_attention_fp8(bfloat16, bf16, 128)
       constant int &use_alibi [[buffer(12)]],                                \
       device const int *block_mask [[buffer(13)]],                           \
       constant int &use_mask [[buffer(14)]],                                 \
+      constant int &window [[buffer(15)]],                                   \
       uint3 tgid [[threadgroup_position_in_grid]],                           \
       uint lane [[thread_index_in_simdgroup]]);
 

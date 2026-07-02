@@ -1124,6 +1124,29 @@ def test_paged_attention_parity(dtype, atol):
     _assert_parity(om, ot, atol=atol)
 
 
+@pytest.mark.parametrize("window", [1, 3, 5])
+def test_paged_attention_window_parity(window):
+    rng = np.random.default_rng(2)
+    B, H, D = 2, 2, 64
+    block_size, ctx = 16, 40
+    nblocks = (ctx + block_size - 1) // block_size
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H, D))).astype(np.float32)
+    bt = np.full((B, nblocks), -1, np.int32)
+    blk = 1
+    for b in range(B):
+        for c in range(nblocks):
+            bt[b, c] = blk; blk += 1
+    cl = np.full((B,), ctx, np.int32)
+    om = tk.paged_attention(_mk(q, "mlx"), _mk(kc, "mlx"), _mk(vc, "mlx"),
+                            mx.array(bt), mx.array(cl), window=window)
+    ot = tk.paged_attention(_mk(q, "torch"), _mk(kc, "torch"), _mk(vc, "torch"),
+                            torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                            window=window)
+    _assert_parity(om, ot, atol=2e-2)
+
+
 @pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])
 def test_paged_attention_fp8_parity(H, H_KV):
     rng = np.random.default_rng(3)

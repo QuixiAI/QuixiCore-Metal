@@ -930,6 +930,7 @@ void launch_paged_attention(
     int use_alibi,
     typename E::in_t block_mask,
     int use_mask,
+    int window,
     const std::string& type_name) {
   e.pipeline(paged_attention_kernel_name(type_name, head_size));
   e.in(q, 0);
@@ -947,6 +948,7 @@ void launch_paged_attention(
   e.bytes(use_alibi, 12);
   e.in(block_mask, 13);
   e.bytes(use_mask, 14);
+  e.bytes(window, 15);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 

@@ -291,23 +291,28 @@ def kv_cache_scales(key: torch.Tensor, value: torch.Tensor):
 
 
 def paged_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
-                    block_table: torch.Tensor, context_lens: torch.Tensor, scale: float = 0.0):
-    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D)."""
-    return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens, float(scale))
+                    block_table: torch.Tensor, context_lens: torch.Tensor, scale: float = 0.0,
+                    window: int = 0):
+    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D).
+    window > 0 restricts to the `window` most recent keys (Mistral sliding window). MPS."""
+    return _ext.paged_attention(q, key_cache, value_cache, block_table, context_lens,
+                                float(scale), int(window))
 
 
 def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, alibi_slopes,
-                          scale=0.0):
-    """Paged decode with a per-head ALiBi linear position bias (alibi_slopes is (num_heads,)). MPS."""
+                          scale=0.0, window=0):
+    """Paged decode with a per-head ALiBi linear position bias (alibi_slopes is (num_heads,)). MPS.
+    window > 0 restricts to the `window` most recent keys."""
     return _ext.paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens,
-                                      alibi_slopes, float(scale))
+                                      alibi_slopes, float(scale), int(window))
 
 
 def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens, block_mask,
-                                 scale=0.0):
-    """Block-sparse paged decode; block_mask (batch, max_blocks) int (1=attend, 0=skip). MPS."""
+                                 scale=0.0, window=0):
+    """Block-sparse paged decode; block_mask (batch, max_blocks) int (1=attend, 0=skip). MPS.
+    window > 0 restricts to the `window` most recent keys."""
     return _ext.paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens,
-                                             block_mask, float(scale))
+                                             block_mask, float(scale), int(window))
 
 
 def paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens, scale=0.0):

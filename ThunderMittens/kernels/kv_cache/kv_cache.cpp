@@ -158,6 +158,7 @@ array paged_attention(
     const array& block_table,
     const array& context_lens,
     float scale,
+    int window,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention: q must have shape (batch, num_heads, head_size)");
@@ -201,7 +202,8 @@ array paged_attention(
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/false),
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/false,
+                                       window),
       {q_c, key_c, value_c, table_c, lens_c, no_alibi, no_mask});
 }
 
@@ -213,6 +215,7 @@ array paged_attention_alibi(
     const array& context_lens,
     const array& alibi_slopes,
     float scale,
+    int window,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_alibi: q must have shape (batch, num_heads, head_size)");
@@ -248,7 +251,8 @@ array paged_attention_alibi(
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/true, /*use_mask=*/false),
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/true, /*use_mask=*/false,
+                                       window),
       {q_c, key_c, value_c, table_c, lens_c, slopes_c, no_mask});
 }
 
@@ -260,6 +264,7 @@ array paged_attention_block_sparse(
     const array& context_lens,
     const array& block_mask,
     float scale,
+    int window,
     StreamOrDevice s) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_block_sparse: q must have shape (batch, num_heads, head_size)");
@@ -298,7 +303,8 @@ array paged_attention_block_sparse(
   return array(
       q.shape(),
       dtype,
-      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/true),
+      std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/true,
+                                       window),
       {q_c, key_c, value_c, table_c, lens_c, no_alibi, mask_c});
 }
 
@@ -599,6 +605,7 @@ void PagedAttention::eval_gpu(
       use_alibi_ ? 1 : 0,
       block_mask,
       use_mask_ ? 1 : 0,
+      window_,
       type_to_name(q));
 }
 

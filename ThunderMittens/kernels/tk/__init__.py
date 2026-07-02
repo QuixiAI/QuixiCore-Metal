@@ -442,34 +442,38 @@ def kv_cache_scales(key, value):
     return _mlx().kv_cache_scales(key, value)
 
 
-def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=0.0):
-    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D)."""
+def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=0.0, window=0):
+    """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D).
+    window > 0 restricts to the `window` most recent keys (Mistral sliding window)."""
     if _is_torch(q):
-        return _torch().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
-    return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale)
+        return _torch().paged_attention(q, key_cache, value_cache, block_table, context_lens,
+                                        scale, window)
+    return _mlx().paged_attention(q, key_cache, value_cache, block_table, context_lens, scale,
+                                  window=window)
 
 
 def paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens, alibi_slopes,
-                          scale=0.0):
+                          scale=0.0, window=0):
     """Paged decode with a per-head ALiBi linear position bias. alibi_slopes is (num_heads,);
-    each score gets slope[h]*(t - context_len + 1). Accepts mlx.array or torch.Tensor (MPS)."""
+    each score gets slope[h]*(t - context_len + 1). window > 0 restricts to the `window` most
+    recent keys. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
         return _torch().paged_attention_alibi(q, key_cache, value_cache, block_table,
-                                              context_lens, alibi_slopes, scale)
+                                              context_lens, alibi_slopes, scale, window)
     return _mlx().paged_attention_alibi(q, key_cache, value_cache, block_table, context_lens,
-                                        alibi_slopes, scale)
+                                        alibi_slopes, scale, window=window)
 
 
 def paged_attention_block_sparse(q, key_cache, value_cache, block_table, context_lens, block_mask,
-                                 scale=0.0):
+                                 scale=0.0, window=0):
     """Block-sparse paged decode: a query skips entire KV blocks it doesn't attend to.
     block_mask is (batch, max_blocks) int (1=attend, 0=skip), sharing block_table's layout.
-    Accepts mlx.array or torch.Tensor (MPS)."""
+    window > 0 restricts to the `window` most recent keys. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
         return _torch().paged_attention_block_sparse(q, key_cache, value_cache, block_table,
-                                                     context_lens, block_mask, scale)
+                                                     context_lens, block_mask, scale, window)
     return _mlx().paged_attention_block_sparse(q, key_cache, value_cache, block_table,
-                                               context_lens, block_mask, scale)
+                                               context_lens, block_mask, scale, window=window)
 
 
 def paged_attention_xcache(q, key_cache, value_cache, block_table, context_lens, scale=0.0):

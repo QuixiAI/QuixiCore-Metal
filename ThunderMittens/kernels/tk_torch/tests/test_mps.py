@@ -157,6 +157,45 @@ def test_paged_attention_gqa(D, H, H_KV):
     assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
 
 
+@pytest.mark.parametrize("window", [1, 16, 63, 640])
+def test_paged_attention_window(window):
+    import numpy as np
+    rng = np.random.default_rng(70 + window)
+    B, H, H_KV, D = 2, 4, 2, 64
+    block_size, ctx = 16, 64
+    nblocks = (ctx + block_size - 1) // block_size
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H_KV, D))).astype(np.float32)
+    bt = np.full((B, nblocks), -1, np.int32)
+    blk = 1
+    for b in range(B):
+        for c in range(nblocks):
+            bt[b, c] = blk; blk += 1
+    cl = np.full((B,), ctx, np.int32)
+    scale = 1.0 / math.sqrt(D)
+    group = H // H_KV
+    qt = torch.from_numpy(q).to(torch.bfloat16).to("mps")
+    kt = torch.from_numpy(kc).to(torch.bfloat16).to("mps")
+    vt = torch.from_numpy(vc).to(torch.bfloat16).to("mps")
+    btt, clt = torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps")
+    got = tk_torch.paged_attention(qt, kt, vt, btt, clt, 0.0, window)
+    ref = np.zeros_like(q)
+    for b in range(B):
+        t0 = max(0, ctx - window)
+        for h in range(H):
+            kvh = h // group
+            K = np.stack([kc[bt[b, t // block_size], t % block_size, kvh] for t in range(t0, ctx)], 0)
+            V = np.stack([vc[bt[b, t // block_size], t % block_size, kvh] for t in range(t0, ctx)], 0)
+            s = (q[b, h] @ K.T) * scale
+            p = np.exp(s - s.max()); p /= p.sum()
+            ref[b, h] = p @ V
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
+    if window >= ctx:  # full context -> equals window=0 exactly
+        full = tk_torch.paged_attention(qt, kt, vt, btt, clt, 0.0, 0)
+        assert torch.equal(got, full)
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 1)])
 @pytest.mark.parametrize("partition_size", [4, 16])

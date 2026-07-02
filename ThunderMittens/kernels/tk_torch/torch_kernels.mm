@@ -828,7 +828,7 @@ static std::tuple<at::Tensor, at::Tensor> mla_kv_insert_fp8_mps(
 static at::Tensor paged_attention_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
-    const at::Tensor& context_lens_in, double scale) {
+    const at::Tensor& context_lens_in, double scale, int64_t window) {
   TORCH_CHECK(q_in.device().is_mps(), "paged_attention: q must be an MPS tensor");
   TORCH_CHECK(key_cache_in.device().is_mps() && value_cache_in.device().is_mps() &&
                   block_table_in.device().is_mps() && context_lens_in.device().is_mps(),
@@ -868,7 +868,7 @@ static at::Tensor paged_attention_mps(
     tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
                                out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
                                static_cast<int>(block_table.size(1)), scale_f, no_alibi, 0,
-                               no_mask, 0, tn);
+                               no_mask, 0, static_cast<int>(window), tn);
   });
   return out;
 }
@@ -877,7 +877,8 @@ static at::Tensor paged_attention_mps(
 static at::Tensor paged_attention_block_sparse_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
-    const at::Tensor& context_lens_in, const at::Tensor& block_mask_in, double scale) {
+    const at::Tensor& context_lens_in, const at::Tensor& block_mask_in, double scale,
+    int64_t window) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_block_sparse: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_block_sparse: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -908,7 +909,7 @@ static at::Tensor paged_attention_block_sparse_mps(
     tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
                                out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
                                static_cast<int>(block_table.size(1)), scale_f, no_alibi, 0,
-                               mask, 1, tn);
+                               mask, 1, static_cast<int>(window), tn);
   });
   return out;
 }
@@ -917,7 +918,8 @@ static at::Tensor paged_attention_block_sparse_mps(
 static at::Tensor paged_attention_alibi_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in,
     const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
-    const at::Tensor& context_lens_in, const at::Tensor& alibi_slopes_in, double scale) {
+    const at::Tensor& context_lens_in, const at::Tensor& alibi_slopes_in, double scale,
+    int64_t window) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_alibi: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_alibi: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -948,7 +950,7 @@ static at::Tensor paged_attention_alibi_mps(
     tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
                                out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
                                static_cast<int>(block_table.size(1)), scale_f, slopes, 1,
-                               no_mask, 0, tn);
+                               no_mask, 0, static_cast<int>(window), tn);
   });
   return out;
 }

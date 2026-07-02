@@ -619,9 +619,11 @@ NB_MODULE(_ext, m) {
       "context_lens"_a,
       "scale"_a = 0.0f,
       nb::kw_only(),
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
-        decode paged attention over caches shaped (num_blocks, block_size, H, D)
+        decode paged attention over caches shaped (num_blocks, block_size, H, D);
+        window > 0 restricts to the `window` most recent keys (Mistral sliding window)
       )");
 
     m.def(
@@ -635,9 +637,11 @@ NB_MODULE(_ext, m) {
       "alibi_slopes"_a,
       "scale"_a = 0.0f,
       nb::kw_only(),
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
         paged decode with a per-head ALiBi linear position bias (alibi_slopes is (num_heads,)).
+        window > 0 restricts to the `window` most recent keys.
       )");
 
     m.def(
@@ -651,9 +655,11 @@ NB_MODULE(_ext, m) {
       "block_mask"_a,
       "scale"_a = 0.0f,
       nb::kw_only(),
+      "window"_a = 0,
       "stream"_a = nb::none(),
       R"(
         block-sparse paged decode; block_mask (batch, max_blocks) int32 (1=attend, 0=skip) per KV block.
+        window > 0 restricts to the `window` most recent keys.
       )");
 
     m.def(

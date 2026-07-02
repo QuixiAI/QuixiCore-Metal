@@ -189,6 +189,60 @@ def test_paged_attention(dtype, atol, D):
     np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=2e-3)
 
 
+def _paged_ref_window(q, key_cache, value_cache, block_table, context_lens, scale, window):
+    """GQA reference restricted to the `window` most recent keys [ctx-window, ctx)."""
+    B, H, D = q.shape
+    H_KV = key_cache.shape[2]
+    group = H // H_KV
+    block_size = key_cache.shape[1]
+    out = np.zeros_like(q, dtype=np.float32)
+    for b in range(B):
+        ctx = context_lens[b]
+        t0 = max(0, ctx - window) if window > 0 else 0
+        for h in range(H):
+            kvh = h // group
+            scores, vals = [], []
+            for t in range(t0, ctx):
+                block = block_table[b, t // block_size]
+                slot = t % block_size
+                scores.append(float(np.dot(q[b, h], key_cache[block, slot, kvh]) * scale))
+                vals.append(value_cache[block, slot, kvh])
+            s = np.array(scores, np.float32)
+            p = np.exp(s - s.max()); p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vals, 0), axis=0)
+    return out
+
+
+@pytest.mark.parametrize("dtype,atol", [("float32", 2e-5), ("bfloat16", 2e-2)])
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
+@pytest.mark.parametrize("window", [1, 3, 16, 63, 64, 640])
+def test_paged_attention_window(dtype, atol, D, H, H_KV, window):
+    rng = np.random.default_rng(70 + D + H + window)
+    B = 2
+    block_size, ctx = 16, 64
+    nblocks = (ctx + block_size - 1) // block_size
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(B * nblocks + 1, block_size, H_KV, D))).astype(np.float32)
+    bt = np.full((B, nblocks), -1, np.int32)
+    blk = 1
+    for b in range(B):
+        for c in range(nblocks):
+            bt[b, c] = blk; blk += 1
+    cl = np.full((B,), ctx, np.int32)
+    qm, km, vm = (mx.array(q).astype(_mx_dtype(dtype)), mx.array(kc).astype(_mx_dtype(dtype)),
+                  mx.array(vc).astype(_mx_dtype(dtype)))
+    got = paged_attention(qm, km, vm, mx.array(bt), mx.array(cl), scale=0.0, window=window)
+    mx.eval(got)
+    ref = _paged_ref_window(_np(qm).astype(np.float32), _np(km).astype(np.float32),
+                            _np(vm).astype(np.float32), bt, cl, 1.0 / math.sqrt(D), window)
+    np.testing.assert_allclose(_np(got).astype(np.float32), ref, atol=atol, rtol=3e-3)
+    if window >= ctx:  # window covering the whole context == the full (window=0) decode, bit-exact
+        full = paged_attention(qm, km, vm, mx.array(bt), mx.array(cl), scale=0.0, window=0)
+        mx.eval(full)
+        np.testing.assert_array_equal(_np(got).astype(np.float32), _np(full).astype(np.float32))
+
+
 def _paged_ref_gqa(q, key_cache, value_cache, block_table, context_lens, scale):
     """GQA/MQA reference: query head h reads KV head h // (H // H_KV)."""
     B, H, D = q.shape

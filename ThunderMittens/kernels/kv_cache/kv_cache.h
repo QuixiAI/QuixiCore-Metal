@@ -36,6 +36,8 @@ std::vector<array> kv_cache_scales(
     const array& value,
     StreamOrDevice s = {});
 
+// window > 0 restricts the decode query to the `window` most recent keys (Mistral sliding window);
+// window <= 0 attends the full context. Composes with ALiBi / block-sparse / GQA.
 array paged_attention(
     const array& q,
     const array& key_cache,
@@ -43,6 +45,7 @@ array paged_attention(
     const array& block_table,
     const array& context_lens,
     float scale = 0.0f,
+    int window = 0,
     StreamOrDevice s = {});
 
 // Paged decode with ALiBi: adds a per-head linear position bias slope[h]*(t-ctx+1) to each score.
@@ -55,6 +58,7 @@ array paged_attention_alibi(
     const array& context_lens,
     const array& alibi_slopes,
     float scale = 0.0f,
+    int window = 0,
     StreamOrDevice s = {});
 
 // Block-sparse paged decode: a query skips entire KV blocks it doesn't attend to. block_mask is
@@ -67,6 +71,7 @@ array paged_attention_block_sparse(
     const array& context_lens,
     const array& block_mask,
     float scale = 0.0f,
+    int window = 0,
     StreamOrDevice s = {});
 
 // vLLM x-packed cache decode: reads caches in vLLM's memory order so a ThunderMittens decode can
@@ -278,8 +283,10 @@ class PagedAttentionFp8 : public Primitive {
 
 class PagedAttention : public Primitive {
  public:
-  PagedAttention(Stream stream, float scale, bool use_alibi = false, bool use_mask = false)
-      : Primitive(stream), scale_(scale), use_alibi_(use_alibi), use_mask_(use_mask) {}
+  PagedAttention(Stream stream, float scale, bool use_alibi = false, bool use_mask = false,
+                 int window = 0)
+      : Primitive(stream), scale_(scale), use_alibi_(use_alibi), use_mask_(use_mask),
+        window_(window) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -300,13 +307,15 @@ class PagedAttention : public Primitive {
   void print(std::ostream& os) override { os << "PagedAttention"; }
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttention&>(other);
-    return scale_ == o.scale_ && use_alibi_ == o.use_alibi_ && use_mask_ == o.use_mask_;
+    return scale_ == o.scale_ && use_alibi_ == o.use_alibi_ && use_mask_ == o.use_mask_ &&
+           window_ == o.window_;
   }
 
  private:
   float scale_;
   bool use_alibi_;
   bool use_mask_;
+  int window_;
 };
 
 class PagedAttentionStaged : public Primitive {
