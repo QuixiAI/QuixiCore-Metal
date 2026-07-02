@@ -51,11 +51,6 @@ block-sparse masks compose on the paged-decode path; the Mamba-2/linear-attentio
 between an O(N²) kernel (small N) and a linear-time chunked pipeline (D∈{64,128}) at measured
 crossovers.
 
-> Honesty note: not every kernel wins at every shape — a few match the framework or trade off in
-> niche regimes (small-D Hadamard, square GEMM, some quant geometries). The full per-kernel ledger,
-> including the accepted losses and rejected experiments, lives in
-> [`perf/optimization_status.md`](perf/optimization_status.md).
-
 ## Prerequisites (all paths)
 
 - Apple Silicon Mac.
