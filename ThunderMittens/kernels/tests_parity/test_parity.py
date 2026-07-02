@@ -137,15 +137,16 @@ def test_attn_varlen_prefill_parity(D, H, H_KV):
 
 @pytest.mark.parametrize("mode,k", [("argmax", 0), ("categorical", 0), ("topk", 8)])
 def test_lm_head_sample_parity(mode, k):
-    # Same metallib + same logit path on both backends -> identical token ids.
+    # fused=True runs the SAME metallib kernel + same serial-dot logit path on both backends, so
+    # token ids match exactly (the default matmul path can differ by ULP-ties across frameworks).
     rng = np.random.default_rng(4)
     T, V, K = 4, 4096, 512
     h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
     W = (0.5 * rng.standard_normal((V, K))).astype(np.float32)
     om = tk.lm_head_sample(_mk(h, "mlx"), _mk(W, "mlx"), mode=mode, k=k,
-                           temperature=0.8, seed=99)
+                           temperature=0.8, seed=99, fused=True)
     ot = tk.lm_head_sample(_mk(h, "torch"), _mk(W, "torch"), mode=mode, k=k,
-                           temperature=0.8, seed=99)
+                           temperature=0.8, seed=99, fused=True)
     _assert_parity(om, ot, atol=0)   # integer token ids: exact
 
 

@@ -724,10 +724,12 @@ def beam_cases(be, preset, formats):
             mx = be.mx
 
             def framework_beam(lg=lg, cm=cm, B=B, BM=BM, V=V):
+                # fair equivalent: also unravels to (token, parent) and gathers the scores
                 logp = lg.astype(mx.float32) - mx.logsumexp(lg.astype(mx.float32), axis=1,
                                                             keepdims=True)
                 sc = (logp.reshape(B, BM, V) + cm.reshape(B, BM, 1)).reshape(B, BM * V)
-                return mx.argpartition(-sc, BM, axis=1)[:, :BM]
+                idx = mx.argpartition(-sc, BM, axis=1)[:, :BM]
+                return idx % V, idx // V, mx.take_along_axis(sc, idx, axis=1)
             baselines["framework_logsoftmax_topk"] = framework_beam
         yield Case("beam", f"advance_B{B}_BM{BM}_V{V}", {"B": B, "BM": BM, "V": V}, "bf16",
                    target=lambda lg=lg, cm=cm, BM=BM: tk.beam_advance(lg, cm, BM),
@@ -779,8 +781,11 @@ def lm_head_cases(be, preset, formats):
             def matmul_argmax(h_d=h_d, W_d=W_d):
                 return tk.argmax_sample(mx.matmul(h_d, W_d.T))
             baselines["matmul+argmax"] = matmul_argmax
+        # target = the no-materialization fused kernel; baseline = matmul+sampler (= the DEFAULT
+        # tk.lm_head_sample path). Fused ties/wins only at very large V; matmul wins the common case.
         yield Case("lm_head", f"argmax_T{T}_V{V}_K{K}", {"T": T, "V": V, "K": K}, "bf16",
-                   target=lambda h_d=h_d, W_d=W_d: tk.lm_head_sample(h_d, W_d, mode="argmax"),
+                   target=lambda h_d=h_d, W_d=W_d:
+                       tk.lm_head_sample(h_d, W_d, mode="argmax", fused=True),
                    baselines=baselines, ref=None, bytes_moved=float(V * K * 2))
 
 

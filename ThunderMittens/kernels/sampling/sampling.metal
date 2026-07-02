@@ -253,35 +253,49 @@ kernel void beam_topk_partials(device const T   *logits        [[buffer(0)]],  /
                                uint row  [[threadgroup_position_in_grid]],
                                uint lane [[thread_index_in_simdgroup]]) {
     const long base = (long)row * V;
-    // log-sum-exp over the row (per-lane online, merged across the simdgroup).
-    float m = SMP_NEG_INF, l = 0.0f;
+    // One pass over the vocab does BOTH the log-sum-exp (per-lane online, merged across the
+    // simdgroup) AND each lane's top-2BM over its strided slice. The global top-2BM is contained in
+    // the union of the per-lane sets, so a 2BM-round cross-lane merge extracts it — reading the
+    // vocab ONCE instead of the old 2BM masked-argmax passes.
+    float m = SMP_NEG_INF, l = 0.0f;          // lse online state
+    float lv[SAMPLE_MAX_K];
+    int   li[SAMPLE_MAX_K];
+    for (int k = 0; k < two_bm; ++k) { lv[k] = SMP_NEG_INF; li[k] = -1; }
+    float minv = SMP_NEG_INF;
+    int   minp = 0;
     for (int i = (int)lane; i < V; i += 32) {
         const float x = float(logits[base + i]);
         const float nm = max(m, x);
         l = l * exp(m - nm) + exp(x - nm);
         m = nm;
+        if (x > minv) {                       // beats the weakest kept candidate -> replace it
+            lv[minp] = x; li[minp] = i;
+            minv = lv[0]; minp = 0;           // recompute the running min over the 2BM slots
+            for (int k = 1; k < two_bm; ++k)
+                if (lv[k] < minv) { minv = lv[k]; minp = k; }
+        }
     }
     const float M = simd_max(m);
     l = simd_sum(l * exp(m - M));
     const float lse = M + log(l);
     const float cumr = cum_log_probs[row];
 
-    int chosen[SAMPLE_MAX_K];   // 2BM <= 32
-    for (int k = 0; k < two_bm; ++k) {
-        float best = SMP_NEG_INF;
-        int bi = (int)lane < V ? (int)lane : 0;
-        for (int i = (int)lane; i < V; i += 32) {
-            bool taken = false;
-            for (int j = 0; j < k; ++j) if (chosen[j] == i) taken = true;
-            if (taken) continue;
-            const float x = float(logits[base + i]);
-            if (x > best || (x == best && i < bi)) { best = x; bi = i; }
+    bool taken[SAMPLE_MAX_K];
+    for (int k = 0; k < two_bm; ++k) taken[k] = false;
+    for (int r = 0; r < two_bm; ++r) {
+        float bv = SMP_NEG_INF;
+        int   bi = -1, bl = -1;
+        for (int k = 0; k < two_bm; ++k) {
+            if (taken[k]) continue;
+            if (lv[k] > bv || (lv[k] == bv && li[k] < bi)) { bv = lv[k]; bi = li[k]; bl = k; }
         }
-        simd_argmax(best, bi);
-        chosen[k] = bi;
+        float gv = bv;
+        int   gi = (bi < 0) ? 0x7fffffff : bi;
+        simd_argmax(gv, gi);                  // global winner of this round (all lanes agree)
+        if (bl >= 0 && bi == gi) taken[bl] = true;   // owner removes it from its set
         if (lane == 0) {
-            cand_token[(long)row * two_bm + k] = bi;
-            cand_score[(long)row * two_bm + k] = cumr + (best - lse);
+            cand_token[(long)row * two_bm + r] = gi;
+            cand_score[(long)row * two_bm + r] = cumr + (gv - lse);
         }
     }
 }
