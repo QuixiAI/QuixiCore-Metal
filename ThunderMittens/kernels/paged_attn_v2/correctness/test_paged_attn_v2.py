@@ -12,7 +12,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import paged_attention_v2, kv_cache_scatter_fp8, paged_attention_v2_fp8
+from tk import (paged_attention_v2, kv_cache_scatter_fp8, paged_attention_v2_fp8,
+                cascade_attention)
 from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
 _MX = {"float32": mx.float32, "bfloat16": mx.bfloat16}
@@ -157,6 +158,52 @@ def test_paged_attention_v2_fp8_window(window):
     q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
     ref = _ref(q_bf, kc_deq, vc_deq, bt, cl, scale, window)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=3e-3)
+
+
+def _cascade_ref(q, pk, pv, kc, vc, bt, cl, scale):
+    """Full softmax over concat([shared prefix, per-request paged suffix])."""
+    B, H, D = q.shape
+    H_KV = pk.shape[1]
+    group = H // H_KV
+    bs = kc.shape[1]
+    plen = pk.shape[0]
+    out = np.zeros_like(q, np.float32)
+    for b in range(B):
+        ctx = int(cl[b])
+        for h in range(H):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(plen):
+                sc.append(float(np.dot(q[b, h], pk[t, kvh]) * scale)); vs.append(pv[t, kvh])
+            for t in range(ctx):
+                blk = bt[b, t // bs]; slot = t % bs
+                sc.append(float(np.dot(q[b, h], kc[blk, slot, kvh]) * scale)); vs.append(vc[blk, slot, kvh])
+            s = np.array(sc, np.float32); p = np.exp(s - s.max()); p /= p.sum()
+            out[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    return out
+
+
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 2), (4, 1)])
+@pytest.mark.parametrize("partition_size", [4, 8, 16])
+@pytest.mark.parametrize("plen", [1, 7, 16])
+def test_cascade_attention(D, H, H_KV, partition_size, plen):
+    """Cascade (shared prefix + paged suffix) == full attention over [prefix ++ suffix]."""
+    rng = np.random.default_rng(30 + D + H + H_KV + partition_size + plen)
+    B, num_blocks, block_size = 2, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+    got = cascade_attention(mx.array(q), mx.array(pk), mx.array(pv), mx.array(kc), mx.array(vc),
+                            mx.array(bt), mx.array(cl), scale=scale, partition_size=partition_size)
+    mx.eval(got)
+    ref = _cascade_ref(q, pk, pv, kc, vc, bt, cl, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-5)
 
 
 if __name__ == "__main__":

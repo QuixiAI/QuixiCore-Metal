@@ -49,7 +49,58 @@ array paged_attention_v2_fp8(
     int window = 0,
     StreamOrDevice s = {});
 
+/**
+ *  Cascade / shared-prefix attention. All B requests attend a single SHARED, CONTIGUOUS prefix KV
+ *  (prefix_k/prefix_v (prefix_len, H_KV, D)) — e.g. a common system prompt — plus each request's own
+ *  paged suffix (key_cache/value_cache + block_table + context_lens, as in paged_attention_v2). The
+ *  prefix and suffix are attended independently, their (m,l,o) states concatenated along the
+ *  partition axis, and folded by the shared paged_attention_reduce log-sum-exp merge — exactly the
+ *  full softmax over [prefix ++ suffix]. q/out (B,H,D); D in {64,128}; GQA/MQA supported.
+ **/
+array cascade_attention(
+    const array& q,
+    const array& prefix_k,
+    const array& prefix_v,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    int partition_size = 512,
+    StreamOrDevice s = {});
+
 // --- internal primitives (not bound directly) ---
+
+class CascadePrefixPartition : public Primitive {
+ public:
+  CascadePrefixPartition(Stream stream, float scale, int num_partitions, int partition_size)
+      : Primitive(stream),
+        scale_(scale),
+        num_partitions_(num_partitions),
+        partition_size_(partition_size) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "CascadePrefixPartition"; }
+  void print(std::ostream& os) override { os << "CascadePrefixPartition"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const CascadePrefixPartition&>(other);
+    return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
+        partition_size_ == o.partition_size_;
+  }
+
+ private:
+  float scale_;
+  int num_partitions_;
+  int partition_size_;
+};
 
 class PagedAttentionV2Partition : public Primitive {
  public:

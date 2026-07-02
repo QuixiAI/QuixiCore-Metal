@@ -246,6 +246,82 @@ kernel void paged_attention_reduce(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cascade / shared-prefix attention: the "prefix" partition. All (batch, head) queries attend a
+// single SHARED, CONTIGUOUS prefix KV (prefix_k/prefix_v: (prefix_len, H_KV, D)) — the common
+// system prompt for a batch of requests. It emits the same locally-normalized (m, l, o) partials
+// as paged_attention_partition, in the identical (B,H,P,D)/(B,H,P) layout, so the two levels'
+// partials can be concatenated along P and folded by the SAME paged_attention_reduce — the
+// mergeable-attention-state (log-sum-exp) merge, with no math change. Host composition:
+//   prefix partials (this kernel) ++ suffix partials (paged_attention_partition, per-request paged
+//   KV) -> concat along P -> paged_attention_reduce.  Ref: flashinfer cascade.py merge_states.
+// ---------------------------------------------------------------------------
+template <typename T, int D>
+kernel void cascade_prefix_partition(
+    device const T *q [[buffer(0)]],           // (B, H, D)
+    device const T *prefix_k [[buffer(1)]],    // (prefix_len, H_KV, D)  shared across the batch
+    device const T *prefix_v [[buffer(2)]],
+    device float *tmp_out [[buffer(3)]],       // (B, H, Pp, D)
+    device float *max_logits [[buffer(4)]],    // (B, H, Pp)
+    device float *exp_sums [[buffer(5)]],      // (B, H, Pp)
+    constant int &prefix_len [[buffer(6)]],
+    constant float &scale [[buffer(7)]],
+    constant int &num_heads [[buffer(8)]],
+    constant int &num_kv_heads [[buffer(9)]],
+    constant int &num_partitions [[buffer(10)]],
+    constant int &partition_size [[buffer(11)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int part = (int)tgid.z;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int start = part * partition_size;
+    const int end = min(start + partition_size, prefix_len);
+
+    const long q_base = ((long)batch * num_heads + head) * D;
+    const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
+    const long out_base = stat_idx * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[q_base + d]);
+        acc[i] = 0.0f;
+    }
+
+    float m = NEG_INF, l = 0.0f;
+    for (int t = start; t < end; ++t) {
+        const long cache_base = ((long)t * num_kv_heads + kv_head) * D;   // contiguous, no paging
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            partial += qv[i] * float(prefix_k[cache_base + d]);
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            acc[i] = acc[i] * alpha + beta * float(prefix_v[cache_base + d]);
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+
+    if (lane == 0) {
+        max_logits[stat_idx] = l == 0.0f ? NEG_INF : m;
+        exp_sums[stat_idx] = l;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+    }
+}
+
 #define instantiate_paged_v2(type_name, T, DVAL)                              \
   template [[host_name("paged_attention_partition_" #type_name "_" #DVAL)]]   \
   [[kernel]] void paged_attention_partition<T, DVAL>(                         \
@@ -275,6 +351,22 @@ kernel void paged_attention_reduce(
       device T *out [[buffer(3)]],                                            \
       constant int &num_heads [[buffer(4)]],                                  \
       constant int &num_partitions [[buffer(5)]],                             \
+      uint3 tgid [[threadgroup_position_in_grid]],                            \
+      uint lane [[thread_index_in_simdgroup]]);                               \
+  template [[host_name("cascade_prefix_partition_" #type_name "_" #DVAL)]]    \
+  [[kernel]] void cascade_prefix_partition<T, DVAL>(                          \
+      device const T *q [[buffer(0)]],                                        \
+      device const T *prefix_k [[buffer(1)]],                                 \
+      device const T *prefix_v [[buffer(2)]],                                 \
+      device float *tmp_out [[buffer(3)]],                                    \
+      device float *max_logits [[buffer(4)]],                                 \
+      device float *exp_sums [[buffer(5)]],                                   \
+      constant int &prefix_len [[buffer(6)]],                                 \
+      constant float &scale [[buffer(7)]],                                    \
+      constant int &num_heads [[buffer(8)]],                                  \
+      constant int &num_kv_heads [[buffer(9)]],                               \
+      constant int &num_partitions [[buffer(10)]],                            \
+      constant int &partition_size [[buffer(11)]],                            \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);
 

@@ -231,6 +231,40 @@ def test_paged_attention_v2(D, H, H_KV, partition_size):
     assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
 
 
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 2), (128, 2, 2)])
+@pytest.mark.parametrize("plen", [7, 16])
+def test_cascade_attention(D, H, H_KV, plen):
+    import numpy as np
+    rng = np.random.default_rng(30 + D + H + plen)
+    B, num_blocks, bs = 2, 8, 4
+    scale = 1.0 / math.sqrt(D)
+    group = H // H_KV
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], np.int32)
+    cl = np.array([10, 16], np.int32)
+    mps = lambda a: torch.from_numpy(a).to(torch.bfloat16).to("mps")
+    got = tk_torch.cascade_attention(mps(q), mps(pk), mps(pv), mps(kc), mps(vc),
+                                     torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                     0.0, 8)
+    ref = np.zeros_like(q)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(plen):
+                sc.append(float(np.dot(q[b, h], pk[t, kvh]) * scale)); vs.append(pv[t, kvh])
+            for t in range(int(cl[b])):
+                blk = bt[b, t // bs]; slot = t % bs
+                sc.append(float(np.dot(q[b, h], kc[blk, slot, kvh]) * scale)); vs.append(vc[blk, slot, kvh])
+            s = np.array(sc, np.float32); p = np.exp(s - s.max()); p /= p.sum()
+            ref[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
+
+
 @pytest.mark.parametrize("window", [1, 16, 640])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_paged_attention_v2_window(window, fp8):

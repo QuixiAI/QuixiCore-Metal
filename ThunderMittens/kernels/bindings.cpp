@@ -306,6 +306,25 @@ NB_MODULE(_ext, m) {
         window > 0 restricts to the `window` most recent keys.
       )");
 
+  m.def(
+      "cascade_attention",
+      &cascade_attention,
+      "q"_a,
+      "prefix_k"_a,
+      "prefix_v"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "partition_size"_a = 512,
+      "stream"_a = nb::none(),
+      R"(
+        cascade / shared-prefix attention: a shared contiguous prefix KV plus each request's paged
+        suffix, merged via the shared log-sum-exp reduce == full softmax over [prefix ++ suffix].
+      )");
+
     m.def(
       "paged_attention_v2_fp8",
       &paged_attention_v2_fp8,

@@ -565,6 +565,23 @@ def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
         scale=scale, partition_size=partition_size, window=window)
 
 
+def cascade_attention(q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
+                      scale=0.0, partition_size=256):
+    """Cascade / shared-prefix attention: all B requests attend a single SHARED contiguous prefix KV
+    (prefix_k/prefix_v (prefix_len, H_KV, D)) plus their own paged suffix (key_cache/value_cache +
+    block_table + context_lens). The two levels' softmax states are merged via the shared
+    log-sum-exp reduce == full attention over [prefix ++ suffix] per request. Amortizes the shared
+    system prompt across a batch. q/out (B,H,D); D in {64,128}; GQA/MQA aware. partition_size must be
+    a multiple of block_size. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().cascade_attention(
+            q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
+            scale, partition_size)
+    return _mlx().cascade_attention(
+        q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
+        scale=scale, partition_size=partition_size)
+
+
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
                            k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3", window=0):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA/MQA aware.

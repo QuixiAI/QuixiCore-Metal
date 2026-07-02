@@ -219,6 +219,28 @@ def test_varlen_build_worklist_parity(cu):
         _assert_parity(a, b, atol=0)
 
 
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 2), (128, 2, 2)])
+@pytest.mark.parametrize("plen", [7, 16])
+def test_cascade_attention_parity(D, H, H_KV, plen):
+    rng = np.random.default_rng(D + H + plen)
+    B, num_blocks, bs = 2, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], np.int32)
+    cl = np.array([10, 16], np.int32)
+    om = tk.cascade_attention(_mk(q, "mlx", "f32"), _mk(pk, "mlx", "f32"), _mk(pv, "mlx", "f32"),
+                              _mk(kc, "mlx", "f32"), _mk(vc, "mlx", "f32"),
+                              mx.array(bt), mx.array(cl), partition_size=8)
+    ot = tk.cascade_attention(_mk(q, "torch", "f32"), _mk(pk, "torch", "f32"), _mk(pv, "torch", "f32"),
+                              _mk(kc, "torch", "f32"), _mk(vc, "torch", "f32"),
+                              torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                              partition_size=8)
+    _assert_parity(om, ot, atol=1e-5)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]
