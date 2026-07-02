@@ -1205,12 +1205,12 @@ template <class E>
 void launch_cross_entropy_fwd(E& e, typename E::in_t logits, typename E::in_t targets,
                               typename E::out_t loss, typename E::out_t lse, int V,
                               int ignore_index, float label_smoothing, float z_loss, float softcap,
-                              int T, const std::string& t) {
-  e.pipeline("cross_entropy_fwd_" + t);
+                              int T, bool mw, const std::string& t) {
+  e.pipeline(mw ? "cross_entropy_fwd_mw_" + t : "cross_entropy_fwd_" + t);
   e.in(logits, 0); e.in(targets, 1); e.out(loss, 2); e.out(lse, 3);
   e.bytes(V, 4); e.bytes(ignore_index, 5); e.bytes(label_smoothing, 6); e.bytes(z_loss, 7);
   e.bytes(softcap, 8);
-  e.dispatch(T, 1, 1, 32, 1, 1);
+  e.dispatch(T, 1, 1, mw ? 128 : 32, 1, 1);
 }
 
 // ----- cross_entropy bwd: logits@0 targets@1 lse@2 grad_out@3 -> grad_logits@4 ; V@5
@@ -1220,12 +1220,12 @@ void launch_cross_entropy_bwd(E& e, typename E::in_t logits, typename E::in_t ta
                               typename E::in_t lse, typename E::in_t grad_out,
                               typename E::out_t grad_logits, int V, int ignore_index,
                               float label_smoothing, float z_loss, float softcap, int T,
-                              const std::string& t) {
-  e.pipeline("cross_entropy_bwd_" + t);
+                              bool mw, const std::string& t) {
+  e.pipeline(mw ? "cross_entropy_bwd_mw_" + t : "cross_entropy_bwd_" + t);
   e.in(logits, 0); e.in(targets, 1); e.in(lse, 2); e.in(grad_out, 3); e.out(grad_logits, 4);
   e.bytes(V, 5); e.bytes(ignore_index, 6); e.bytes(label_smoothing, 7); e.bytes(z_loss, 8);
   e.bytes(softcap, 9);
-  e.dispatch(T, 1, 1, 32, 1, 1);
+  e.dispatch(T, 1, 1, mw ? 128 : 32, 1, 1);
 }
 
 // ----- flux_gelu: D@0 A@1 B@2 bias@3 ; N@4 K@5 M@6 (i32) ; grid (M/32, N/32, 1) -----

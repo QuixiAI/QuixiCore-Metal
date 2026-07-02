@@ -90,8 +90,10 @@ void CrossEntropyFwd::eval_gpu(const std::vector<array>& inputs, std::vector<arr
   const int V = logits.shape(1);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
+  // 4-simdgroup variant when the 1-simdgroup grid would under-occupy the GPU (small T, large V).
+  const bool mw = T < 512 && V >= 8192;
   tk::launch_cross_entropy_fwd(enc, logits, targets, loss, lse, V, ignore_index_,
-                               label_smoothing_, z_loss_, softcap_, T, type_to_name(logits));
+                               label_smoothing_, z_loss_, softcap_, T, mw, type_to_name(logits));
 }
 
 void CrossEntropyBwd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -112,8 +114,9 @@ void CrossEntropyBwd::eval_gpu(const std::vector<array>& inputs, std::vector<arr
   const int V = logits.shape(1);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
+  const bool mw = T < 512 && V >= 8192;
   tk::launch_cross_entropy_bwd(enc, logits, targets, lse, grad_out, grad_logits, V, ignore_index_,
-                               label_smoothing_, z_loss_, softcap_, T, type_to_name(logits));
+                               label_smoothing_, z_loss_, softcap_, T, mw, type_to_name(logits));
 }
 
 #define TK_CE_NO_AUTODIFF(CLASS, LABEL)                                      \

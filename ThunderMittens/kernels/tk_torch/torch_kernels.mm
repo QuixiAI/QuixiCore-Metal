@@ -1658,7 +1658,8 @@ static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_cross_entropy_fwd(e, logits, targets, loss, lse, V, static_cast<int>(ignore_index),
                                  static_cast<float>(label_smoothing), static_cast<float>(z_loss),
-                                 static_cast<float>(softcap), T, tk_type_name(logits));
+                                 static_cast<float>(softcap), T, T < 512 && V >= 8192,
+                                 tk_type_name(logits));
   });
   return {loss, lse};
 }
@@ -1681,7 +1682,7 @@ static at::Tensor cross_entropy_bwd_mps(
     tk::launch_cross_entropy_bwd(e, logits, targets, lse, grad_out, grad_logits, V,
                                  static_cast<int>(ignore_index), static_cast<float>(label_smoothing),
                                  static_cast<float>(z_loss), static_cast<float>(softcap), T,
-                                 tk_type_name(logits));
+                                 T < 512 && V >= 8192, tk_type_name(logits));
   });
   return grad_logits;
 }
