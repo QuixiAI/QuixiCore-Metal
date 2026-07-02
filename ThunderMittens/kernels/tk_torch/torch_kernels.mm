@@ -1895,7 +1895,9 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
     auto vec = [&] { return at::empty({Bsz, H, (long)N}, f32); };
     // P (X_j B_j^T): forward ssd_chunk_kv with (X,B) swapped, then the exclusive prefix scan.
     auto pkv = st(), P = st();
-    // Reverse states Q (C_i dY_i^T) and its transpose Qt (dY_i C_i^T, via (dY,C) swapped).
+    // Reverse states Q (C_i dY_i^T) and its transpose Qt (dY_i C_i^T, via (dY,C) swapped). Qt = Q^T
+    // exactly, but materializing it via a general (…,D,D) transpose regresses the common seq-2048
+    // shape ~30% (scatter-bound) — the cheap qkv MMA + scan wins, so keep the two-pass build.
     auto qkv = st(), qex = st(), qtkv = st(), qtex = st();
     auto r = vec(), ri = vec(), cc = vec(), ci = vec();
     tk_encode([&](TorchEncoder& e) {

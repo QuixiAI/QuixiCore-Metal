@@ -332,7 +332,87 @@ Reverted; both rejected geometries documented at the launch site. The moderate-N
 float GEMV gap is now formally an accepted limitation (integer w8a8 got its win
 from 2-row; float paths resist both geometries).
 
+## Wave 3/4 — serving + training families (2026-07-02)
+
+Seven new families (MoE schedule/gather, varlen prefill, fused LM-head, beam
+advance, sliding-window paged decode, Mamba2 backward + D=128, fused
+cross-entropy) plus a Wave-4 close-out pass. Capability + honest perf tradeoffs:
+
+### LM-head sampling — DEFAULT ROUTES THROUGH MATMUL (fused GEMV is a fallback)
+The fused per-lane `lm_head_argcat/topk_partials` GEMV reads W column-major and
+re-reads it per token; on Apple that loses to `mx.matmul(h, Wᵀ)` + the fast
+sampler by 2.7–3.9× at (T∈{1,8}, V∈{32000,128256}). So `tk.lm_head_sample`
+**defaults to matmul+sampler** (dense and quant: `qgemv/qgemm` then the sampler).
+The fused path is kept (now vec4-coalesced + a `tk_dequant8<FMT>` quant reader for
+q8_0/q4_0) for `fused=True` callers and cross-backend parity, but it is not the
+latency winner — the coalesced/tiled rewrite closed the gap toward the matmul
+bandwidth floor without beating it. Correctness re-covered by fused-vs-logits
+oracle tests (dense + quant).
+
+### beam advance — single-pass register top-M (2.5–6.5×, now beats framework)
+Replaced the multi-pass selection with a single-pass register top-M merge over
+the (beam×vocab) candidate rows (parent-id penalty history threaded in). Exact,
+and 2.5–6.5× faster than the framework top-k baseline. `beam_reorder_kv` (a
+host helper over `kv_cache_copy_blocks`) and `beam_length_penalty`
+(FasterTransformer `((5+len)/6)^α` normalization) round out the beam API — both
+host-side policy, no kernel.
+
+### fused cross-entropy — ~11× in the fused-linear regime; +softcap capability
+`fused_linear_cross_entropy` stays the big win (avoids materializing the (T,V)
+logits). Added the Gemma-2 final-logit **softcap** (`z' = c·tanh(z/c)`, gradient
+through tanh) threaded fwd+bwd; vec4 vocab-scan loads; and a 4-simdgroup-per-row
+variant routed for the latency-bound small-T/large-V case (2–3× there over the
+1-simdgroup scan). All measured; the 4-simdgroup path is kept only where it wins.
+
+### sliding-window paged decode — threaded through fp8 + v2 partition paths
+`window` now clamps the key loop on `paged_attention_fp8`,
+`paged_attention_partition`, and `_partition_fp8` (raises the lower bound only;
+out-of-window whole partitions write l==0 and are dropped by the reduce). So
+long-context windowed decode uses the partitioned path instead of falling back.
+`window=0` / `window≥ctx` are bit-identical to the pre-existing outputs;
+`window+alibi` and `window+block_sparse` compose.
+
+### Mamba2 chunked linear-time backward — LANDED (D=64), parity with quadratic
+The quadratic backward rescans every earlier key tile per query tile (O(N²D)).
+The chunked backward mirrors the forward pipeline (intra-chunk bounded quadratic
++ inter-chunk D×D states P/Q/Qᵀ staged through device scratch), giving O(N(L+D)D)
+and matching the O(N²) route to <2% on dC/dB/dX/dcl. Routed for D=64, N%64==0,
+N≥128 (else the quadratic fallback, unchanged for D=128 / small N), exactly like
+the forward. Comprehensive sweep: bwd (1,8,2048,64) 0.369 ms, (2,16,4096,64)
+2.76 ms — total work grows 8× between those points (4× batch·head, 2× N) yet
+time grows only 7.5×, i.e. near-linear in N (the quadratic route would grow with
+N²). Backward is ~3–4.5× the matching forward (dC/dB/dX + P + Q + Qᵀ states).
+
+### Wave-4 perf-pass audit (2026-07-02) — the new families are already at their optima
+Went kernel-by-kernel over the Wave-3/4 code looking for wins; the honest result
+is that they were built perf-first and there is no shippable win left:
+- **beam advance** already beats the framework top-k 1.2–5.1× (single-pass
+  register top-M); **fused cross-entropy** is 9.5–13.8× ahead (bandwidth-floor
+  logit scan, lane-coalesced; vec4 was correctly *skipped* — the exp/tanh is
+  compute-bound, and vec4 would only muddy coalescing); **sliding-window** is a
+  key-loop clamp that strictly *reduces* work; **lm-head fused** is vec4'd and
+  its W-reuse rewrite was already tried and rejected (lost parallelism) — the
+  default routes T>1 through matmul+sampler, so the fused path is a T=1
+  specialization that already wins there. No change to any of these.
+- **REJECTED — mamba2 backward Qᵀ-via-transpose.** Qt_c = Q_c^T *exactly* (the
+  reverse scan's decay is element-independent; verified bit-exact in numpy), so
+  the second `qkv` MMA + reverse-scan pass that builds Qt is provably redundant
+  and could be replaced by transposing the scanned Q. Implemented on both
+  backends and MEASURED against the two-pass in the same session: the general
+  (…,D,D) transpose is scatter-bound and **regressed the common seq-2048 shape
+  ~30%** (0.37→0.49 ms) for only ~4.5% at seq-4096 (2.67→2.55 ms). A
+  fused-transpose-in-scan hits the same scatter-bound 64×64 write. Reverted; the
+  two-pass (cheap qkv MMA + coalesced scan) is kept and the tradeoff is
+  documented at the launch site.
+
 ## Decision log
+- 2026-07-02: Wave-4 perf-pass audit — the new families are already perf-first;
+  no shippable win. Rejected the mamba2-backward Qᵀ-via-transpose (bit-exact but
+  scatter-bound; −30% on seq-2048). Re-confirmed beam/CE/lm-head/window optima.
+- 2026-07-02: Wave-4 close-out — sliding-window on fp8/v2 decode; beam
+  reorder-kv + length-penalty; CE softcap + vec4/4-simdgroup; LM-head coalesced
+  GEMV + quant reader (default still matmul+sampler); Mamba2 chunked linear-time
+  backward (parity-checked vs the quadratic route). All dual-backend + parity.
 - 2026-07-01: harness rewritten (schema v1, all families, batched timing);
   perf.md updated to match reality (reference mirrors, device context, timing
   methodology, serving section).

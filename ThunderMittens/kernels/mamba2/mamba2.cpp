@@ -216,7 +216,10 @@ std::vector<array> ssd_chunked_bwd(const array& C, const array& B, const array& 
   auto P = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdChunkScan>(to_stream(s)),
                  {pkv, cl_c});
   // Reverse state Q_c = sum_{i>chunk c} exp(cl_i-cl[r_c]) C_i dY_i^T (C rows, dY cols) for dX, and
-  // its transpose Qt_c = sum ... dY_i C_i^T (dY rows, C cols) for dB — built by SWAPPING (C,dY).
+  // its transpose Qt_c (dY rows, C cols) for dB — built by SWAPPING (C,dY). Qt_c = Q_c^T EXACTLY
+  // (the reverse scan applies element-independent decay), so Qt could be a transpose of qex instead
+  // of a second qkv MMA + scan — but MEASURED: the general (…,D,D) transpose is scatter-bound and
+  // regressed the common seq-2048 shape ~30% (only ~4.5% faster at 4096), so the two-pass wins.
   auto qkv = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQkv>(to_stream(s)),
                    {C_c, dY_c, cl_c});
   auto qex = array({Bsz, H, Cn, D, D}, float32, std::make_shared<SsdBwdQscan>(to_stream(s)),
