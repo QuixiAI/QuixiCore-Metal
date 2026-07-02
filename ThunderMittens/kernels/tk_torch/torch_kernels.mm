@@ -1642,6 +1642,39 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
   return out;
 }
 
+// Fused LM-head + sampling over quantized (q8_0/q4_0) weights (dequantized on read).
+static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
+                                       const at::Tensor& bias_in, int64_t V, int64_t K,
+                                       const std::string& fmt, int64_t mode, double temperature,
+                                       int64_t seed) {
+  TORCH_CHECK(h_in.device().is_mps() && tk_is_float_dtype(h_in),
+              "lm_head_sample_q: h must be a float MPS tensor");
+  TORCH_CHECK(h_in.dim() == 2 && h_in.size(1) == K, "lm_head_sample_q: h must be (T, K)");
+  TORCH_CHECK(mode == 0 || mode == 1, "lm_head_sample_q: only argmax (0) / categorical (1)");
+  constexpr int TILE_V = 256;
+  auto h = h_in.contiguous();
+  auto Wq = Wq_in.to(at::kByte).contiguous();
+  auto bias = bias_in.to(at::kFloat).contiguous();
+  const int T = h.size(0);
+  const int num_vtiles = (static_cast<int>(V) + TILE_V - 1) / TILE_V;
+  const int use_bias = bias.numel() > 1 ? 1 : 0;
+  const int use_gumbel = (mode == 1) ? 1 : 0;
+  auto i32 = h.options().dtype(at::kInt);
+  auto f32 = h.options().dtype(at::kFloat);
+  auto out = at::empty({T}, i32);
+  auto part_val = at::empty({T, num_vtiles}, f32);
+  auto part_id = at::empty({T, num_vtiles}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_argcat_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
+                                         static_cast<int>(K), TILE_V, num_vtiles,
+                                         1.0f / static_cast<float>(temperature),
+                                         static_cast<unsigned>(seed), use_gumbel, use_bias, T, fmt,
+                                         tk_type_name(h));
+    tk::launch_lm_head_argcat_reduce(e, part_val, part_id, out, num_vtiles, T);
+  });
+  return out;
+}
+
 // Fused cross-entropy forward: per-row [loss, lse] without storing (T, V) probabilities.
 static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
     const at::Tensor& logits_in, const at::Tensor& targets_in, int64_t ignore_index,
@@ -2220,6 +2253,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
   m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");
+  m.def("lm_head_sample_q", &lm_head_sample_q_mps,
+        "ThunderMittens fused LM-head + sampling over quantized weights (MPS)");
   m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "ThunderMittens fused cross-entropy fwd (MPS)");
   m.def("cross_entropy_bwd", &cross_entropy_bwd_mps, "ThunderMittens fused cross-entropy bwd (MPS)");
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");

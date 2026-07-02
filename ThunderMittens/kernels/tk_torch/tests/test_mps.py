@@ -986,6 +986,25 @@ def test_beam_advance(B, BM, V):
     np.testing.assert_array_equal(pb.cpu().numpy(), opb)
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+def test_lm_head_sample_quant(fmt):
+    import numpy as np
+    import tk
+    from tk.quant import QUANT_FORMATS
+    quant, dequant = QUANT_FORMATS[fmt]
+    T, V, K = 4, 4000, 512
+    rng = np.random.default_rng(11)
+    W = (0.3 * rng.standard_normal((V, K))).astype(np.float32)
+    Wq = quant(W)
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    hm = torch.from_numpy(h).to(torch.bfloat16).to("mps")
+    tok = tk.lm_head_sample(hm, torch.from_numpy(Wq).to("mps"), mode="argmax",
+                            format=fmt).cpu().numpy()
+    L = (h.astype(np.float64)) @ dequant(Wq).astype(np.float64).T
+    for t in range(T):
+        assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-2
+
+
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])
 def test_matmul_arbitrary(nkm):
     N, K, M = nkm

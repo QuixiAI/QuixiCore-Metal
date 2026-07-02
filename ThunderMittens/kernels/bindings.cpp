@@ -810,6 +810,24 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "lm_head_sample_q",
+      &lm_head_sample_q,
+      "h"_a,
+      "wq"_a,
+      "bias"_a,
+      "v"_a,
+      "k"_a,
+      "fmt"_a,
+      "mode"_a,
+      "temperature"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        fused LM-head + sampling over quantized (q8_0/q4_0) weights; mode 0=argmax, 1=categorical
+      )");
+
+    m.def(
       "cross_entropy_fwd",
       &cross_entropy_fwd,
       "logits"_a,

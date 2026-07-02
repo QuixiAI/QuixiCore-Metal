@@ -25,6 +25,57 @@ array lm_head_sample(
     uint32_t seed,
     StreamOrDevice s = {});
 
+/**
+ *  Fused LM-head + sampling over QUANTIZED weights (dequantized on read). Wq is the packed weight
+ *  tensor for format `fmt` (q8_0/q4_0), K is the full hidden dim. mode 0 = argmax, 1 = categorical
+ *  (topk not supported for the quant path). Returns (T,) int32. h fp16/bf16/f32.
+ **/
+array lm_head_sample_q(
+    const array& h,
+    const array& Wq,
+    const array& bias,
+    int V,
+    int K,
+    const std::string& fmt,
+    int mode,
+    float temperature,
+    uint32_t seed,
+    StreamOrDevice s = {});
+
+class LmHeadArgcatPartialsQ : public Primitive {
+ public:
+  LmHeadArgcatPartialsQ(Stream stream, int use_gumbel, float invtemp, uint32_t seed, int use_bias,
+                        int tile_v, int V, int K, const std::string& fmt)
+      : Primitive(stream), use_gumbel_(use_gumbel), invtemp_(invtemp), seed_(seed),
+        use_bias_(use_bias), tile_v_(tile_v), V_(V), K_(K), fmt_(fmt) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadArgcatPartialsQ"; }
+  void print(std::ostream& os) override { os << "LmHeadArgcatPartialsQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const LmHeadArgcatPartialsQ&>(other);
+    return use_gumbel_ == o.use_gumbel_ && invtemp_ == o.invtemp_ && seed_ == o.seed_ &&
+           use_bias_ == o.use_bias_ && tile_v_ == o.tile_v_ && V_ == o.V_ && K_ == o.K_ &&
+           fmt_ == o.fmt_;
+  }
+
+ private:
+  int use_gumbel_;
+  float invtemp_;
+  uint32_t seed_;
+  int use_bias_;
+  int tile_v_;
+  int V_;
+  int K_;
+  std::string fmt_;
+};
+
 class LmHeadArgcatPartials : public Primitive {
  public:
   LmHeadArgcatPartials(Stream stream, int use_gumbel, float invtemp, uint32_t seed, int use_bias,

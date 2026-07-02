@@ -396,6 +396,13 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
 
 
+def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, temperature, seed):
+    """Fused LM-head + sampling over quantized (q8_0/q4_0) weights. mode 0=argmax, 1=categorical.
+    Returns (T,) int32. MPS."""
+    return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode),
+                                 float(temperature), int(seed))
+
+
 def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss, softcap=0.0):
     """Fused cross-entropy forward. Returns (loss (T,), lse (T,)) f32. MPS."""
     return _ext.cross_entropy_fwd(logits, targets, int(ignore_index),
