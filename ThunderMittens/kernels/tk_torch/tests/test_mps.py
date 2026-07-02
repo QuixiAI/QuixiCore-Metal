@@ -1134,8 +1134,8 @@ def _mamba2_fwd_ref(C, Bm, X, cumlog, N):
 
 
 @pytest.mark.parametrize("shape", [(1, 2, 64, 64), (2, 2, 128, 64),
-                                   # auto-routed chunked (N >= threshold, N%64==0):
-                                   (1, 1, 2048, 64)])
+                                   # auto-routed chunked (N >= threshold, N%64==0), both head dims:
+                                   (1, 1, 2048, 64), (1, 1, 4096, 128)])
 def test_mamba2(shape):
     B, H, N, D = shape
     torch.manual_seed(0)
@@ -1201,8 +1201,8 @@ def _mamba2_bwd_inputs(shape, seed):
 
 
 @pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 1, 128, 128), (1, 2, 128, 64),
-                                   # auto-routed chunked (N >= threshold, N%64==0):
-                                   (1, 1, 2048, 64)])
+                                   # auto-routed chunked (N >= threshold, N%64==0), both head dims:
+                                   (1, 1, 2048, 64), (1, 1, 4096, 128)])
 def test_mamba2_bwd(shape):
     import numpy as np
     Bh, H, N, D = shape
@@ -1243,15 +1243,18 @@ def test_mamba2_bwd_chunked_forced(shape):
 
 
 @pytest.mark.parametrize("D", [64, 128])
-def test_ssd_decode(D):
-    """T iterated decode steps == the fp32 recurrence oracle; the state updates IN PLACE."""
+@pytest.mark.parametrize("decay", [True, False])
+def test_ssd_decode(D, decay):
+    """T iterated decode steps == the fp32 recurrence oracle; the state updates IN PLACE. decay=False
+    pins alpha == 1 (pure accumulation / undecayed linear attention)."""
     import numpy as np
     B, H, T = 2, 2, 5
-    rng = np.random.default_rng(3 + D)
+    rng = np.random.default_rng(3 + D + (0 if decay else 100))
     S_ref = np.zeros((B, H, D, D), np.float32)
     S = torch.zeros(B, H, D, D, device="mps")
     for t in range(T):
-        alpha = rng.uniform(0.9, 1.0, (B, H)).astype(np.float32)
+        alpha = (rng.uniform(0.9, 1.0, (B, H)).astype(np.float32) if decay
+                 else np.ones((B, H), np.float32))
         x = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
         k = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
         q = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)

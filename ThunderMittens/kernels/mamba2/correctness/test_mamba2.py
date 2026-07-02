@@ -107,10 +107,11 @@ def _rel(g, ref):
 
 @pytest.mark.parametrize("shape", [(2, 2, 64, 64), (1, 2, 128, 64), (2, 2, 64, 128),
                                    (1, 1, 256, 128),
-                                   # auto-routed chunked (N >= threshold, N%64==0):
-                                   (1, 1, 2048, 64)])
+                                   # auto-routed chunked (N >= threshold, N%64==0), both head dims —
+                                   # exercises the mamba2_bwd router's chunked branch at D=64 AND D=128:
+                                   (1, 1, 2048, 64), (1, 1, 4096, 128)])
 def test_mamba2_bwd(shape):
-    torch = pytest.importorskip("torch")  # noqa: F841
+    pytest.importorskip("torch")
     Bh, H, N, D = shape
     C, Bn, X, cl, dY = _bwd_inputs(shape, Bh + H + N + D)
     rC, rB, rX, rcl = _bwd_oracle(C, Bn, X, cl, dY)
@@ -128,7 +129,7 @@ def test_mamba2_bwd(shape):
                                    (1, 2, 128, 128), (1, 1, 256, 128)])
 def test_mamba2_bwd_chunked_forced(shape):
     """The forced chunked linear-time backward at small N, both head dims, vs autograd."""
-    torch = pytest.importorskip("torch")  # noqa: F841
+    pytest.importorskip("torch")
     Bh, H, N, D = shape
     C, Bn, X, cl, dY = _bwd_inputs(shape, 10 + N + D)
     rC, rB, rX, rcl = _bwd_oracle(C, Bn, X, cl, dY)
@@ -215,14 +216,17 @@ def test_mamba2_dcl_to_da():
 
 
 @pytest.mark.parametrize("D", [64, 128])
-def test_ssd_decode(D):
-    """T iterated decode steps == the fp32 recurrence oracle (state and readout)."""
+@pytest.mark.parametrize("decay", [True, False])
+def test_ssd_decode(D, decay):
+    """T iterated decode steps == the fp32 recurrence oracle (state and readout). decay=False pins
+    alpha == 1 (pure accumulation / undecayed linear attention — the a==1 boundary of the recurrence)."""
     B, H, T = 2, 2, 5
-    rng = np.random.default_rng(3 + D)
+    rng = np.random.default_rng(3 + D + (0 if decay else 100))
     S = np.zeros((B, H, D, D), np.float32)
     Smx = mx.array(S)
     for t in range(T):
-        alpha = rng.uniform(0.9, 1.0, (B, H)).astype(np.float32)
+        alpha = (rng.uniform(0.9, 1.0, (B, H)).astype(np.float32) if decay
+                 else np.ones((B, H), np.float32))
         x = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
         k = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
         q = (0.3 * rng.standard_normal((B, H, D))).astype(np.float32)
