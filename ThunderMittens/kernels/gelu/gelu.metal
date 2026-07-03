@@ -43,4 +43,33 @@ instantiate_gelu(512);
 instantiate_gelu(768);
 instantiate_gelu(1024);
 
+// GELU backward (tanh approximation): dx = dy * gelu'(x). With k=sqrt(2/pi), a=0.044715,
+// inner = k*(x + a*x^3), t = tanh(inner):  gelu'(x) = 0.5*(1+t) + 0.5*x*(1-t^2)*k*(1+3a*x^2).
+// Flat one-thread-per-element; any shape; T templated (fp32/fp16/bf16).
+template <typename T>
+kernel void gelu_bwd(device const T *x  [[buffer(0)]],
+                     device const T *dy [[buffer(1)]],
+                     device T       *dx [[buffer(2)]],
+                     constant int &n    [[buffer(3)]],
+                     uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    const float xv = float(x[gid]);
+    const float k = 0.7978845608028654f, a = 0.044715f;
+    const float inner = k * (xv + a * xv * xv * xv);
+    const float t = metal::precise::tanh(inner);
+    const float dinner = k * (1.0f + 3.0f * a * xv * xv);
+    const float gp = 0.5f * (1.0f + t) + 0.5f * xv * (1.0f - t * t) * dinner;
+    dx[gid] = T(float(dy[gid]) * gp);
+}
+
+#define instantiate_gelu_bwd(type_name, T)                                     \
+  template [[host_name("gelu_bwd_" #type_name)]] [[kernel]] void                \
+  gelu_bwd<T>(device const T *x [[buffer(0)]], device const T *dy [[buffer(1)]], \
+    device T *dx [[buffer(2)]], constant int &n [[buffer(3)]],                  \
+    uint gid [[thread_position_in_grid]]);
+
+instantiate_gelu_bwd(float32, float)
+instantiate_gelu_bwd(float16, half)
+instantiate_gelu_bwd(bfloat16, bf16)
+
 }

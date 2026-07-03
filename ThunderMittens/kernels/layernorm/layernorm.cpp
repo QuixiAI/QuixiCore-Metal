@@ -127,6 +127,56 @@ std::pair<std::vector<array>, std::vector<int>> LayerNorm::vmap(
 }
 
 /** Equivalence check **/
+// ---- LayerNorm backward (dX kernel; dW/dbias/mean/rstd via the framework in the router) ----
+array layernorm_bwd_dx(
+    const array& x,
+    const array& weight,
+    const array& dy,
+    const array& mean,
+    const array& rstd,
+    StreamOrDevice s /* = {} */) {
+  const Dtype dt = x.dtype();
+  auto x_c = contiguous(x, false, s);
+  auto w_c = contiguous(astype(weight, dt, s), false, s);
+  auto dy_c = contiguous(astype(dy, dt, s), false, s);
+  auto mean_c = contiguous(astype(mean, float32, s), false, s);
+  auto rstd_c = contiguous(astype(rstd, float32, s), false, s);
+  return array(x.shape(), dt, std::make_shared<LayerNormBwdDx>(to_stream(s)),
+               {x_c, w_c, dy_c, mean_c, rstd_c});
+}
+
+void LayerNormBwdDx::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LayerNormBwdDx has no CPU implementation.");
+}
+void LayerNormBwdDx::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& w = inputs[1];
+  auto& dy = inputs[2];
+  auto& mean = inputs[3];
+  auto& rstd = inputs[4];
+  auto& dx = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dx.set_data(allocator::malloc_or_wait(dx.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_layernorm_bwd_dx(enc, x, w, dy, mean, rstd, dx, rows, D, type_to_name(x));
+}
+std::vector<array> LayerNormBwdDx::jvp(const std::vector<array>&, const std::vector<array>&,
+                                       const std::vector<int>&) {
+  throw std::runtime_error("LayerNormBwdDx has no jvp implementation.");
+}
+std::vector<array> LayerNormBwdDx::vjp(const std::vector<array>&, const std::vector<array>&,
+                                       const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("LayerNormBwdDx has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> LayerNormBwdDx::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("LayerNormBwdDx has no vmap implementation.");
+}
+
 bool LayerNorm::is_equivalent(const Primitive& other) const {
   const LayerNorm& r_other = static_cast<const LayerNorm&>(other);
   return eps_ == r_other.eps_;

@@ -153,6 +153,20 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "layernorm_bwd_dx",
+      &layernorm_bwd_dx,
+      "x"_a,
+      "weight"_a,
+      "dy"_a,
+      "mean"_a,
+      "rstd"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        LayerNorm backward dX: rstd*(g - mean(g) - x_hat*mean(g*x_hat)), g=dY*W. mean/rstd (rows,).
+      )");
+
+    m.def(
       "rms_norm",
       &rms_norm,
       "x"_a,
@@ -162,6 +176,19 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         rms_norm over the last axis: x * rsqrt(mean(x^2) + eps) * weight
+      )");
+
+    m.def(
+      "rms_norm_bwd_dx",
+      &rms_norm_bwd_dx,
+      "x"_a,
+      "weight"_a,
+      "dy"_a,
+      "rstd"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        RMSNorm backward dX: rstd*(dY*W) - (rstd^3 * rowsum(dY*W*x)/D) * x. rstd (rows,) precomputed.
       )");
 
     m.def(
@@ -610,6 +637,17 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         GELU activation (tanh approximation), over the last axis
+      )");
+
+    m.def(
+      "gelu_bwd",
+      &gelu_bwd,
+      "x"_a,
+      "dy"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        GELU backward (tanh approximation): dx = dy * gelu'(x). Elementwise.
       )");
 
     m.def(

@@ -29,6 +29,35 @@ array layernorm(
 // Primitive
 ///////////////////////////////////////////////////////////////////////////////
 
+/**
+ *  LayerNorm backward, dX only. With g = dY*W, x_hat = (x-mean)*rstd:
+ *      dX_i = rstd*(g_i - mean_j(g) - x_hat_i * mean_j(g*x_hat)).
+ *  x/dy (rows, D); w (D,); mean/rstd (rows,) fp32 precomputed. dW/dbias are framework reductions.
+ **/
+array layernorm_bwd_dx(
+    const array& x,
+    const array& weight,
+    const array& dy,
+    const array& mean,
+    const array& rstd,
+    StreamOrDevice s = {});
+
+class LayerNormBwdDx : public Primitive {
+ public:
+  explicit LayerNormBwdDx(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LayerNormBwdDx"; }
+  void print(std::ostream& os) override { os << "LayerNormBwdDx"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 class LayerNorm : public Primitive {
  public:
   explicit LayerNorm(Stream stream, float eps)

@@ -63,4 +63,41 @@ instantiate_rms_norm(512);
 instantiate_rms_norm(768);
 instantiate_rms_norm(1024);
 
+// RMSNorm backward, dX only (dW = sum_rows dY*x*rstd is a cheap framework reduction). Per row, with
+// m = dY*W and s = sum_j m_j x_j:  dX_i = rstd*m_i - (rstd^3 * s / D) * x_i  (Liger's factorization).
+// rstd (rows,) is precomputed in the framework. One simdgroup per row; any D; T templated.
+template <typename T>
+kernel void rms_norm_bwd_dx(device const T     *x    [[buffer(0)]],   // (rows, D)
+                            device const T     *w    [[buffer(1)]],   // (D,)
+                            device const T     *dy   [[buffer(2)]],   // (rows, D)
+                            device const float *rstd [[buffer(3)]],   // (rows,)
+                            device T           *dx   [[buffer(4)]],   // (rows, D)
+                            constant int &D          [[buffer(5)]],
+                            uint row  [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * D;
+    const float r = rstd[row];
+    float s = 0.0f;
+    for (int j = (int)lane; j < D; j += 32) {
+        s += (float(dy[base + j]) * float(w[j])) * float(x[base + j]);
+    }
+    s = metal::simd_sum(s);
+    const float c = r * r * r * s / float(D);
+    for (int j = (int)lane; j < D; j += 32) {
+        const float m = float(dy[base + j]) * float(w[j]);
+        dx[base + j] = T(r * m - c * float(x[base + j]));
+    }
+}
+
+#define instantiate_rms_norm_bwd(type_name, T)                                 \
+  template [[host_name("rms_norm_bwd_dx_" #type_name)]] [[kernel]] void         \
+  rms_norm_bwd_dx<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
+    device const T *dy [[buffer(2)]], device const float *rstd [[buffer(3)]],  \
+    device T *dx [[buffer(4)]], constant int &D [[buffer(5)]],                  \
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_rms_norm_bwd(float32, float)
+instantiate_rms_norm_bwd(float16, half)
+instantiate_rms_norm_bwd(bfloat16, bf16)
+
 }

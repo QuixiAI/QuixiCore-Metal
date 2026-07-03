@@ -56,3 +56,30 @@ if __name__ == "__main__":
     for shp in SHAPES:
         test_layernorm_matches_mlx(shp)
         print(f"ok {shp}")
+
+
+import numpy as np
+from tk import layernorm_backward
+
+
+@pytest.mark.parametrize("R,D", [(8, 256), (4, 512), (16, 64)])
+def test_layernorm_backward(R, D):
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(R + D + 1)
+    x = (0.5 * rng.standard_normal((R, D))).astype(np.float32)
+    w = (0.5 * rng.standard_normal((D,))).astype(np.float32)
+    b = (0.3 * rng.standard_normal((D,))).astype(np.float32)
+    dy = (0.3 * rng.standard_normal((R, D))).astype(np.float32)
+    eps = 1e-5
+    xt = torch.tensor(x, requires_grad=True); wt = torch.tensor(w, requires_grad=True)
+    bt = torch.tensor(b, requires_grad=True)
+    y = torch.nn.functional.layer_norm(xt, (D,), wt, bt, eps)
+    y.backward(torch.tensor(dy))
+    dx, dw, db = layernorm_backward(mx.array(x), mx.array(w), mx.array(dy), eps)
+    mx.eval(dx, dw, db)
+
+    def rel(g, ref):
+        return np.abs(np.array(g) - ref).max() / (np.abs(ref).max() + 1e-9)
+    assert rel(dx, xt.grad.numpy()) < 1e-4
+    assert rel(dw, wt.grad.numpy()) < 1e-4
+    assert rel(db, bt.grad.numpy()) < 1e-4

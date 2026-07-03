@@ -1623,3 +1623,46 @@ def test_dispatch_routes_torch_to_mps():
     got = tk.layernorm(x, w, b)
     exp = F.layer_norm(x, (D,), w, b, 1e-5)
     assert _maxdiff(got, exp) < 0.06
+
+
+@pytest.mark.parametrize("R,D", [(8, 256), (16, 64)])
+def test_rms_norm_backward(R, D):
+    import numpy as np, tk
+    rng = np.random.default_rng(R + D)
+    x = (0.5 * rng.standard_normal((R, D))).astype(np.float32)
+    w = (0.5 * rng.standard_normal((D,))).astype(np.float32)
+    dy = (0.3 * rng.standard_normal((R, D))).astype(np.float32)
+    xt = torch.tensor(x, requires_grad=True); wt = torch.tensor(w, requires_grad=True)
+    (xt * torch.rsqrt((xt ** 2).mean(-1, keepdim=True) + 1e-5) * wt).backward(torch.tensor(dy))
+    dx, dw = tk.rms_norm_backward(torch.from_numpy(x).to("mps"), torch.from_numpy(w).to("mps"),
+                                  torch.from_numpy(dy).to("mps"), 1e-5)
+    rel = lambda g, r: np.abs(g.float().cpu().numpy() - r).max() / (np.abs(r).max() + 1e-9)
+    assert rel(dx, xt.grad.numpy()) < 1e-4 and rel(dw, wt.grad.numpy()) < 1e-4
+
+
+@pytest.mark.parametrize("R,D", [(8, 256), (16, 64)])
+def test_layernorm_backward(R, D):
+    import numpy as np, tk
+    rng = np.random.default_rng(R + D + 1)
+    x = (0.5 * rng.standard_normal((R, D))).astype(np.float32)
+    w = (0.5 * rng.standard_normal((D,))).astype(np.float32)
+    b = (0.3 * rng.standard_normal((D,))).astype(np.float32)
+    dy = (0.3 * rng.standard_normal((R, D))).astype(np.float32)
+    xt = torch.tensor(x, requires_grad=True); wt = torch.tensor(w, requires_grad=True)
+    bt = torch.tensor(b, requires_grad=True)
+    torch.nn.functional.layer_norm(xt, (D,), wt, bt, 1e-5).backward(torch.tensor(dy))
+    dx, dw, db = tk.layernorm_backward(torch.from_numpy(x).to("mps"), torch.from_numpy(w).to("mps"),
+                                       torch.from_numpy(dy).to("mps"), 1e-5)
+    rel = lambda g, r: np.abs(g.float().cpu().numpy() - r).max() / (np.abs(r).max() + 1e-9)
+    assert rel(dx, xt.grad.numpy()) < 1e-4 and rel(dw, wt.grad.numpy()) < 1e-4 and rel(db, bt.grad.numpy()) < 1e-4
+
+
+def test_gelu_backward():
+    import numpy as np, tk
+    rng = np.random.default_rng(2)
+    x = (1.5 * rng.standard_normal((6, 128))).astype(np.float32)
+    dy = (0.4 * rng.standard_normal((6, 128))).astype(np.float32)
+    xt = torch.tensor(x, requires_grad=True)
+    torch.nn.functional.gelu(xt, approximate="tanh").backward(torch.tensor(dy))
+    dx = tk.gelu_backward(torch.from_numpy(x).to("mps"), torch.from_numpy(dy).to("mps"))
+    assert np.abs(dx.float().cpu().numpy() - xt.grad.numpy()).max() / (np.abs(xt.grad.numpy()).max() + 1e-9) < 1e-4

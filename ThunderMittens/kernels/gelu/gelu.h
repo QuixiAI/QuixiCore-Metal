@@ -20,6 +20,28 @@ array gelu(
     StreamOrDevice s = {}
 );
 
+/** GELU backward (tanh approximation): dx = dy * gelu'(x). Elementwise; returns x's shape/dtype. */
+array gelu_bwd(
+    const array& x,
+    const array& dy,
+    StreamOrDevice s = {});
+
+class GeluBwd : public Primitive {
+ public:
+  explicit GeluBwd(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "GeluBwd"; }
+  void print(std::ostream& os) override { os << "GeluBwd"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Primitive
 ///////////////////////////////////////////////////////////////////////////////

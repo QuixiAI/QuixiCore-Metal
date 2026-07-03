@@ -1640,3 +1640,24 @@ def test_paged_attention_staged_parity(H, H_KV):
         _mk(q, "torch", "bf16"), _mk(key_cache, "torch", "bf16"), _mk(value_cache, "torch", "bf16"),
         torch.from_numpy(block_table).to("mps"), torch.from_numpy(context_lens).to("mps"))
     _assert_parity(om, ot, atol=2e-2)
+
+
+def test_norm_backward_parity():
+    rng = np.random.default_rng(11)
+    R, D = 8, 256
+    x = (0.5 * rng.standard_normal((R, D))).astype(np.float32)
+    w = (0.5 * rng.standard_normal((D,))).astype(np.float32)
+    dy = (0.3 * rng.standard_normal((R, D))).astype(np.float32)
+    # rms
+    mdx, mdw = tk.rms_norm_backward(_mk(x, "mlx", "f32"), _mk(w, "mlx", "f32"), _mk(dy, "mlx", "f32"), 1e-5)
+    tdx, tdw = tk.rms_norm_backward(_mk(x, "torch", "f32"), _mk(w, "torch", "f32"), _mk(dy, "torch", "f32"), 1e-5)
+    _assert_parity(mdx, tdx, atol=1e-5); _assert_parity(mdw, tdw, atol=1e-5)
+    # layernorm
+    b = (0.3 * rng.standard_normal((D,))).astype(np.float32)  # noqa: F841
+    ldx, ldw, ldb = tk.layernorm_backward(_mk(x, "mlx", "f32"), _mk(w, "mlx", "f32"), _mk(dy, "mlx", "f32"), 1e-5)
+    tldx, tldw, tldb = tk.layernorm_backward(_mk(x, "torch", "f32"), _mk(w, "torch", "f32"), _mk(dy, "torch", "f32"), 1e-5)
+    _assert_parity(ldx, tldx, atol=1e-5); _assert_parity(ldw, tldw, atol=1e-5); _assert_parity(ldb, tldb, atol=1e-5)
+    # gelu
+    gm = tk.gelu_backward(_mk(x, "mlx", "f32"), _mk(dy, "mlx", "f32"))
+    gt = tk.gelu_backward(_mk(x, "torch", "f32"), _mk(dy, "torch", "f32"))
+    _assert_parity(gm, gt, atol=1e-5)

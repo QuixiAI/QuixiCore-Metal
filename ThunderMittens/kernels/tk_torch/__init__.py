@@ -134,6 +134,18 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     return _ext.rms_norm(x, weight, float(eps))
 
 
+def rms_norm_bwd_dx(x, weight, dy, rstd):
+    """RMSNorm backward dX kernel (rstd (rows,) precomputed). Use tk.rms_norm_backward for the full
+    (dx, dweight). MPS tensors."""
+    return _ext.rms_norm_bwd_dx(x, weight, dy, rstd)
+
+
+def layernorm_bwd_dx(x, weight, dy, mean, rstd):
+    """LayerNorm backward dX kernel (mean/rstd (rows,) precomputed). Use tk.layernorm_backward for
+    the full (dx, dweight, dbias). MPS tensors."""
+    return _ext.layernorm_bwd_dx(x, weight, dy, mean, rstd)
+
+
 def rms_norm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual). bf16 MPS; D in {256,512,768,1024}."""
     return _ext.rms_norm_add(x, residual, weight, float(eps))
@@ -227,6 +239,11 @@ def mla_decode_fp8_sparse(q, data_cache, scale_cache, block_table, indices, topk
 def mla_decode(q, kv_cache, block_table, context_lens, scale=0.0):
     """DeepSeek MLA absorb-path latent flash-decode (MQA). q (B,N,576), cache (nb,bs,576) -> o (B,N,512). MPS."""
     return _ext.mla_decode(q, kv_cache, block_table, context_lens, float(scale))
+
+
+def gelu_bwd(x, dy):
+    """GELU (tanh approx) backward: dx = dy * gelu'(x). MPS tensors."""
+    return _ext.gelu_bwd(x, dy)
 
 
 def gelu(x: torch.Tensor):

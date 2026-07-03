@@ -25,6 +25,34 @@ array rms_norm(
     StreamOrDevice s = {} // Stream on which to schedule the operation
 );
 
+/**
+ *  RMSNorm backward, dX only: dX_i = rstd*(dY_i*W_i) - (rstd^3 * sum_j(dY_j*W_j*x_j) / D) * x_i.
+ *  x/dy (rows, D); w (D,); rstd (rows,) fp32 precomputed. Returns dX (rows, D). dW (= sum over rows
+ *  of dY*x*rstd) and dbias are cheap framework reductions done by the router.
+ **/
+array rms_norm_bwd_dx(
+    const array& x,
+    const array& weight,
+    const array& dy,
+    const array& rstd,
+    StreamOrDevice s = {});
+
+class RMSNormBwdDx : public Primitive {
+ public:
+  explicit RMSNormBwdDx(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "RMSNormBwdDx"; }
+  void print(std::ostream& os) override { os << "RMSNormBwdDx"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Primitive
 ///////////////////////////////////////////////////////////////////////////////

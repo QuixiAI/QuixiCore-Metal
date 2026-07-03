@@ -42,6 +42,36 @@ def layernorm(x, weight, bias, eps=1e-5):
     return _mlx().layernorm(x, weight, bias, eps=eps)
 
 
+def layernorm_backward(x, weight, dy, eps=1e-5):
+    """LayerNorm backward. Returns (dx, dweight, dbias): dx has x's shape (fused dX kernel),
+    dweight/dbias (D,) summed over rows. x/dy (..., D), weight (D,). Matches torch autograd. mean,
+    rstd, dweight, dbias are framework reductions; the per-row dX is the kernel. mlx / torch (MPS)."""
+    D = x.shape[-1]
+    if _is_torch(x):
+        import torch
+        xf = x.reshape(-1, D).contiguous().float()
+        dyf = dy.reshape(-1, D).contiguous()
+        mean = xf.mean(-1, keepdim=True)
+        rstd = torch.rsqrt(((xf - mean) ** 2).mean(-1, keepdim=True) + eps)   # (rows,1)
+        xhat = (xf - mean) * rstd
+        dx = _torch().layernorm_bwd_dx(x.reshape(-1, D).contiguous(), weight, dyf,
+                                       mean.squeeze(-1).contiguous(), rstd.squeeze(-1).contiguous())
+        dw = (dyf.float() * xhat).sum(0).to(weight.dtype)
+        db = dyf.float().sum(0).to(weight.dtype)
+        return dx.reshape(x.shape), dw, db
+    import mlx.core as mx
+    xf = mx.reshape(x, (-1, D)).astype(mx.float32)
+    dyf = mx.reshape(dy, (-1, D))
+    mean = mx.mean(xf, axis=-1, keepdims=True)
+    rstd = mx.rsqrt(mx.mean((xf - mean) ** 2, axis=-1, keepdims=True) + eps)  # (rows,1)
+    xhat = (xf - mean) * rstd
+    dx = _mlx().layernorm_bwd_dx(mx.reshape(x, (-1, D)), weight, dyf, mx.reshape(mean, (-1,)),
+                                 mx.reshape(rstd, (-1,)))
+    dw = mx.sum(dyf.astype(mx.float32) * xhat, axis=0).astype(weight.dtype)
+    db = mx.sum(dyf.astype(mx.float32), axis=0).astype(weight.dtype)
+    return mx.reshape(dx, x.shape), dw, db
+
+
 def add_rt(x, y):
     """Elementwise x + y. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):
@@ -367,6 +397,29 @@ def rms_norm(x, weight, eps=1e-5):
     return _mlx().rms_norm(x, weight, eps=eps)
 
 
+def rms_norm_backward(x, weight, dy, eps=1e-5):
+    """RMSNorm backward. Returns (dx, dweight): dx has x's shape (fused dX kernel), dweight (D,) is
+    summed over all rows. x/dy (..., D), weight (D,). Matches torch autograd. The row std (rstd) and
+    dweight are cheap framework reductions; the per-row dX (reduction + Liger-factored combine) is
+    the kernel. Accepts mlx.array or torch.Tensor (MPS)."""
+    D = x.shape[-1]
+    if _is_torch(x):
+        import torch
+        xf = x.reshape(-1, D).contiguous()
+        dyf = dy.reshape(-1, D).contiguous()
+        rstd = torch.rsqrt((xf.float() ** 2).mean(-1, keepdim=True) + eps)   # (rows, 1)
+        dx = _torch().rms_norm_bwd_dx(xf, weight, dyf, rstd.squeeze(-1).contiguous())
+        dw = (dyf.float() * xf.float() * rstd).sum(0).to(weight.dtype)
+        return dx.reshape(x.shape), dw
+    import mlx.core as mx
+    xf = mx.reshape(x, (-1, D))
+    dyf = mx.reshape(dy, (-1, D))
+    rstd = mx.rsqrt(mx.mean(xf.astype(mx.float32) ** 2, axis=-1, keepdims=True) + eps)  # (rows,1)
+    dx = _mlx().rms_norm_bwd_dx(xf, weight, dyf, mx.reshape(rstd, (-1,)))
+    dw = mx.sum(dyf.astype(mx.float32) * xf.astype(mx.float32) * rstd, axis=0).astype(weight.dtype)
+    return mx.reshape(dx, x.shape), dw
+
+
 def softmax(x):
     """Softmax over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):
@@ -387,6 +440,14 @@ def gelu(x):
     if _is_torch(x):
         return _torch().gelu(x)
     return _mlx().gelu(x)
+
+
+def gelu_backward(x, dy):
+    """GELU (tanh approx) backward: dx = dy * gelu'(x). Elementwise; returns x's shape. Matches
+    torch autograd for F.gelu(approximate='tanh'). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().gelu_bwd(x, dy)
+    return _mlx().gelu_bwd(x, dy)
 
 
 def glu(x, gate, mode="swiglu", alpha=1.0, limit=1.0e20):

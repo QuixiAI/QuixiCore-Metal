@@ -130,6 +130,15 @@ void launch_layernorm(E& e, typename E::in_t x, typename E::in_t w, typename E::
   e.bytes(M, 4); e.bytes(eps, 5);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
+template <class E>
+void launch_layernorm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t dy,
+                             typename E::in_t mean, typename E::in_t rstd, typename E::out_t dx,
+                             int rows, int D, const std::string& type_name) {
+  e.pipeline("layernorm_bwd_dx_" + type_name);
+  e.in(x, 0); e.in(w, 1); e.in(dy, 2); e.in(mean, 3); e.in(rstd, 4); e.out(dx, 5);
+  e.bytes(D, 6);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
 
 // ----- add_rt: x@0 y@1 -> out@2 ; rows@3(i32) cols@4(i32) ; flat, one thread per 4 elements
 // (vec4). The original 8x8-register-tile version measured 0.34x of mx add (64 elements per
@@ -197,6 +206,15 @@ void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
   e.in(x, 0); e.in(w, 1); e.out(o, 2);
   e.bytes(M, 3); e.bytes(eps, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_rms_norm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t dy,
+                            typename E::in_t rstd, typename E::out_t dx, int rows, int D,
+                            const std::string& type_name) {
+  e.pipeline("rms_norm_bwd_dx_" + type_name);
+  e.in(x, 0); e.in(w, 1); e.in(dy, 2); e.in(rstd, 3); e.out(dx, 4);
+  e.bytes(D, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- rms_norm_add: x@0 residual@1 w@2 -> o@3 res_out@4 ; M@5(u32) eps@6(f32) ;
@@ -813,6 +831,14 @@ void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int 
   e.in(x, 0); e.out(o, 1);
   e.bytes(M, 2);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_gelu_bwd(E& e, typename E::in_t x, typename E::in_t dy, typename E::out_t dx, int n,
+                     const std::string& type_name) {
+  e.pipeline("gelu_bwd_" + type_name);
+  e.in(x, 0); e.in(dy, 1); e.out(dx, 2); e.bytes(n, 3);
+  constexpr int threads = 256;
+  e.dispatch((n + threads - 1) / threads, 1, 1, threads, 1, 1);
 }
 
 // ----- glu family: x@0 gate@1 -> out@2 ; n@3(uint32) alpha@4 limit@5 ; flat, one thread per

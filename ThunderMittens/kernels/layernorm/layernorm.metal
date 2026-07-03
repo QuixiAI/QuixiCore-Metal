@@ -77,4 +77,48 @@ instantiate_layernorm(512);
 instantiate_layernorm(768);
 instantiate_layernorm(1024);
 
+// LayerNorm backward, dX only (dW = sum_rows dY*x_hat, dB = sum_rows dY are framework reductions).
+// With g = dY*W and x_hat = (x-mean)*rstd:  dX_i = rstd*(g_i - mean_j(g) - x_hat_i*mean_j(g*x_hat)).
+// mean/rstd (rows,) precomputed in the framework. One simdgroup per row; any D; T templated.
+template <typename T>
+kernel void layernorm_bwd_dx(device const T     *x    [[buffer(0)]],   // (rows, D)
+                             device const T     *w    [[buffer(1)]],   // (D,)
+                             device const T     *dy   [[buffer(2)]],   // (rows, D)
+                             device const float *mean [[buffer(3)]],   // (rows,)
+                             device const float *rstd [[buffer(4)]],   // (rows,)
+                             device T           *dx   [[buffer(5)]],   // (rows, D)
+                             constant int &D          [[buffer(6)]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * D;
+    const float mu = mean[row];
+    const float r = rstd[row];
+    float s1 = 0.0f, s2 = 0.0f;
+    for (int j = (int)lane; j < D; j += 32) {
+        const float g = float(dy[base + j]) * float(w[j]);
+        const float xhat = (float(x[base + j]) - mu) * r;
+        s1 += g;
+        s2 += g * xhat;
+    }
+    s1 = metal::simd_sum(s1) / float(D);
+    s2 = metal::simd_sum(s2) / float(D);
+    for (int j = (int)lane; j < D; j += 32) {
+        const float g = float(dy[base + j]) * float(w[j]);
+        const float xhat = (float(x[base + j]) - mu) * r;
+        dx[base + j] = T(r * (g - s1 - xhat * s2));
+    }
+}
+
+#define instantiate_layernorm_bwd(type_name, T)                                \
+  template [[host_name("layernorm_bwd_dx_" #type_name)]] [[kernel]] void         \
+  layernorm_bwd_dx<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
+    device const T *dy [[buffer(2)]], device const float *mean [[buffer(3)]],   \
+    device const float *rstd [[buffer(4)]], device T *dx [[buffer(5)]],         \
+    constant int &D [[buffer(6)]],                                             \
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_layernorm_bwd(float32, float)
+instantiate_layernorm_bwd(float16, half)
+instantiate_layernorm_bwd(bfloat16, bf16)
+
 }

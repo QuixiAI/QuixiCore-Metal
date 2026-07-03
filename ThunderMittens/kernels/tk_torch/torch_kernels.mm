@@ -131,6 +131,25 @@ static at::Tensor layernorm_mps(const at::Tensor& x_in, const at::Tensor& w_in,
   return out;
 }
 
+static at::Tensor layernorm_bwd_dx_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                       const at::Tensor& dy_in, const at::Tensor& mean_in,
+                                       const at::Tensor& rstd_in) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "layernorm_bwd_dx: x must be a float MPS tensor");
+  auto x = x_in.contiguous();
+  auto w = w_in.to(x.scalar_type()).contiguous();
+  auto dy = dy_in.to(x.scalar_type()).contiguous();
+  auto mean = mean_in.to(at::kFloat).contiguous();
+  auto rstd = rstd_in.to(at::kFloat).contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto dx = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_bwd_dx(e, x, w, dy, mean, rstd, dx, rows, D, tk_type_name(x));
+  });
+  return dx;
+}
+
 static at::Tensor add_rt_mps(const at::Tensor& x_in, const at::Tensor& y_in) {
   TORCH_CHECK(x_in.device().is_mps(), "add_rt: x must be an MPS tensor");
   TORCH_CHECK(x_in.sizes() == y_in.sizes(), "add_rt: x and y must have the same shape");
@@ -188,6 +207,23 @@ static at::Tensor rms_norm_mps(const at::Tensor& x_in, const at::Tensor& w_in, d
   const float eps_f = static_cast<float>(eps);
   tk_encode([&](TorchEncoder& e) { tk::launch_rms_norm(e, x, w, out, M, D, eps_f); });
   return out;
+}
+
+static at::Tensor rms_norm_bwd_dx_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                      const at::Tensor& dy_in, const at::Tensor& rstd_in) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "rms_norm_bwd_dx: x must be a float MPS tensor");
+  auto x = x_in.contiguous();
+  auto w = w_in.to(x.scalar_type()).contiguous();
+  auto dy = dy_in.to(x.scalar_type()).contiguous();
+  auto rstd = rstd_in.to(at::kFloat).contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto dx = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_bwd_dx(e, x, w, dy, rstd, dx, rows, D, tk_type_name(x));
+  });
+  return dx;
 }
 
 // Fused residual-add + RMSNorm. Returns (out, x+residual).
@@ -336,6 +372,17 @@ static at::Tensor gelu_mps(const at::Tensor& x_in) {
   auto out = at::empty_like(x);
   tk_encode([&](TorchEncoder& e) { tk::launch_gelu(e, x, out, M, D); });
   return out;
+}
+
+static at::Tensor gelu_bwd_mps(const at::Tensor& x_in, const at::Tensor& dy_in) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "gelu_bwd: x must be a float MPS tensor");
+  auto x = x_in.contiguous();
+  auto dy = dy_in.to(x.scalar_type()).contiguous();
+  const int n = static_cast<int>(x.numel());
+  auto dx = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) { tk::launch_gelu_bwd(e, x, dy, dx, n, tk_type_name(x)); });
+  return dx;
 }
 
 static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at::Tensor& table_in,
@@ -2512,10 +2559,12 @@ static at::Tensor qgemm_w2a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_i
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
+  m.def("layernorm_bwd_dx", &layernorm_bwd_dx_mps, "ThunderMittens LayerNorm backward dX (MPS)");
   m.def("add_rt", &add_rt_mps, "ThunderMittens add_rt elementwise add (MPS)");
   m.def("matmul_custom", &matmul_custom_mps, "ThunderMittens matmul_custom GEMM (MPS)");
   m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)");
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
+  m.def("rms_norm_bwd_dx", &rms_norm_bwd_dx_mps, "ThunderMittens RMSNorm backward dX (MPS)");
   m.def("rms_norm_add", &rms_norm_add_mps, "ThunderMittens fused residual-add + RMSNorm (MPS)");
   m.def("layernorm_add", &layernorm_add_mps, "ThunderMittens fused residual-add + LayerNorm (MPS)");
   m.def("rms_norm_add_fp8", &rms_norm_add_fp8_mps, "ThunderMittens fused add+rms_norm static fp8 (MPS)");
@@ -2525,6 +2574,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
+  m.def("gelu_bwd", &gelu_bwd_mps, "ThunderMittens GELU backward (MPS)");
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,
         "ThunderMittens multimodal span merge (MPS)");

@@ -28,3 +28,20 @@ if __name__ == "__main__":
     for shp in SHAPES:
         test_gelu_matches_mlx(shp)
         print("ok", shp)
+
+
+import numpy as np
+from tk import gelu_backward
+
+
+@pytest.mark.parametrize("shape", [(6, 128), (4, 512), (3, 5, 64)])
+def test_gelu_backward(shape):
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(hash(shape) % 1000)
+    x = (1.5 * rng.standard_normal(shape)).astype(np.float32)
+    dy = (0.4 * rng.standard_normal(shape)).astype(np.float32)
+    xt = torch.tensor(x, requires_grad=True)
+    torch.nn.functional.gelu(xt, approximate="tanh").backward(torch.tensor(dy))
+    dx = gelu_backward(mx.array(x), mx.array(dy))
+    mx.eval(dx)
+    assert np.abs(np.array(dx) - xt.grad.numpy()).max() / (np.abs(xt.grad.numpy()).max() + 1e-9) < 1e-4
