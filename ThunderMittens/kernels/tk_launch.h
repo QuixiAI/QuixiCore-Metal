@@ -483,6 +483,28 @@ void launch_spec_verify_linear(E& e, typename E::in_t draft_tokens, typename E::
   e.bytes(S, 7); e.bytes(V, 8); e.bytes(seed, 9);
   e.dispatch(B, 1, 1, 32, 1, 1);
 }
+// spec_compact: single threadgroup (B<=256) exclusive-scan compaction of accepted tokens.
+template <class E>
+void launch_spec_compact(E& e, typename E::in_t out_tokens, typename E::in_t accepted_cnt,
+                         typename E::in_t seq_lens, typename E::out_t packed_tokens,
+                         typename E::out_t packed_pos, typename E::out_t cu_accepted, int B,
+                         int Sp1) {
+  e.pipeline("spec_compact");
+  e.in(out_tokens, 0); e.in(accepted_cnt, 1); e.in(seq_lens, 2);
+  e.out(packed_tokens, 3); e.out(packed_pos, 4); e.out(cu_accepted, 5);
+  e.bytes(B, 6); e.bytes(Sp1, 7);
+  int nthreads = ((B + 31) / 32) * 32;
+  if (nthreads < 32) nthreads = 32;
+  if (nthreads > 256) nthreads = 256;
+  e.dispatch(1, 1, 1, nthreads, 1, 1);
+}
+template <class E>
+void launch_spec_update_kv_meta(E& e, typename E::in_t seq_lens, typename E::in_t accepted_cnt,
+                                typename E::out_t new_seq_lens, int B) {
+  e.pipeline("spec_update_kv_meta");
+  e.in(seq_lens, 0); e.in(accepted_cnt, 1); e.out(new_seq_lens, 2); e.bytes(B, 3);
+  e.dispatch((B + 255) / 256, 1, 1, 256, 1, 1);
+}
 
 // ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
 //        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----

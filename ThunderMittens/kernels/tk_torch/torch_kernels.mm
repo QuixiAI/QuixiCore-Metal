@@ -1689,6 +1689,37 @@ static std::vector<at::Tensor> spec_verify_linear_mps(
   return {out_tokens, accepted_cnt};
 }
 
+static std::vector<at::Tensor> spec_compact_mps(const at::Tensor& out_tokens_in,
+    const at::Tensor& accepted_cnt_in, const at::Tensor& seq_lens_in) {
+  TORCH_CHECK(out_tokens_in.device().is_mps() && out_tokens_in.dim() == 2,
+              "spec_compact: out_tokens must be (B, S+1) MPS");
+  const int B = out_tokens_in.size(0), Sp1 = out_tokens_in.size(1);
+  TORCH_CHECK(B <= 256, "spec_compact: B must be <= 256");
+  auto ot = out_tokens_in.to(at::kInt).contiguous();
+  auto ac = accepted_cnt_in.to(at::kInt).contiguous();
+  auto sl = seq_lens_in.to(at::kInt).contiguous();
+  auto i32 = ot.options();
+  auto packed_tokens = at::empty({B * Sp1}, i32);
+  auto packed_pos = at::empty({B * Sp1}, i32);
+  auto cu_accepted = at::empty({B + 1}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_spec_compact(e, ot, ac, sl, packed_tokens, packed_pos, cu_accepted, B, Sp1);
+  });
+  return {packed_tokens, packed_pos, cu_accepted};
+}
+
+static at::Tensor spec_update_kv_meta_mps(const at::Tensor& seq_lens_in,
+                                          const at::Tensor& accepted_cnt_in) {
+  TORCH_CHECK(seq_lens_in.device().is_mps() && seq_lens_in.dim() == 1,
+              "spec_update_kv_meta: seq_lens must be (B,) MPS");
+  const int B = seq_lens_in.size(0);
+  auto sl = seq_lens_in.to(at::kInt).contiguous();
+  auto ac = accepted_cnt_in.to(at::kInt).contiguous();
+  auto out = at::empty({B}, sl.options());
+  tk_encode([&](TorchEncoder& e) { tk::launch_spec_update_kv_meta(e, sl, ac, out, B); });
+  return out;
+}
+
 static at::Tensor apply_penalty_mps(const at::Tensor& logits_in, const at::Tensor& prev_in,
                                     const at::Tensor& bias_in, const at::Tensor& parent_in,
                                     double temperature,
@@ -2749,6 +2780,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_token_bitmask", &apply_token_bitmask_mps, "ThunderMittens grammar bitmask masking (MPS)");
   m.def("apply_bad_words", &apply_bad_words_mps, "ThunderMittens bad/stop-word masking (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
+  m.def("spec_compact", &spec_compact_mps, "ThunderMittens spec accepted-token compaction (MPS)");
+  m.def("spec_update_kv_meta", &spec_update_kv_meta_mps, "ThunderMittens spec KV meta update (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,
         "ThunderMittens speculative linear rejection-sampling verification (MPS)");
   m.def("apply_penalty", &apply_penalty_mps, "ThunderMittens logit penalties (MPS)");

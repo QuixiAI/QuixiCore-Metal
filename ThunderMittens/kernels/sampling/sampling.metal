@@ -512,6 +512,49 @@ kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  
     if (lane == 0) accepted_cnt[b] = rejected_at;
 }
 
+// spec_compact: gather each request's valid tokens (accepted drafts + the recovered/bonus token,
+// vlen = accepted_cnt+1) from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets
+// (exclusive scan of vlen). packed_pos[k] = seq_lens[b] + j is the absolute KV position of the
+// j-th token. packed_* are sized B*(S+1) (upper bound); cu_accepted[B] holds the real total, unused
+// tail is -1. Single threadgroup (B <= 256). Ref: vLLM rejection_sampler parse_output.
+kernel void spec_compact(device const int *out_tokens   [[buffer(0)]],   // (B, S+1)
+                         device const int *accepted_cnt [[buffer(1)]],   // (B,)
+                         device const int *seq_lens     [[buffer(2)]],   // (B,)
+                         device int *packed_tokens      [[buffer(3)]],   // (B*(S+1),)
+                         device int *packed_pos         [[buffer(4)]],   // (B*(S+1),)
+                         device int *cu_accepted        [[buffer(5)]],   // (B+1,)
+                         constant int &B                [[buffer(6)]],
+                         constant int &Sp1              [[buffer(7)]],    // S+1
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint nthreads [[threads_per_threadgroup]]) {
+    threadgroup int sg_sums[8];    // nthreads/32 <= 8
+    int vlen = 0, sl = 0;
+    if ((int)tid < B) { vlen = accepted_cnt[tid] + 1; sl = seq_lens[tid]; }
+    int total = 0;
+    const int off = mittens::threadgroup_exclusive_scan_i32(vlen, tid, nthreads, sg_sums, total);
+    if ((int)tid < B) {
+        cu_accepted[tid] = off;
+        for (int j = 0; j < vlen; ++j) {                 // disjoint range [off, off+vlen)
+            packed_tokens[off + j] = out_tokens[(long)tid * Sp1 + j];
+            packed_pos[off + j]    = sl + j;
+        }
+    }
+    if (tid == 0) cu_accepted[B] = total;
+    const int cap = B * Sp1;
+    for (int i = (int)tid; i < cap; i += (int)nthreads) {  // sentinel-fill the unused tail
+        if (i >= total) { packed_tokens[i] = -1; packed_pos[i] = -1; }
+    }
+}
+
+// spec_update_kv_meta: new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1 (post-verify KV length).
+kernel void spec_update_kv_meta(device const int *seq_lens     [[buffer(0)]],  // (B,)
+                                device const int *accepted_cnt [[buffer(1)]],  // (B,)
+                                device int *new_seq_lens       [[buffer(2)]],  // (B,)
+                                constant int &B                [[buffer(3)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if ((int)gid < B) { new_seq_lens[gid] = seq_lens[gid] + accepted_cnt[gid] + 1; }
+}
+
 #define instantiate_beam(type_name, T)                                          \
   template [[host_name("beam_topk_partials_" #type_name)]] [[kernel]] void       \
   beam_topk_partials<T>(device const T *logits [[buffer(0)]],                    \

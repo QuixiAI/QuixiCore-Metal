@@ -582,6 +582,29 @@ NB_MODULE(_ext, m) {
         [out_tokens (B,S+1) int32 (-1 = placeholder), accepted_cnt (B,) int32].
       )");
 
+  m.def(
+      "spec_compact",
+      &spec_compact,
+      "out_tokens"_a,
+      "accepted_cnt"_a,
+      "seq_lens"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Compact accepted spec tokens: returns [packed_tokens, packed_pos, cu_accepted] (all int32).
+      )");
+
+  m.def(
+      "spec_update_kv_meta",
+      &spec_update_kv_meta,
+      "seq_lens"_a,
+      "accepted_cnt"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32.
+      )");
+
     m.def(
       "apply_penalty",
       &apply_penalty,

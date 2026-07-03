@@ -12,8 +12,8 @@ import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
-                spec_verify_linear, min_p_sample, typical_p_sample, apply_token_bitmask,
-                apply_bad_words)
+                spec_verify_linear, spec_compact, spec_update_kv_meta, min_p_sample,
+                typical_p_sample, apply_token_bitmask, apply_bad_words)
 
 
 def _pack_bitmask(allow):
@@ -128,6 +128,34 @@ def test_apply_token_bitmask(V):
     out = np.array(apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow))))
     np.testing.assert_array_equal(out[allow], logits[allow])   # allowed logits untouched
     assert (out[~allow] < -1e30).all()                         # masked -> -inf sentinel
+
+
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1)])
+def test_spec_compact_and_kv_meta(B, S):
+    rng = np.random.default_rng(B * 10 + S)
+    Sp1 = S + 1
+    accepted_cnt = rng.integers(0, S + 1, size=B).astype(np.int32)   # 0..S accepted
+    seq_lens = rng.integers(1, 100, size=B).astype(np.int32)
+    out_tokens = np.full((B, Sp1), -1, np.int32)
+    for b in range(B):
+        for j in range(int(accepted_cnt[b]) + 1):
+            out_tokens[b, j] = rng.integers(0, 32000)
+    pk, pos, cu = spec_compact(mx.array(out_tokens), mx.array(accepted_cnt), mx.array(seq_lens))
+    pk, pos, cu = np.array(pk), np.array(pos), np.array(cu)
+    # numpy reference
+    vlen = accepted_cnt + 1
+    cu_ref = np.concatenate([[0], np.cumsum(vlen)]).astype(np.int32)
+    cap = B * Sp1
+    pk_ref = -np.ones(cap, np.int32); pos_ref = -np.ones(cap, np.int32)
+    for b in range(B):
+        for j in range(int(vlen[b])):
+            pk_ref[cu_ref[b] + j] = out_tokens[b, j]
+            pos_ref[cu_ref[b] + j] = seq_lens[b] + j
+    np.testing.assert_array_equal(cu, cu_ref)
+    np.testing.assert_array_equal(pk, pk_ref)
+    np.testing.assert_array_equal(pos, pos_ref)
+    nsl = np.array(spec_update_kv_meta(mx.array(seq_lens), mx.array(accepted_cnt)))
+    np.testing.assert_array_equal(nsl, seq_lens + accepted_cnt + 1)
 
 
 def _typical_p_kept(logits_row, typical_p, invtemp):

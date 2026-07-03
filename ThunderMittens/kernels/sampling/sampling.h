@@ -335,6 +335,50 @@ class SpecVerifyLinear : public Primitive {
   uint32_t seed_;
 };
 
+/** spec_compact: gather each request's valid tokens (accepted + recovered/bonus, vlen=accepted_cnt+1)
+ *  from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets. Returns [packed_tokens
+ *  (B*(S+1),) int32, packed_pos (B*(S+1),) int32, cu_accepted (B+1,) int32]; packed_pos[k] =
+ *  seq_lens[b]+j is the absolute KV position; cu_accepted[B] is the real total, unused tail is -1. */
+std::vector<array> spec_compact(
+    const array& out_tokens, const array& accepted_cnt, const array& seq_lens,
+    StreamOrDevice s = {});
+
+/** spec_update_kv_meta: new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32. */
+array spec_update_kv_meta(
+    const array& seq_lens, const array& accepted_cnt, StreamOrDevice s = {});
+
+class SpecCompact : public Primitive {
+ public:
+  explicit SpecCompact(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SpecCompact"; }
+  void print(std::ostream& os) override { os << "SpecCompact"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class SpecUpdateKvMeta : public Primitive {
+ public:
+  explicit SpecUpdateKvMeta(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SpecUpdateKvMeta"; }
+  void print(std::ostream& os) override { os << "SpecUpdateKvMeta"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 class BeamTopkPartials : public Primitive {
  public:
   BeamTopkPartials(Stream stream, int two_bm) : Primitive(stream), two_bm_(two_bm) {}

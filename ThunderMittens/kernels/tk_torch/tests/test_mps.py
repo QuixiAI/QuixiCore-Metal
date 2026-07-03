@@ -1291,6 +1291,35 @@ def test_merge_multimodal_spans():
     np.testing.assert_allclose(o, ref, atol=1e-5)
 
 
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
+def test_spec_compact_and_kv_meta(B, S):
+    import numpy as np
+    rng = np.random.default_rng(B * 10 + S)
+    Sp1 = S + 1
+    accepted_cnt = rng.integers(0, S + 1, size=B).astype(np.int32)
+    seq_lens = rng.integers(1, 100, size=B).astype(np.int32)
+    out_tokens = np.full((B, Sp1), -1, np.int32)
+    for b in range(B):
+        for j in range(int(accepted_cnt[b]) + 1):
+            out_tokens[b, j] = rng.integers(0, 32000)
+    pk, pos, cu = tk_torch.spec_compact(torch.from_numpy(out_tokens).to("mps"),
+                                        torch.from_numpy(accepted_cnt).to("mps"),
+                                        torch.from_numpy(seq_lens).to("mps"))
+    vlen = accepted_cnt + 1
+    cu_ref = np.concatenate([[0], np.cumsum(vlen)]).astype(np.int32)
+    pk_ref = -np.ones(B * Sp1, np.int32); pos_ref = -np.ones(B * Sp1, np.int32)
+    for b in range(B):
+        for j in range(int(vlen[b])):
+            pk_ref[cu_ref[b] + j] = out_tokens[b, j]
+            pos_ref[cu_ref[b] + j] = seq_lens[b] + j
+    np.testing.assert_array_equal(cu.cpu().numpy(), cu_ref)
+    np.testing.assert_array_equal(pk.cpu().numpy(), pk_ref)
+    np.testing.assert_array_equal(pos.cpu().numpy(), pos_ref)
+    nsl = tk_torch.spec_update_kv_meta(torch.from_numpy(seq_lens).to("mps"),
+                                       torch.from_numpy(accepted_cnt).to("mps"))
+    np.testing.assert_array_equal(nsl.cpu().numpy(), seq_lens + accepted_cnt + 1)
+
+
 @pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 1, 128)])
 def test_spec_verify_linear(B, S, V):
     import numpy as np

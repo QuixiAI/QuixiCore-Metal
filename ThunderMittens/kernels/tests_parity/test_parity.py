@@ -336,6 +336,28 @@ def test_apply_token_bitmask_parity(V):
     _assert_parity(om, ot, atol=0)           # masked logits: bit-identical
 
 
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
+def test_spec_compact_parity(B, S):
+    rng = np.random.default_rng(B * 7 + S)
+    Sp1 = S + 1
+    accepted_cnt = rng.integers(0, S + 1, size=B).astype(np.int32)
+    seq_lens = rng.integers(1, 100, size=B).astype(np.int32)
+    out_tokens = np.full((B, Sp1), -1, np.int32)
+    for b in range(B):
+        for j in range(int(accepted_cnt[b]) + 1):
+            out_tokens[b, j] = rng.integers(0, 32000)
+    om = tk.spec_compact(mx.array(out_tokens), mx.array(accepted_cnt), mx.array(seq_lens))
+    ot = tk.spec_compact(torch.from_numpy(out_tokens).to("mps"),
+                         torch.from_numpy(accepted_cnt).to("mps"),
+                         torch.from_numpy(seq_lens).to("mps"))
+    for a, b in zip(om, ot):
+        _assert_parity(a, b, atol=0)
+    nm = tk.spec_update_kv_meta(mx.array(seq_lens), mx.array(accepted_cnt))
+    nt = tk.spec_update_kv_meta(torch.from_numpy(seq_lens).to("mps"),
+                                torch.from_numpy(accepted_cnt).to("mps"))
+    _assert_parity(nm, nt, atol=0)
+
+
 @pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 5, 200)])
 def test_spec_verify_linear_parity(B, S, V):
     rng = np.random.default_rng(B + S + V)

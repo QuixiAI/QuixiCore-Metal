@@ -1140,6 +1140,26 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
     return out[0], out[1]
 
 
+def spec_compact(out_tokens, accepted_cnt, seq_lens):
+    """Compact accepted spec tokens: gather each request's valid tokens (accepted drafts + the
+    recovered/bonus token, vlen=accepted_cnt+1) from out_tokens (B, S+1) into packed buffers.
+    Returns (packed_tokens (B*(S+1),), packed_pos (B*(S+1),), cu_accepted (B+1,)), all int32:
+    packed_pos[k] = seq_lens[b]+j (absolute KV position), cu_accepted[B] = total, tail = -1. B<=256.
+    Ref: vLLM rejection_sampler parse_output. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(out_tokens):
+        return tuple(_torch().spec_compact(out_tokens, accepted_cnt, seq_lens))
+    out = _mlx().spec_compact(out_tokens, accepted_cnt, seq_lens)
+    return out[0], out[1], out[2]
+
+
+def spec_update_kv_meta(seq_lens, accepted_cnt):
+    """Post-verify KV length: new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(seq_lens):
+        return _torch().spec_update_kv_meta(seq_lens, accepted_cnt)
+    return _mlx().spec_update_kv_meta(seq_lens, accepted_cnt)
+
+
 def beam_reorder_kv(key_cache, value_cache, block_table, parent_beam, seq_lens):
     """Reorder a paged KV cache after a beam step so each new beam's physical blocks hold its
     parent beam's KV history. Returns (key_cache', value_cache') (new caches — the copy op clones

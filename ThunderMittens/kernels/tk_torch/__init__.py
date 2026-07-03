@@ -342,6 +342,16 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
                                          accept_u, int(seed)))
 
 
+def spec_compact(out_tokens, accepted_cnt, seq_lens):
+    """Compact accepted spec tokens -> (packed_tokens, packed_pos, cu_accepted) int32. B<=256. MPS."""
+    return tuple(_ext.spec_compact(out_tokens, accepted_cnt, seq_lens))
+
+
+def spec_update_kv_meta(seq_lens, accepted_cnt):
+    """new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32. MPS."""
+    return _ext.spec_update_kv_meta(seq_lens, accepted_cnt)
+
+
 def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
                           seq_lens: torch.Tensor, block_size: int):
     """Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).

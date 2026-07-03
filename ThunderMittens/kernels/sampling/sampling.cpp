@@ -658,4 +658,78 @@ void SpecVerifyLinear::eval_gpu(const std::vector<array>& inputs, std::vector<ar
 }
 TK_BEAM_NO_AUTODIFF(SpecVerifyLinear, "SpecVerifyLinear")
 
+std::vector<array> spec_compact(
+    const array& out_tokens, const array& accepted_cnt, const array& seq_lens,
+    StreamOrDevice s /* = {} */) {
+  if (out_tokens.ndim() != 2) {
+    throw std::invalid_argument("spec_compact: out_tokens must be (B, S+1)");
+  }
+  const int B = out_tokens.shape(0);
+  const int Sp1 = out_tokens.shape(1);
+  if (B > 256) {
+    throw std::invalid_argument("spec_compact: B must be <= 256 (single-threadgroup scan)");
+  }
+  if (accepted_cnt.ndim() != 1 || accepted_cnt.shape(0) != B || seq_lens.shape(0) != B) {
+    throw std::invalid_argument("spec_compact: accepted_cnt / seq_lens must be (B,)");
+  }
+  auto ot_c = contiguous(astype(out_tokens, int32, s), false, s);
+  auto ac_c = contiguous(astype(accepted_cnt, int32, s), false, s);
+  auto sl_c = contiguous(astype(seq_lens, int32, s), false, s);
+  return array::make_arrays(
+      {{B * Sp1}, {B * Sp1}, {B + 1}}, {int32, int32, int32},
+      std::make_shared<SpecCompact>(to_stream(s)), {ot_c, ac_c, sl_c});
+}
+
+void SpecCompact::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("SpecCompact has no CPU implementation.");
+}
+void SpecCompact::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& out_tokens = inputs[0];
+  auto& accepted_cnt = inputs[1];
+  auto& seq_lens = inputs[2];
+  auto& packed_tokens = outputs[0];
+  auto& packed_pos = outputs[1];
+  auto& cu_accepted = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  packed_tokens.set_data(allocator::malloc_or_wait(packed_tokens.nbytes()));
+  packed_pos.set_data(allocator::malloc_or_wait(packed_pos.nbytes()));
+  cu_accepted.set_data(allocator::malloc_or_wait(cu_accepted.nbytes()));
+  const int B = out_tokens.shape(0);
+  const int Sp1 = out_tokens.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_spec_compact(enc, out_tokens, accepted_cnt, seq_lens, packed_tokens, packed_pos,
+                          cu_accepted, B, Sp1);
+}
+TK_BEAM_NO_AUTODIFF(SpecCompact, "SpecCompact")
+
+array spec_update_kv_meta(const array& seq_lens, const array& accepted_cnt,
+                          StreamOrDevice s /* = {} */) {
+  if (seq_lens.ndim() != 1 || accepted_cnt.shape(0) != seq_lens.shape(0)) {
+    throw std::invalid_argument("spec_update_kv_meta: seq_lens / accepted_cnt must be (B,)");
+  }
+  const int B = seq_lens.shape(0);
+  auto sl_c = contiguous(astype(seq_lens, int32, s), false, s);
+  auto ac_c = contiguous(astype(accepted_cnt, int32, s), false, s);
+  return array({B}, int32, std::make_shared<SpecUpdateKvMeta>(to_stream(s)), {sl_c, ac_c});
+}
+
+void SpecUpdateKvMeta::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("SpecUpdateKvMeta has no CPU implementation.");
+}
+void SpecUpdateKvMeta::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& seq_lens = inputs[0];
+  auto& accepted_cnt = inputs[1];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int B = seq_lens.shape(0);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_spec_update_kv_meta(enc, seq_lens, accepted_cnt, out, B);
+}
+TK_BEAM_NO_AUTODIFF(SpecUpdateKvMeta, "SpecUpdateKvMeta")
+
 } // namespace mlx::core
