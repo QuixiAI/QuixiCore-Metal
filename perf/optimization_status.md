@@ -1,5 +1,27 @@
 # ThunderMittens — performance status
 
+## Wave-6 close-out (2026-07-02/03)
+
+New serving/training families landed dual-backend + parity-tested (see the README "Serving &
+training kernels" table): typical-p / bad-words / grammar-bitmask masking, quant LM-head top-p,
+linear + **tree** speculative verification (`spec_verify_tree`), `spec_compact` / `spec_update_kv_meta`,
+zero-copy beam `beam_remap_block_table`, **N-level** cascade attention, on-device `build_multimodal_src`,
+`embedding_backward` (atomic scatter-add), GLU/GELU/RMSNorm/LayerNorm/fused-add-RMSNorm backward,
+`dropout`, and fused `AdamW`. The comprehensive bench sweep now runs **0 skips across 46 families**
+(`perf/results/2026-07-02/235051-mlx-comprehensive/`); an end-to-end serving+training integration
+test (`tk/tests/test_integration.py`) chains them on both backends. Perf wins + rejects are in the
+"Wave-6 perf pass" section below.
+
+**Scoped follow-ons (correct + tested surface exists; these are the two deferred extensions):**
+- **Fully device-resident varlen** (`attn_varlen`): the tile worklist builds on device
+  (`varlen_build_worklist`), but Q pad/gather + output re-gather still run host-side; a device
+  Q-pad/gather + output re-gather pair (and a two-level scan for B>256) would close the last host
+  bubble. The host path is correct and tested today.
+- **fp8 cascade prefix** (`cascade_prefix_partition_fp8`): the N-level cascade is done over bf16/fp16
+  prefixes; an fp8 (uint8 + per-head dequant) prefix partition would mirror the existing
+  `paged_attention_v2_fp8` partition. fp8 *paged* decode already exists; this only fp8-compresses the
+  shared prefix.
+
 Running notebook for the per-kernel optimization loop described in `perf/perf.md`.
 Numbers are throughput-style median per-call ms from `perf/bench_kernels.py`
 (adaptive batched timing, ≥2 ms per timed sample), Apple M4 Max 40-core

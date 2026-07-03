@@ -51,6 +51,31 @@ block-sparse masks compose on the paged-decode path; the Mamba-2/linear-attentio
 between an O(N²) kernel (small N) and a linear-time chunked pipeline (D∈{64,128}) at measured
 crossovers.
 
+### Serving & training kernels (Waves 5–6)
+
+A full serving + training surface, all dual-backend (MLX + PyTorch-MPS from one metallib) and
+cross-backend parity-tested:
+
+- **Sampling / decoding** — top-k, top-p, min-p, **typical-p**, categorical, argmax (fused Gumbel-max,
+  seed-reproducible on host); grammar **allow-bitmask** + **bad/stop-word** masking; repetition /
+  presence / frequency penalties; fused quantized LM-head sampling (argmax / categorical / top-k /
+  **top-p nucleus**, no `(T,V)` logits materialization).
+- **Speculative decoding** — linear (vLLM) **and tree** rejection verification, plus device-resident
+  `spec_compact` / `spec_update_kv_meta` post-processing (no host readback between verify and KV append).
+- **Beam search** — single-pass advance, on-device KV reorder (copy-path **and** zero-copy
+  block-table remap), device copy-pair builder.
+- **Attention** — cascade / shared-prefix decode, now **N-level** (multi shared prefix), over the
+  paged-v2 partition/reduce.
+- **Multimodal / embeddings** — token embedding lookup **+ backward** (atomic scatter-add), on-device
+  multimodal `src` builder + span merge.
+- **Training** — RMSNorm / LayerNorm / GELU **backward**, fused-add-RMSNorm backward, GLU-family
+  backward (all 6 modes), **dropout** (mask-free, seed-reproducible), and a fused **AdamW** step.
+
+Measured Wave-6 perf wins (MLX, M-series): **embedding_lookup 8.0×** and **merge_multimodal_spans
+11.9×** (threadgroup-per-token + vec4; embedding is now 2.3× *faster* than the framework gather),
+**beam KV reorder ~1.45×** (vec4 cache clone/copy). See `perf/optimization_status.md` for the full
+sweep + the honest rejects.
+
 ## Prerequisites (all paths)
 
 - Apple Silicon Mac.
