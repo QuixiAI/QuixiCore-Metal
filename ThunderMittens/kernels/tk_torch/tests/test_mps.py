@@ -1114,6 +1114,31 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+@pytest.mark.parametrize("wd", [0.0, 0.05])
+def test_adamw_vs_torch(wd):
+    import numpy as np
+    rng = np.random.default_rng(int(wd * 100) + 1)
+    D = 2048
+    lr, b1, b2, eps = 1e-3, 0.9, 0.999, 1e-8
+    p0 = (0.1 * rng.standard_normal(D)).astype(np.float32)
+    pt = torch.from_numpy(p0.copy()).to("mps").requires_grad_(True)
+    opt = torch.optim.AdamW([pt], lr=lr, betas=(b1, b2), eps=eps, weight_decay=wd)
+    p = p0.copy(); m = np.zeros(D, np.float32); v = np.zeros(D, np.float32)
+    for t in range(1, 4):
+        g = rng.standard_normal(D).astype(np.float32)
+        opt.zero_grad()
+        pt.grad = torch.from_numpy(g.copy()).to("mps")
+        opt.step()
+        pk, mk, vk = tk_torch.adamw(torch.from_numpy(p).to("mps"), torch.from_numpy(g).to("mps"),
+                                    torch.from_numpy(m).to("mps"), torch.from_numpy(v).to("mps"),
+                                    lr, b1, b2, eps, wd, t)
+        p, m, v = pk.cpu().numpy(), mk.cpu().numpy(), vk.cpu().numpy()
+        st = opt.state[pt]
+        assert np.allclose(p, pt.detach().cpu().numpy(), atol=1e-5), (t, np.abs(p - pt.detach().cpu().numpy()).max())
+        assert np.allclose(m, st["exp_avg"].cpu().numpy(), atol=1e-5)
+        assert np.allclose(v, st["exp_avg_sq"].cpu().numpy(), atol=1e-6)
+
+
 @pytest.mark.parametrize("p", [0.0, 0.3, 0.7])
 def test_dropout(p):
     import numpy as np

@@ -33,6 +33,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
+    os.path.join(_KERNELS, "optim", "adamw.metal"),
     os.path.join(_KERNELS, "embedding", "embedding.metal"),
     os.path.join(_KERNELS, "glu", "glu.metal"),
     os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
@@ -260,6 +261,12 @@ def dropout(x: torch.Tensor, p: float, seed: int):
 def dropout_backward(dy: torch.Tensor, p: float, seed: int):
     """Dropout backward: dx = keep ? dy/(1-p) : 0 (same mask from seed). MPS."""
     return _ext.dropout(dy, float(p), int(seed), True)
+
+
+def adamw(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step):
+    """AdamW step. Returns (param', m', v'); m/v are fp32 moment state, step (t) >= 1. MPS."""
+    return tuple(_ext.adamw(param, grad, m, v, float(lr), float(beta1), float(beta2),
+                            float(eps), float(weight_decay), int(step)))
 
 
 def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",

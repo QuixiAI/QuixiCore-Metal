@@ -135,6 +135,7 @@
 				kernels/flux/flux.cpp,
 				kernels/gelu/gelu.cpp,
 				kernels/dropout/dropout.cpp,
+				kernels/optim/adamw.cpp,
 				kernels/embedding/embedding.cpp,
 				kernels/gemm_staged/gemm_staged.cpp,
 				kernels/hedgehog/hedgehog.cpp,

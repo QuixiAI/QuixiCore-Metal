@@ -215,6 +215,23 @@ def test_embedding_lookup_parity():
     _assert_parity(om, ot, atol=0)
 
 
+def test_adamw_parity():
+    rng = np.random.default_rng(23)
+    D = 1024
+    p = (0.1 * rng.standard_normal(D)).astype(np.float32)
+    g = rng.standard_normal(D).astype(np.float32)
+    m = np.abs(rng.standard_normal(D)).astype(np.float32)
+    v = np.abs(rng.standard_normal(D)).astype(np.float32)
+    kw = dict(lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.01, step=3)
+    pm, mm, vm = tk.adamw(_mk(p, "mlx", "f32"), _mk(g, "mlx", "f32"),
+                          _mk(m, "mlx", "f32"), _mk(v, "mlx", "f32"), **kw)
+    ptt, mtt, vtt = tk.adamw(_mk(p, "torch", "f32"), _mk(g, "torch", "f32"),
+                             _mk(m, "torch", "f32"), _mk(v, "torch", "f32"), **kw)
+    _assert_parity(pm, ptt, atol=1e-6)
+    _assert_parity(mm, mtt, atol=1e-6)
+    _assert_parity(vm, vtt, atol=1e-6)
+
+
 @pytest.mark.parametrize("p", [0.0, 0.3, 0.7])
 def test_dropout_parity(p):
     # same (seed, index) hash on both backends -> IDENTICAL mask, so fwd/bwd are bit-parity.

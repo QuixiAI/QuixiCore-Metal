@@ -42,6 +42,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/mla/mla.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/optim/adamw.cpp
     ${CMAKE_CURRENT_LIST_DIR}/embedding/embedding.cpp
     ${CMAKE_CURRENT_LIST_DIR}/glu/glu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.cpp
@@ -105,6 +106,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/mla/mla.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.metal
+        ${CMAKE_CURRENT_LIST_DIR}/optim/adamw.metal
         ${CMAKE_CURRENT_LIST_DIR}/embedding/embedding.metal
         ${CMAKE_CURRENT_LIST_DIR}/glu/glu.metal
         ${CMAKE_CURRENT_LIST_DIR}/hadamard/hadamard.metal

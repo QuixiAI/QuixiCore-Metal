@@ -851,6 +851,20 @@ void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int 
   e.bytes(M, 2);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
+// AdamW step: param/grad/m/v -> param_out/m_out/v_out (bias-corr factors bc1,bc2 from the host).
+template <class E>
+void launch_adamw(E& e, typename E::in_t param, typename E::in_t grad, typename E::in_t m,
+                  typename E::in_t v, typename E::out_t param_out, typename E::out_t m_out,
+                  typename E::out_t v_out, float lr, float beta1, float beta2, float eps, float wd,
+                  float bc1, float bc2, uint32_t n, const std::string& type_name) {
+  e.pipeline("adamw_" + type_name);
+  e.in(param, 0); e.in(grad, 1); e.in(m, 2); e.in(v, 3);
+  e.out(param_out, 4); e.out(m_out, 5); e.out(v_out, 6);
+  e.bytes(lr, 7); e.bytes(beta1, 8); e.bytes(beta2, 9); e.bytes(eps, 10); e.bytes(wd, 11);
+  e.bytes(bc1, 12); e.bytes(bc2, 13); e.bytes(n, 14);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
 // Dropout fwd/bwd (same signature; bwd selects the backward kernel). out = keep ? x/(1-p) : 0.
 template <class E>
 void launch_dropout(E& e, typename E::in_t x, typename E::out_t out, uint32_t seed, float p,

@@ -72,6 +72,7 @@
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
 #include "dropout/dropout.h"
+#include "optim/adamw.h"
 #include "embedding/embedding.h"
 #include "glu/glu.h"
 #include "hadamard/hadamard.h"
@@ -673,6 +674,25 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         Dropout backward: dx = keep ? dy/(1-p) : 0 (same mask recomputed from seed).
+      )");
+
+    m.def(
+      "adamw",
+      &adamw,
+      "param"_a,
+      "grad"_a,
+      "m"_a,
+      "v"_a,
+      "lr"_a,
+      "beta1"_a,
+      "beta2"_a,
+      "eps"_a,
+      "weight_decay"_a,
+      "step"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        AdamW step: returns (param', m', v') from (param, grad, m, v) and step t.
       )");
 
     m.def(

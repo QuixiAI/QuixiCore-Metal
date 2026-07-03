@@ -471,6 +471,19 @@ def dropout_backward(dy, p, seed):
     return _mlx().dropout_backward(dy, float(p), int(seed))
 
 
+def adamw(param, grad, m, v, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0, step=1):
+    """AdamW optimizer step (decoupled weight decay). Given param/grad and fp32 moment state m, v and
+    the 1-based step t, returns (param', m', v'):
+        m' = b1 m + (1-b1) g;  v' = b2 v + (1-b2) g^2;  mhat = m'/(1-b1^t);  vhat = v'/(1-b2^t)
+        param' = param - lr*( mhat/(sqrt(vhat)+eps) + wd*param )
+    Matches torch.optim.AdamW. m, v must be float32. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(param):
+        return _torch().adamw(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step)
+    out = _mlx().adamw(param, grad, m, v, float(lr), float(beta1), float(beta2), float(eps),
+                       float(weight_decay), int(step))
+    return out[0], out[1], out[2]
+
+
 def gelu_backward(x, dy):
     """GELU (tanh approx) backward: dx = dy * gelu'(x). Elementwise; returns x's shape. Matches
     torch autograd for F.gelu(approximate='tanh'). Accepts mlx.array or torch.Tensor (MPS)."""

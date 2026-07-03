@@ -399,6 +399,32 @@ static at::Tensor dropout_mps(const at::Tensor& x_in, double p, int64_t seed, bo
   return out;
 }
 
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> adamw_mps(
+    const at::Tensor& param_in, const at::Tensor& grad_in, const at::Tensor& m_in,
+    const at::Tensor& v_in, double lr, double beta1, double beta2, double eps,
+    double weight_decay, int64_t step) {
+  TORCH_CHECK(param_in.device().is_mps() && tk_is_float_dtype(param_in),
+              "adamw: param must be a float MPS tensor");
+  TORCH_CHECK(m_in.scalar_type() == at::kFloat && v_in.scalar_type() == at::kFloat,
+              "adamw: moment state m, v must be float32");
+  TORCH_CHECK(param_in.sizes() == grad_in.sizes() && param_in.sizes() == m_in.sizes() &&
+              param_in.sizes() == v_in.sizes(), "adamw: param, grad, m, v shapes must match");
+  TORCH_CHECK(step >= 1, "adamw: step (t) must be >= 1");
+  auto param = param_in.contiguous();
+  auto grad = grad_in.to(param.scalar_type()).contiguous();
+  auto m = m_in.contiguous(), v = v_in.contiguous();
+  auto p_out = at::empty_like(param), m_out = at::empty_like(m), v_out = at::empty_like(v);
+  const float bc1 = 1.0f - std::pow(static_cast<float>(beta1), static_cast<float>(step));
+  const float bc2 = 1.0f - std::pow(static_cast<float>(beta2), static_cast<float>(step));
+  const uint32_t n = static_cast<uint32_t>(param.numel());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_adamw(e, param, grad, m, v, p_out, m_out, v_out, static_cast<float>(lr),
+                     static_cast<float>(beta1), static_cast<float>(beta2), static_cast<float>(eps),
+                     static_cast<float>(weight_decay), bc1, bc2, n, tk_type_name(param));
+  });
+  return {p_out, m_out, v_out};
+}
+
 static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at::Tensor& table_in,
                                        const at::Tensor& pos_table_in, double scale) {
   TORCH_CHECK(token_ids_in.device().is_mps() && token_ids_in.dim() == 1,
@@ -2631,6 +2657,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
   m.def("gelu_bwd", &gelu_bwd_mps, "ThunderMittens GELU backward (MPS)");
   m.def("dropout", &dropout_mps, "ThunderMittens inverted dropout fwd/bwd (MPS)");
+  m.def("adamw", &adamw_mps, "ThunderMittens AdamW optimizer step (MPS)");
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("embedding_backward", &embedding_backward_mps,
         "ThunderMittens embedding backward / scatter-add grad (MPS)");
