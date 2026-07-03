@@ -1452,6 +1452,15 @@ void launch_lm_head_topk_reduce(E& e, typename E::in_t part_val, typename E::in_
   e.bytes(num_vtiles, 3); e.bytes(topk, 4); e.bytes(seed, 5); e.bytes(invtemp, 6);
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
+template <class E>
+void launch_lm_head_topp_reduce(E& e, typename E::in_t part_val, typename E::in_t part_id,
+                                typename E::out_t out_idx, int num_vtiles, int topk, float p,
+                                unsigned seed, float invtemp, int T) {
+  e.pipeline("lm_head_topp_reduce");
+  e.in(part_val, 0); e.in(part_id, 1); e.out(out_idx, 2);
+  e.bytes(num_vtiles, 3); e.bytes(topk, 4); e.bytes(p, 5); e.bytes(seed, 6); e.bytes(invtemp, 7);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
 
 // ----- cross_entropy fwd: logits@0 targets@1 -> loss@2 lse@3 ; V@4 ignore_index@5 (i32)
 //        label_smoothing@6 z_loss@7 (f32) ; grid (T,) × 32 (one simdgroup per row). -----

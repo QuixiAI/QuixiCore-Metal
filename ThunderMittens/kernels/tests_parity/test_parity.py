@@ -166,6 +166,22 @@ def test_lm_head_sample_quant_parity(fmt, mode, k):
     _assert_parity(om, ot, atol=0)   # same dequant + reduce metallib -> exact token ids
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("p", [0.5, 0.9])
+def test_lm_head_sample_quant_topp_parity(fmt, p):
+    from tk.quant import QUANT_FORMATS
+    quant, _ = QUANT_FORMATS[fmt]
+    rng = np.random.default_rng(fmt.__hash__() % 1000 + int(p * 10))
+    T, V, K = 4, 4000, 512
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    Wq = quant((0.3 * rng.standard_normal((V, K))).astype(np.float32))
+    om = tk.lm_head_sample(_mk(h, "mlx"), mx.array(Wq), mode="topp", k=32, temperature=0.8,
+                           seed=9, format=fmt, top_p=p)
+    ot = tk.lm_head_sample(_mk(h, "torch"), torch.from_numpy(Wq).to("mps"), mode="topp", k=32,
+                           temperature=0.8, seed=9, format=fmt, top_p=p)
+    _assert_parity(om, ot, atol=0)   # same pool + bisection + Gumbel -> exact token ids
+
+
 @pytest.mark.parametrize("eps,z,softcap", [(0.0, 0.0, 0.0), (0.1, 1e-4, 0.0), (0.0, 0.0, 30.0)])
 def test_cross_entropy_parity(eps, z, softcap):
     rng = np.random.default_rng(6)

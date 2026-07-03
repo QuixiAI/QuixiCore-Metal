@@ -252,6 +252,60 @@ kernel void lm_head_topk_reduce(device const float *part_val   [[buffer(0)]],   
     if (lane == 0) out_idx[t] = bi;
 }
 
+// Top-p (nucleus) reduce over the merged over-selected candidate pool (num_vtiles*topk per token):
+// standard "top-k(k') then top-p" — the pool's own softmax approximates the full normalizer for the
+// peaked LM-head distribution (the nucleus for typical p sits well inside the top-k'). Mirrors
+// top_p_sample: reduce max/Z over the pool, bisect the tempered-logit threshold L for cumulative
+// mass >= p, then Gumbel-max over {ls >= L}. The Gumbel noise is indexed by the GLOBAL vocab id.
+kernel void lm_head_topp_reduce(device const float *part_val [[buffer(0)]],   // (T, num_vtiles, topk)
+                                device const int   *part_id  [[buffer(1)]],
+                                device int         *out_idx  [[buffer(2)]],
+                                constant int   &num_vtiles   [[buffer(3)]],
+                                constant int   &topk         [[buffer(4)]],
+                                constant float &p            [[buffer(5)]],
+                                constant uint  &seed         [[buffer(6)]],
+                                constant float &invtemp      [[buffer(7)]],
+                                uint  t    [[threadgroup_position_in_grid]],
+                                uint  lane [[thread_index_in_simdgroup]]) {
+    const int ncand = num_vtiles * topk;
+    const long base = (long)t * ncand;
+    float mx = LMH_NEG_INF;
+    for (int j = (int)lane; j < ncand; j += 32) {
+        if (part_id[base + j] >= 0) { mx = max(mx, part_val[base + j] * invtemp); }
+    }
+    mx = simd_max(mx);
+    float Z = 0.0f;
+    for (int j = (int)lane; j < ncand; j += 32) {
+        if (part_id[base + j] >= 0) { Z += exp(part_val[base + j] * invtemp - mx); }
+    }
+    Z = simd_sum(Z);
+    float lo = mx - 40.0f, hi = mx;             // bisect L: largest L with mass{ls>=L} >= p
+    for (int it = 0; it < 32; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        float sm = 0.0f;
+        for (int j = (int)lane; j < ncand; j += 32) {
+            const float ls = part_val[base + j] * invtemp;
+            if (part_id[base + j] >= 0 && ls >= mid) { sm += exp(ls - mx); }
+        }
+        sm = simd_sum(sm) / Z;
+        if (sm >= p) { lo = mid; } else { hi = mid; }
+    }
+    const float L = lo;
+    float best = LMH_NEG_INF;
+    int   bi   = -1;
+    for (int j = (int)lane; j < ncand; j += 32) {
+        const int id = part_id[base + j];
+        const float ls = part_val[base + j] * invtemp;
+        if (id < 0 || ls < L) { continue; }
+        const float pert = ls + rng_gumbel(seed, (uint)t, (uint)id);
+        if (pert > best || (pert == best && id < bi)) { best = pert; bi = id; }
+    }
+    float gbest = best;
+    int   gid   = (bi < 0) ? 0x7fffffff : bi;
+    simd_argmax(gbest, gid);
+    if (lane == 0) { out_idx[t] = (gbest == LMH_NEG_INF) ? -1 : gid; }
+}
+
 // Quantized top-k partials: same per-lane top-k as lm_head_topk_partials, but W is packed
 // (V, K/block_k, block_bytes) uchar dequantized on the fly via tk_dequant8<FMT>. Feeds the SAME
 // lm_head_topk_reduce (global merge + Gumbel-max), so the fused quant top-k path avoids ever

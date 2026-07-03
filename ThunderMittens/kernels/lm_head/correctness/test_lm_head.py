@@ -175,6 +175,39 @@ def test_quant_topk(fmt, k):
             assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-2
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("p", [0.5, 0.9])
+def test_quant_topp(fmt, p):
+    # Fused quant top-p (nucleus over the over-selected top-k' pool) vs the dequant-logits nucleus.
+    # The pool nucleus is a subset of the full-vocab nucleus, so the sampled token must lie in it.
+    from tk.quant import QUANT_FORMATS
+    quant, dequant = QUANT_FORMATS[fmt]
+    T, V, K, temp = 2, 4000, 512, 0.8
+    rng = np.random.default_rng(41 + int(p * 10))
+    W = (0.3 * rng.standard_normal((V, K))).astype(np.float32)
+    Wq = quant(W)
+    h = (0.6 * rng.standard_normal((T, K))).astype(np.float32)
+    Wdq = dequant(Wq).astype(np.float64)
+    L = (h.astype(np.float64) @ Wdq.T) / temp     # tempered logits
+    nucleus = []
+    for t in range(T):
+        ls = L[t]
+        mxv = ls.max(); pex = np.exp(ls - mxv); Z = pex.sum()
+        order = np.argsort(-ls, kind="stable")
+        cum, keep = 0.0, set()
+        for v in order:
+            cum += pex[v] / Z
+            keep.add(int(v))
+            if cum >= p:
+                break
+        nucleus.append(keep)
+    for seed in range(40):
+        tok = np.array(tk.lm_head_sample(mx.array(h), mx.array(Wq), mode="topp",
+                                         k=32, temperature=temp, seed=seed, format=fmt, top_p=p))
+        for t in range(T):
+            assert int(tok[t]) in nucleus[t], (fmt, p, seed, t, int(tok[t]))
+
+
 if __name__ == "__main__":
     test_argmax("bfloat16", 1, 32000, 2048)
     test_categorical("float32", 4, 32000, 2048)

@@ -1032,45 +1032,59 @@ def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100
     return total / n, mx.concatenate(dh_parts, axis=0), dW
 
 
-_LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2}
+_LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2, "topp": 3}
 
 
 _LM_QUANT_BLOCK_K = {"q8_0": 32, "q4_0": 32}
 
 
 def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None, fused=False,
-                   format=None):
+                   format=None, top_p=0.9):
     """LM-head + sampling: a decode token per row of h. h (T, K), W (V, K) row-major, both
-    fp16/bf16/f32. mode in {"argmax", "categorical", "topk"} (top-p -> matmul + top_p_sample).
+    fp16/bf16/f32. mode in {"argmax", "categorical", "topk", "topp"}.
 
     format ("q8_0"/"q4_0") selects the fused quantized-weight path: W is the packed weight tensor
-    (dequantized on read, no logits materialization); supports argmax/categorical/topk.
-    bias is an optional (V,) additive logit bias. Returns (T,) int32 token ids. The Gumbel noise is
-    indexed by the global vocab id, so the draw equals the unfused sampler on the same logits + seed.
+    (dequantized on read, no logits materialization); supports all four modes. For "topp" the fused
+    quant path over-selects the top-k' candidate pool (k = the cap, default 32) then does a nucleus
+    (top-p, threshold top_p) reduce over that pool — the standard "top-k then top-p" (the pool's
+    softmax approximates the full normalizer for the peaked LM-head distribution). bias is an
+    optional (V,) additive logit bias. Returns (T,) int32 token ids. The Gumbel noise is indexed by
+    the global vocab id, so the draw equals the unfused sampler on the same logits + seed.
     Accepts mlx.array or torch.Tensor (MPS).
 
-    Default path: logits = h @ W.T (the framework matmul reads W once and is at the bandwidth floor)
-    then the fast fused sampler. This is ~2.5x faster than a hand-written fused GEMV on Apple, where
-    the head GEMV is bandwidth-bound and matmul is already optimal; the saved (T,V) logits traffic is
-    negligible. fused=True runs the single-kernel no-materialization variant instead (a capability for
-    memory-pressured huge-V decode; slower here — matmul wins)."""
+    Default path: logits = h @ W.T then the fast fused sampler (dense top-p = matmul + top_p_sample).
+    fused=True runs the single-kernel no-materialization variant instead."""
     if mode not in _LM_HEAD_MODES:
         raise ValueError(f"lm_head_sample: mode must be one of {list(_LM_HEAD_MODES)}")
     if format is not None:
         if format not in _LM_QUANT_BLOCK_K:
             raise ValueError(f"lm_head_sample: quant format must be one of {list(_LM_QUANT_BLOCK_K)}")
         m = _LM_HEAD_MODES[mode]
+        kk = int(k) if int(k) > 0 else (32 if mode in ("topk", "topp") else 0)
         V = W.shape[0]
         K = W.shape[1] * _LM_QUANT_BLOCK_K[format]   # packed Wq is (V, K/block_k, block_bytes)
         if _is_torch(h):
             import torch
             b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
-            return _torch().lm_head_sample_q(h, W, b, V, K, format, m, int(k), float(temperature),
-                                             int(seed))
+            return _torch().lm_head_sample_q(h, W, b, V, K, format, m, kk, float(temperature),
+                                             int(seed), float(top_p))
         import mlx.core as mx
         b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
-        return _mlx().lm_head_sample_q(h, W, b, V, K, format, m, int(k), float(temperature),
-                                       int(seed))
+        return _mlx().lm_head_sample_q(h, W, b, V, K, format, m, kk, float(temperature),
+                                       int(seed), float(top_p))
+    if mode == "topp":
+        # dense top-p: materialize logits (matmul reads W once, bandwidth-optimal) then top_p_sample.
+        if _is_torch(h):
+            import torch
+            logits = torch.matmul(h, W.transpose(-1, -2))
+            if bias is not None:
+                logits = logits + bias.to(logits.dtype)
+        else:
+            import mlx.core as mx
+            logits = mx.matmul(h, mx.swapaxes(W, -1, -2))
+            if bias is not None:
+                logits = logits + bias.astype(logits.dtype)
+        return top_p_sample(logits, top_p, temperature=temperature, seed=seed)
     if fused:
         m = _LM_HEAD_MODES[mode]
         if _is_torch(h):

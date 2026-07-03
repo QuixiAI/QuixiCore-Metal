@@ -1094,11 +1094,13 @@ NB_MODULE(_ext, m) {
       "topk"_a,
       "temperature"_a,
       "seed"_a,
+      "top_p"_a = 0.0f,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
         fused LM-head + sampling over quantized (q8_0/q4_0) weights; mode 0=argmax, 1=categorical,
-        2=topk (topk = k, reuses the dense top-k reduce). No (T,V) logits materialization.
+        2=topk, 3=topp (nucleus over the over-selected top-k candidate pool; top_p in (0,1], k = the
+        candidate cap). No (T,V) logits materialization.
       )");
 
     m.def(

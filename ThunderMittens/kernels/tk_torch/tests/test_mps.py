@@ -1396,6 +1396,23 @@ def test_lm_head_sample_quant(fmt):
         for t in range(T):
             top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
             assert tk_tok[t] in top or (L[t].max() - L[t, tk_tok[t]]) < 1e-2
+    # fused quant top-p: sampled token must be in the dequant-logits nucleus (superset of the pool)
+    for p in (0.5, 0.9):
+        Ls = L / 0.8
+        nuc = []
+        for t in range(T):
+            ls = Ls[t]; pex = np.exp(ls - ls.max()); Z = pex.sum()
+            cum, keep = 0.0, set()
+            for v in np.argsort(-ls, kind="stable"):
+                cum += pex[v] / Z; keep.add(int(v))
+                if cum >= p:
+                    break
+            nuc.append(keep)
+        for seed in range(20):
+            tp = tk.lm_head_sample(hm, torch.from_numpy(Wq).to("mps"), mode="topp", k=32,
+                                   temperature=0.8, seed=seed, format=fmt, top_p=p).cpu().numpy()
+            for t in range(T):
+                assert int(tp[t]) in nuc[t]
 
 
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])

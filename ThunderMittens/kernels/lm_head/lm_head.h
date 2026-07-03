@@ -41,6 +41,7 @@ array lm_head_sample_q(
     int k,
     float temperature,
     uint32_t seed,
+    float top_p = 0.0f,   // mode 3 (topp): nucleus threshold; k = over-selected candidate cap
     StreamOrDevice s = {});
 
 class LmHeadArgcatPartialsQ : public Primitive {
@@ -201,6 +202,32 @@ class LmHeadTopkReduce : public Primitive {
  private:
   int topk_;
   float invtemp_;
+  uint32_t seed_;
+};
+
+// Top-p (nucleus) reduce over the over-selected candidate pool (feeds off LmHeadTopkPartials(Q)).
+class LmHeadToppReduce : public Primitive {
+ public:
+  LmHeadToppReduce(Stream stream, int topk, float p, float invtemp, uint32_t seed)
+      : Primitive(stream), topk_(topk), p_(p), invtemp_(invtemp), seed_(seed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadToppReduce"; }
+  void print(std::ostream& os) override { os << "LmHeadToppReduce"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const LmHeadToppReduce&>(other);
+    return topk_ == o.topk_ && p_ == o.p_ && invtemp_ == o.invtemp_ && seed_ == o.seed_;
+  }
+
+ private:
+  int topk_;
+  float p_, invtemp_;
   uint32_t seed_;
 };
 

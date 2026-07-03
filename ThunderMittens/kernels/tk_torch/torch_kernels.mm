@@ -2052,11 +2052,12 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
 static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
                                        const at::Tensor& bias_in, int64_t V, int64_t K,
                                        const std::string& fmt, int64_t mode, int64_t topk,
-                                       double temperature, int64_t seed) {
+                                       double temperature, int64_t seed, double top_p) {
   TORCH_CHECK(h_in.device().is_mps() && tk_is_float_dtype(h_in),
               "lm_head_sample_q: h must be a float MPS tensor");
   TORCH_CHECK(h_in.dim() == 2 && h_in.size(1) == K, "lm_head_sample_q: h must be (T, K)");
-  TORCH_CHECK(mode >= 0 && mode <= 2, "lm_head_sample_q: mode 0=argmax, 1=categorical, 2=topk");
+  TORCH_CHECK(mode >= 0 && mode <= 3,
+              "lm_head_sample_q: mode 0=argmax, 1=categorical, 2=topk, 3=topp");
   constexpr int TILE_V = 256;
   auto h = h_in.contiguous();
   auto Wq = Wq_in.to(at::kByte).contiguous();
@@ -2069,17 +2070,25 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   auto f32 = h.options().dtype(at::kFloat);
   auto out = at::empty({T}, i32);
   const float invtemp = 1.0f / static_cast<float>(temperature);
-  if (mode == 2) {
+  if (mode == 2 || mode == 3) {
     const int k = static_cast<int>(topk);
-    TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample_q: topk k must be in [1, 64]");
+    TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample_q: k must be in [1, 64]");
+    TORCH_CHECK(mode != 3 || (top_p > 0.0 && top_p <= 1.0),
+                "lm_head_sample_q: topp requires top_p in (0, 1]");
     auto part_val = at::empty({T, num_vtiles, k}, f32);
     auto part_id = at::empty({T, num_vtiles, k}, i32);
     tk_encode([&](TorchEncoder& e) {
       tk::launch_lm_head_topk_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
                                          static_cast<int>(K), TILE_V, num_vtiles, k, use_bias, T,
                                          fmt, tn);
-      tk::launch_lm_head_topk_reduce(e, part_val, part_id, out, num_vtiles, k,
-                                     static_cast<unsigned>(seed), invtemp, T);
+      if (mode == 2) {
+        tk::launch_lm_head_topk_reduce(e, part_val, part_id, out, num_vtiles, k,
+                                       static_cast<unsigned>(seed), invtemp, T);
+      } else {
+        tk::launch_lm_head_topp_reduce(e, part_val, part_id, out, num_vtiles, k,
+                                       static_cast<float>(top_p), static_cast<unsigned>(seed),
+                                       invtemp, T);
+      }
     });
     return out;
   }

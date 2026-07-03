@@ -470,11 +470,11 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
 
 
-def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed):
+def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed, top_p=0.0):
     """Fused LM-head + sampling over quantized (q8_0/q4_0) weights. mode 0=argmax, 1=categorical,
-    2=topk (topk = k). Returns (T,) int32. MPS."""
+    2=topk, 3=topp (nucleus over the top-k candidate pool, top_p in (0,1]). Returns (T,) int32. MPS."""
     return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode), int(topk),
-                                 float(temperature), int(seed))
+                                 float(temperature), int(seed), float(top_p))
 
 
 def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss, softcap=0.0):
