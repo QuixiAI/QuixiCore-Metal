@@ -142,10 +142,21 @@ def rms_norm_bwd_dx(x, weight, dy, rstd):
     return _ext.rms_norm_bwd_dx(x, weight, dy, rstd)
 
 
+def rms_norm_bwd_fused(x, weight, dy, eps):
+    """Fused RMSNorm backward -> (dx, dweight) in one pass (rstd in-kernel + atomic dweight). MPS."""
+    return tuple(_ext.rms_norm_bwd_fused(x, weight, dy, float(eps)))
+
+
 def layernorm_bwd_dx(x, weight, dy, mean, rstd):
     """LayerNorm backward dX kernel (mean/rstd (rows,) precomputed). Use tk.layernorm_backward for
     the full (dx, dweight, dbias). MPS tensors."""
     return _ext.layernorm_bwd_dx(x, weight, dy, mean, rstd)
+
+
+def layernorm_bwd_fused(x, weight, dy, eps):
+    """Fused LayerNorm backward -> (dx, dweight, dbias) in one pass (mean/rstd in-kernel + atomic
+    dweight/dbias). MPS."""
+    return tuple(_ext.layernorm_bwd_fused(x, weight, dy, float(eps)))
 
 
 def rms_norm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):

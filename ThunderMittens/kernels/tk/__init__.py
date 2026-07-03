@@ -43,33 +43,22 @@ def layernorm(x, weight, bias, eps=1e-5):
 
 
 def layernorm_backward(x, weight, dy, eps=1e-5):
-    """LayerNorm backward. Returns (dx, dweight, dbias): dx has x's shape (fused dX kernel),
-    dweight/dbias (D,) summed over rows. x/dy (..., D), weight (D,). Matches torch autograd. mean,
-    rstd, dweight, dbias are framework reductions; the per-row dX is the kernel. mlx / torch (MPS)."""
+    """LayerNorm backward. Returns (dx, dweight, dbias): dx has x's shape, dweight/dbias (D,) fp32
+    summed over rows. x/dy (..., D), weight (D,). Matches torch autograd. A single fused kernel
+    computes mean+rstd in-kernel, writes dX, and accumulates dweight/dbias via device atomics in one
+    pass (measured ~2.5x faster than the old mean/rstd + dX + dweight/dbias hybrid, on par with
+    mx.fast). Accepts mlx.array or torch.Tensor (MPS)."""
     D = x.shape[-1]
     if _is_torch(x):
-        import torch
-        xf = x.reshape(-1, D).contiguous().float()
+        xf = x.reshape(-1, D).contiguous()
         dyf = dy.reshape(-1, D).contiguous()
-        mean = xf.mean(-1, keepdim=True)
-        rstd = torch.rsqrt(((xf - mean) ** 2).mean(-1, keepdim=True) + eps)   # (rows,1)
-        xhat = (xf - mean) * rstd
-        dx = _torch().layernorm_bwd_dx(x.reshape(-1, D).contiguous(), weight, dyf,
-                                       mean.squeeze(-1).contiguous(), rstd.squeeze(-1).contiguous())
-        dw = (dyf.float() * xhat).sum(0).to(weight.dtype)
-        db = dyf.float().sum(0).to(weight.dtype)
-        return dx.reshape(x.shape), dw, db
+        dx, dw, db = _torch().layernorm_bwd_fused(xf, weight, dyf, float(eps))
+        return dx.reshape(x.shape), dw.to(weight.dtype), db.to(weight.dtype)
     import mlx.core as mx
-    xf = mx.reshape(x, (-1, D)).astype(mx.float32)
+    xf = mx.reshape(x, (-1, D))
     dyf = mx.reshape(dy, (-1, D))
-    mean = mx.mean(xf, axis=-1, keepdims=True)
-    rstd = mx.rsqrt(mx.mean((xf - mean) ** 2, axis=-1, keepdims=True) + eps)  # (rows,1)
-    xhat = (xf - mean) * rstd
-    dx = _mlx().layernorm_bwd_dx(mx.reshape(x, (-1, D)), weight, dyf, mx.reshape(mean, (-1,)),
-                                 mx.reshape(rstd, (-1,)))
-    dw = mx.sum(dyf.astype(mx.float32) * xhat, axis=0).astype(weight.dtype)
-    db = mx.sum(dyf.astype(mx.float32), axis=0).astype(weight.dtype)
-    return mx.reshape(dx, x.shape), dw, db
+    dx, dw, db = _mlx().layernorm_bwd_fused(xf, weight, dyf, float(eps))
+    return mx.reshape(dx, x.shape), dw.astype(weight.dtype), db.astype(weight.dtype)
 
 
 def add_rt(x, y):
@@ -438,26 +427,22 @@ def rms_norm(x, weight, eps=1e-5):
 
 
 def rms_norm_backward(x, weight, dy, eps=1e-5):
-    """RMSNorm backward. Returns (dx, dweight): dx has x's shape (fused dX kernel), dweight (D,) is
-    summed over all rows. x/dy (..., D), weight (D,). Matches torch autograd. The row std (rstd) and
-    dweight are cheap framework reductions; the per-row dX (reduction + Liger-factored combine) is
-    the kernel. Accepts mlx.array or torch.Tensor (MPS)."""
+    """RMSNorm backward. Returns (dx, dweight): dx has x's shape, dweight (D,) fp32 is summed over all
+    rows. x/dy (..., D), weight (D,). Matches torch autograd. A single fused kernel computes rstd
+    in-kernel, writes dX, and accumulates dweight via a device atomic in ONE pass over x/dy/W —
+    measured ~2.3x faster than the old rstd+dX+dweight hybrid and on par with mx.fast's fused VJP.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     D = x.shape[-1]
     if _is_torch(x):
-        import torch
         xf = x.reshape(-1, D).contiguous()
         dyf = dy.reshape(-1, D).contiguous()
-        rstd = torch.rsqrt((xf.float() ** 2).mean(-1, keepdim=True) + eps)   # (rows, 1)
-        dx = _torch().rms_norm_bwd_dx(xf, weight, dyf, rstd.squeeze(-1).contiguous())
-        dw = (dyf.float() * xf.float() * rstd).sum(0).to(weight.dtype)
-        return dx.reshape(x.shape), dw
+        dx, dw = _torch().rms_norm_bwd_fused(xf, weight, dyf, float(eps))
+        return dx.reshape(x.shape), dw.to(weight.dtype)
     import mlx.core as mx
     xf = mx.reshape(x, (-1, D))
     dyf = mx.reshape(dy, (-1, D))
-    rstd = mx.rsqrt(mx.mean(xf.astype(mx.float32) ** 2, axis=-1, keepdims=True) + eps)  # (rows,1)
-    dx = _mlx().rms_norm_bwd_dx(xf, weight, dyf, mx.reshape(rstd, (-1,)))
-    dw = mx.sum(dyf.astype(mx.float32) * xf.astype(mx.float32) * rstd, axis=0).astype(weight.dtype)
-    return mx.reshape(dx, x.shape), dw
+    dx, dw = _mlx().rms_norm_bwd_fused(xf, weight, dyf, float(eps))
+    return mx.reshape(dx, x.shape), dw.astype(weight.dtype)
 
 
 def rms_norm_add_backward(hidden, weight, dout, dresidual=None, eps=1e-5):

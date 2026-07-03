@@ -150,6 +150,44 @@ static at::Tensor layernorm_bwd_dx_mps(const at::Tensor& x_in, const at::Tensor&
   return dx;
 }
 
+static std::vector<at::Tensor> layernorm_bwd_fused_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                                       const at::Tensor& dy_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "layernorm_bwd_fused: x must be a float MPS tensor");
+  auto x = x_in.contiguous();
+  auto w = w_in.to(x.scalar_type()).contiguous();
+  auto dy = dy_in.to(x.scalar_type()).contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto dx = at::empty_like(x);
+  auto f32 = x.options().dtype(at::kFloat);
+  auto dweight = at::zeros({D}, f32);                   // atomic accumulators (pre-zeroed)
+  auto dbias = at::zeros({D}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_bwd_fused(e, x, w, dy, dx, dweight, dbias, rows, D,
+                                   static_cast<float>(eps), tk_type_name(x));
+  });
+  return {dx, dweight, dbias};
+}
+
+static std::vector<at::Tensor> rms_norm_bwd_fused_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                                      const at::Tensor& dy_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "rms_norm_bwd_fused: x must be a float MPS tensor");
+  auto x = x_in.contiguous();
+  auto w = w_in.to(x.scalar_type()).contiguous();
+  auto dy = dy_in.to(x.scalar_type()).contiguous();
+  const int D = x.size(-1);
+  const int rows = static_cast<int>(x.numel() / D);
+  auto dx = at::empty_like(x);
+  auto dweight = at::zeros({D}, x.options().dtype(at::kFloat));   // atomic accumulator (pre-zeroed)
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_bwd_fused(e, x, w, dy, dx, dweight, rows, D, static_cast<float>(eps),
+                                  tk_type_name(x));
+  });
+  return {dx, dweight};
+}
+
 static at::Tensor add_rt_mps(const at::Tensor& x_in, const at::Tensor& y_in) {
   TORCH_CHECK(x_in.device().is_mps(), "add_rt: x must be an MPS tensor");
   TORCH_CHECK(x_in.sizes() == y_in.sizes(), "add_rt: x and y must have the same shape");
@@ -2954,11 +2992,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("_set_library", &tk_set_library, "set the metallib path");
   m.def("layernorm", &layernorm_mps, "ThunderMittens LayerNorm (MPS)");
   m.def("layernorm_bwd_dx", &layernorm_bwd_dx_mps, "ThunderMittens LayerNorm backward dX (MPS)");
+  m.def("layernorm_bwd_fused", &layernorm_bwd_fused_mps,
+        "ThunderMittens fused LayerNorm backward -> [dX, dweight, dbias] (MPS)");
   m.def("add_rt", &add_rt_mps, "ThunderMittens add_rt elementwise add (MPS)");
   m.def("matmul_custom", &matmul_custom_mps, "ThunderMittens matmul_custom GEMM (MPS)");
   m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)");
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
   m.def("rms_norm_bwd_dx", &rms_norm_bwd_dx_mps, "ThunderMittens RMSNorm backward dX (MPS)");
+  m.def("rms_norm_bwd_fused", &rms_norm_bwd_fused_mps,
+        "ThunderMittens fused RMSNorm backward -> [dX, dweight] (MPS)");
   m.def("rms_norm_add", &rms_norm_add_mps, "ThunderMittens fused residual-add + RMSNorm (MPS)");
   m.def("layernorm_add", &layernorm_add_mps, "ThunderMittens fused residual-add + LayerNorm (MPS)");
   m.def("rms_norm_add_fp8", &rms_norm_add_fp8_mps, "ThunderMittens fused add+rms_norm static fp8 (MPS)");

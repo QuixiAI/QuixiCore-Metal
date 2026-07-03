@@ -53,6 +53,34 @@ class RMSNormBwdDx : public Primitive {
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 
+/**
+ *  Fully-fused RMSNorm backward: computes rstd in-kernel and returns [dX (rows,D), dweight (D,) fp32]
+ *  in one pass (atomic dweight accumulation). x/dy (rows,D), w (D,). eps folds into rstd.
+ **/
+std::vector<array> rms_norm_bwd_fused(
+    const array& x, const array& weight, const array& dy, float eps, StreamOrDevice s = {});
+
+class RMSNormBwdFused : public Primitive {
+ public:
+  RMSNormBwdFused(Stream stream, float eps) : Primitive(stream), eps_(eps) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "RMSNormBwdFused"; }
+  void print(std::ostream& os) override { os << "RMSNormBwdFused"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return eps_ == static_cast<const RMSNormBwdFused&>(other).eps_;
+  }
+
+ private:
+  float eps_;
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Primitive
 ///////////////////////////////////////////////////////////////////////////////

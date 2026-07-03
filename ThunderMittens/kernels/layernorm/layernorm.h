@@ -58,6 +58,34 @@ class LayerNormBwdDx : public Primitive {
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 
+/**
+ *  Fully-fused LayerNorm backward: computes mean+rstd in-kernel and returns [dX (rows,D),
+ *  dweight (D,) fp32, dbias (D,) fp32] in one pass (atomic dweight/dbias accumulation).
+ **/
+std::vector<array> layernorm_bwd_fused(
+    const array& x, const array& weight, const array& dy, float eps, StreamOrDevice s = {});
+
+class LayerNormBwdFused : public Primitive {
+ public:
+  LayerNormBwdFused(Stream stream, float eps) : Primitive(stream), eps_(eps) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LayerNormBwdFused"; }
+  void print(std::ostream& os) override { os << "LayerNormBwdFused"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return eps_ == static_cast<const LayerNormBwdFused&>(other).eps_;
+  }
+
+ private:
+  float eps_;
+};
+
 class LayerNorm : public Primitive {
  public:
   explicit LayerNorm(Stream stream, float eps)

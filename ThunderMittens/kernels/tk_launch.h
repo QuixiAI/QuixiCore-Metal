@@ -139,6 +139,17 @@ void launch_layernorm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w, typen
   e.bytes(D, 6);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
+// fused LayerNorm backward: mean/rstd in-kernel + dX + atomic dweight & dbias (both (D,) fp32 zeroed).
+template <class E>
+void launch_layernorm_bwd_fused(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t dy,
+                                typename E::out_t dx, typename E::out_t dweight,
+                                typename E::out_t dbias, int rows, int D, float eps,
+                                const std::string& type_name) {
+  e.pipeline("layernorm_bwd_fused_" + type_name);
+  e.in(x, 0); e.in(w, 1); e.in(dy, 2); e.out(dx, 3); e.out(dweight, 4); e.out(dbias, 5);
+  e.bytes(D, 6); e.bytes(eps, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
 
 // ----- add_rt: x@0 y@1 -> out@2 ; rows@3(i32) cols@4(i32) ; flat, one thread per 4 elements
 // (vec4). The original 8x8-register-tile version measured 0.34x of mx add (64 elements per
@@ -214,6 +225,16 @@ void launch_rms_norm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w, typena
   e.pipeline("rms_norm_bwd_dx_" + type_name);
   e.in(x, 0); e.in(w, 1); e.in(dy, 2); e.in(rstd, 3); e.out(dx, 4);
   e.bytes(D, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+// fused RMSNorm backward: rstd in-kernel + dX + atomic dweight (dweight (D,) fp32 zeroed first).
+template <class E>
+void launch_rms_norm_bwd_fused(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t dy,
+                               typename E::out_t dx, typename E::out_t dweight, int rows, int D,
+                               float eps, const std::string& type_name) {
+  e.pipeline("rms_norm_bwd_fused_" + type_name);
+  e.in(x, 0); e.in(w, 1); e.in(dy, 2); e.out(dx, 3); e.out(dweight, 4);
+  e.bytes(D, 5); e.bytes(eps, 6);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 

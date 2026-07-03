@@ -109,12 +109,61 @@ kernel void layernorm_bwd_dx(device const T     *x    [[buffer(0)]],   // (rows,
     }
 }
 
+// Fully-fused LayerNorm backward: one simdgroup per row computes mean+rstd in-kernel, writes dX, and
+// accumulates dweight[j] += dY*x_hat and dbias[j] += dY via device float atomics (both (D,) fp32,
+// zeroed first) — one fused kernel instead of the framework mean/rstd + dX kernel + framework
+// dweight/dbias passes. Wave-7 #1.
+template <typename T>
+kernel void layernorm_bwd_fused(device const T *x    [[buffer(0)]],   // (rows, D)
+                                device const T *w    [[buffer(1)]],   // (D,)
+                                device const T *dy   [[buffer(2)]],   // (rows, D)
+                                device T       *dx   [[buffer(3)]],   // (rows, D)
+                                device metal::atomic_float *dweight [[buffer(4)]],  // (D,) zeroed
+                                device metal::atomic_float *dbias   [[buffer(5)]],  // (D,) zeroed
+                                constant int   &D    [[buffer(6)]],
+                                constant float &eps  [[buffer(7)]],
+                                uint row  [[threadgroup_position_in_grid]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * D;
+    float sx = 0.0f, sxx = 0.0f;                       // mean + variance
+    for (int j = (int)lane; j < D; j += 32) {
+        const float xv = float(x[base + j]);
+        sx += xv; sxx += xv * xv;
+    }
+    sx = metal::simd_sum(sx); sxx = metal::simd_sum(sxx);
+    const float mu = sx / float(D);
+    const float r  = metal::rsqrt(sxx / float(D) - mu * mu + eps);
+    float s1 = 0.0f, s2 = 0.0f;                        // sum g, sum g*x_hat
+    for (int j = (int)lane; j < D; j += 32) {
+        const float g = float(dy[base + j]) * float(w[j]);
+        const float xhat = (float(x[base + j]) - mu) * r;
+        s1 += g; s2 += g * xhat;
+    }
+    s1 = metal::simd_sum(s1) / float(D);
+    s2 = metal::simd_sum(s2) / float(D);
+    for (int j = (int)lane; j < D; j += 32) {
+        const float dyv = float(dy[base + j]);
+        const float g = dyv * float(w[j]);
+        const float xhat = (float(x[base + j]) - mu) * r;
+        dx[base + j] = T(r * (g - s1 - xhat * s2));
+        atomic_add_float(dweight, (long)j, dyv * xhat);   // dweight[j] += dY*x_hat
+        atomic_add_float(dbias,   (long)j, dyv);          // dbias[j]   += dY
+    }
+}
+
 #define instantiate_layernorm_bwd(type_name, T)                                \
   template [[host_name("layernorm_bwd_dx_" #type_name)]] [[kernel]] void         \
   layernorm_bwd_dx<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
     device const T *dy [[buffer(2)]], device const float *mean [[buffer(3)]],   \
     device const float *rstd [[buffer(4)]], device T *dx [[buffer(5)]],         \
     constant int &D [[buffer(6)]],                                             \
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("layernorm_bwd_fused_" #type_name)]] [[kernel]] void      \
+  layernorm_bwd_fused<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
+    device const T *dy [[buffer(2)]], device T *dx [[buffer(3)]],               \
+    device metal::atomic_float *dweight [[buffer(4)]],                          \
+    device metal::atomic_float *dbias [[buffer(5)]], constant int &D [[buffer(6)]], \
+    constant float &eps [[buffer(7)]],                                         \
     uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_layernorm_bwd(float32, float)

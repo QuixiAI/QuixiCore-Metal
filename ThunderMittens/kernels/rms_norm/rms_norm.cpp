@@ -166,6 +166,51 @@ std::pair<std::vector<array>, std::vector<int>> RMSNormBwdDx::vmap(
   throw std::runtime_error("RMSNormBwdDx has no vmap implementation.");
 }
 
+std::vector<array> rms_norm_bwd_fused(
+    const array& x, const array& weight, const array& dy, float eps, StreamOrDevice s /* = {} */) {
+  const Dtype dt = x.dtype();
+  const int D = x.shape(-1);
+  auto x_c = contiguous(x, false, s);
+  auto w_c = contiguous(astype(weight, dt, s), false, s);
+  auto dy_c = contiguous(astype(dy, dt, s), false, s);
+  return array::make_arrays(
+      {x.shape(), {D}}, {dt, float32},
+      std::make_shared<RMSNormBwdFused>(to_stream(s), eps), {x_c, w_c, dy_c});
+}
+
+void RMSNormBwdFused::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("RMSNormBwdFused has no CPU implementation.");
+}
+void RMSNormBwdFused::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& w = inputs[1];
+  auto& dy = inputs[2];
+  auto& dx = outputs[0];
+  auto& dweight = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dx.set_data(allocator::malloc_or_wait(dx.nbytes()));
+  dweight.set_data(allocator::malloc_or_wait(dweight.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_embedding_zero_f32(enc, dweight, D);      // zero the atomic dweight accumulator first
+  tk::launch_rms_norm_bwd_fused(enc, x, w, dy, dx, dweight, rows, D, eps_, type_to_name(x));
+}
+std::vector<array> RMSNormBwdFused::jvp(const std::vector<array>&, const std::vector<array>&,
+                                        const std::vector<int>&) {
+  throw std::runtime_error("RMSNormBwdFused has no jvp implementation.");
+}
+std::vector<array> RMSNormBwdFused::vjp(const std::vector<array>&, const std::vector<array>&,
+                                        const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("RMSNormBwdFused has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> RMSNormBwdFused::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("RMSNormBwdFused has no vmap implementation.");
+}
+
 bool RMSNorm::is_equivalent(const Primitive& other) const {
   const RMSNorm& r_other = static_cast<const RMSNorm&>(other);
   return eps_ == r_other.eps_;

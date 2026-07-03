@@ -89,11 +89,50 @@ kernel void rms_norm_bwd_dx(device const T     *x    [[buffer(0)]],   // (rows, 
     }
 }
 
+// Fully-fused RMSNorm backward: one simdgroup per row computes rstd IN-KERNEL (sum x^2) alongside the
+// dX combine sum (sum dY*W*x) in a single pass, writes dX, and accumulates dweight[j] += dY*x*rstd via
+// a device float atomic (dweight (D,) fp32 zeroed first). Removes the framework rstd + dweight passes
+// (one read of x/dY/W instead of three). Wave-7 #1: measure the dweight-atomic contention vs mx.fast.
+template <typename T>
+kernel void rms_norm_bwd_fused(device const T     *x    [[buffer(0)]],   // (rows, D)
+                               device const T     *w    [[buffer(1)]],   // (D,)
+                               device const T     *dy   [[buffer(2)]],   // (rows, D)
+                               device T           *dx   [[buffer(3)]],   // (rows, D)
+                               device metal::atomic_float *dweight [[buffer(4)]],  // (D,) zeroed
+                               constant int   &D        [[buffer(5)]],
+                               constant float &eps      [[buffer(6)]],
+                               uint row  [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * D;
+    float ssq = 0.0f, s = 0.0f;                       // sum x^2 (for rstd) and sum dY*W*x (for dX)
+    for (int j = (int)lane; j < D; j += 32) {
+        const float xv = float(x[base + j]);
+        ssq += xv * xv;
+        s   += (float(dy[base + j]) * float(w[j])) * xv;
+    }
+    ssq = metal::simd_sum(ssq);
+    s   = metal::simd_sum(s);
+    const float r = metal::rsqrt(ssq / float(D) + eps);
+    const float c = r * r * r * s / float(D);
+    for (int j = (int)lane; j < D; j += 32) {
+        const float xv = float(x[base + j]);
+        const float m  = float(dy[base + j]) * float(w[j]);
+        dx[base + j] = T(r * m - c * xv);
+        atomic_add_float(dweight, (long)j, float(dy[base + j]) * xv * r);   // dweight[j] += dY*x*rstd
+    }
+}
+
 #define instantiate_rms_norm_bwd(type_name, T)                                 \
   template [[host_name("rms_norm_bwd_dx_" #type_name)]] [[kernel]] void         \
   rms_norm_bwd_dx<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
     device const T *dy [[buffer(2)]], device const float *rstd [[buffer(3)]],  \
     device T *dx [[buffer(4)]], constant int &D [[buffer(5)]],                  \
+    uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("rms_norm_bwd_fused_" #type_name)]] [[kernel]] void      \
+  rms_norm_bwd_fused<T>(device const T *x [[buffer(0)]], device const T *w [[buffer(1)]], \
+    device const T *dy [[buffer(2)]], device T *dx [[buffer(3)]],               \
+    device metal::atomic_float *dweight [[buffer(4)]], constant int &D [[buffer(5)]], \
+    constant float &eps [[buffer(6)]],                                         \
     uint row [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_rms_norm_bwd(float32, float)

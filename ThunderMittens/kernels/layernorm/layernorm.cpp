@@ -177,6 +177,54 @@ std::pair<std::vector<array>, std::vector<int>> LayerNormBwdDx::vmap(
   throw std::runtime_error("LayerNormBwdDx has no vmap implementation.");
 }
 
+std::vector<array> layernorm_bwd_fused(
+    const array& x, const array& weight, const array& dy, float eps, StreamOrDevice s /* = {} */) {
+  const Dtype dt = x.dtype();
+  const int D = x.shape(-1);
+  auto x_c = contiguous(x, false, s);
+  auto w_c = contiguous(astype(weight, dt, s), false, s);
+  auto dy_c = contiguous(astype(dy, dt, s), false, s);
+  return array::make_arrays(
+      {x.shape(), {D}, {D}}, {dt, float32, float32},
+      std::make_shared<LayerNormBwdFused>(to_stream(s), eps), {x_c, w_c, dy_c});
+}
+
+void LayerNormBwdFused::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LayerNormBwdFused has no CPU implementation.");
+}
+void LayerNormBwdFused::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& w = inputs[1];
+  auto& dy = inputs[2];
+  auto& dx = outputs[0];
+  auto& dweight = outputs[1];
+  auto& dbias = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dx.set_data(allocator::malloc_or_wait(dx.nbytes()));
+  dweight.set_data(allocator::malloc_or_wait(dweight.nbytes()));
+  dbias.set_data(allocator::malloc_or_wait(dbias.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_embedding_zero_f32(enc, dweight, D);      // zero the atomic accumulators first
+  tk::launch_embedding_zero_f32(enc, dbias, D);
+  tk::launch_layernorm_bwd_fused(enc, x, w, dy, dx, dweight, dbias, rows, D, eps_, type_to_name(x));
+}
+std::vector<array> LayerNormBwdFused::jvp(const std::vector<array>&, const std::vector<array>&,
+                                          const std::vector<int>&) {
+  throw std::runtime_error("LayerNormBwdFused has no jvp implementation.");
+}
+std::vector<array> LayerNormBwdFused::vjp(const std::vector<array>&, const std::vector<array>&,
+                                          const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("LayerNormBwdFused has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> LayerNormBwdFused::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("LayerNormBwdFused has no vmap implementation.");
+}
+
 bool LayerNorm::is_equivalent(const Primitive& other) const {
   const LayerNorm& r_other = static_cast<const LayerNorm&>(other);
   return eps_ == r_other.eps_;

@@ -169,6 +169,19 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "layernorm_bwd_fused",
+      &layernorm_bwd_fused,
+      "x"_a,
+      "weight"_a,
+      "dy"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused LayerNorm backward: returns [dX (rows,D), dweight (D,) fp32, dbias (D,) fp32].
+      )");
+
+    m.def(
       "rms_norm",
       &rms_norm,
       "x"_a,
@@ -191,6 +204,19 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         RMSNorm backward dX: rstd*(dY*W) - (rstd^3 * rowsum(dY*W*x)/D) * x. rstd (rows,) precomputed.
+      )");
+
+    m.def(
+      "rms_norm_bwd_fused",
+      &rms_norm_bwd_fused,
+      "x"_a,
+      "weight"_a,
+      "dy"_a,
+      "eps"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Fused RMSNorm backward: returns [dX (rows,D), dweight (D,) fp32], rstd computed in-kernel.
       )");
 
     m.def(
