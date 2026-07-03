@@ -873,6 +873,16 @@ def apply_token_bitmask(logits, bitmask):
     return _mlx().apply_token_bitmask(logits, bitmask)
 
 
+def apply_bad_words(logits, bad_ids, bad_lens):
+    """Bad / stop-word masking: set logits[t, bad_ids[t,j]] = -inf for each j < bad_lens[t]. logits
+    (T, V); bad_ids (T, maxbad) int (pad unused slots with anything, bad_lens gates them); bad_lens
+    (T,) int. Returns masked logits, same dtype. Composes with the penalty/bitmask chain before a
+    sampler. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().apply_bad_words(logits, bad_ids, bad_lens)
+    return _mlx().apply_bad_words(logits, bad_ids, bad_lens)
+
+
 def embedding_lookup(token_ids, table, pos_table=None, scale=1.0):
     """Token embedding lookup: out[t] = scale*table[token_ids[t]] (+ pos_table[t] if given). A
     negative / out-of-range token id emits zeros (padding). token_ids (num_tok,) int; table

@@ -1080,6 +1080,25 @@ def test_min_p_sample(min_p):
     assert seen <= kept
 
 
+@pytest.mark.parametrize("V", [50, 200])
+def test_apply_bad_words(V):
+    import numpy as np
+    rng = np.random.default_rng(V + 5)
+    T, maxbad = 4, 6
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    bad_lens = rng.integers(0, maxbad + 1, size=T).astype(np.int32)
+    bad_ids = rng.integers(0, V, size=(T, maxbad)).astype(np.int32)
+    out = tk_torch.apply_bad_words(torch.from_numpy(logits).to("mps"),
+                                   torch.from_numpy(bad_ids).to("mps"),
+                                   torch.from_numpy(bad_lens).to("mps")).cpu().numpy()
+    is_bad = np.zeros((T, V), bool)
+    for t in range(T):
+        for j in range(int(bad_lens[t])):
+            is_bad[t, bad_ids[t, j]] = True
+    np.testing.assert_array_equal(out[~is_bad], logits[~is_bad])
+    assert (out[is_bad] < -1e30).all()
+
+
 @pytest.mark.parametrize("V", [40, 70])
 def test_apply_token_bitmask(V):
     import numpy as np

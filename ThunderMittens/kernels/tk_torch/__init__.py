@@ -606,6 +606,12 @@ def apply_token_bitmask(logits: torch.Tensor, bitmask: torch.Tensor):
     return _ext.apply_token_bitmask(logits, bitmask)
 
 
+def apply_bad_words(logits, bad_ids, bad_lens):
+    """Bad / stop-word masking: logits[t, bad_ids[t,j]] = -inf for j < bad_lens[t]. bad_ids
+    (T, maxbad) int, bad_lens (T,) int. Returns masked logits, same dtype. MPS."""
+    return _ext.apply_bad_words(logits, bad_ids, bad_lens)
+
+
 def beam_advance(logits, cum_log_probs, beam_width):
     """Beam-search advance: fused log-softmax + cumulative score + top-beam_width with parent
     tracking. logits (B*BM, V), cum_log_probs (B, BM). Returns (next_token, parent_beam,

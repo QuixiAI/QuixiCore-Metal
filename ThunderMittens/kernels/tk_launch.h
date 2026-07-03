@@ -512,6 +512,15 @@ void launch_apply_token_bitmask(E& e, typename E::in_t logits, typename E::in_t 
   e.bytes(V, 3); e.bytes(num_words, 4);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
+template <class E>
+void launch_apply_bad_words(E& e, typename E::in_t logits, typename E::in_t bad_ids,
+                            typename E::in_t bad_lens, typename E::out_t out, int rows, int V,
+                            int maxbad, const std::string& type_name) {
+  e.pipeline("apply_bad_words_" + type_name);
+  e.in(logits, 0); e.in(bad_ids, 1); e.in(bad_lens, 2); e.out(out, 3);
+  e.bytes(V, 4); e.bytes(maxbad, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
 
 // ----- token embedding + multimodal span merge: one threadgroup per token, threads stride D
 //        (vec4 when D%4==0). Thread count = vec4-groups rounded to a warp, capped at 256. -----

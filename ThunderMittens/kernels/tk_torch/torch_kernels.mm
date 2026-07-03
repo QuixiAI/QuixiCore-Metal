@@ -1783,6 +1783,28 @@ static at::Tensor apply_token_bitmask_mps(const at::Tensor& logits_in, const at:
   return out;
 }
 
+static at::Tensor apply_bad_words_mps(const at::Tensor& logits_in, const at::Tensor& bad_ids_in,
+                                      const at::Tensor& bad_lens_in) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "apply_bad_words: logits must be a float MPS tensor");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  auto bad_ids = bad_ids_in.to(at::kInt).contiguous();
+  auto bad_lens = bad_lens_in.to(at::kInt).contiguous();
+  TORCH_CHECK(bad_ids.dim() == 2 && bad_ids.size(0) == rows,
+              "apply_bad_words: bad_ids must be (num_tokens, maxbad)");
+  TORCH_CHECK(bad_lens.dim() == 1 && bad_lens.size(0) == rows,
+              "apply_bad_words: bad_lens must be (num_tokens,)");
+  const int maxbad = bad_ids.size(1);
+  auto out = at::empty_like(logits);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_apply_bad_words(e, logits, bad_ids, bad_lens, out, rows, V, maxbad,
+                               tk_type_name(logits));
+  });
+  return out;
+}
+
 // Per-tensor (global) dynamic quant via atomic-max. Returns (codes, scale scalar).
 static std::tuple<at::Tensor, at::Tensor> quantize_per_tensor_mps(const at::Tensor& x_in,
                                                                   bool is_int8) {
@@ -2704,6 +2726,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
   m.def("min_p_sample", &min_p_sample_mps, "ThunderMittens min-p sampling (MPS)");
   m.def("apply_token_bitmask", &apply_token_bitmask_mps, "ThunderMittens grammar bitmask masking (MPS)");
+  m.def("apply_bad_words", &apply_bad_words_mps, "ThunderMittens bad/stop-word masking (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,
         "ThunderMittens speculative linear rejection-sampling verification (MPS)");

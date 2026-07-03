@@ -295,6 +295,19 @@ def test_min_p_sample_parity(min_p):
     _assert_parity(om, ot, atol=0)           # token ids: exact (same Gumbel)
 
 
+@pytest.mark.parametrize("V", [50, 200])
+def test_apply_bad_words_parity(V):
+    rng = np.random.default_rng(V + 9)
+    T, maxbad = 3, 6
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    bad_lens = rng.integers(0, maxbad + 1, size=T).astype(np.int32)
+    bad_ids = rng.integers(0, V, size=(T, maxbad)).astype(np.int32)
+    om = tk.apply_bad_words(_mk(logits, "mlx", "f32"), mx.array(bad_ids), mx.array(bad_lens))
+    ot = tk.apply_bad_words(_mk(logits, "torch", "f32"), torch.from_numpy(bad_ids).to("mps"),
+                            torch.from_numpy(bad_lens).to("mps"))
+    _assert_parity(om, ot, atol=0)           # masked logits: bit-identical
+
+
 @pytest.mark.parametrize("V", [40, 200])
 def test_apply_token_bitmask_parity(V):
     rng = np.random.default_rng(V)

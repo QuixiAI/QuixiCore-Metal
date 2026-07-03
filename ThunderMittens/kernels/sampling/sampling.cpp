@@ -505,8 +505,52 @@ void ApplyTokenBitmask::eval_gpu(const std::vector<array>& inputs, std::vector<a
                                  type_to_name(logits));
 }
 
+array apply_bad_words(const array& logits, const array& bad_ids, const array& bad_lens,
+                      StreamOrDevice s /* = {} */) {
+  if (logits.ndim() < 1) {
+    throw std::invalid_argument("apply_bad_words: logits must have at least 1 dimension");
+  }
+  if (!(logits.dtype() == float32 || logits.dtype() == float16 || logits.dtype() == bfloat16)) {
+    throw std::invalid_argument("apply_bad_words: logits must be float32, float16, or bfloat16");
+  }
+  const int V = logits.shape(-1);
+  const int rows = static_cast<int>(logits.size() / V);
+  if (bad_ids.ndim() != 2 || bad_ids.shape(0) != rows) {
+    throw std::invalid_argument("apply_bad_words: bad_ids must be (num_tokens, maxbad)");
+  }
+  if (bad_lens.ndim() != 1 || bad_lens.shape(0) != rows) {
+    throw std::invalid_argument("apply_bad_words: bad_lens must be (num_tokens,)");
+  }
+  auto x = contiguous(logits, false, s);
+  auto ids = contiguous(astype(bad_ids, int32, s), false, s);
+  auto lens = contiguous(astype(bad_lens, int32, s), false, s);
+  return array(logits.shape(), logits.dtype(),
+               std::make_shared<ApplyBadWords>(to_stream(s)), {x, ids, lens});
+}
+
+void ApplyBadWords::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("ApplyBadWords has no CPU implementation.");
+}
+void ApplyBadWords::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& bad_ids = inputs[1];
+  auto& bad_lens = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int V = logits.shape(-1);
+  const int rows = static_cast<int>(logits.size() / V);
+  const int maxbad = bad_ids.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_apply_bad_words(enc, logits, bad_ids, bad_lens, out, rows, V, maxbad,
+                             type_to_name(logits));
+}
+
 TK_BEAM_NO_AUTODIFF(MinPSample, "MinPSample")
 TK_BEAM_NO_AUTODIFF(ApplyTokenBitmask, "ApplyTokenBitmask")
+TK_BEAM_NO_AUTODIFF(ApplyBadWords, "ApplyBadWords")
 
 // ----------------------------- spec_verify_linear -----------------------------
 

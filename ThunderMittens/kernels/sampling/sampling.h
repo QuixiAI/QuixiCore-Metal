@@ -52,6 +52,11 @@ array min_p_sample(
 array apply_token_bitmask(
     const array& logits, const array& bitmask, StreamOrDevice s = {});
 
+/** Bad / stop-word masking: logits[t, bad_ids[t,j]] = -inf for j < bad_lens[t]. logits (T, V);
+ *  bad_ids (T, maxbad) int; bad_lens (T,) int. Returns masked logits (T, V), same dtype. */
+array apply_bad_words(
+    const array& logits, const array& bad_ids, const array& bad_lens, StreamOrDevice s = {});
+
 /**
  *  Apply temperature + repetition/presence/frequency penalties to logits given the
  *  generated token history. logits (T, V); prev_tokens (T, L) int (out-of-range entries,
@@ -201,6 +206,23 @@ class ApplyTokenBitmask : public Primitive {
       const std::vector<array>&, const std::vector<int>&) override;
   const char* name() const { return "ApplyTokenBitmask"; }
   void print(std::ostream& os) override { os << "ApplyTokenBitmask"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class ApplyBadWords : public Primitive {
+ public:
+  explicit ApplyBadWords(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "ApplyBadWords"; }
+  void print(std::ostream& os) override { os << "ApplyBadWords"; }
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 

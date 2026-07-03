@@ -527,6 +527,19 @@ NB_MODULE(_ext, m) {
         (bitmask (T, ceil(V/32)) uint32) for token v is 0. Returns masked logits, same dtype.
       )");
 
+  m.def(
+      "apply_bad_words",
+      &apply_bad_words,
+      "logits"_a,
+      "bad_ids"_a,
+      "bad_lens"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Bad / stop-word masking: logits[t, bad_ids[t,j]] = -inf for j < bad_lens[t]. Returns masked
+        logits, same dtype. bad_ids (T, maxbad) int, bad_lens (T,) int.
+      )");
+
     m.def(
       "beam_advance",
       &beam_advance,

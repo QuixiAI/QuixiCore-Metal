@@ -271,6 +271,28 @@ kernel void apply_token_bitmask(device const T    *logits    [[buffer(0)]],   //
     }
 }
 
+// Bad / stop-word masking: out = logits, then out[t, bad_ids[t,j]] = -inf for each j < bad_lens[t].
+// One simdgroup per row: copy the row, simdgroup-barrier, then scatter -inf at the row's bad ids
+// (the barrier orders the copy before the scatter so a bad id isn't overwritten by a late copy).
+template <typename T>
+kernel void apply_bad_words(device const T   *logits   [[buffer(0)]],   // (num_tokens, V)
+                            device const int *bad_ids  [[buffer(1)]],   // (num_tokens, maxbad)
+                            device const int *bad_lens [[buffer(2)]],   // (num_tokens,)
+                            device T         *out      [[buffer(3)]],
+                            constant int     &V        [[buffer(4)]],
+                            constant int     &maxbad   [[buffer(5)]],
+                            uint row  [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    const long lbase = (long)row * V;
+    for (int v = (int)lane; v < V; v += 32) { out[lbase + v] = logits[lbase + v]; }
+    metal::simdgroup_barrier(metal::mem_flags::mem_device);
+    const int nb = bad_lens[row];
+    for (int j = (int)lane; j < nb; j += 32) {
+        const int bid = bad_ids[(long)row * maxbad + j];
+        if (bid >= 0 && bid < V) { out[lbase + bid] = T(SMP_NEG_INF); }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Beam-search advance (two stages, the TRT-LLM / FasterTransformer recipe):
 //   beam_topk_partials : grid (B*BM,), one simdgroup per beam row. Computes the row's
@@ -499,7 +521,16 @@ kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  
                          constant int &V [[buffer(3)]],                       \
                          constant int &num_words [[buffer(4)]],               \
                          uint row [[threadgroup_position_in_grid]],           \
-                         uint lane [[thread_index_in_simdgroup]]);
+                         uint lane [[thread_index_in_simdgroup]]);            \
+  template [[host_name("apply_bad_words_" #type_name)]] [[kernel]] void        \
+  apply_bad_words<T>(device const T *logits [[buffer(0)]],                    \
+                     device const int *bad_ids [[buffer(1)]],                 \
+                     device const int *bad_lens [[buffer(2)]],                \
+                     device T *out [[buffer(3)]],                             \
+                     constant int &V [[buffer(4)]],                           \
+                     constant int &maxbad [[buffer(5)]],                      \
+                     uint row [[threadgroup_position_in_grid]],               \
+                     uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_sampling(float32, float)
 instantiate_sampling(float16, half)

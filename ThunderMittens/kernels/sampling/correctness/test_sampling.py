@@ -12,7 +12,7 @@ import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
-                spec_verify_linear, min_p_sample, apply_token_bitmask)
+                spec_verify_linear, min_p_sample, apply_token_bitmask, apply_bad_words)
 
 
 def _pack_bitmask(allow):
@@ -127,6 +127,22 @@ def test_apply_token_bitmask(V):
     out = np.array(apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow))))
     np.testing.assert_array_equal(out[allow], logits[allow])   # allowed logits untouched
     assert (out[~allow] < -1e30).all()                         # masked -> -inf sentinel
+
+
+@pytest.mark.parametrize("V", [50, 200])
+def test_apply_bad_words(V):
+    rng = np.random.default_rng(V + 5)
+    T, maxbad = 4, 6
+    logits = rng.standard_normal((T, V)).astype(np.float32)
+    bad_lens = rng.integers(0, maxbad + 1, size=T).astype(np.int32)
+    bad_ids = rng.integers(0, V, size=(T, maxbad)).astype(np.int32)
+    out = np.array(apply_bad_words(mx.array(logits), mx.array(bad_ids), mx.array(bad_lens)))
+    is_bad = np.zeros((T, V), bool)
+    for t in range(T):
+        for j in range(int(bad_lens[t])):
+            is_bad[t, bad_ids[t, j]] = True
+    np.testing.assert_array_equal(out[~is_bad], logits[~is_bad])   # non-bad untouched
+    assert (out[is_bad] < -1e30).all()                            # bad -> -inf sentinel
 
 
 def test_apply_token_bitmask_then_sample():
