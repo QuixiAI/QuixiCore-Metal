@@ -156,6 +156,41 @@ array beam_build_copy_pairs(
       {pb_c, bt_c, sl_c});
 }
 
+array beam_remap_block_table(
+    const array& block_table,
+    const array& parent_beam,
+    StreamOrDevice s) {
+  if (parent_beam.ndim() != 2 || block_table.ndim() != 2) {
+    throw std::invalid_argument("beam_remap_block_table: parent_beam (B,BM), block_table (B*BM,mb)");
+  }
+  const int B = parent_beam.shape(0), BM = parent_beam.shape(1);
+  const int nrows = block_table.shape(0), max_blocks = block_table.shape(1);
+  if (nrows != B * BM) {
+    throw std::invalid_argument("beam_remap_block_table: block_table rows must be B*BM");
+  }
+  auto bt_c = contiguous(astype(block_table, int32, s), false, s);
+  auto pb_c = contiguous(astype(parent_beam, int32, s), false, s);
+  return array({nrows, max_blocks}, int32,
+               std::make_shared<BeamRemapBlockTable>(to_stream(s)), {bt_c, pb_c});
+}
+
+void BeamRemapBlockTable::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BeamRemapBlockTable has no CPU implementation.");
+}
+void BeamRemapBlockTable::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& block_table = inputs[0];
+  auto& parent_beam = inputs[1];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int BM = parent_beam.shape(1);
+  const int nrows = block_table.shape(0), max_blocks = block_table.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_beam_remap_block_table(enc, block_table, parent_beam, out, nrows, BM, max_blocks);
+}
+
 std::vector<array> kv_cache_scales(
     const array& key,
     const array& value,
@@ -861,6 +896,7 @@ TK_KV_NO_AUTODIFF(PagedAttentionFp8, "PagedAttentionFp8")
 TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
 TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
 TK_KV_NO_AUTODIFF(BeamBuildCopyPairs, "BeamBuildCopyPairs")
+TK_KV_NO_AUTODIFF(BeamRemapBlockTable, "BeamRemapBlockTable")
 TK_KV_NO_AUTODIFF(KvCacheScales, "KvCacheScales")
 TK_KV_NO_AUTODIFF(PagedAttention, "PagedAttention")
 TK_KV_NO_AUTODIFF(PagedAttentionStaged, "PagedAttentionStaged")

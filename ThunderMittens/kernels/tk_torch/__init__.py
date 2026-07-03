@@ -366,6 +366,11 @@ def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
     return _ext.beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
 
 
+def beam_remap_block_table(block_table, parent_beam):
+    """Zero-copy beam reorder: new_block_table[b*BM+k] = block_table[b*BM+parent_beam[b,k]]. MPS."""
+    return _ext.beam_remap_block_table(block_table, parent_beam)
+
+
 def kv_cache_scales(key: torch.Tensor, value: torch.Tensor):
     """Return fp8 KV-cache scales `(key_scale, value_scale)` as absmax / 240. MPS tensors."""
     return _ext.kv_cache_scales(key, value)

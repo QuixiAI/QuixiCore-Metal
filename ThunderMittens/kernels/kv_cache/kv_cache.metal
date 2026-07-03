@@ -190,6 +190,27 @@ kernel void beam_build_copy_pairs(device const int  *parent_beam [[buffer(0)]], 
     pairs[2 * (long)gid + 1] = dst;
 }
 
+// Zero-copy beam KV reorder: emit a new block table where each child beam's rows point at its PARENT
+// beam's physical blocks (no KV copy) — new_block_table[b*BM+k] = block_table[b*BM+parent_beam[b,k]].
+// Caveat: children then SHARE physical blocks with the parent, so the cache manager must refcount /
+// copy-on-write a block before any beam mutates it (out of scope here). One threadgroup per beam row.
+kernel void beam_remap_block_table(device const int *block_table     [[buffer(0)]],  // (B*BM, max_blocks)
+                                   device const int *parent_beam     [[buffer(1)]],  // (B, BM)
+                                   device int       *new_block_table [[buffer(2)]],  // (B*BM, max_blocks)
+                                   constant int &BM         [[buffer(3)]],
+                                   constant int &max_blocks [[buffer(4)]],
+                                   uint  row      [[threadgroup_position_in_grid]],
+                                   uint  lid      [[thread_position_in_threadgroup]],
+                                   uint  nthreads [[threads_per_threadgroup]]) {
+    const int b = (int)row / BM;
+    const int parent = parent_beam[row];               // per-batch-local parent index in [0, BM)
+    const long dst = (long)row * max_blocks;
+    const long src = (long)(b * BM + parent) * max_blocks;
+    for (int c = (int)lid; c < max_blocks; c += (int)nthreads) {
+        new_block_table[dst + c] = block_table[src + c];
+    }
+}
+
 template <typename T>
 kernel void kv_cache_scales(device const T *key [[buffer(0)]],
                             device const T *value [[buffer(1)]],

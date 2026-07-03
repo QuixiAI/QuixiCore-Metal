@@ -7,6 +7,8 @@ import numpy as np
 import pytest
 
 from tk import (
+    beam_remap_block_table,
+    beam_reorder_kv,
     kv_cache_copy_blocks,
     kv_cache_gather,
     kv_cache_scales,
@@ -659,3 +661,36 @@ def test_fp8_kv_roundtrip_e5m2(D, H, H_KV):
     q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
     ref = _paged_ref_gqa(q_bf, kc_deq, vc_deq, block_table, context_lens, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-3)
+
+
+@pytest.mark.parametrize("BM", [4, 8])
+def test_beam_remap_block_table(BM):
+    # zero-copy remap vs (a) the numpy row-gather and (b) the copy-path (beam_reorder_kv) on read.
+    rng = np.random.default_rng(BM)
+    B, H_KV, D, ctx = 2, 8, 128, 512
+    block_size = 16
+    max_blocks = ctx // block_size
+    nbeams = B * BM
+    num_blocks = nbeams * max_blocks
+    kc = (0.1 * rng.standard_normal((num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+    parent = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    seq = np.full(nbeams, ctx, np.int32)
+    new_bt = np.array(beam_remap_block_table(mx.array(bt), mx.array(parent)))
+    # (a) direct row gather
+    ref = np.zeros_like(bt)
+    for b in range(B):
+        for k in range(BM):
+            ref[b * BM + k] = bt[b * BM + int(parent[b, k])]
+    np.testing.assert_array_equal(new_bt, ref)
+    # (b) reading a child's blocks from the ORIGINAL cache via new_bt == reading from the
+    # beam_reorder_kv'd cache via the original bt (both yield the parent's KV history).
+    kc2, _ = beam_reorder_kv(mx.array(kc).astype(mx.bfloat16), mx.array(kc).astype(mx.bfloat16),
+                             mx.array(bt), mx.array(parent), mx.array(seq))
+    kc2 = np.array(kc2.astype(mx.float32))
+    kc_bf = np.array(mx.array(kc).astype(mx.bfloat16).astype(mx.float32))
+    for row in range(nbeams):
+        for c in range(max_blocks):
+            b_read = kc_bf[new_bt[row, c]]          # original cache via remapped table
+            a_read = kc2[bt[row, c]]                # reordered cache via original table
+            np.testing.assert_allclose(a_read, b_read, atol=1e-2)

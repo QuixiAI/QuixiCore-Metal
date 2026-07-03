@@ -702,6 +702,22 @@ static at::Tensor beam_build_copy_pairs_mps(
   return pairs;
 }
 
+static at::Tensor beam_remap_block_table_mps(const at::Tensor& block_table_in,
+                                             const at::Tensor& parent_beam_in) {
+  TORCH_CHECK(block_table_in.device().is_mps() && parent_beam_in.device().is_mps(),
+              "beam_remap_block_table: inputs must be MPS tensors");
+  TORCH_CHECK(parent_beam_in.dim() == 2 && block_table_in.dim() == 2,
+              "beam_remap_block_table: parent_beam (B,BM), block_table (B*BM,max_blocks)");
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  auto parent_beam = parent_beam_in.to(at::kInt).contiguous();
+  const int BM = parent_beam.size(1), nrows = block_table.size(0), max_blocks = block_table.size(1);
+  auto out = at::empty({nrows, max_blocks}, block_table.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_beam_remap_block_table(e, block_table, parent_beam, out, nrows, BM, max_blocks);
+  });
+  return out;
+}
+
 static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
     const at::Tensor& key_in, const at::Tensor& value_in) {
   TORCH_CHECK(key_in.device().is_mps(), "kv_cache_scales: key must be MPS");
@@ -2792,6 +2808,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("kv_cache_gather", &kv_cache_gather_mps, "ThunderMittens KV cache gather (MPS)");
   m.def("kv_cache_copy_blocks", &kv_cache_copy_blocks_mps, "ThunderMittens KV cache block copy (MPS)");
   m.def("beam_build_copy_pairs", &beam_build_copy_pairs_mps, "ThunderMittens beam KV reorder copy-pair builder (MPS)");
+  m.def("beam_remap_block_table", &beam_remap_block_table_mps, "ThunderMittens zero-copy beam block-table remap (MPS)");
   m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
   m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
   m.def("paged_attention_alibi", &paged_attention_alibi_mps, "ThunderMittens paged decode with ALiBi (MPS)");

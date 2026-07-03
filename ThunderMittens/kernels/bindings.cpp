@@ -904,6 +904,17 @@ NB_MODULE(_ext, m) {
         Returns a fixed (B*BM*max_blocks, 2) int64 buffer for kv_cache_copy_blocks.
       )");
 
+  m.def(
+      "beam_remap_block_table",
+      &beam_remap_block_table,
+      "block_table"_a,
+      "parent_beam"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Zero-copy beam reorder: new_block_table[b*BM+k] = block_table[b*BM+parent_beam[b,k]].
+      )");
+
     m.def(
       "kv_cache_scales",
       &kv_cache_scales,

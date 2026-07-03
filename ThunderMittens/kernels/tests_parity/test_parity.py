@@ -290,6 +290,19 @@ def test_embedding_backward_parity():
     _assert_parity(om, ot, atol=1e-5)   # atomic add order differs -> not bit-exact
 
 
+@pytest.mark.parametrize("BM", [4, 8])
+def test_beam_remap_block_table_parity(BM):
+    rng = np.random.default_rng(BM + 3)
+    B, ctx, block_size = 2, 512, 16
+    max_blocks = ctx // block_size
+    nbeams = B * BM
+    bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+    parent = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    om = tk.beam_remap_block_table(mx.array(bt), mx.array(parent))
+    ot = tk.beam_remap_block_table(torch.from_numpy(bt).to("mps"), torch.from_numpy(parent).to("mps"))
+    _assert_parity(om, ot, atol=0)
+
+
 def test_build_multimodal_src_parity():
     so = np.array([5, 15, 30], np.int32)
     sl = np.array([4, 6, 5], np.int32)

@@ -1129,6 +1129,17 @@ void launch_beam_build_copy_pairs(E& e, typename E::in_t parent_beam, typename E
   constexpr int threads = 256;
   e.dispatch((n_slots + threads - 1) / threads, 1, 1, threads, 1, 1);
 }
+// beam_remap_block_table: one threadgroup per beam row, threads copy the block columns (row gather).
+template <class E>
+void launch_beam_remap_block_table(E& e, typename E::in_t block_table, typename E::in_t parent_beam,
+                                   typename E::out_t new_block_table, int nrows, int BM,
+                                   int max_blocks) {
+  e.pipeline("beam_remap_block_table");
+  e.in(block_table, 0); e.in(parent_beam, 1); e.out(new_block_table, 2);
+  e.bytes(BM, 3); e.bytes(max_blocks, 4);
+  int threads = max_blocks < 32 ? 32 : (max_blocks > 256 ? 256 : max_blocks);
+  e.dispatch(nrows, 1, 1, threads, 1, 1);
+}
 
 // ----- KV cache scales: key@0 value@1 -> key_scale@2 value_scale@3 ; n@4.
 // Single threadgroup scans the arrays and emits absmax / 240, matching vLLM's fp8 scale convention. -----

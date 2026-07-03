@@ -1149,6 +1149,17 @@ def beam_build_copy_pairs(parent_beam, block_table, seq_lens, block_size):
     return _mlx().beam_build_copy_pairs(parent_beam, block_table, seq_lens, int(block_size))
 
 
+def beam_remap_block_table(block_table, parent_beam):
+    """Zero-copy beam KV reorder: return a new block table (B*BM, max_blocks) where each child beam's
+    rows point at its parent beam's PHYSICAL blocks (new[b*BM+k] = block_table[b*BM+parent_beam[b,k]])
+    — no KV copy (the alternative to beam_reorder_kv). Children SHARE physical blocks, so the cache
+    manager must refcount / copy-on-write a block before a beam mutates it (out of scope). block_table
+    (B*BM, max_blocks) int, parent_beam (B, BM) int. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(block_table):
+        return _torch().beam_remap_block_table(block_table, parent_beam)
+    return _mlx().beam_remap_block_table(block_table, parent_beam)
+
+
 def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, accept_u, seed):
     """Speculative decoding: linear (non-tree) rejection-sampling verification (vLLM contract).
     draft_tokens (B,S) int; draft_probs (B,S,V) f32; target_probs (B,S+1,V) f32; bonus_tokens (B,)

@@ -42,6 +42,15 @@ array beam_build_copy_pairs(
     int block_size,
     StreamOrDevice s = {});
 
+/** Zero-copy beam KV reorder: returns a new block table (B*BM, max_blocks) int32 where each child
+ *  beam's rows point at its parent beam's physical blocks (new[b*BM+k] = block_table[b*BM+
+ *  parent_beam[b,k]]) — no KV copy. Children share physical blocks: the cache manager must
+ *  refcount / copy-on-write before a beam mutates a block (out of scope). */
+array beam_remap_block_table(
+    const array& block_table,
+    const array& parent_beam,
+    StreamOrDevice s = {});
+
 std::vector<array> kv_cache_scales(
     const array& key,
     const array& value,
@@ -216,6 +225,22 @@ class KvCacheCopyBlocks : public Primitive {
   const char* name() const { return "KvCacheCopyBlocks"; }
 
   void print(std::ostream& os) override { os << "KvCacheCopyBlocks"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class BeamRemapBlockTable : public Primitive {
+ public:
+  explicit BeamRemapBlockTable(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "BeamRemapBlockTable"; }
+  void print(std::ostream& os) override { os << "BeamRemapBlockTable"; }
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 

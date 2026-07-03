@@ -986,6 +986,23 @@ def test_cross_entropy(dtype, tol):
     assert np.abs(g.float().cpu().numpy() - lt.grad.numpy()).max() < tol
 
 
+def test_beam_remap_block_table():
+    import numpy as np
+    rng = np.random.default_rng(4)
+    B, BM, ctx, block_size = 2, 4, 512, 16
+    max_blocks = ctx // block_size
+    nbeams = B * BM
+    bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+    parent = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+    new_bt = tk_torch.beam_remap_block_table(torch.from_numpy(bt).to("mps"),
+                                             torch.from_numpy(parent).to("mps")).cpu().numpy()
+    ref = np.zeros_like(bt)
+    for b in range(B):
+        for k in range(BM):
+            ref[b * BM + k] = bt[b * BM + int(parent[b, k])]
+    np.testing.assert_array_equal(new_bt, ref)
+
+
 def test_beam_reorder_kv():
     import numpy as np
     import tk
