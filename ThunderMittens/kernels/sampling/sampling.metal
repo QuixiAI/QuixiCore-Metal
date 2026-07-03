@@ -365,6 +365,23 @@ kernel void apply_bad_words(device const T   *logits   [[buffer(0)]],   // (num_
 //     BM*2BM candidates -> next_token, parent_beam, new cum_log_probs. Keeping 2BM per
 //     beam guarantees the union contains the flat top-BM over (BM*V). BM <= 16 (2BM <= 32).
 // ---------------------------------------------------------------------------
+
+// emit functor for the Family-B masked_topk_local merge: writes each winner as a beam candidate
+// (token id + cumulative logprob cum + (logit - lse)) on lane 0.
+struct beam_part_emit {
+    device float *cand_score;
+    device int   *cand_token;
+    long obase;                 // row * two_bm
+    float cumr, lse;
+    uint lane;
+    METAL_FUNC void operator()(int kk, float gv, int gi) {
+        if (lane == 0) {
+            cand_token[obase + kk] = gi;
+            cand_score[obase + kk] = cumr + (gv - lse);
+        }
+    }
+};
+
 template <typename T>
 kernel void beam_topk_partials(device const T   *logits        [[buffer(0)]],  // (B*BM, V)
                                device const float *cum_log_probs [[buffer(1)]], // (B*BM,)
@@ -402,24 +419,11 @@ kernel void beam_topk_partials(device const T   *logits        [[buffer(0)]],  /
     const float lse = M + log(l);
     const float cumr = cum_log_probs[row];
 
+    // extract the global top-2BM from the per-lane sets (Family-B merge helper); each round's winner
+    // becomes a beam candidate with score cum_log_prob + (logit - lse) = the child's cumulative logprob.
     bool taken[SAMPLE_MAX_K];
-    for (int k = 0; k < two_bm; ++k) taken[k] = false;
-    for (int r = 0; r < two_bm; ++r) {
-        float bv = SMP_NEG_INF;
-        int   bi = -1, bl = -1;
-        for (int k = 0; k < two_bm; ++k) {
-            if (taken[k]) continue;
-            if (lv[k] > bv || (lv[k] == bv && li[k] < bi)) { bv = lv[k]; bi = li[k]; bl = k; }
-        }
-        float gv = bv;
-        int   gi = (bi < 0) ? 0x7fffffff : bi;
-        simd_argmax(gv, gi);                  // global winner of this round (all lanes agree)
-        if (bl >= 0 && bi == gi) taken[bl] = true;   // owner removes it from its set
-        if (lane == 0) {
-            cand_token[(long)row * two_bm + r] = gi;
-            cand_score[(long)row * two_bm + r] = cumr + (gv - lse);
-        }
-    }
+    beam_part_emit emit{cand_score, cand_token, (long)row * two_bm, cumr, lse, lane};
+    masked_topk_local(lv, li, taken, two_bm, two_bm, SMP_NEG_INF, emit);
 }
 
 kernel void beam_select(device const float *cand_score   [[buffer(0)]],  // (B*BM, 2BM)

@@ -52,6 +52,38 @@ static METAL_FUNC void masked_topk(thread FN &cand, int n, int K, uint lane, flo
     }
 }
 
+/**
+ * @brief K rounds of masked cross-lane argmax over a per-lane LOCAL candidate set (the "Family-B"
+ * idiom). Each lane already holds its own `nloc` (value,id) slots — its strided top-K over the input;
+ * the global top-K is contained in the union of the per-lane sets, so K rounds of {local masked max
+ * (ties -> smaller id) -> simd_argmax -> the winning lane clears that slot} extract it in order.
+ * `emit(kk, gbest, gid)` is called by every lane for round kk's winner (guard `lane == 0` inside the
+ * functor if the write must be single-threaded); the caller supplies the sentinel and decides how a
+ * `gbest == neg_inf` (empty) round is written. `used` is per-lane scratch (>= nloc); the helper
+ * initialises it. Mirrors `masked_topk` above but for a pre-built local set rather than a scan functor.
+ */
+template <typename EMIT>
+static METAL_FUNC void masked_topk_local(thread float *mine_val, thread int *mine_id,
+                                         thread bool *used, int nloc, int K, float neg_inf,
+                                         thread EMIT &emit) {
+    for (int j = 0; j < nloc; ++j) { used[j] = false; }
+    for (int kk = 0; kk < K; ++kk) {
+        float best = neg_inf;
+        int   bi = -1, bl = -1;
+        for (int j = 0; j < nloc; ++j) {
+            if (used[j]) { continue; }
+            if (mine_val[j] > best || (mine_val[j] == best && mine_id[j] < bi)) {
+                best = mine_val[j]; bi = mine_id[j]; bl = j;
+            }
+        }
+        float gbest = best;
+        int   gid   = (bi < 0) ? 0x7fffffff : bi;
+        simd_argmax(gbest, gid);
+        if (bl >= 0 && bi == gid) { used[bl] = true; }   // owner of the winner clears its slot
+        emit(kk, gbest, gid);
+    }
+}
+
 /** Candidate accessor: id == scan index, value = float(arr[base + idx]), always valid.
  *  Used by top-k sampling and MoE routing (dense per-row logit scan). */
 template <typename T>

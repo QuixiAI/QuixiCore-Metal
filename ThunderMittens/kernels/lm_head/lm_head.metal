@@ -24,6 +24,22 @@ using namespace mittens;
 constant float LMH_NEG_INF = -3.4028234663852886e38f;
 constant int LMH_MAX_K = 64;
 
+// emit functor for the Family-B masked_topk_local merge in the top-k/top-p partials kernels: writes
+// each round's winner into the per-tile (part_val, part_id) partials on lane 0 (-1 id for an empty
+// round). Shared by lm_head_topk_partials / lm_head_topk_partials_q / lm_head_topp_partials_q.
+struct lmh_part_emit {
+    device float *part_val;
+    device int   *part_id;
+    long pbase;
+    uint lane;
+    METAL_FUNC void operator()(int kk, float gbest, int gid) {
+        if (lane == 0) {
+            part_val[pbase + kk] = gbest;
+            part_id[pbase + kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
+        }
+    }
+};
+
 // ---- argmax / categorical ----
 // Grid (num_vtiles, num_tok), one simdgroup per (vocab tile, token) — max parallelism (the GEMV is
 // compute-bound here, so parallelism beats W-reuse). Each lane owns the tile's vocab rows
@@ -199,29 +215,11 @@ kernel void lm_head_topk_partials(device const T     *h          [[buffer(0)]],
         if (use_bias) ls += bias[v];
         mine_val[nmine] = ls;
         mine_id[nmine]  = v;
-        used[nmine]     = false;
         ++nmine;
     }
     const long pbase = ((long)t * num_vtiles + vtile) * topk;
-    for (int kk = 0; kk < topk; ++kk) {
-        float best = LMH_NEG_INF;
-        int   bi   = -1;
-        int   bl   = -1;
-        for (int j = 0; j < nmine; ++j) {
-            if (used[j]) continue;
-            if (mine_val[j] > best || (mine_val[j] == best && mine_id[j] < bi)) {
-                best = mine_val[j]; bi = mine_id[j]; bl = j;
-            }
-        }
-        float gbest = best;
-        int   gid   = (bi < 0) ? 0x7fffffff : bi;
-        simd_argmax(gbest, gid);
-        if (bl >= 0 && bi == gid) used[bl] = true;   // owner of the winner marks it used
-        if (lane == 0) {
-            part_val[pbase + kk] = gbest;
-            part_id[pbase + kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
-        }
-    }
+    lmh_part_emit emit{part_val, part_id, pbase, lane};   // Family-B merge -> per-tile top-k partials
+    masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF, emit);
 }
 
 kernel void lm_head_topk_reduce(device const float *part_val   [[buffer(0)]],   // (num_tok, num_vtiles, K)
@@ -356,29 +354,11 @@ kernel void lm_head_topk_partials_q(device const T     *h          [[buffer(0)]]
         if (use_bias) ls += bias[v];
         mine_val[nmine] = ls;
         mine_id[nmine]  = v;
-        used[nmine]     = false;
         ++nmine;
     }
     const long pbase = ((long)t * num_vtiles + vtile) * topk;
-    for (int kk = 0; kk < topk; ++kk) {
-        float best = LMH_NEG_INF;
-        int   bi   = -1;
-        int   bl   = -1;
-        for (int j = 0; j < nmine; ++j) {
-            if (used[j]) continue;
-            if (mine_val[j] > best || (mine_val[j] == best && mine_id[j] < bi)) {
-                best = mine_val[j]; bi = mine_id[j]; bl = j;
-            }
-        }
-        float gbest = best;
-        int   gid   = (bi < 0) ? 0x7fffffff : bi;
-        simd_argmax(gbest, gid);
-        if (bl >= 0 && bi == gid) used[bl] = true;
-        if (lane == 0) {
-            part_val[pbase + kk] = gbest;
-            part_id[pbase + kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
-        }
-    }
+    lmh_part_emit emit{part_val, part_id, pbase, lane};   // Family-B merge -> per-tile top-k partials
+    masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF, emit);
 }
 
 #define instantiate_lm_head_topk_q(hn, FMT, T)                                     \
@@ -450,7 +430,6 @@ kernel void lm_head_topp_partials_q(device const T     *h          [[buffer(0)]]
         else           { lsum += exp(tl - lmax); }
         mine_val[nmine] = ls;
         mine_id[nmine]  = v;
-        used[nmine]     = false;
         ++nmine;
     }
     // per-tile lse = logsumexp over all lanes' tempered logits
@@ -460,25 +439,8 @@ kernel void lm_head_topp_partials_q(device const T     *h          [[buffer(0)]]
         part_lse[(long)t * num_vtiles + vtile] = (gsum > 0.0f) ? (gmax + log(gsum)) : LMH_NEG_INF;
     }
     const long pbase = ((long)t * num_vtiles + vtile) * topk;
-    for (int kk = 0; kk < topk; ++kk) {
-        float best = LMH_NEG_INF;
-        int   bi   = -1;
-        int   bl   = -1;
-        for (int j = 0; j < nmine; ++j) {
-            if (used[j]) continue;
-            if (mine_val[j] > best || (mine_val[j] == best && mine_id[j] < bi)) {
-                best = mine_val[j]; bi = mine_id[j]; bl = j;
-            }
-        }
-        float gbest = best;
-        int   gid   = (bi < 0) ? 0x7fffffff : bi;
-        simd_argmax(gbest, gid);
-        if (bl >= 0 && bi == gid) used[bl] = true;
-        if (lane == 0) {
-            part_val[pbase + kk] = gbest;
-            part_id[pbase + kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
-        }
-    }
+    lmh_part_emit emit{part_val, part_id, pbase, lane};   // Family-B merge -> per-tile top-k partials
+    masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF, emit);
 }
 
 #define instantiate_lm_head_topp_q(hn, FMT, T)                                     \
