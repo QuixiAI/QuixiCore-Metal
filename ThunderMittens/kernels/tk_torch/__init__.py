@@ -32,6 +32,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
+    os.path.join(_KERNELS, "embedding", "embedding.metal"),
     os.path.join(_KERNELS, "glu", "glu.metal"),
     os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
     os.path.join(_KERNELS, "kv_cache", "kv_cache.metal"),
@@ -539,6 +540,17 @@ def top_p_sample(logits: torch.Tensor, p: float, temperature: float = 1.0, seed:
 def min_p_sample(logits: torch.Tensor, min_p: float, temperature: float = 1.0, seed: int = 0):
     """min-p sampling: Gumbel-max over tokens with prob >= min_p * max_prob. int32. MPS."""
     return _ext.min_p_sample(logits, float(min_p), float(temperature), int(seed))
+
+
+def embedding_lookup(token_ids, table, pos_table=None, scale: float = 1.0):
+    """Token embedding lookup: out[t] = scale*table[token_ids[t]] (+ pos_table[t] if given). MPS."""
+    pt = pos_table if pos_table is not None else torch.zeros(1, dtype=table.dtype, device=table.device)
+    return _ext.embedding_lookup(token_ids, table, pt, float(scale))
+
+
+def merge_multimodal_spans(text, modal, src):
+    """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. MPS."""
+    return _ext.merge_multimodal_spans(text, modal, src)
 
 
 def apply_token_bitmask(logits: torch.Tensor, bitmask: torch.Tensor):

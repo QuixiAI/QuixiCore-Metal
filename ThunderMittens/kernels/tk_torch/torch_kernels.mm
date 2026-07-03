@@ -28,6 +28,8 @@ static inline id<MTLBuffer> mtl_buffer(const at::Tensor& t) {
 static inline NSUInteger byte_offset(const at::Tensor& t) {
   return static_cast<NSUInteger>(t.storage_offset()) * t.element_size();
 }
+static bool tk_is_float_dtype(const at::Tensor& t);   // defined below
+
 static inline std::string tk_type_name(const at::Tensor& t) {
   switch (t.scalar_type()) {
     case at::kFloat: return "float32";
@@ -333,6 +335,51 @@ static at::Tensor gelu_mps(const at::Tensor& x_in) {
   const uint32_t M = static_cast<uint32_t>(x.numel() / D);
   auto out = at::empty_like(x);
   tk_encode([&](TorchEncoder& e) { tk::launch_gelu(e, x, out, M, D); });
+  return out;
+}
+
+static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at::Tensor& table_in,
+                                       const at::Tensor& pos_table_in, double scale) {
+  TORCH_CHECK(token_ids_in.device().is_mps() && token_ids_in.dim() == 1,
+              "embedding_lookup: token_ids must be a 1-D MPS tensor");
+  TORCH_CHECK(table_in.dim() == 2 && tk_is_float_dtype(table_in),
+              "embedding_lookup: table must be (vocab, D) float");
+  auto token_ids = token_ids_in.to(at::kInt).contiguous();
+  auto table = table_in.contiguous();
+  const int n_tok = token_ids.size(0), vocab = table.size(0), D = table.size(1);
+  const bool use_pos = pos_table_in.numel() > 1;
+  auto pos_table = use_pos ? pos_table_in.to(table.scalar_type()).contiguous()
+                           : at::zeros({1}, table.options());
+  if (use_pos) {
+    TORCH_CHECK(pos_table.dim() == 2 && pos_table.size(0) == n_tok && pos_table.size(1) == D,
+                "embedding_lookup: pos_table must be (num_tok, D)");
+  }
+  auto out = at::empty({n_tok, D}, table.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_embedding_lookup(e, token_ids, table, pos_table, out, D, vocab, n_tok,
+                                static_cast<float>(scale), use_pos ? 1 : 0, tk_type_name(table));
+  });
+  return out;
+}
+
+static at::Tensor merge_multimodal_spans_mps(const at::Tensor& text_in, const at::Tensor& modal_in,
+                                             const at::Tensor& src_in) {
+  TORCH_CHECK(text_in.device().is_mps() && text_in.dim() == 2 && tk_is_float_dtype(text_in),
+              "merge_multimodal_spans: text must be (num_tok, D) float MPS");
+  TORCH_CHECK(modal_in.dim() == 2 && modal_in.size(1) == text_in.size(1) &&
+                  modal_in.scalar_type() == text_in.scalar_type(),
+              "merge_multimodal_spans: modal must be (num_modal, D), same D/dtype");
+  TORCH_CHECK(src_in.dim() == 1 && src_in.size(0) == text_in.size(0),
+              "merge_multimodal_spans: src must be (num_tok,)");
+  auto text = text_in.contiguous();
+  auto modal = modal_in.contiguous();
+  auto src = src_in.to(at::kInt).contiguous();
+  const int n_tok = text.size(0), D = text.size(1), n_modal = modal.size(0);
+  auto out = at::empty_like(text);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_merge_multimodal_spans(e, text, modal, src, out, D, n_tok, n_modal,
+                                      tk_type_name(text));
+  });
   return out;
 }
 
@@ -2478,6 +2525,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("softmax", &softmax_mps, "ThunderMittens softmax (MPS)");
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
+  m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
+  m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,
+        "ThunderMittens multimodal span merge (MPS)");
   m.def("glu", &glu_mps, "ThunderMittens GLU-family activation (MPS)");
   m.def("hadamard", &hadamard_mps, "ThunderMittens Hadamard/FWHT (MPS)");
   m.def("kv_cache_scatter", &kv_cache_scatter_mps, "ThunderMittens KV cache scatter (MPS)");

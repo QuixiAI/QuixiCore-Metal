@@ -1100,6 +1100,34 @@ def test_apply_token_bitmask(V):
     assert (out[~allow] < -1e30).all()
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_embedding_lookup(dtype):
+    import numpy as np
+    rng = np.random.default_rng(0)
+    vocab, D, T = 200, 128, 12
+    table = (0.3 * rng.standard_normal((vocab, D))).astype(np.float32)
+    tok = rng.integers(0, vocab, size=T).astype(np.int32); tok[4] = -1
+    o = tk_torch.embedding_lookup(torch.from_numpy(tok).to("mps"),
+                                  torch.from_numpy(table).to(dtype).to("mps"),
+                                  scale=1.5).float().cpu().numpy()
+    ref = np.where(tok[:, None] >= 0, table[np.clip(tok, 0, vocab - 1)] * 1.5, 0.0)
+    assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
+
+
+def test_merge_multimodal_spans():
+    import numpy as np
+    rng = np.random.default_rng(2)
+    T, M, D = 16, 6, 128
+    text = (0.3 * rng.standard_normal((T, D))).astype(np.float32)
+    modal = (0.3 * rng.standard_normal((M, D))).astype(np.float32)
+    src = np.full(T, -1, np.int32); src[2:5] = np.arange(3); src[9:11] = np.arange(3, 5)
+    o = tk_torch.merge_multimodal_spans(torch.from_numpy(text).to("mps"),
+                                        torch.from_numpy(modal).to("mps"),
+                                        torch.from_numpy(src).to("mps")).cpu().numpy()
+    ref = np.where(src[:, None] >= 0, modal[np.clip(src, 0, M - 1)], text)
+    np.testing.assert_allclose(o, ref, atol=1e-5)
+
+
 @pytest.mark.parametrize("B,S,V", [(3, 4, 50), (2, 1, 128)])
 def test_spec_verify_linear(B, S, V):
     import numpy as np

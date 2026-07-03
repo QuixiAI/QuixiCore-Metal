@@ -71,6 +71,7 @@
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
+#include "embedding/embedding.h"
 #include "glu/glu.h"
 #include "hadamard/hadamard.h"
 #include "kv_cache/kv_cache.h"
@@ -609,6 +610,31 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         GELU activation (tanh approximation), over the last axis
+      )");
+
+    m.def(
+      "embedding_lookup",
+      &embedding_lookup,
+      "token_ids"_a,
+      "table"_a,
+      "pos_table"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Token embedding lookup: out[t] = scale*table[token_ids[t]] (+ pos_table[t] if size>1).
+      )");
+
+    m.def(
+      "merge_multimodal_spans",
+      &merge_multimodal_spans,
+      "text"_a,
+      "modal"_a,
+      "src"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Multimodal span merge: out[t] = src[t]>=0 ? modal[src[t]] : text[t].
       )");
 
     m.def(

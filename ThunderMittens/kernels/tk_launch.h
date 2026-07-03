@@ -495,6 +495,30 @@ void launch_apply_token_bitmask(E& e, typename E::in_t logits, typename E::in_t 
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
+// ----- token embedding + multimodal span merge: flat one-thread-per-element (n_tok*D). -----
+template <class E>
+void launch_embedding_lookup(E& e, typename E::in_t token_ids, typename E::in_t table,
+                             typename E::in_t pos_table, typename E::out_t out, int D, int vocab,
+                             int n_tok, float scale, int use_pos, const std::string& type_name) {
+  e.pipeline("embedding_lookup_" + type_name);
+  e.in(token_ids, 0); e.in(table, 1); e.in(pos_table, 2); e.out(out, 3);
+  e.bytes(D, 4); e.bytes(vocab, 5); e.bytes(n_tok, 6); e.bytes(scale, 7); e.bytes(use_pos, 8);
+  const long total = (long)n_tok * D;
+  constexpr int threads = 256;
+  e.dispatch((int)((total + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+template <class E>
+void launch_merge_multimodal_spans(E& e, typename E::in_t text, typename E::in_t modal,
+                                   typename E::in_t src, typename E::out_t out, int D, int n_tok,
+                                   int n_modal, const std::string& type_name) {
+  e.pipeline("merge_multimodal_spans_" + type_name);
+  e.in(text, 0); e.in(modal, 1); e.in(src, 2); e.out(out, 3);
+  e.bytes(D, 4); e.bytes(n_tok, 5); e.bytes(n_modal, 6);
+  const long total = (long)n_tok * D;
+  constexpr int threads = 256;
+  e.dispatch((int)((total + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
 // ----- penalty_histogram: prev_tokens@0(i32) -> counts@1(atomic i32) ; V@2 L@3 TL@4 ; grid (TL).
 //        counts[(row,tok)] += 1 for each valid history token. Zero counts first. -----
 template <class E>

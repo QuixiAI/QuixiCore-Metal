@@ -760,6 +760,30 @@ def apply_token_bitmask(logits, bitmask):
     return _mlx().apply_token_bitmask(logits, bitmask)
 
 
+def embedding_lookup(token_ids, table, pos_table=None, scale=1.0):
+    """Token embedding lookup: out[t] = scale*table[token_ids[t]] (+ pos_table[t] if given). A
+    negative / out-of-range token id emits zeros (padding). token_ids (num_tok,) int; table
+    (vocab, D); optional pos_table (num_tok, D). Returns (num_tok, D). Accepts mlx / torch (MPS)."""
+    if _is_torch(table):
+        import torch
+        pt = pos_table if pos_table is not None else torch.zeros(1, dtype=table.dtype,
+                                                                 device=table.device)
+        return _torch().embedding_lookup(token_ids, table, pt, float(scale))
+    import mlx.core as mx
+    pt = pos_table if pos_table is not None else mx.zeros((1,), dtype=table.dtype)
+    return _mlx().embedding_lookup(token_ids, table, pt, float(scale))
+
+
+def merge_multimodal_spans(text, modal, src):
+    """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. text (num_tok, D),
+    modal (num_modal, D) same dtype, src (num_tok,) int (-1 keeps the text embedding, >=0 gathers a
+    modal row). The src map is the flattened placeholder->modal index list (build it host-side from
+    the image/audio span offsets/lengths). Returns (num_tok, D). Accepts mlx / torch (MPS)."""
+    if _is_torch(text):
+        return _torch().merge_multimodal_spans(text, modal, src)
+    return _mlx().merge_multimodal_spans(text, modal, src)
+
+
 def cross_entropy(logits, targets, ignore_index=-100, reduction="mean", label_smoothing=0.0,
                   z_loss=0.0, softcap=0.0, return_lse=False):
     """Fused cross-entropy over the vocab axis WITHOUT storing the (T, V) probabilities.

@@ -203,6 +203,30 @@ def test_beam_advance_parity(B, BM, V):
     _assert_parity(om[2], ot[2], atol=1e-4)  # scores
 
 
+def test_embedding_lookup_parity():
+    rng = np.random.default_rng(0)
+    vocab, D, T = 200, 128, 12
+    table = (0.3 * rng.standard_normal((vocab, D))).astype(np.float32)
+    tok = rng.integers(0, vocab, size=T).astype(np.int32); tok[4] = -1
+    pos = (0.2 * rng.standard_normal((T, D))).astype(np.float32)
+    om = tk.embedding_lookup(mx.array(tok), _mk(table, "mlx", "f32"), pos_table=mx.array(pos), scale=1.5)
+    ot = tk.embedding_lookup(torch.from_numpy(tok).to("mps"), _mk(table, "torch", "f32"),
+                             pos_table=torch.from_numpy(pos).to("mps"), scale=1.5)
+    _assert_parity(om, ot, atol=0)
+
+
+def test_merge_multimodal_spans_parity():
+    rng = np.random.default_rng(3)
+    T, M, D = 16, 6, 128
+    text = (0.3 * rng.standard_normal((T, D))).astype(np.float32)
+    modal = (0.3 * rng.standard_normal((M, D))).astype(np.float32)
+    src = np.full(T, -1, np.int32); src[2:5] = np.arange(3); src[9:11] = np.arange(3, 5)
+    om = tk.merge_multimodal_spans(_mk(text, "mlx", "f32"), _mk(modal, "mlx", "f32"), mx.array(src))
+    ot = tk.merge_multimodal_spans(_mk(text, "torch", "f32"), _mk(modal, "torch", "f32"),
+                                   torch.from_numpy(src).to("mps"))
+    _assert_parity(om, ot, atol=0)
+
+
 @pytest.mark.parametrize("min_p", [0.2, 0.5])
 def test_min_p_sample_parity(min_p):
     rng = np.random.default_rng(int(min_p * 100))
