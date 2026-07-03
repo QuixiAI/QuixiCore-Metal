@@ -64,8 +64,9 @@ cross-backend parity-tested:
   `spec_compact` / `spec_update_kv_meta` post-processing (no host readback between verify and KV append).
 - **Beam search** — single-pass advance, on-device KV reorder (copy-path **and** zero-copy
   block-table remap), device copy-pair builder.
-- **Attention** — cascade / shared-prefix decode, now **N-level** (multi shared prefix), over the
-  paged-v2 partition/reduce.
+- **Attention** — cascade / shared-prefix decode, **N-level** (multi shared prefix) with an optional
+  **fp8 prefix**, over the paged-v2 partition/reduce; **fully device-resident varlen prefill** (device
+  Q pad/gather + output re-gather, no host pad/transpose loop).
 - **Multimodal / embeddings** — token embedding lookup **+ backward** (atomic scatter-add), on-device
   multimodal `src` builder + span merge.
 - **Training** — RMSNorm / LayerNorm / GELU **backward**, fused-add-RMSNorm backward, GLU-family

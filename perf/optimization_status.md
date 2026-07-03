@@ -12,15 +12,15 @@ zero-copy beam `beam_remap_block_table`, **N-level** cascade attention, on-devic
 test (`tk/tests/test_integration.py`) chains them on both backends. Perf wins + rejects are in the
 "Wave-6 perf pass" section below.
 
-**Scoped follow-ons (correct + tested surface exists; these are the two deferred extensions):**
-- **Fully device-resident varlen** (`attn_varlen`): the tile worklist builds on device
-  (`varlen_build_worklist`), but Q pad/gather + output re-gather still run host-side; a device
-  Q-pad/gather + output re-gather pair (and a two-level scan for B>256) would close the last host
-  bubble. The host path is correct and tested today.
-- **fp8 cascade prefix** (`cascade_prefix_partition_fp8`): the N-level cascade is done over bf16/fp16
-  prefixes; an fp8 (uint8 + per-head dequant) prefix partition would mirror the existing
-  `paged_attention_v2_fp8` partition. fp8 *paged* decode already exists; this only fp8-compresses the
-  shared prefix.
+**Follow-ons — now DONE:**
+- **Fully device-resident varlen** ✅ (`attn_varlen_prefill_device`): device `varlen_q_pad_gather` +
+  `varlen_o_regather` replace the host pad/transpose loop; the whole path (worklist → pad/gather →
+  attention → re-gather) runs on-device from a DEVICE `cu_seqlens` with a single scalar readback
+  (`total_padded`). Remaining minor cap: the worklist's single-threadgroup scan caps B≤256 (a
+  two-level scan for B>256 is the last small piece; large-B prefill batches are rare).
+- **fp8 cascade prefix** ✅ (`cascade_attention_fp8` / `cascade_prefix_partition_fp8`): uint8 fp8
+  (e4m3/e5m2) shared prefix, per-kv-head dequant on read, mirroring `paged_attention_v2_fp8`;
+  validated == full attention over [dequant(prefix) ++ suffix].
 
 Running notebook for the per-kernel optimization loop described in `perf/perf.md`.
 Numbers are throughput-style median per-call ms from `perf/bench_kernels.py`
