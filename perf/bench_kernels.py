@@ -1054,9 +1054,12 @@ def qgemv_cases(be, preset, formats):
     tk = be.tk()
     rng = np.random.default_rng(20)
     fmts = formats or QGEMV_FMTS[preset]
+    # NOTE: the giant lm-head shape (32000, 4096) is deliberately NOT in comprehensive — over the
+    # ~10 comprehensive formats its 524 MB fp32 oracle + 262 MB fp16 copy per format OOMs the sweep.
+    # Bench it on its own with `--kernel qgemv --formats q4_0,q8_0` if you want lm-head-vocab numbers.
     shapes = _pick(preset, [(4096, 4096)],
                    [(4096, 4096), (11008, 4096)],
-                   [(4096, 4096), (11008, 4096), (4096, 11008), (32000, 4096),
+                   [(4096, 4096), (11008, 4096), (4096, 11008),
                     (3840, 2560), (13824, 2560), (2560, 6912)])
     for N, K in shapes:
         x = rng.standard_normal((K, 1)).astype(np.float32)
@@ -1084,7 +1087,8 @@ def qgemv_cases(be, preset, formats):
                     lambda x_row=x_row, mw=mw, msc=msc, mb=mb, gs=gs, bits=bits: \
                     mx.quantized_matmul(x_row, mw, msc, mb, transpose=True,
                                         group_size=gs, bits=bits)
-            ref = wdq @ be.to_numpy(x_d)   # f32 (f64 matmul warns spuriously under Accelerate)
+            ref = (wdq @ be.to_numpy(x_d)).astype(np.float16)  # oracle fp16 (halves host residency)
+            del wdq                         # free the 524 MB fp32 dequant before the next format
             yield Case("qgemv", f"{fmt}_N{N}_K{K}", {"N": N, "K": K, "M": 1}, "f16", fmt=fmt,
                        target=lambda wq_d=wq_d, x_d=x_d, f=fmt: tk.qgemv(wq_d, x_d, format=f),
                        baselines=baselines, ref=ref,
@@ -1430,6 +1434,322 @@ def quant_rt_cases(be, preset, formats):
         yield Case("quant_rt", f"per_token_fp8_N{N}_D{Dm}", {"N": N, "D": Dm}, "f16",
                    target=lambda x_d=x_d: tk.quantize_per_token_fp8(x_d),
                    baselines={}, ref=None, bytes_moved=3.0 * N * Dm)
+
+
+# --------------------------------------------------------------------------- Wave-5 kernels
+# Training-side backward (numpy oracles from the standard formulas, on bf16-rounded inputs).
+def _rms_bwd_ref(xb, wb, dyb, eps=1e-5):
+    D = xb.shape[-1]
+    rstd = 1.0 / np.sqrt((xb ** 2).mean(-1, keepdims=True) + eps)
+    return rstd * (wb * dyb) - (rstd ** 3 / D) * xb * (wb * dyb * xb).sum(-1, keepdims=True)
+
+
+def _ln_bwd_ref(xb, wb, dyb, eps=1e-5):
+    mu = xb.mean(-1, keepdims=True)
+    rstd = 1.0 / np.sqrt(xb.var(-1, keepdims=True) + eps)
+    xhat = (xb - mu) * rstd
+    dxhat = dyb * wb
+    return rstd * (dxhat - dxhat.mean(-1, keepdims=True) - xhat * (dxhat * xhat).mean(-1, keepdims=True))
+
+
+def _gelu_bwd_ref(xb, dyb):
+    k = 0.7978845608028654
+    z = k * (xb + 0.044715 * xb ** 3)
+    t = np.tanh(z)
+    gp = 0.5 * (1.0 + t) + 0.5 * xb * (1.0 - t ** 2) * k * (1.0 + 3.0 * 0.044715 * xb ** 2)
+    return dyb * gp
+
+
+_NORM_BWD_SHAPES = ([(4096, 1024)], [(4096, 1024), (16384, 256)],
+                    [(r, d) for r in (4096, 16384, 65536) for d in (256, 512, 1024)])
+
+
+@register("rms_norm_bwd")
+def rms_norm_bwd_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(210)
+    for N, D in _pick(preset, *_NORM_BWD_SHAPES):
+        x, w, dy = (rng.standard_normal((N, D)).astype(np.float32),
+                    rng.standard_normal(D).astype(np.float32),
+                    rng.standard_normal((N, D)).astype(np.float32))
+        x_d, w_d, dy_d = be.array(x, "bf16"), be.array(w, "bf16"), be.array(dy, "bf16")
+        xb, wb, dyb = (be.to_numpy(x_d).astype(np.float64), be.to_numpy(w_d).astype(np.float64),
+                       be.to_numpy(dy_d).astype(np.float64))
+        ref = _rms_bwd_ref(xb, wb, dyb)
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+            baselines["mx.fast.rms_norm.vjp"] = lambda x_d=x_d, w_d=w_d, dy_d=dy_d: \
+                mx.vjp(lambda t: mx.fast.rms_norm(t, w_d, 1e-5), [x_d], [dy_d])[1][0]
+        yield Case("rms_norm_bwd", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d, w_d=w_d, dy_d=dy_d: tk.rms_norm_backward(x_d, w_d, dy_d),
+                   out_to_numpy=lambda o: be.to_numpy(o[0]),
+                   baselines=baselines, ref=ref, bytes_moved=3 * N * D * 2)
+
+
+@register("layernorm_bwd")
+def layernorm_bwd_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(211)
+    for N, D in _pick(preset, *_NORM_BWD_SHAPES):
+        x, w, dy = (rng.standard_normal((N, D)).astype(np.float32),
+                    rng.standard_normal(D).astype(np.float32),
+                    rng.standard_normal((N, D)).astype(np.float32))
+        x_d, w_d, dy_d = be.array(x, "bf16"), be.array(w, "bf16"), be.array(dy, "bf16")
+        xb, wb, dyb = (be.to_numpy(x_d).astype(np.float64), be.to_numpy(w_d).astype(np.float64),
+                       be.to_numpy(dy_d).astype(np.float64))
+        ref = _ln_bwd_ref(xb, wb, dyb)
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+            b_d = be.array(rng.standard_normal(D).astype(np.float32), "bf16")
+            baselines["mx.fast.layer_norm.vjp"] = lambda x_d=x_d, w_d=w_d, b_d=b_d, dy_d=dy_d: \
+                mx.vjp(lambda t: mx.fast.layer_norm(t, w_d, b_d, 1e-5), [x_d], [dy_d])[1][0]
+        yield Case("layernorm_bwd", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d, w_d=w_d, dy_d=dy_d: tk.layernorm_backward(x_d, w_d, dy_d),
+                   out_to_numpy=lambda o: be.to_numpy(o[0]),
+                   baselines=baselines, ref=ref, bytes_moved=3 * N * D * 2)
+
+
+@register("gelu_bwd")
+def gelu_bwd_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(212)
+    shapes = _pick(preset, [(4096, 1024)], [(4096, 1024), (16384, 1024)],
+                   [(r, d) for r in (4096, 16384, 65536) for d in (256, 1024)])
+    for N, D in shapes:
+        x, dy = rng.standard_normal((N, D)).astype(np.float32), rng.standard_normal((N, D)).astype(np.float32)
+        x_d, dy_d = be.array(x, "bf16"), be.array(dy, "bf16")
+        xb, dyb = be.to_numpy(x_d).astype(np.float64), be.to_numpy(dy_d).astype(np.float64)
+        ref = _gelu_bwd_ref(xb, dyb)
+        yield Case("gelu_bwd", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d, dy_d=dy_d: tk.gelu_backward(x_d, dy_d),
+                   baselines={}, ref=ref, bytes_moved=3 * N * D * 2)
+
+
+# Sampling / grammar masking.
+@register("min_p_sample")
+def min_p_sample_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(220)
+    shapes = _pick(preset, [(256, 32000)], [(256, 32000), (1024, 32000)],
+                   [(256, 128256), (1024, 128256), (2048, 128256)])
+    for T, V in shapes:
+        lg = be.array(rng.standard_normal((T, V)).astype(np.float32), "f32")
+        yield Case("min_p_sample", f"T{T}_V{V}", {"T": T, "V": V}, "f32",
+                   target=lambda lg=lg: tk.min_p_sample(lg, 0.05, temperature=1.0, seed=0),
+                   baselines={}, ref=None, bytes_moved=float(T * V * 4))
+
+
+@register("apply_token_bitmask")
+def apply_token_bitmask_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(221)
+    NEG = -3.4028234663852886e38   # SMP_NEG_INF; f32 keeps it finite (bf16 would round to -inf)
+    shapes = _pick(preset, [(256, 32000)], [(256, 32000), (1024, 32000)],
+                   [(512, 128256), (1024, 128256)])
+    for T, V in shapes:
+        logits = rng.standard_normal((T, V)).astype(np.float32)
+        nwords = (V + 31) // 32
+        allow = rng.integers(0, 2, size=(T, V)).astype(np.uint32)
+        allow[:, 0] = 1                                  # keep >=1 token per row
+        ap = np.zeros((T, nwords * 32), np.uint32)
+        ap[:, :V] = allow
+        ap = ap.reshape(T, nwords, 32)
+        packed = np.zeros((T, nwords), np.uint32)
+        for j in range(32):
+            packed |= ap[:, :, j] << np.uint32(j)
+        lg = be.array(logits, "f32")
+        bm_d = be.int_array(packed.view(np.int32))
+        ref = np.where(allow.astype(bool), logits.astype(np.float64), NEG)
+        yield Case("apply_token_bitmask", f"T{T}_V{V}", {"T": T, "V": V}, "f32",
+                   target=lambda lg=lg, bm_d=bm_d: tk.apply_token_bitmask(lg, bm_d),
+                   baselines={}, ref=ref, bytes_moved=float(T * V * 4))
+
+
+@register("lm_head_q")
+def lm_head_q_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(224)
+    fmts = formats or ["q4_0", "q8_0"]
+    shapes = _pick(preset, [(1, 32000, 4096)],
+                   [(1, 32000, 4096), (8, 32000, 4096)],
+                   [(1, 128256, 4096), (8, 128256, 4096)])
+    for T, V, K in shapes:
+        h_d = be.array((0.5 * rng.standard_normal((T, K))).astype(np.float32), "bf16")
+        for fmt in fmts:
+            bk, bb = BLOCK_INFO[fmt]
+            if K % bk:
+                continue
+            wq, wdq = _packed_weight(fmt, V, K)
+            wq_d = be.raw_array(wq)
+            w_half = be.array(wdq, "f16")
+            del wdq
+            baselines = {"dense_matmul_topk": (lambda h_d=h_d, w_half=w_half:
+                                               tk.lm_head_sample(h_d, w_half, mode="topk", k=8))}
+            yield Case("lm_head_q", f"topk_{fmt}_T{T}_V{V}_K{K}", {"T": T, "V": V, "K": K},
+                       "bf16", fmt=fmt,
+                       target=lambda h_d=h_d, wq_d=wq_d, f=fmt:
+                           tk.lm_head_sample(h_d, wq_d, mode="topk", k=8, format=f),
+                       baselines=baselines, ref=None, weight_bytes=float(V * (K // bk) * bb))
+
+
+# Embedding / multimodal.
+@register("embedding_lookup")
+def embedding_lookup_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(222)
+    shapes = _pick(preset, [(1024, 4096, 32000)],
+                   [(1024, 4096, 32000), (4096, 4096, 32000)],
+                   [(4096, 4096, 128256), (8192, 4096, 128256)])
+    for T, D, VOCAB in shapes:
+        # all ids valid: table[id] + pos is unambiguous (padding-id semantics are in the test suite)
+        ids = rng.integers(0, VOCAB, size=(T,)).astype(np.int32)
+        tab_d = be.array((0.02 * rng.standard_normal((VOCAB, D))).astype(np.float32), "bf16")
+        pos_d = be.array((0.02 * rng.standard_normal((T, D))).astype(np.float32), "bf16")
+        ids_d = be.int_array(ids)
+        tb, pb = be.to_numpy(tab_d).astype(np.float64), be.to_numpy(pos_d).astype(np.float64)
+        ref = tb[ids] + pb
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+            baselines["mx.take+add"] = lambda ids_d=ids_d, tab_d=tab_d, pos_d=pos_d: \
+                tab_d[mx.maximum(ids_d, 0)] + pos_d
+        else:
+            baselines["torch.index+add"] = lambda ids_d=ids_d, tab_d=tab_d, pos_d=pos_d: \
+                tab_d[ids_d.clamp(min=0)] + pos_d
+        yield Case("embedding_lookup", f"T{T}_D{D}_V{VOCAB}", {"T": T, "D": D, "V": VOCAB}, "bf16",
+                   target=lambda ids_d=ids_d, tab_d=tab_d, pos_d=pos_d:
+                       tk.embedding_lookup(ids_d, tab_d, pos_table=pos_d, scale=1.0),
+                   baselines=baselines, ref=ref, bytes_moved=float(2 * T * D * 2))
+
+
+@register("merge_multimodal_spans")
+def merge_multimodal_spans_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(223)
+    shapes = _pick(preset, [(4096, 4096, 512)],
+                   [(4096, 4096, 512), (8192, 4096, 1024)],
+                   [(8192, 8192, 2048), (16384, 8192, 4096)])
+    for T, D, M in shapes:
+        text_d = be.array((0.02 * rng.standard_normal((T, D))).astype(np.float32), "bf16")
+        modal_d = be.array((0.02 * rng.standard_normal((M, D))).astype(np.float32), "bf16")
+        src = np.full((T,), -1, np.int32)
+        pos = rng.choice(T, size=min(M, T), replace=False)
+        src[pos] = rng.integers(0, M, size=len(pos)).astype(np.int32)
+        src_d = be.int_array(src)
+        txb, mdb = be.to_numpy(text_d).astype(np.float64), be.to_numpy(modal_d).astype(np.float64)
+        ref = np.where(src[:, None] >= 0, mdb[np.clip(src, 0, M - 1)], txb)
+        yield Case("merge_multimodal_spans", f"T{T}_D{D}_M{M}", {"T": T, "D": D, "M": M}, "bf16",
+                   target=lambda text_d=text_d, modal_d=modal_d, src_d=src_d:
+                       tk.merge_multimodal_spans(text_d, modal_d, src_d),
+                   baselines={}, ref=ref, bytes_moved=float(2 * T * D * 2))
+
+
+# Serving: cascade / speculative / beam KV / varlen scheduler (measured; correctness in the suites).
+@register("cascade_attention")
+def cascade_attention_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(225)
+    shapes = _pick(preset, [(4, 16, 4, 128, 512, 512)],
+                   [(8, 32, 8, 128, 1024, 1024)],
+                   [(8, 32, 8, 128, 2048, 2048), (16, 32, 8, 128, 4096, 2048)])
+    for B, H, H_KV, D, pfx, ctx in shapes:
+        block_size = 16
+        max_blocks = (ctx + block_size - 1) // block_size
+        num_blocks = B * max_blocks
+        q_d = be.array((0.1 * rng.standard_normal((B, H, D))).astype(np.float32), "bf16")
+        pk_d = be.array((0.1 * rng.standard_normal((pfx, H_KV, D))).astype(np.float32), "bf16")
+        pv_d = be.array((0.1 * rng.standard_normal((pfx, H_KV, D))).astype(np.float32), "bf16")
+        kc_d = be.array((0.1 * rng.standard_normal((num_blocks, block_size, H_KV, D))).astype(np.float32), "bf16")
+        vc_d = be.array((0.1 * rng.standard_normal((num_blocks, block_size, H_KV, D))).astype(np.float32), "bf16")
+        bt_d = be.int_array(np.arange(B * max_blocks, dtype=np.int32).reshape(B, max_blocks))
+        cl_d = be.int_array(np.full((B,), ctx, dtype=np.int32))
+        scale = 1.0 / np.sqrt(D)
+        yield Case("cascade_attention", f"B{B}H{H}pfx{pfx}ctx{ctx}",
+                   {"B": B, "H": H, "pfx": pfx, "ctx": ctx, "D": D}, "bf16",
+                   target=lambda q_d=q_d, pk_d=pk_d, pv_d=pv_d, kc_d=kc_d, vc_d=vc_d, bt_d=bt_d,
+                   cl_d=cl_d, scale=scale:
+                       tk.cascade_attention(q_d, pk_d, pv_d, kc_d, vc_d, bt_d, cl_d,
+                                            scale=float(scale), partition_size=256),
+                   baselines={}, ref=None, bytes_moved=2.0 * B * (pfx + ctx) * H_KV * D * 2)
+
+
+@register("spec_verify_linear")
+def spec_verify_linear_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(226)
+    shapes = _pick(preset, [(8, 4, 32000)], [(16, 4, 32000), (32, 8, 32000)],
+                   [(32, 8, 128256), (64, 8, 128256)])
+    for B, S, V in shapes:
+        dt_d = be.int_array(rng.integers(0, V, size=(B, S)).astype(np.int32))
+        dp = np.abs(rng.standard_normal((B, S, V))).astype(np.float32)
+        dp /= dp.sum(-1, keepdims=True)
+        tp = np.abs(rng.standard_normal((B, S + 1, V))).astype(np.float32)
+        tp /= tp.sum(-1, keepdims=True)
+        dp_d, tp_d = be.array(dp, "f32"), be.array(tp, "f32")
+        bonus_d = be.int_array(rng.integers(0, V, size=(B,)).astype(np.int32))
+        u_d = be.array(rng.random((B, S)).astype(np.float32), "f32")
+        yield Case("spec_verify_linear", f"B{B}_S{S}_V{V}", {"B": B, "S": S, "V": V}, "f32",
+                   target=lambda dt_d=dt_d, dp_d=dp_d, tp_d=tp_d, bonus_d=bonus_d, u_d=u_d:
+                       tk.spec_verify_linear(dt_d, dp_d, tp_d, bonus_d, u_d, 0),
+                   baselines={}, ref=None, bytes_moved=float(B * (2 * S + 1) * V * 4))
+
+
+@register("beam_reorder_kv")
+def beam_reorder_kv_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(227)
+    shapes = _pick(preset, [(4, 4, 8, 128, 512)], [(8, 8, 8, 128, 1024)],
+                   [(8, 8, 8, 128, 2048), (16, 4, 8, 128, 4096)])
+    for B, BM, H_KV, D, ctx in shapes:
+        block_size = 16
+        max_blocks = (ctx + block_size - 1) // block_size
+        nbeams = B * BM
+        num_blocks = nbeams * max_blocks
+        kc_d = be.array((0.1 * rng.standard_normal((num_blocks, block_size, H_KV, D))).astype(np.float32), "bf16")
+        vc_d = be.array((0.1 * rng.standard_normal((num_blocks, block_size, H_KV, D))).astype(np.float32), "bf16")
+        bt_d = be.int_array(np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks))
+        parent_d = be.int_array(rng.integers(0, BM, size=(B, BM)).astype(np.int32))
+        seq_d = be.int_array(np.full((nbeams,), ctx, np.int32))
+        yield Case("beam_reorder_kv", f"B{B}BM{BM}ctx{ctx}", {"B": B, "BM": BM, "ctx": ctx, "D": D},
+                   "bf16",
+                   target=lambda kc_d=kc_d, vc_d=vc_d, bt_d=bt_d, parent_d=parent_d, seq_d=seq_d:
+                       tk.beam_reorder_kv(kc_d, vc_d, bt_d, parent_d, seq_d),
+                   baselines={}, ref=None, bytes_moved=2.0 * nbeams * ctx * H_KV * D * 2)
+
+
+@register("beam_build_copy_pairs")
+def beam_build_copy_pairs_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(228)
+    shapes = _pick(preset, [(4, 4, 512)], [(8, 8, 1024)], [(8, 8, 2048), (16, 4, 4096)])
+    for B, BM, ctx in shapes:
+        block_size = 16
+        max_blocks = (ctx + block_size - 1) // block_size
+        nbeams = B * BM
+        bt_d = be.int_array(np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks))
+        parent_d = be.int_array(rng.integers(0, BM, size=(B, BM)).astype(np.int32))
+        seq_d = be.int_array(np.full((nbeams,), ctx, np.int32))
+        yield Case("beam_build_copy_pairs", f"B{B}BM{BM}ctx{ctx}", {"B": B, "BM": BM, "ctx": ctx},
+                   "int",
+                   target=lambda parent_d=parent_d, bt_d=bt_d, seq_d=seq_d:
+                       tk.beam_build_copy_pairs(parent_d, bt_d, seq_d, block_size),
+                   baselines={}, ref=None, bytes_moved=float(nbeams * max_blocks * 2 * 8))
+
+
+@register("varlen_build_worklist")
+def varlen_build_worklist_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(229)
+    for B in _pick(preset, [16], [16, 64], [64, 128, 256]):
+        qlens = rng.integers(1, 512, size=(B,)).astype(np.int32)
+        cu = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
+        max_tiles = int(sum((int(q) + 7) // 8 for q in qlens)) + 4
+        cu_d = be.int_array(cu)
+        yield Case("varlen_build_worklist", f"B{B}", {"B": B, "max_tiles": max_tiles}, "int",
+                   target=lambda cu_d=cu_d, mt=max_tiles: tk.varlen_build_worklist(cu_d, mt),
+                   baselines={}, ref=None, bytes_moved=float(max_tiles * 4))
 
 
 # --------------------------------------------------------------------------- runner
