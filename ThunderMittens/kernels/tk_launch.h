@@ -972,7 +972,8 @@ void launch_kv_cache_clone(
   e.out(value_out, 3);
   e.bytes(n, 4);
   constexpr int threads = 256;
-  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+  const uint64_t n4 = (n + 3) / 4;   // one thread per vec4 group (kernel handles the scalar tail)
+  e.dispatch(static_cast<int>((n4 + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
 
 // ----- KV cache block copy: in-place over output caches. mapping is (num_pairs,2) int64. -----

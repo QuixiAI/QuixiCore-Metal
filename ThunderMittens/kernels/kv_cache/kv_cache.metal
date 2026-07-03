@@ -107,12 +107,17 @@ kernel void kv_cache_clone(device const T *key_cache [[buffer(0)]],
                            device T *key_out [[buffer(2)]],
                            device T *value_out [[buffer(3)]],
                            constant ulong &n [[buffer(4)]],
-                           uint tid [[thread_position_in_grid]]) {
-    if ((ulong)tid >= n) {
-        return;
+                           uint gid [[thread_position_in_grid]]) {
+    // vec4 the full-cache clone (n = num_blocks*block_size*H_KV*D is a multiple of 4); 8/16-byte
+    // transactions instead of 2-byte scalar loads. Tail handles any non-multiple-of-4 remainder.
+    typedef typename base_types::packing<T>::packed_four T4;
+    const ulong i = (ulong)gid * 4;
+    if (i + 4 <= n) {
+        *(device T4*)(key_out + i)   = *(device const T4*)(key_cache + i);
+        *(device T4*)(value_out + i) = *(device const T4*)(value_cache + i);
+    } else {
+        for (ulong j = i; j < n; ++j) { key_out[j] = key_cache[j]; value_out[j] = value_cache[j]; }
     }
-    key_out[tid] = key_cache[tid];
-    value_out[tid] = value_cache[tid];
 }
 
 // Copy KV blocks src->dst. Reads from the ORIGINAL cache (key_src/value_src) and writes the CLONE
@@ -136,7 +141,15 @@ kernel void kv_cache_copy_blocks(device const T *key_src [[buffer(0)]],
 
     const long src_base = src_block * numel_per_block;
     const long dst_base = dst_block * numel_per_block;
-    for (int i = (int)tid; i < numel_per_block; i += (int)tptg) {
+    // vec4 the block copy (numel_per_block = block_size*H_KV*D is a multiple of 4, and both bases are
+    // multiples of it -> 4-aligned); scalar tail covers any non-multiple-of-4 remainder.
+    typedef typename base_types::packing<T>::packed_four T4;
+    const int N4 = (numel_per_block & 3) == 0 ? numel_per_block : 0;
+    for (int i = (int)tid * 4; i < N4; i += (int)tptg * 4) {
+        *(device T4*)(key_dst + dst_base + i)   = *(device const T4*)(key_src + src_base + i);
+        *(device T4*)(value_dst + dst_base + i) = *(device const T4*)(value_src + src_base + i);
+    }
+    for (int i = N4 + (int)tid; i < numel_per_block; i += (int)tptg) {
         key_dst[dst_base + i] = key_src[src_base + i];
         value_dst[dst_base + i] = value_src[src_base + i];
     }
