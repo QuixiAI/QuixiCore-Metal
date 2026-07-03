@@ -1331,6 +1331,30 @@ def test_glu_backward(mode):
     assert torch.allclose(db, g.grad, atol=1e-3)
 
 
+def test_glu_backward_swiglu_oai_clamp():
+    # swiglu_oai with a small limit so the min/clamp branches are active; vs the analytic clamped
+    # gradient (finite-diff / autograd is invalid across the clamp kink).
+    import numpy as np
+    rng = np.random.default_rng(11)
+    alpha, limit = 1.3, 1.5
+    a = (3.0 * rng.standard_normal((8, 256))).astype(np.float32)
+    b = (3.0 * rng.standard_normal((8, 256))).astype(np.float32)
+    dc = rng.standard_normal((8, 256)).astype(np.float32)
+    a = np.where(np.abs(a - limit) < 1e-2, a + 0.1, a)
+    b = np.where(np.abs(np.abs(b) - limit) < 1e-2, b + 0.1, b)
+    da, db = tk_torch.glu_backward(torch.from_numpy(a).to("mps"), torch.from_numpy(b).to("mps"),
+                                   torch.from_numpy(dc).to("mps"), mode="swiglu_oai",
+                                   alpha=alpha, limit=limit)
+    x0 = np.minimum(a, limit); x1 = np.clip(b, -limit, limit)
+    s0 = 1.0 / (1.0 + np.exp(-x0 * alpha)); f = x0 * s0
+    ind_a = (a < limit).astype(np.float32); ind_b = ((b < limit) & (b > -limit)).astype(np.float32)
+    db_ref = dc * f * ind_b
+    da_ref = dc * (1.0 + x1) * (s0 + x0 * alpha * s0 * (1.0 - s0)) * ind_a
+    assert (a >= limit).any() and ((b >= limit) | (b <= -limit)).any()
+    assert np.max(np.abs(da.cpu().numpy() - da_ref)) < 1e-4
+    assert np.max(np.abs(db.cpu().numpy() - db_ref)) < 1e-4
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_embedding_backward(dtype):
     import numpy as np

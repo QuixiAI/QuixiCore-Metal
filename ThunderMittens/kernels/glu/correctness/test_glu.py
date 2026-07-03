@@ -133,3 +133,39 @@ def test_geglu_erf_backward_is_exact_derivative_of_forward():
     da_ref = dc * gate * dact
     assert np.max(np.abs(np.array(db) - db_ref)) < 3e-5, np.max(np.abs(np.array(db) - db_ref))
     assert np.max(np.abs(np.array(da) - da_ref)) < 3e-5, np.max(np.abs(np.array(da) - da_ref))
+
+
+def _swiglu_oai_grad_ref(a, b, dc, alpha, limit):
+    # Analytic gradient of out = (min(a,limit)*sigmoid(alpha*min(a,limit))) * (1 + clamp(b,-limit,limit)).
+    # min/clamp derivatives are 0 outside the active region (the clamp KINK -- finite-diff is invalid there).
+    x0 = np.minimum(a, limit)
+    x1 = np.clip(b, -limit, limit)
+    s0 = 1.0 / (1.0 + np.exp(-x0 * alpha))
+    f = x0 * s0
+    ind_a = (a < limit).astype(np.float32)                       # d min(a,limit)/da
+    ind_b = ((b < limit) & (b > -limit)).astype(np.float32)      # d clamp(b)/db
+    db = dc * f * ind_b
+    da = dc * (1.0 + x1) * (s0 + x0 * alpha * s0 * (1.0 - s0)) * ind_a
+    return da, db
+
+
+def test_swiglu_oai_clamp_gradient():
+    # Small limit so many inputs are on the clamped side; compare to the analytic clamped gradient
+    # (NOT finite-diff -- the min/clamp kinks make central differences wrong across the boundary).
+    from tk import glu_backward
+    rng = np.random.default_rng(11)
+    alpha, limit = 1.3, 1.5
+    a = (3.0 * rng.standard_normal((8, 256))).astype(np.float32)  # spans well past +/-limit
+    b = (3.0 * rng.standard_normal((8, 256))).astype(np.float32)
+    dc = rng.standard_normal((8, 256)).astype(np.float32)
+    # keep inputs off the exact kinks so the one-sided indicator is unambiguous vs the kernel's <
+    a = np.where(np.abs(a - limit) < 1e-2, a + 0.1, a)
+    b = np.where(np.abs(np.abs(b) - limit) < 1e-2, b + 0.1, b)
+    da, db = glu_backward(mx.array(a), mx.array(b), mx.array(dc), mode="swiglu_oai",
+                          alpha=alpha, limit=limit)
+    mx.eval(da, db)
+    da_ref, db_ref = _swiglu_oai_grad_ref(a, b, dc, alpha, limit)
+    # assert we actually exercised both clamp branches (else the test proves nothing)
+    assert (a >= limit).any() and ((b >= limit) | (b <= -limit)).any()
+    assert np.max(np.abs(np.array(da) - da_ref)) < 1e-4, np.max(np.abs(np.array(da) - da_ref))
+    assert np.max(np.abs(np.array(db) - db_ref)) < 1e-4, np.max(np.abs(np.array(db) - db_ref))

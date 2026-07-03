@@ -267,8 +267,9 @@ def test_dropout_parity(p):
                                   "geglu_quick"])
 def test_glu_backward_parity(mode):
     rng = np.random.default_rng(31)
-    x = rng.standard_normal((4, 512)).astype(np.float32)
-    g = rng.standard_normal((4, 512)).astype(np.float32)
+    # scale = 3 so swiglu_oai's clamp (limit 2.5) is active on both backends, not just the smooth region
+    x = (3.0 * rng.standard_normal((4, 512))).astype(np.float32)
+    g = (3.0 * rng.standard_normal((4, 512))).astype(np.float32)
     dc = rng.standard_normal((4, 512)).astype(np.float32)
     dam, dbm = tk.glu_backward(_mk(x, "mlx", "f32"), _mk(g, "mlx", "f32"),
                                _mk(dc, "mlx", "f32"), mode=mode, alpha=1.3, limit=2.5)
