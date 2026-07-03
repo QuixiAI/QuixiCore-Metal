@@ -45,21 +45,34 @@ instantiate_gelu(1024);
 
 // GELU backward (tanh approximation): dx = dy * gelu'(x). With k=sqrt(2/pi), a=0.044715,
 // inner = k*(x + a*x^3), t = tanh(inner):  gelu'(x) = 0.5*(1+t) + 0.5*x*(1-t^2)*k*(1+3a*x^2).
-// Flat one-thread-per-element; any shape; T templated (fp32/fp16/bf16).
+// One thread per 4 elements (vec4 loads/stores when the 4-block fits; scalar tail otherwise) — the
+// same packed_four pattern glu_bwd/embedding use, which roughly doubled bf16 elementwise bandwidth
+// vs the scalar per-element access. Any shape; T templated (fp32/fp16/bf16).
+METAL_FUNC float gelu_bwd_grad(float xv) {
+    const float k = 0.7978845608028654f, a = 0.044715f;
+    const float inner = k * (xv + a * xv * xv * xv);
+    const float t = metal::precise::tanh(inner);
+    const float dinner = k * (1.0f + 3.0f * a * xv * xv);
+    return 0.5f * (1.0f + t) + 0.5f * xv * (1.0f - t * t) * dinner;
+}
 template <typename T>
 kernel void gelu_bwd(device const T *x  [[buffer(0)]],
                      device const T *dy [[buffer(1)]],
                      device T       *dx [[buffer(2)]],
                      constant int &n    [[buffer(3)]],
                      uint gid [[thread_position_in_grid]]) {
-    if ((int)gid >= n) return;
-    const float xv = float(x[gid]);
-    const float k = 0.7978845608028654f, a = 0.044715f;
-    const float inner = k * (xv + a * xv * xv * xv);
-    const float t = metal::precise::tanh(inner);
-    const float dinner = k * (1.0f + 3.0f * a * xv * xv);
-    const float gp = 0.5f * (1.0f + t) + 0.5f * xv * (1.0f - t * t) * dinner;
-    dx[gid] = T(float(dy[gid]) * gp);
+    typedef typename base_types::packing<T>::packed_four T4;
+    const uint base = gid * 4;
+    if (base + 4 <= (uint)n) {
+        float4 xv  = float4(((device const T4*)(x  + base))[0]);
+        float4 dyv = float4(((device const T4*)(dy + base))[0]);
+        float4 r;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) r[i] = dyv[i] * gelu_bwd_grad(xv[i]);
+        ((device T4*)(dx + base))[0] = T4(r);
+    } else {
+        for (uint i = base; i < (uint)n; ++i) dx[i] = T(float(dy[i]) * gelu_bwd_grad(float(x[i])));
+    }
 }
 
 #define instantiate_gelu_bwd(type_name, T)                                     \

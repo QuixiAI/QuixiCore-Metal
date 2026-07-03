@@ -967,7 +967,8 @@ void launch_gelu_bwd(E& e, typename E::in_t x, typename E::in_t dy, typename E::
   e.pipeline("gelu_bwd_" + type_name);
   e.in(x, 0); e.in(dy, 1); e.out(dx, 2); e.bytes(n, 3);
   constexpr int threads = 256;
-  e.dispatch((n + threads - 1) / threads, 1, 1, threads, 1, 1);
+  const int nthreads = (n + 3) / 4;                 // one thread per 4 elements (vec4)
+  e.dispatch((nthreads + threads - 1) / threads, 1, 1, threads, 1, 1);
 }
 
 // ----- glu family: x@0 gate@1 -> out@2 ; n@3(uint32) alpha@4 limit@5 ; flat, one thread per
