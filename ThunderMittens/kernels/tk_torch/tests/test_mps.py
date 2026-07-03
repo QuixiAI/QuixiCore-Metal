@@ -1114,6 +1114,33 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+@pytest.mark.parametrize("p", [0.0, 0.3, 0.7])
+def test_dropout(p):
+    import numpy as np
+    M32 = np.uint64(0xFFFFFFFF)
+
+    def rng_uniform(seed, idx):
+        a = idx.astype(np.uint64)
+        x = (np.uint64(seed) * np.uint64(0x9E3779B9) + a * np.uint64(0x85EBCA77)) & M32
+        x = (x ^ (x >> np.uint64(16))) & M32
+        x = (x * np.uint64(0x7FEB352D)) & M32
+        x = (x ^ (x >> np.uint64(15))) & M32
+        x = (x * np.uint64(0x846CA68B)) & M32
+        x = (x ^ (x >> np.uint64(16))) & M32
+        return (x >> np.uint64(8)).astype(np.float64) * (1.0 / 16777216.0)
+
+    rng = np.random.default_rng(int(p * 10) + 2)
+    shape, seed = (64, 512), 424242
+    x = rng.standard_normal(shape).astype(np.float32)
+    dy = rng.standard_normal(shape).astype(np.float32)
+    keep = (rng_uniform(seed, np.arange(x.size, dtype=np.uint64)).reshape(shape) >= p)
+    inv = 1.0 / (1.0 - p)
+    out = tk_torch.dropout(torch.from_numpy(x).to("mps"), p, seed).cpu().numpy()
+    dx = tk_torch.dropout_backward(torch.from_numpy(dy).to("mps"), p, seed).cpu().numpy()
+    assert np.allclose(out, np.where(keep, x * inv, 0.0), atol=1e-4)
+    assert np.allclose(dx, np.where(keep, dy * inv, 0.0), atol=1e-4)
+
+
 @pytest.mark.parametrize("D", [256, 1024])
 def test_rms_norm_add_backward(D):
     # fused residual-add + RMSNorm backward (router composition) vs torch autograd.

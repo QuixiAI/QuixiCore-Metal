@@ -215,6 +215,21 @@ def test_embedding_lookup_parity():
     _assert_parity(om, ot, atol=0)
 
 
+@pytest.mark.parametrize("p", [0.0, 0.3, 0.7])
+def test_dropout_parity(p):
+    # same (seed, index) hash on both backends -> IDENTICAL mask, so fwd/bwd are bit-parity.
+    rng = np.random.default_rng(int(p * 10) + 4)
+    x = rng.standard_normal((32, 256)).astype(np.float32)
+    dy = rng.standard_normal((32, 256)).astype(np.float32)
+    seed = 77
+    om = tk.dropout(_mk(x, "mlx", "f32"), p, seed)
+    ot = tk.dropout(_mk(x, "torch", "f32"), p, seed)
+    _assert_parity(om, ot, atol=1e-6)
+    bm = tk.dropout_backward(_mk(dy, "mlx", "f32"), p, seed)
+    bt = tk.dropout_backward(_mk(dy, "torch", "f32"), p, seed)
+    _assert_parity(bm, bt, atol=1e-6)
+
+
 @pytest.mark.parametrize("mode", ["reglu", "geglu", "swiglu", "swiglu_oai", "geglu_erf",
                                   "geglu_quick"])
 def test_glu_backward_parity(mode):

@@ -385,6 +385,20 @@ static at::Tensor gelu_bwd_mps(const at::Tensor& x_in, const at::Tensor& dy_in) 
   return dx;
 }
 
+static at::Tensor dropout_mps(const at::Tensor& x_in, double p, int64_t seed, bool bwd) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "dropout: x must be a float MPS tensor");
+  TORCH_CHECK(p >= 0.0 && p < 1.0, "dropout: p must be in [0, 1)");
+  auto x = x_in.contiguous();
+  auto out = at::empty_like(x);
+  const uint32_t n = static_cast<uint32_t>(x.numel());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_dropout(e, x, out, static_cast<uint32_t>(seed), static_cast<float>(p), n, bwd,
+                       tk_type_name(x));
+  });
+  return out;
+}
+
 static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at::Tensor& table_in,
                                        const at::Tensor& pos_table_in, double scale) {
   TORCH_CHECK(token_ids_in.device().is_mps() && token_ids_in.dim() == 1,
@@ -2616,6 +2630,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rotary", &rotary_mps, "ThunderMittens rotary/RoPE (MPS)");
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
   m.def("gelu_bwd", &gelu_bwd_mps, "ThunderMittens GELU backward (MPS)");
+  m.def("dropout", &dropout_mps, "ThunderMittens inverted dropout fwd/bwd (MPS)");
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("embedding_backward", &embedding_backward_mps,
         "ThunderMittens embedding backward / scatter-add grad (MPS)");

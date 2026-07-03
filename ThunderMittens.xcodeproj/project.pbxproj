@@ -134,6 +134,7 @@
 				kernels/qgemm_int/qgemm_int.cpp,
 				kernels/flux/flux.cpp,
 				kernels/gelu/gelu.cpp,
+				kernels/dropout/dropout.cpp,
 				kernels/embedding/embedding.cpp,
 				kernels/gemm_staged/gemm_staged.cpp,
 				kernels/hedgehog/hedgehog.cpp,

@@ -71,6 +71,7 @@
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
 #include "gelu/gelu.h"
+#include "dropout/dropout.h"
 #include "embedding/embedding.h"
 #include "glu/glu.h"
 #include "hadamard/hadamard.h"
@@ -648,6 +649,30 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         GELU backward (tanh approximation): dx = dy * gelu'(x). Elementwise.
+      )");
+
+    m.def(
+      "dropout",
+      &dropout,
+      "x"_a,
+      "p"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Inverted dropout: out = keep ? x/(1-p) : 0, keep_i = rng_uniform(seed, i) >= p.
+      )");
+
+    m.def(
+      "dropout_backward",
+      &dropout_backward,
+      "dy"_a,
+      "p"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Dropout backward: dx = keep ? dy/(1-p) : 0 (same mask recomputed from seed).
       )");
 
     m.def(

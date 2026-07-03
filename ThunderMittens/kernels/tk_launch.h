@@ -851,6 +851,18 @@ void launch_gelu(E& e, typename E::in_t x, typename E::out_t o, uint32_t M, int 
   e.bytes(M, 2);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
+// Dropout fwd/bwd (same signature; bwd selects the backward kernel). out = keep ? x/(1-p) : 0.
+template <class E>
+void launch_dropout(E& e, typename E::in_t x, typename E::out_t out, uint32_t seed, float p,
+                    uint32_t n, bool bwd, const std::string& type_name) {
+  e.pipeline((bwd ? "dropout_bwd_" : "dropout_fwd_") + type_name);
+  e.in(x, 0); e.out(out, 1);
+  e.bytes(seed, 2); e.bytes(p, 3);
+  const float inv_keep = 1.0f / (1.0f - p);
+  e.bytes(inv_keep, 4); e.bytes(n, 5);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
 template <class E>
 void launch_gelu_bwd(E& e, typename E::in_t x, typename E::in_t dy, typename E::out_t dx, int n,
                      const std::string& type_name) {

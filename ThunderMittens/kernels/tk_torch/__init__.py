@@ -32,6 +32,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
+    os.path.join(_KERNELS, "dropout", "dropout.metal"),
     os.path.join(_KERNELS, "embedding", "embedding.metal"),
     os.path.join(_KERNELS, "glu", "glu.metal"),
     os.path.join(_KERNELS, "hadamard", "hadamard.metal"),
@@ -249,6 +250,16 @@ def gelu_bwd(x, dy):
 def gelu(x: torch.Tensor):
     """GELU (tanh approx) over the last axis. bf16 MPS; D in {256,512,768,1024}."""
     return _ext.gelu(x)
+
+
+def dropout(x: torch.Tensor, p: float, seed: int):
+    """Inverted dropout: out = keep ? x/(1-p) : 0, keep from (seed, index). p in [0,1). MPS."""
+    return _ext.dropout(x, float(p), int(seed), False)
+
+
+def dropout_backward(dy: torch.Tensor, p: float, seed: int):
+    """Dropout backward: dx = keep ? dy/(1-p) : 0 (same mask from seed). MPS."""
+    return _ext.dropout(dy, float(p), int(seed), True)
 
 
 def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",

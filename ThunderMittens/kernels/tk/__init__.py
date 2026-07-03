@@ -454,6 +454,23 @@ def gelu(x):
     return _mlx().gelu(x)
 
 
+def dropout(x, p, seed):
+    """Inverted dropout (training): out = keep ? x/(1-p) : 0, keep_i = rng_uniform(seed, i) >= p.
+    The keep-mask is a pure function of (seed, index), so dropout_backward with the SAME seed/p
+    recomputes it exactly (no mask storage). p in [0, 1). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().dropout(x, float(p), int(seed))
+    return _mlx().dropout(x, float(p), int(seed))
+
+
+def dropout_backward(dy, p, seed):
+    """Dropout backward: dx = keep ? dy/(1-p) : 0, same mask recomputed from (seed, p) as the
+    matching dropout forward. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(dy):
+        return _torch().dropout_backward(dy, float(p), int(seed))
+    return _mlx().dropout_backward(dy, float(p), int(seed))
+
+
 def gelu_backward(x, dy):
     """GELU (tanh approx) backward: dx = dy * gelu'(x). Elementwise; returns x's shape. Matches
     torch autograd for F.gelu(approximate='tanh'). Accepts mlx.array or torch.Tensor (MPS)."""
