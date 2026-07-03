@@ -109,6 +109,41 @@ class LmHeadTopkPartialsQ : public Primitive {
   std::string fmt_;
 };
 
+// Like LmHeadTopkPartialsQ but ALSO emits a per-tile tempered logsumexp (3rd output) so the top-p
+// reduce can build the true full-vocab normalizer. Carries invtemp (the softmax normalizer is
+// temperature-dependent).
+class LmHeadToppPartialsQ : public Primitive {
+ public:
+  LmHeadToppPartialsQ(Stream stream, int topk, int use_bias, int tile_v, int V, int K, float invtemp,
+                      const std::string& fmt)
+      : Primitive(stream), topk_(topk), use_bias_(use_bias), tile_v_(tile_v), V_(V), K_(K),
+        invtemp_(invtemp), fmt_(fmt) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadToppPartialsQ"; }
+  void print(std::ostream& os) override { os << "LmHeadToppPartialsQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const LmHeadToppPartialsQ&>(other);
+    return topk_ == o.topk_ && use_bias_ == o.use_bias_ && tile_v_ == o.tile_v_ && V_ == o.V_ &&
+           K_ == o.K_ && invtemp_ == o.invtemp_ && fmt_ == o.fmt_;
+  }
+
+ private:
+  int topk_;
+  int use_bias_;
+  int tile_v_;
+  int V_;
+  int K_;
+  float invtemp_;
+  std::string fmt_;
+};
+
 class LmHeadArgcatPartials : public Primitive {
  public:
   LmHeadArgcatPartials(Stream stream, int use_gumbel, float invtemp, uint32_t seed, int use_bias,

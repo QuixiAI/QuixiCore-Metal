@@ -2283,17 +2283,22 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
                 "lm_head_sample_q: topp requires top_p in (0, 1]");
     auto part_val = at::empty({T, num_vtiles, k}, f32);
     auto part_id = at::empty({T, num_vtiles, k}, i32);
+    auto part_lse = at::empty({T, num_vtiles}, f32);   // top-p only (per-tile logsumexp for true Z)
     tk_encode([&](TorchEncoder& e) {
-      tk::launch_lm_head_topk_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
-                                         static_cast<int>(K), TILE_V, num_vtiles, k, use_bias, T,
-                                         fmt, tn);
       if (mode == 2) {
+        tk::launch_lm_head_topk_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
+                                           static_cast<int>(K), TILE_V, num_vtiles, k, use_bias, T,
+                                           fmt, tn);
         tk::launch_lm_head_topk_reduce(e, part_val, part_id, out, num_vtiles, k,
                                        static_cast<unsigned>(seed), invtemp, T);
       } else {
+        // top-p: dedicated partials also emit the per-tile logsumexp for the true full-vocab Z
+        tk::launch_lm_head_topp_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
+                                           static_cast<int>(K), TILE_V, num_vtiles, k, use_bias,
+                                           invtemp, part_lse, T, fmt, tn);
         tk::launch_lm_head_topp_reduce(e, part_val, part_id, out, num_vtiles, k,
                                        static_cast<float>(top_p), static_cast<unsigned>(seed),
-                                       invtemp, T);
+                                       invtemp, part_lse, T);
       }
     });
     return out;

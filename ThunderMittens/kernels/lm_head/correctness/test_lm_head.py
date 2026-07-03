@@ -208,6 +208,55 @@ def test_quant_topp(fmt, p):
             assert int(tok[t]) in nucleus[t], (fmt, p, seed, t, int(tok[t]))
 
 
+def test_quant_topp_true_normalizer():
+    # The fused quant top-p uses the TRUE full-vocab normalizer (per-tile logsumexps), so the nucleus
+    # is the exact full-vocab nucleus (not the pool-only approximation, which would use a too-small Z
+    # and drop the low-prob tail of the nucleus). Construct a moderately-tailed distribution where the
+    # true nucleus is strictly LARGER than the pool-Z nucleus but still fits inside the top-k' pool,
+    # then assert (a) every sample lies in the true nucleus and (b) the kernel samples tokens the
+    # pool-Z approximation would have excluded -- i.e. the wider (correct) nucleus.
+    from tk.quant import QUANT_FORMATS
+    quant, dequant = QUANT_FORMATS["q8_0"]
+    V, K, temp, k, TILE_V, p, scale = 1024, 256, 1.0, 32, 256, 0.7, 0.35
+    rng = np.random.default_rng(0)
+    W = (scale * rng.standard_normal((V, K))).astype(np.float32); Wq = quant(W)
+    Wdq = dequant(Wq).astype(np.float64)
+    h1 = (scale * rng.standard_normal((1, K))).astype(np.float32)
+    L = (h1.astype(np.float64) @ Wdq.T / temp)[0]
+    # reconstruct the kernel's candidate pool: top-k within each TILE_V-sized vocab tile
+    pool = []
+    for tv in range(V // TILE_V):
+        seg = L[tv * TILE_V:(tv + 1) * TILE_V]
+        pool += list(np.argsort(-seg)[:k] + tv * TILE_V)
+    pool = np.array(sorted(pool)); mx_l = L.max()
+    Z_full = np.exp(L - mx_l).sum(); Z_pool = np.exp(L[pool] - mx_l).sum()
+    order = pool[np.argsort(-L[pool])]
+
+    def nucleus_with(Z):
+        cum, s = 0.0, []
+        for v in order:
+            cum += np.exp(L[v] - mx_l) / Z; s.append(int(v))
+            if cum >= p:
+                break
+        return set(s), cum
+
+    nuc_true, cum_true = nucleus_with(Z_full)
+    nuc_pool, _ = nucleus_with(Z_pool)
+    assert cum_true >= p                         # true nucleus fits inside the pool
+    assert nuc_true > nuc_pool                   # strictly larger (this is what true-Z fixes)
+    extra = nuc_true - nuc_pool                  # tokens only the true normalizer keeps
+
+    # many independent samples in one launch: identical rows, Gumbel varies with the row index
+    Tn = 800
+    h = np.repeat(h1, Tn, axis=0)
+    tok = np.array(tk.lm_head_sample(mx.array(h), mx.array(Wq), mode="topp",
+                                     k=k, temperature=temp, seed=0, format="q8_0", top_p=p))
+    sampled = set(int(x) for x in tok)
+    assert sampled <= nuc_true, sampled - nuc_true          # never sample outside the true nucleus
+    n_extra = sum(int(x) in extra for x in tok)
+    assert n_extra > 0, (len(extra), "kernel must sample the true-normalizer tail of the nucleus")
+
+
 if __name__ == "__main__":
     test_argmax("bfloat16", 1, 32000, 2048)
     test_categorical("float32", 4, 32000, 2048)

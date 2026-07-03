@@ -1513,6 +1513,21 @@ void launch_lm_head_topk_partials_q(E& e, typename E::in_t h, typename E::in_t W
   e.dispatch(num_vtiles, T, 1, 32, 1, 1);
 }
 
+// quant top-p partials: like topk_partials_q + a per-tile tempered logsumexp (part_lse@12, invtemp@11).
+template <class E>
+void launch_lm_head_topp_partials_q(E& e, typename E::in_t h, typename E::in_t Wq,
+                                    typename E::out_t part_val, typename E::out_t part_id,
+                                    typename E::in_t bias, int V, int K, int TILE_V, int num_vtiles,
+                                    int topk, int use_bias, float invtemp,
+                                    typename E::out_t part_lse, int T, const std::string& fmt,
+                                    const std::string& htype) {
+  e.pipeline("lm_head_topp_partials_q_" + fmt + "_" + htype);
+  e.in(h, 0); e.in(Wq, 1); e.out(part_val, 2); e.out(part_id, 3); e.in(bias, 4);
+  e.bytes(V, 5); e.bytes(K, 6); e.bytes(TILE_V, 7); e.bytes(num_vtiles, 8);
+  e.bytes(topk, 9); e.bytes(use_bias, 10); e.bytes(invtemp, 11); e.out(part_lse, 12);
+  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+}
+
 // topk reduce: part_val@0 part_id@1 -> out_idx@2 ; num_vtiles@3 topk@4 (i32) seed@5 (u32)
 //   invtemp@6 (f32) ; grid (T,) × 32.
 template <class E>
@@ -1527,10 +1542,11 @@ void launch_lm_head_topk_reduce(E& e, typename E::in_t part_val, typename E::in_
 template <class E>
 void launch_lm_head_topp_reduce(E& e, typename E::in_t part_val, typename E::in_t part_id,
                                 typename E::out_t out_idx, int num_vtiles, int topk, float p,
-                                unsigned seed, float invtemp, int T) {
+                                unsigned seed, float invtemp, typename E::in_t part_lse, int T) {
   e.pipeline("lm_head_topp_reduce");
   e.in(part_val, 0); e.in(part_id, 1); e.out(out_idx, 2);
   e.bytes(num_vtiles, 3); e.bytes(topk, 4); e.bytes(p, 5); e.bytes(seed, 6); e.bytes(invtemp, 7);
+  e.in(part_lse, 8);
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 

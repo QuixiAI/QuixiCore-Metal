@@ -119,18 +119,25 @@ array lm_head_sample_q(
     if (mode == 3 && !(top_p > 0.0f && top_p <= 1.0f)) {
       throw std::invalid_argument("lm_head_sample_q: topp requires top_p in (0, 1]");
     }
-    auto parts = array::make_arrays(
-        {{T, num_vtiles, k}, {T, num_vtiles, k}}, {float32, int32},
-        std::make_shared<LmHeadTopkPartialsQ>(to_stream(s), k, use_bias, LMH_TILE_V, V, K, fmt),
-        {h_c, Wq_c, bias_c});
     if (mode == 2) {
+      auto parts = array::make_arrays(
+          {{T, num_vtiles, k}, {T, num_vtiles, k}}, {float32, int32},
+          std::make_shared<LmHeadTopkPartialsQ>(to_stream(s), k, use_bias, LMH_TILE_V, V, K, fmt),
+          {h_c, Wq_c, bias_c});
       return array({T}, int32,
                    std::make_shared<LmHeadTopkReduce>(to_stream(s), k, 1.0f / temperature, seed),
                    {parts[0], parts[1]});
     }
+    // top-p: the dedicated partials also emit the per-tile logsumexp for the true full-vocab Z
+    const float invtemp = 1.0f / temperature;
+    auto parts = array::make_arrays(
+        {{T, num_vtiles, k}, {T, num_vtiles, k}, {T, num_vtiles}}, {float32, int32, float32},
+        std::make_shared<LmHeadToppPartialsQ>(to_stream(s), k, use_bias, LMH_TILE_V, V, K, invtemp,
+                                              fmt),
+        {h_c, Wq_c, bias_c});
     return array({T}, int32,
-                 std::make_shared<LmHeadToppReduce>(to_stream(s), k, top_p, 1.0f / temperature, seed),
-                 {parts[0], parts[1]});
+                 std::make_shared<LmHeadToppReduce>(to_stream(s), k, top_p, invtemp, seed),
+                 {parts[0], parts[1], parts[2]});
   }
 
   const int use_gumbel = (mode == 1) ? 1 : 0;
@@ -263,6 +270,31 @@ void LmHeadTopkPartialsQ::eval_gpu(const std::vector<array>& inputs, std::vector
                                      num_vtiles, topk_, use_bias_, T, fmt_, type_to_name(h));
 }
 
+// ---------------- topp partials (quant) ----------------
+void LmHeadToppPartialsQ::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadToppPartialsQ has no CPU implementation.");
+}
+void LmHeadToppPartialsQ::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& h = inputs[0];
+  auto& Wq = inputs[1];
+  auto& bias = inputs[2];
+  auto& part_val = outputs[0];
+  auto& part_id = outputs[1];
+  auto& part_lse = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  part_val.set_data(allocator::malloc_or_wait(part_val.nbytes()));
+  part_id.set_data(allocator::malloc_or_wait(part_id.nbytes()));
+  part_lse.set_data(allocator::malloc_or_wait(part_lse.nbytes()));
+  const int T = h.shape(0);
+  const int num_vtiles = part_val.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_lm_head_topp_partials_q(enc, h, Wq, part_val, part_id, bias, V_, K_, tile_v_,
+                                     num_vtiles, topk_, use_bias_, invtemp_, part_lse, T, fmt_,
+                                     type_to_name(h));
+}
+
 // ---------------- topk reduce ----------------
 void LmHeadTopkReduce::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("LmHeadTopkReduce has no CPU implementation.");
@@ -291,6 +323,7 @@ void LmHeadToppReduce::eval_cpu(const std::vector<array>&, std::vector<array>&) 
 void LmHeadToppReduce::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
   auto& part_val = inputs[0];
   auto& part_id = inputs[1];
+  auto& part_lse = inputs[2];
   auto& out = outputs[0];
   auto& s = stream();
   auto& d = metal::device(s.device);
@@ -300,7 +333,7 @@ void LmHeadToppReduce::eval_gpu(const std::vector<array>& inputs, std::vector<ar
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_lm_head_topp_reduce(enc, part_val, part_id, out, num_vtiles, topk_, p_, seed_,
-                                 invtemp_, T);
+                                 invtemp_, part_lse, T);
 }
 
 #define TK_LMH_NO_AUTODIFF(CLASS, LABEL)                                     \
@@ -324,6 +357,7 @@ TK_LMH_NO_AUTODIFF(LmHeadArgcatPartialsQ, "LmHeadArgcatPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadArgcatReduce, "LmHeadArgcatReduce")
 TK_LMH_NO_AUTODIFF(LmHeadTopkPartials, "LmHeadTopkPartials")
 TK_LMH_NO_AUTODIFF(LmHeadTopkPartialsQ, "LmHeadTopkPartialsQ")
+TK_LMH_NO_AUTODIFF(LmHeadToppPartialsQ, "LmHeadToppPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadTopkReduce, "LmHeadTopkReduce")
 TK_LMH_NO_AUTODIFF(LmHeadToppReduce, "LmHeadToppReduce")
 
