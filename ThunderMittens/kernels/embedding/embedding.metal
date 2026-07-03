@@ -12,7 +12,10 @@ using namespace mittens;
 //   merge_multimodal_spans:  out[t] = src[t] >= 0 ? modal[src[t]] : text[t].  The per-row src map
 //                      encodes which text positions are replaced by image/audio/video embeddings
 //                      (built host-side from span offsets/lengths); the kernel is a per-row select.
-// Both are flat one-thread-per-element (t*D + d); T templated (fp16/bf16/fp32).
+// Both run ONE THREADGROUP PER TOKEN (t = threadgroup id), threads striding over D — this hoists
+// the row base out of the inner loop (no per-element t=gid/D, d=gid%D integer divides) and lets the
+// contiguous row be read/written as vec4 (packed_four) when D%4==0 (rows are then 4-aligned); a
+// scalar loop covers the D%4!=0 case. T templated (fp16/bf16/fp32).
 // Ref: FasterTransformer gpt_kernels invokeInputIdsEmbeddingLookupPosEncoding.
 // ---------------------------------------------------------------------------
 
@@ -26,20 +29,30 @@ kernel void embedding_lookup(device const int *token_ids [[buffer(0)]],  // (num
                              constant int   &n_tok       [[buffer(6)]],
                              constant float &scale       [[buffer(7)]],
                              constant int   &use_pos     [[buffer(8)]],
-                             uint gid [[thread_position_in_grid]]) {
-    const long total = (long)n_tok * D;
-    if ((long)gid >= total) return;
-    const int t = (int)((long)gid / D);
-    const int d = (int)((long)gid % D);
+                             uint  t        [[threadgroup_position_in_grid]],
+                             uint  lid      [[thread_position_in_threadgroup]],
+                             uint  nthreads [[threads_per_threadgroup]]) {
+    typedef typename base_types::packing<T>::packed_four T4;
     const int tok = token_ids[t];
-    float v = 0.0f;
-    if (tok >= 0 && tok < vocab) v = float(table[(long)tok * D + d]) * scale;
-    if (use_pos) v += float(pos_table[(long)t * D + d]);
-    out[gid] = T(v);
+    const bool valid = tok >= 0 && tok < vocab;
+    device const T *trow = table + (long)(valid ? tok : 0) * D;
+    device const T *prow = pos_table + (long)t * D;
+    device T       *orow = out + (long)t * D;
+    const int D4 = ((D & 3) == 0) ? D : 0;   // vec4 body only when rows are 4-aligned
+    for (int d = (int)lid * 4; d < D4; d += (int)nthreads * 4) {
+        float4 v = valid ? float4(*(device const T4*)(trow + d)) * scale : float4(0.0f);
+        if (use_pos) v += float4(*(device const T4*)(prow + d));
+        *(device T4*)(orow + d) = T4(v);
+    }
+    for (int d = D4 + (int)lid; d < D; d += (int)nthreads) {   // scalar tail / D%4!=0 path
+        float v = valid ? float(trow[d]) * scale : 0.0f;
+        if (use_pos) v += float(prow[d]);
+        orow[d] = T(v);
+    }
 }
 
 // out[t] = (src[t] >= 0) ? modal[src[t]] : text[t]. src (num_tok,) int: -1 keeps the text embedding,
-// >=0 gathers row src[t] of the modal embeddings. One thread per (t, d) element.
+// >=0 gathers row src[t] of the modal embeddings. One threadgroup per token (row select + copy).
 template <typename T>
 kernel void merge_multimodal_spans(device const T   *text  [[buffer(0)]],   // (num_tok, D)
                                    device const T   *modal [[buffer(1)]],   // (num_modal, D)
@@ -48,13 +61,21 @@ kernel void merge_multimodal_spans(device const T   *text  [[buffer(0)]],   // (
                                    constant int &D         [[buffer(4)]],
                                    constant int &n_tok     [[buffer(5)]],
                                    constant int &n_modal   [[buffer(6)]],
-                                   uint gid [[thread_position_in_grid]]) {
-    const long total = (long)n_tok * D;
-    if ((long)gid >= total) return;
-    const int t = (int)((long)gid / D);
-    const int d = (int)((long)gid % D);
+                                   uint  t        [[threadgroup_position_in_grid]],
+                                   uint  lid      [[thread_position_in_threadgroup]],
+                                   uint  nthreads [[threads_per_threadgroup]]) {
+    typedef typename base_types::packing<T>::packed_four T4;
     const int sm = src[t];
-    out[gid] = (sm >= 0 && sm < n_modal) ? modal[(long)sm * D + d] : text[gid];
+    const bool use_modal = sm >= 0 && sm < n_modal;
+    device const T *srow = use_modal ? (modal + (long)sm * D) : (text + (long)t * D);
+    device T       *orow = out + (long)t * D;
+    const int D4 = ((D & 3) == 0) ? D : 0;
+    for (int d = (int)lid * 4; d < D4; d += (int)nthreads * 4) {
+        *(device T4*)(orow + d) = *(device const T4*)(srow + d);
+    }
+    for (int d = D4 + (int)lid; d < D; d += (int)nthreads) {
+        orow[d] = srow[d];
+    }
 }
 
 #define instantiate_embedding(type_name, T)                                        \
@@ -64,13 +85,15 @@ kernel void merge_multimodal_spans(device const T   *text  [[buffer(0)]],   // (
     device T *out [[buffer(3)]], constant int &D [[buffer(4)]],                     \
     constant int &vocab [[buffer(5)]], constant int &n_tok [[buffer(6)]],           \
     constant float &scale [[buffer(7)]], constant int &use_pos [[buffer(8)]],       \
-    uint gid [[thread_position_in_grid]]);                                          \
+    uint t [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], \
+    uint nthreads [[threads_per_threadgroup]]);                                     \
   template [[host_name("merge_multimodal_spans_" #type_name)]] [[kernel]] void      \
   merge_multimodal_spans<T>(device const T *text [[buffer(0)]],                     \
     device const T *modal [[buffer(1)]], device const int *src [[buffer(2)]],       \
     device T *out [[buffer(3)]], constant int &D [[buffer(4)]],                     \
     constant int &n_tok [[buffer(5)]], constant int &n_modal [[buffer(6)]],         \
-    uint gid [[thread_position_in_grid]]);
+    uint t [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], \
+    uint nthreads [[threads_per_threadgroup]]);
 
 instantiate_embedding(float32, float)
 instantiate_embedding(float16, half)
