@@ -22,8 +22,12 @@
 
 namespace mlx::core {
 
-array ssd_chunked(const array& Cq, const array& Bm, const array& X, const array& cl,
+array ssd_chunked(const array& Cq_in, const array& Bm_in, const array& X_in, const array& cl_in,
                   StreamOrDevice s) {
+  // Kernels read raw buffers, so a transposed/strided view from the Python wrapper would be read
+  // as garbage past row 0 ([[mlx-strided-view-contiguity]]). No-op when already row-contiguous.
+  auto Cq = contiguous(Cq_in, false, s), Bm = contiguous(Bm_in, false, s);
+  auto X = contiguous(X_in, false, s), cl = contiguous(cl_in, false, s);
   const int B = Cq.shape(0), H = Cq.shape(1), N = Cq.shape(2), D = Cq.shape(3);
   const int C = N / 64;   // chunk L = 64 (must match SSD_CHUNK_L in the metal)
   auto kv = array({B, H, C, D, D}, float32,
@@ -36,8 +40,12 @@ array ssd_chunked(const array& Cq, const array& Bm, const array& X, const array&
                std::make_shared<SsdChunkOut>(to_stream(s)), {Cq, Bm, X, cl, sex});
 }
 
-array mamba2(const array& C, const array& B, const array& X, const array& cumlog,
+array mamba2(const array& C_in, const array& B_in, const array& X_in, const array& cumlog_in,
              StreamOrDevice s) {
+  // Force row-contiguity for the quadratic-kernel path too (the chunked path re-forces in
+  // ssd_chunked; both are no-ops when already contiguous). [[mlx-strided-view-contiguity]]
+  auto C = contiguous(C_in, false, s), B = contiguous(B_in, false, s);
+  auto X = contiguous(X_in, false, s), cumlog = contiguous(cumlog_in, false, s);
   assert(C.dtype() == bfloat16 && B.dtype() == bfloat16 && X.dtype() == bfloat16);
   assert(cumlog.dtype() == float32);
   assert(C.shape() == B.shape() && B.shape() == X.shape());

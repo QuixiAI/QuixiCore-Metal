@@ -667,10 +667,11 @@ def mamba2_chunked(C, B, X, cumlog):
     return _ext.mamba2_chunked(C, B, X, cumlog)
 
 
-def mamba2_bwd(C, B, X, cumlog, dY):
+def mamba2_bwd(C, B, X, cumlog, dY, force_quadratic=False):
     """Mamba-2 / SSD backward. Returns (dC, dB, dX, dcumlog) matching the forward shapes. MPS.
-    Auto-routed like the forward (chunked linear-time above the measured crossovers)."""
-    return _ext.mamba2_bwd(C, B, X, cumlog, dY)
+    Auto-routed like the forward (chunked linear-time above the measured crossovers);
+    force_quadratic pins the quadratic path (matches MLX)."""
+    return _ext.mamba2_bwd(C, B, X, cumlog, dY, force_quadratic)
 
 
 def mamba2_bwd_chunked(C, B, X, cumlog, dY):

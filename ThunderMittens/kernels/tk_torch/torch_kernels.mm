@@ -2185,7 +2185,7 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> ssd_chunked_bw
 
 static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps(
     const at::Tensor& C_in, const at::Tensor& B_in, const at::Tensor& X_in,
-    const at::Tensor& cl_in, const at::Tensor& dY_in) {
+    const at::Tensor& cl_in, const at::Tensor& dY_in, bool force_quadratic = false) {
   TORCH_CHECK(C_in.device().is_mps() && C_in.scalar_type() == at::kBFloat16,
               "mamba2_bwd: C,B,X,dY must be bfloat16 MPS");
   TORCH_CHECK(cl_in.scalar_type() == at::kFloat, "mamba2_bwd: cumlog must be float32");
@@ -2197,8 +2197,8 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> mamba2_bwd_mps
   TORCH_CHECK(D == 64 || D == 128, "mamba2_bwd: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "mamba2_bwd: N must be a multiple of 8");
   // Chunked linear-time backward above the same measured crossovers as the forward; quadratic
-  // (in-kernel fp32 dcumlog) below.
-  if (N % kSsdChunkL == 0 && N >= ssd_chunk_min(D)) {
+  // (in-kernel fp32 dcumlog) below. force_quadratic pins the quadratic path (matches MLX).
+  if (!force_quadratic && N % kSsdChunkL == 0 && N >= ssd_chunk_min(D)) {
     return ssd_chunked_bwd(C, B, X, cl, dY);
   }
   auto f32 = C.options().dtype(at::kFloat);
@@ -2645,7 +2645,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("hedgehog", &hedgehog_mps, "ThunderMittens hedgehog linear attention (MPS)");
   m.def("lin_attn_causal", &lin_attn_causal_mps, "ThunderMittens causal linear attention (MPS)");
   m.def("mamba2", &mamba2_mps, "ThunderMittens Mamba-2 / SSD forward (MPS)");
-  m.def("mamba2_bwd", &mamba2_bwd_mps, "ThunderMittens Mamba-2 / SSD backward (MPS)");
+  m.def("mamba2_bwd", &mamba2_bwd_mps, "ThunderMittens Mamba-2 / SSD backward (MPS)",
+        pybind11::arg("C"), pybind11::arg("B"), pybind11::arg("X"), pybind11::arg("cumlog"),
+        pybind11::arg("dY"), pybind11::arg("force_quadratic") = false);
   m.def("mamba2_chunked", &mamba2_chunked_mps,
         "ThunderMittens Mamba-2 / SSD forward, forced chunked route (MPS)");
   m.def("mamba2_bwd_chunked", &mamba2_bwd_chunked_mps,
