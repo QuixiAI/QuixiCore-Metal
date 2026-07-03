@@ -280,22 +280,25 @@ kernel void typical_p_sample(device const T *logits  [[buffer(0)]],
     Z = simd_sum(Z);
     S1 = simd_sum(S1);
     const float logZ = metal::log(Z);
-    const float H = mx + logZ - S1 / Z;        // row entropy
+    const float mxlz = mx + logZ;              // -log p_v = mxlz - ls_v  (loop-invariant)
+    const float H = mxlz - S1 / Z;             // row entropy
     // max surprise (upper bisection bound); mass{s<=smax} == 1 >= typ_p always.
     float smax = 0.0f;
     for (int i = (int)lane; i < V; i += 32) {
         const float ls = float(logits[base + i]) * invtemp;
-        smax = max(smax, metal::abs((mx + logZ - ls) - H));
+        smax = max(smax, metal::abs((mxlz - ls) - H));
     }
     smax = simd_max(smax);
-    // Smallest tau with mass{s_v <= tau} >= typ_p (mass is monotone increasing in tau).
+    // Smallest tau with mass{s_v <= tau} >= typ_p (mass is monotone increasing in tau). 16 bisection
+    // steps resolve tau to smax/65536 (<< the V-token surprise spacing) -- 32 was pure overkill and
+    // the bisection is the kernel's whole cost (each step re-scans V). Ref: HF TypicalLogitsWarper.
     float lo = 0.0f, hi = smax;
-    for (int it = 0; it < 32; ++it) {
+    for (int it = 0; it < 16; ++it) {
         const float mid = 0.5f * (lo + hi);
         float mass = 0.0f;
         for (int i = (int)lane; i < V; i += 32) {
             const float ls = float(logits[base + i]) * invtemp;
-            if (metal::abs((mx + logZ - ls) - H) <= mid) { mass += exp(ls - mx); }
+            if (metal::abs((mxlz - ls) - H) <= mid) { mass += exp(ls - mx); }
         }
         mass = simd_sum(mass) / Z;
         if (mass >= typ_p) { hi = mid; } else { lo = mid; }
@@ -306,7 +309,7 @@ kernel void typical_p_sample(device const T *logits  [[buffer(0)]],
     int bi = (int)lane < V ? (int)lane : 0;
     for (int i = (int)lane; i < V; i += 32) {
         const float ls = float(logits[base + i]) * invtemp;
-        if (metal::abs((mx + logZ - ls) - H) > tau) { continue; }
+        if (metal::abs((mxlz - ls) - H) > tau) { continue; }
         const float pert = ls + rng_gumbel(seed, (uint)row, (uint)i);
         if (pert > best || (pert == best && i < bi)) { best = pert; bi = i; }
     }
