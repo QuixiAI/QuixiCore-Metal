@@ -33,6 +33,20 @@ METAL_FUNC float glu_erf_approx(float x) {
     return sx * y;
 }
 
+// Exact analytic derivative of glu_erf_approx (even function: d/dx of an odd approx). With
+// t = 1/(1+P|x|), poly = A1 t + A2 t^2 + .. + A5 t^5, and dt/d|x| = -P t^2:
+//   d/dx [1 - poly * exp(-x^2)] = exp(-x^2) * (2|x| poly + P t^2 * dpoly/dt).
+// Used by glu_grad mode 4 so the geglu_erf backward is the *exact* derivative of glu_eval mode 4
+// (not the true-Gaussian derivative of the ideal erf, which the approximate forward never equals).
+METAL_FUNC float glu_erf_approx_deriv(float x) {
+    const float ax = metal::abs(x);
+    const float t = 1.0f / (1.0f + GLU_ERF_P * ax);
+    const float poly = (((((GLU_ERF_A5 * t + GLU_ERF_A4) * t) + GLU_ERF_A3) * t + GLU_ERF_A2) * t + GLU_ERF_A1) * t;
+    const float dpoly_dt = (((5.0f * GLU_ERF_A5 * t + 4.0f * GLU_ERF_A4) * t + 3.0f * GLU_ERF_A3) * t
+                            + 2.0f * GLU_ERF_A2) * t + GLU_ERF_A1;
+    return metal::exp(-ax * ax) * (2.0f * ax * poly + GLU_ERF_P * t * t * dpoly_dt);
+}
+
 METAL_FUNC float glu_gelu_tanh(float x) {
     const float inner = GLU_SQRT_2_OVER_PI * x * (1.0f + GLU_GELU_COEF_A * x * x);
     return 0.5f * x * (1.0f + glu_tanh(inner));
@@ -90,8 +104,8 @@ kernel void glu(device const T *x [[buffer(0)]],
 }
 
 // Backward of out = act(a)*b: db = dc*act(a); da = dc*b*act'(a). a=x (gate half), b=gate (up half).
-// Each mode's act' is the exact derivative of its glu_eval branch (geglu_erf uses the exact-erf
-// derivative; its forward's A&S erf approximation matches to ~1e-7 so the pair is self-consistent).
+// Each mode's act' is the exact derivative of its glu_eval branch (geglu_erf differentiates the A&S
+// erf approximation itself via glu_erf_approx_deriv, so the forward/backward pair is bit-consistent).
 METAL_FUNC void glu_grad(int mode, float a, float b, float dc, float alpha, float limit,
                          thread float &da, thread float &db) {
     if (mode == 0) {                       // reglu: act = relu(a)
@@ -125,11 +139,12 @@ METAL_FUNC void glu_grad(int mode, float a, float b, float dc, float alpha, floa
         da = dc * (1.0f + x1) * (s0 + x0 * alpha * s0 * (1.0f - s0)) * ind_a;
         return;
     }
-    if (mode == 4) {                       // geglu_erf: act = 0.5 a (1+erf(a/sqrt2))
-        const float e = glu_erf_approx(a * GLU_SQRT_2_INV);
+    if (mode == 4) {                       // geglu_erf: act = 0.5 a (1+erf_approx(a/sqrt2))
+        const float u = a * GLU_SQRT_2_INV;
+        const float e = glu_erf_approx(u);
+        const float de = glu_erf_approx_deriv(u) * GLU_SQRT_2_INV;   // d erf_approx(a/sqrt2) / da
         db = dc * (0.5f * a * (1.0f + e));
-        da = dc * b * (0.5f * (1.0f + e) +
-                       0.5f * a * GLU_SQRT_2_OVER_PI * metal::exp(-0.5f * a * a));
+        da = dc * b * (0.5f * (1.0f + e) + 0.5f * a * de);
         return;
     }
     // mode 5: geglu_quick: act = a*sigmoid(1.702 a) = a/(1+exp(COEF*a)), COEF=-1.702

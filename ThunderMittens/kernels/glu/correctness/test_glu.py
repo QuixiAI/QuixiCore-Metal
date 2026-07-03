@@ -4,6 +4,7 @@ Run from kernels/: python -m pytest glu/correctness/test_glu.py -q
 """
 
 import mlx.core as mx
+import numpy as np
 import pytest
 
 from tk import glu
@@ -90,3 +91,45 @@ def test_glu_backward_finite_diff(mode):
     for got, ref in ((da, da_fd), (db, db_fd)):
         err = mx.max(mx.abs((got - ref) * mask)).item()
         assert err < 2e-2, (mode, err)
+
+
+# --- numpy mirror of the tk A&S erf approximation and its exact analytic derivative ---
+_EP, _A1, _A2, _A3, _A4, _A5 = (0.3275911, 0.254829592, -0.284496736, 1.421413741,
+                                -1.453152027, 1.061405429)
+
+
+def _erf_approx_np(x):
+    sx = np.sign(x); ax = np.abs(x)
+    t = 1.0 / (1.0 + _EP * ax)
+    poly = (((((_A5 * t + _A4) * t) + _A3) * t + _A2) * t + _A1) * t
+    return sx * (1.0 - poly * np.exp(-ax * ax))
+
+
+def _erf_approx_deriv_np(x):
+    ax = np.abs(x)
+    t = 1.0 / (1.0 + _EP * ax)
+    poly = (((((_A5 * t + _A4) * t) + _A3) * t + _A2) * t + _A1) * t
+    dpoly = (((5.0 * _A5 * t + 4.0 * _A4) * t + 3.0 * _A3) * t + 2.0 * _A2) * t + _A1
+    return np.exp(-ax * ax) * (2.0 * ax * poly + _EP * t * t * dpoly)
+
+
+def test_geglu_erf_backward_is_exact_derivative_of_forward():
+    # geglu_erf forward uses the A&S erf approximation; the backward must be the EXACT derivative of
+    # THAT approximation (not the ideal-erf Gaussian), so forward/backward are a bit-consistent pair.
+    from tk import glu_backward
+    inv_sqrt2 = 0.7071067811865476
+    rng = np.random.default_rng(7)
+    x = rng.standard_normal((4, 512)).astype(np.float32)
+    gate = rng.standard_normal((4, 512)).astype(np.float32)
+    dc = rng.standard_normal((4, 512)).astype(np.float32)
+    da, db = glu_backward(mx.array(x), mx.array(gate), mx.array(dc), mode="geglu_erf")
+    mx.eval(da, db)
+    u = x * inv_sqrt2
+    e = _erf_approx_np(u)
+    de = _erf_approx_deriv_np(u) * inv_sqrt2            # d erf_approx(x/sqrt2) / dx
+    act = 0.5 * x * (1.0 + e)                           # == glu_gelu_erf(x)
+    dact = 0.5 * (1.0 + e) + 0.5 * x * de              # exact derivative of the approx forward
+    db_ref = dc * act
+    da_ref = dc * gate * dact
+    assert np.max(np.abs(np.array(db) - db_ref)) < 3e-5, np.max(np.abs(np.array(db) - db_ref))
+    assert np.max(np.abs(np.array(da) - da_ref)) < 3e-5, np.max(np.abs(np.array(da) - da_ref))
