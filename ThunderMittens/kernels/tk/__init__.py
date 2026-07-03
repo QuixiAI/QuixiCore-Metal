@@ -148,7 +148,8 @@ def varlen_build_worklist(cu_seqlens, max_tiles):
     (max_tiles,), tile_local0 (max_tiles,), n_tiles (1,)); tile_seq is -1 past n_tiles. max_tiles is
     a host upper bound on sum(ceil(qlen/8)) — Metal cannot size a grid from device data, so the
     caller provides the bound and reads n_tiles / pad_off[-1] to drive the downstream dispatch.
-    B <= 256 (single-threadgroup scan). Accepts mlx.array or torch.Tensor (MPS)."""
+    Any B (single-threadgroup chunked scan: each thread owns a contiguous batch chunk). Accepts
+    mlx.array or torch.Tensor (MPS)."""
     if _is_torch(cu_seqlens):
         return tuple(_torch().varlen_build_worklist(cu_seqlens, int(max_tiles)))
     out = _mlx().varlen_build_worklist(cu_seqlens, int(max_tiles))
@@ -236,8 +237,8 @@ def attn_varlen_prefill_device(q_packed, key_cache, value_cache, block_table, co
     head-major layout, runs the paged-prefill attention, and re-gathers the output back to packed —
     all on-device from a DEVICE cu_seqlens (B+1,) int, with only ONE scalar readback (total_padded,
     to size the padded buffer; Metal can't size a grid from device data). Same result as the host
-    attn_varlen_prefill path, but no O(B) host loop / host pad+transpose. B <= 256 (single-threadgroup
-    worklist scan). q_packed (total_q, H, D) bf16. Accepts mlx.array or torch.Tensor (MPS)."""
+    attn_varlen_prefill path, but no O(B) host loop / host pad+transpose. Any B (chunked worklist
+    scan). q_packed (total_q, H, D) bf16. Accepts mlx.array or torch.Tensor (MPS)."""
     total_q, H, D = q_packed.shape
     if scale == 0.0:
         scale = 1.0 / (float(D) ** 0.5)

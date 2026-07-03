@@ -145,26 +145,41 @@ kernel void varlen_build_worklist(device const int *cu_seqlens [[buffer(0)]],   
                                   uint tid [[thread_index_in_threadgroup]],
                                   uint nthreads [[threads_per_threadgroup]]) {
     threadgroup int sg_sums[8];    // nthreads / 32 <= 8 (nthreads <= 256)
-    int qlen = 0, ntile = 0, padded = 0;
-    if ((int)tid < B) {
-        qlen = cu_seqlens[tid + 1] - cu_seqlens[tid];
-        ntile = (qlen + 7) / 8;
-        padded = ntile * 8;
-        qlens[tid] = qlen;
+    // CHUNKED single-threadgroup scan: each thread owns a CONTIGUOUS chunk of batches, so B is not
+    // capped by the thread count (the old one-thread-per-batch form capped at nthreads<=256). Two
+    // passes over the (cheap-to-recompute) chunk: (1) per-thread local tile/pad totals, (2) a
+    // threadgroup exclusive scan over those totals gives each thread its base offset, (3) re-walk the
+    // chunk emitting tile_seq/tile_local0 + pad_off from the base. No per-chunk storage.
+    const int chunk = (B + (int)nthreads - 1) / (int)nthreads;
+    int lo = (int)tid * chunk; if (lo > B) { lo = B; }
+    int hi = lo + chunk;       if (hi > B) { hi = B; }
+    int local_tiles = 0, local_pad = 0;
+    for (int b = lo; b < hi; ++b) {
+        const int qlen = cu_seqlens[b + 1] - cu_seqlens[b];
+        qlens[b] = qlen;
+        const int nt = (qlen + 7) / 8;
+        local_tiles += nt;
+        local_pad += nt * 8;
     }
     int total_tiles = 0;
-    const int tile_off = mittens::threadgroup_exclusive_scan_i32(ntile, tid, nthreads, sg_sums,
-                                                                 total_tiles);
+    const int base_tile = mittens::threadgroup_exclusive_scan_i32(local_tiles, tid, nthreads,
+                                                                  sg_sums, total_tiles);
     metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);   // reuse sg_sums for scan #2
     int total_padded = 0;
-    const int poff = mittens::threadgroup_exclusive_scan_i32(padded, tid, nthreads, sg_sums,
-                                                            total_padded);
-    if ((int)tid < B) pad_off[tid] = poff;
+    const int base_pad = mittens::threadgroup_exclusive_scan_i32(local_pad, tid, nthreads, sg_sums,
+                                                                total_padded);
     if (tid == 0) { pad_off[B] = total_padded; n_tiles[0] = total_tiles; }
-    // emit this seq's tiles into [tile_off, tile_off + ntile)  (all < total_tiles)
-    for (int t = 0; t < ntile; ++t) {
-        tile_seq[tile_off + t] = (int)tid;
-        tile_local0[tile_off + t] = t * 8;
+    int run_tile = base_tile, run_pad = base_pad;
+    for (int b = lo; b < hi; ++b) {
+        const int qlen = cu_seqlens[b + 1] - cu_seqlens[b];
+        const int nt = (qlen + 7) / 8;
+        pad_off[b] = run_pad;
+        for (int t = 0; t < nt; ++t) {
+            tile_seq[run_tile + t] = b;
+            tile_local0[run_tile + t] = t * 8;
+        }
+        run_tile += nt;
+        run_pad += nt * 8;
     }
     // sentinel-fill unused slots [total_tiles, max_tiles) (disjoint from the emit ranges above)
     for (int i = (int)tid; i < max_tiles; i += (int)nthreads) {

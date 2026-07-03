@@ -16,8 +16,9 @@ test (`tk/tests/test_integration.py`) chains them on both backends. Perf wins + 
 - **Fully device-resident varlen** ✅ (`attn_varlen_prefill_device`): device `varlen_q_pad_gather` +
   `varlen_o_regather` replace the host pad/transpose loop; the whole path (worklist → pad/gather →
   attention → re-gather) runs on-device from a DEVICE `cu_seqlens` with a single scalar readback
-  (`total_padded`). Remaining minor cap: the worklist's single-threadgroup scan caps B≤256 (a
-  two-level scan for B>256 is the last small piece; large-B prefill batches are rare).
+  (`total_padded`). `varlen_build_worklist` now handles **any B** — a single-threadgroup CHUNKED scan
+  (each thread owns a contiguous batch chunk: local totals → threadgroup exclusive scan → re-walk with
+  the base offset) lifted the old B≤256 cap. Validated == host worklist for B up to 1000.
 - **fp8 cascade prefix** ✅ (`cascade_attention_fp8` / `cascade_prefix_partition_fp8`): uint8 fp8
   (e4m3/e5m2) shared prefix, per-kv-head dequant on read, mirroring `paged_attention_v2_fp8`;
   validated == full attention over [dequant(prefix) ++ suffix].

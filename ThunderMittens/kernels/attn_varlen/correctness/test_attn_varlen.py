@@ -175,6 +175,25 @@ def test_varlen_build_worklist(cu):
     assert (ts2[n:] == -1).all()
 
 
+@pytest.mark.parametrize("B", [257, 512, 1000])
+def test_varlen_build_worklist_large_B(B):
+    """B > 256 exercises the chunked scan (each thread owns a contiguous batch chunk)."""
+    rng = np.random.default_rng(B)
+    qlens = rng.integers(1, 40, size=B).astype(np.int32)
+    cu = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
+    ql, _padded, poff, ts, tl = tk._varlen_worklist(cu)
+    max_tiles = int(sum((int(x) + 7) // 8 for x in qlens)) + B
+    q2, po2, ts2, tl2, nt2 = tk.varlen_build_worklist(mx.array(cu), max_tiles)
+    mx.eval(q2, po2, ts2, tl2, nt2)
+    q2, po2, ts2, tl2, nt2 = (np.array(x) for x in (q2, po2, ts2, tl2, nt2))
+    n = len(ts)
+    assert int(nt2[0]) == n
+    np.testing.assert_array_equal(q2, ql)
+    np.testing.assert_array_equal(po2, poff.astype(np.int32))
+    np.testing.assert_array_equal(ts2[:n], ts)
+    np.testing.assert_array_equal(tl2[:n], tl)
+
+
 if __name__ == "__main__":
     test_equal_lengths(64)
     test_ragged(64)

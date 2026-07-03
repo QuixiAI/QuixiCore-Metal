@@ -2142,7 +2142,7 @@ static std::vector<at::Tensor> varlen_build_worklist_mps(
               "varlen_build_worklist: cu_seqlens must be a 1-D MPS tensor (B+1,)");
   auto cu = cu_seqlens_in.to(at::kInt).contiguous();
   const int B = static_cast<int>(cu.size(0)) - 1;
-  TORCH_CHECK(B >= 1 && B <= 256, "varlen_build_worklist: B in [1,256]");
+  TORCH_CHECK(B >= 1, "varlen_build_worklist: B must be >= 1");   // chunked scan: any B
   auto i32 = cu.options().dtype(at::kInt);
   auto qlens = at::empty({(long)B}, i32);
   auto pad_off = at::empty({(long)(B + 1)}, i32);

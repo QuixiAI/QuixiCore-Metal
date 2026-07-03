@@ -51,7 +51,7 @@ std::vector<array> varlen_build_worklist(
     StreamOrDevice s /* = {} */) {
   assert(cu_seqlens.ndim() == 1);
   const int B = cu_seqlens.shape(0) - 1;
-  assert(B >= 1 && B <= 256 && "varlen_build_worklist: B in [1,256] (single-threadgroup scan)");
+  assert(B >= 1 && "varlen_build_worklist: B must be >= 1");   // chunked scan: any B
   auto cu_c = contiguous(astype(cu_seqlens, int32, s), false, s);
   auto out = array::make_arrays(
       {{B}, {B + 1}, {max_tiles}, {max_tiles}, {1}},

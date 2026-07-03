@@ -922,6 +922,25 @@ def test_varlen_build_worklist(cu):
     assert (ts2[n:] == -1).all()
 
 
+@pytest.mark.parametrize("B", [257, 600])
+def test_varlen_build_worklist_large_B(B):
+    import numpy as np
+    import tk
+    rng = np.random.default_rng(B)
+    qlens = rng.integers(1, 40, size=B).astype(np.int32)
+    cu = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
+    ql, _p, poff, ts, tl = tk._varlen_worklist(cu)
+    max_tiles = int(sum((int(x) + 7) // 8 for x in qlens)) + B
+    q2, po2, ts2, tl2, nt2 = tk_torch.varlen_build_worklist(torch.from_numpy(cu).to("mps"), max_tiles)
+    q2, po2, ts2, tl2, nt2 = (x.cpu().numpy() for x in (q2, po2, ts2, tl2, nt2))
+    n = len(ts)
+    assert int(nt2[0]) == n
+    np.testing.assert_array_equal(q2, ql)
+    np.testing.assert_array_equal(po2, poff.astype(np.int32))
+    np.testing.assert_array_equal(ts2[:n], ts)
+    np.testing.assert_array_equal(tl2[:n], tl)
+
+
 @pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 4)])
 def test_attn_varlen_prefill(D, H, H_KV):
     import numpy as np
