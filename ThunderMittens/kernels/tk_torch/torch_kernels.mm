@@ -1395,6 +1395,60 @@ static at::Tensor cascade_attention_mps(
   return out;
 }
 
+static at::Tensor cascade_attention_multi_mps(
+    const at::Tensor& q_in, const std::vector<at::Tensor>& prefix_ks,
+    const std::vector<at::Tensor>& prefix_vs, const at::Tensor& key_cache_in,
+    const at::Tensor& value_cache_in, const at::Tensor& block_table_in,
+    const at::Tensor& context_lens_in, double scale, int64_t partition_size) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.dim() == 3, "cascade_multi: q must be (B,H,D) MPS");
+  TORCH_CHECK(!prefix_ks.empty() && prefix_ks.size() == prefix_vs.size(),
+              "cascade_multi: need >=1 matching prefix level");
+  const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int H_KV = key_cache_in.size(2), block_size = key_cache_in.size(1);
+  TORCH_CHECK(D == 64 || D == 128, "cascade_multi: head_size must be 64 or 128");
+  TORCH_CHECK(partition_size > 0 && partition_size % block_size == 0,
+              "cascade_multi: partition_size must be a positive multiple of block_size");
+  auto q = q_in.contiguous();
+  auto key_cache = key_cache_in.contiguous(), value_cache = value_cache_in.contiguous();
+  auto block_table = block_table_in.to(at::kInt).contiguous();
+  auto context_lens = context_lens_in.to(at::kInt).contiguous();
+  const int ps = static_cast<int>(partition_size);
+  const int max_suffix = static_cast<int>(block_table.size(1)) * block_size;
+  const int Ps = std::max(1, (max_suffix + ps - 1) / ps);
+  auto f32 = q.options().dtype(at::kFloat);
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : 1.0f / std::sqrt(static_cast<float>(D));
+  const std::string tn = tk_type_name(q);
+  std::vector<at::Tensor> tmps, mls, ess;
+  int total_parts = 0;
+  tk_encode([&](TorchEncoder& e) {
+    for (size_t i = 0; i < prefix_ks.size(); ++i) {
+      auto pk = prefix_ks[i].contiguous(), pv = prefix_vs[i].contiguous();
+      const int plen = pk.size(0);
+      const int Pp = std::max(1, (plen + ps - 1) / ps);
+      auto p_tmp = at::empty({B, H, Pp, D}, f32), p_ml = at::empty({B, H, Pp}, f32),
+           p_es = at::empty({B, H, Pp}, f32);
+      tk::launch_cascade_prefix_partition(e, q, pk, pv, p_tmp, p_ml, p_es, B, H, H_KV, D, plen,
+                                          scale_f, Pp, ps, tn);
+      tmps.push_back(p_tmp); mls.push_back(p_ml); ess.push_back(p_es);
+      total_parts += Pp;
+    }
+    auto s_tmp = at::empty({B, H, Ps, D}, f32), s_ml = at::empty({B, H, Ps}, f32),
+         s_es = at::empty({B, H, Ps}, f32);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens,
+                                         s_tmp, s_ml, s_es, B, H, H_KV, D, block_size,
+                                         static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, tn);
+    tmps.push_back(s_tmp); mls.push_back(s_ml); ess.push_back(s_es);
+    total_parts += Ps;
+  });
+  auto tmp = at::cat(tmps, 2), ml = at::cat(mls, 2), es = at::cat(ess, 2);
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, total_parts, tn);
+  });
+  return out;
+}
+
 // Long-context paged decode over an fp8 (uint8) cache, dequantized on read with per-head scales.
 static at::Tensor paged_attention_v2_fp8_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
@@ -2828,6 +2882,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mla_kv_insert_fp8", &mla_kv_insert_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 MLA KV-insert (MPS)");
   m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
   m.def("cascade_attention", &cascade_attention_mps, "ThunderMittens cascade / shared-prefix attention (MPS)");
+  m.def("cascade_attention_multi", &cascade_attention_multi_mps, "ThunderMittens N-level cascade attention (MPS)");
   m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");

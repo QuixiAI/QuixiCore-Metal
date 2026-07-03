@@ -521,6 +521,14 @@ def cascade_attention(q: torch.Tensor, prefix_k: torch.Tensor, prefix_v: torch.T
                                   context_lens, float(scale), int(partition_size))
 
 
+def cascade_attention_multi(q, prefix_ks, prefix_vs, key_cache, value_cache, block_table,
+                            context_lens, scale: float = 0.0, partition_size: int = 512):
+    """N-level cascade: a list of shared-prefix levels + the paged suffix, merged in one reduce ==
+    full attention over [level0 ++ ... ++ suffix]. MPS tensors."""
+    return _ext.cascade_attention_multi(q, list(prefix_ks), list(prefix_vs), key_cache, value_cache,
+                                        block_table, context_lens, float(scale), int(partition_size))
+
+
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
                            k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3", window=0):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA aware. MPS.

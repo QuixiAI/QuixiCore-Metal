@@ -355,6 +355,25 @@ NB_MODULE(_ext, m) {
         suffix, merged via the shared log-sum-exp reduce == full softmax over [prefix ++ suffix].
       )");
 
+  m.def(
+      "cascade_attention_multi",
+      &cascade_attention_multi,
+      "q"_a,
+      "prefix_ks"_a,
+      "prefix_vs"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "partition_size"_a = 512,
+      "stream"_a = nb::none(),
+      R"(
+        N-level cascade attention: a list of shared-prefix levels + the paged suffix, all partials
+        concatenated + one log-sum-exp reduce == full softmax over [level0 ++ ... ++ suffix].
+      )");
+
     m.def(
       "paged_attention_v2_fp8",
       &paged_attention_v2_fp8,

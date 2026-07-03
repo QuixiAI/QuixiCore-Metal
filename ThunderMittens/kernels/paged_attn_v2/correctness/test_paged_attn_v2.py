@@ -206,6 +206,32 @@ def test_cascade_attention(D, H, H_KV, partition_size, plen):
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-5)
 
 
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("plens", [[4, 8, 3], [1, 16, 7]])
+def test_cascade_attention_multi(D, plens):
+    """N-level cascade (list of shared prefixes + paged suffix) == full attn over [levels ++ suffix]."""
+    rng = np.random.default_rng(70 + D + sum(plens))
+    B, H, H_KV = 2, 4, 2
+    num_blocks, block_size, ps = 8, 4, 8
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pks = [(0.2 * rng.normal(size=(pl, H_KV, D))).astype(np.float32) for pl in plens]
+    pvs = [(0.2 * rng.normal(size=(pl, H_KV, D))).astype(np.float32) for pl in plens]
+    kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+    got = cascade_attention(mx.array(q), [mx.array(x) for x in pks], [mx.array(x) for x in pvs],
+                            mx.array(kc), mx.array(vc), mx.array(bt), mx.array(cl), scale=scale,
+                            partition_size=ps)
+    mx.eval(got)
+    # reference: concatenate all levels' prefix KV, then reuse the 2-level cascade ref
+    pk_all = np.concatenate(pks, axis=0)
+    pv_all = np.concatenate(pvs, axis=0)
+    ref = _cascade_ref(q, pk_all, pv_all, kc, vc, bt, cl, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-5)
+
+
 if __name__ == "__main__":
     for ps in (4, 8, 16):
         test_paged_attention_v2("float32", 3e-5, 64, 4, 2, ps)

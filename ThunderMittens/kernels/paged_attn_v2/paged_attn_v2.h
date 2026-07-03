@@ -69,6 +69,19 @@ array cascade_attention(
     int partition_size = 512,
     StreamOrDevice s = {});
 
+// N-level cascade: a list of shared-prefix levels + the paged suffix, merged in one reduce.
+array cascade_attention_multi(
+    const array& q,
+    const std::vector<array>& prefix_ks,
+    const std::vector<array>& prefix_vs,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale = 0.0f,
+    int partition_size = 512,
+    StreamOrDevice s = {});
+
 // --- internal primitives (not bound directly) ---
 
 class CascadePrefixPartition : public Primitive {

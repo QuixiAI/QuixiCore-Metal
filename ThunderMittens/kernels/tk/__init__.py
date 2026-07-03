@@ -685,7 +685,19 @@ def cascade_attention(q, prefix_k, prefix_v, key_cache, value_cache, block_table
     block_table + context_lens). The two levels' softmax states are merged via the shared
     log-sum-exp reduce == full attention over [prefix ++ suffix] per request. Amortizes the shared
     system prompt across a batch. q/out (B,H,D); D in {64,128}; GQA/MQA aware. partition_size must be
-    a multiple of block_size. Accepts mlx.array or torch.Tensor (MPS)."""
+    a multiple of block_size.
+
+    N-level cascade: pass prefix_k/prefix_v as a LIST of levels ([(prefix_len_i, H_KV, D), ...]) — all
+    levels' + the suffix's partials are concatenated and merged in one reduce == full attention over
+    [level0 ++ ... ++ suffix]. Accepts mlx.array or torch.Tensor (MPS)."""
+    if isinstance(prefix_k, (list, tuple)):
+        if _is_torch(q):
+            return _torch().cascade_attention_multi(
+                q, list(prefix_k), list(prefix_v), key_cache, value_cache, block_table,
+                context_lens, scale, partition_size)
+        return _mlx().cascade_attention_multi(
+            q, list(prefix_k), list(prefix_v), key_cache, value_cache, block_table, context_lens,
+            scale=scale, partition_size=partition_size)
     if _is_torch(q):
         return _torch().cascade_attention(
             q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,

@@ -265,6 +265,37 @@ def test_cascade_attention(D, H, H_KV, plen):
     assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
 
 
+@pytest.mark.parametrize("plens", [[4, 8, 3], [1, 16, 7]])
+def test_cascade_attention_multi(plens):
+    import numpy as np
+    rng = np.random.default_rng(sum(plens))
+    B, H, H_KV, D, num_blocks, bs = 2, 4, 2, 64, 8, 4
+    scale = 1.0 / math.sqrt(D); group = H // H_KV
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pks = [(0.2 * rng.normal(size=(pl, H_KV, D))).astype(np.float32) for pl in plens]
+    pvs = [(0.2 * rng.normal(size=(pl, H_KV, D))).astype(np.float32) for pl in plens]
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], np.int32); cl = np.array([10, 16], np.int32)
+    mps = lambda a: torch.from_numpy(a).to(torch.bfloat16).to("mps")
+    got = tk_torch.cascade_attention_multi(mps(q), [mps(x) for x in pks], [mps(x) for x in pvs],
+                                           mps(kc), mps(vc), torch.from_numpy(bt).to("mps"),
+                                           torch.from_numpy(cl).to("mps"), 0.0, 8)
+    pk_all = np.concatenate(pks, 0); pv_all = np.concatenate(pvs, 0); plen = pk_all.shape[0]
+    ref = np.zeros_like(q)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group; sc, vs = [], []
+            for t in range(plen):
+                sc.append(float(np.dot(q[b, h], pk_all[t, kvh]) * scale)); vs.append(pv_all[t, kvh])
+            for t in range(int(cl[b])):
+                blk = bt[b, t // bs]; slot = t % bs
+                sc.append(float(np.dot(q[b, h], kc[blk, slot, kvh]) * scale)); vs.append(vc[blk, slot, kvh])
+            s = np.array(sc, np.float32); p = np.exp(s - s.max()); p /= p.sum()
+            ref[b, h] = np.sum(p[:, None] * np.stack(vs), axis=0)
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
+
+
 @pytest.mark.parametrize("window", [1, 16, 640])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_paged_attention_v2_window(window, fp8):

@@ -177,6 +177,70 @@ array cascade_attention(
       {tmp, ml, es});
 }
 
+array cascade_attention_multi(
+    const array& q,
+    const std::vector<array>& prefix_ks,
+    const std::vector<array>& prefix_vs,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    float scale /* = 0.0f */,
+    int partition_size /* = 512 */,
+    StreamOrDevice s /* = {} */) {
+  if (prefix_ks.empty() || prefix_ks.size() != prefix_vs.size()) {
+    throw std::invalid_argument("cascade_attention_multi: need >=1 matching prefix level");
+  }
+  if (q.ndim() != 3 || key_cache.ndim() != 4 || value_cache.ndim() != 4 ||
+      key_cache.shape() != value_cache.shape()) {
+    throw std::invalid_argument("cascade_attention_multi: bad q / cache shapes");
+  }
+  const int D = q.shape(2);
+  if (!(D == 64 || D == 128) || key_cache.shape(3) != D) {
+    throw std::invalid_argument("cascade_attention_multi: head_size must be 64/128 and match cache");
+  }
+  const int block_size = key_cache.shape(1);
+  if (partition_size <= 0 || partition_size % block_size != 0) {
+    throw std::invalid_argument("cascade_attention_multi: partition_size must be a +ve multiple of block_size");
+  }
+  const Dtype dtype = q.dtype();
+  auto q_c = pav2_cast(q, dtype, s);
+  auto key_c = pav2_cast(key_cache, dtype, s);
+  auto value_c = pav2_cast(value_cache, dtype, s);
+  auto table_c = contiguous(astype(block_table, int32, s), false, s);
+  auto lens_c = contiguous(astype(context_lens, int32, s), false, s);
+  const int B = q.shape(0), H = q.shape(1);
+  const int max_suffix = block_table.shape(1) * block_size;
+  const int Ps = std::max(1, (max_suffix + partition_size - 1) / partition_size);
+
+  // Per-level prefix partials + the paged suffix partials, all concatenated along the partition
+  // axis, then ONE shared log-sum-exp reduce == full attention over [level0 ++ ... ++ suffix].
+  std::vector<array> tmps, mls, ess;
+  for (size_t i = 0; i < prefix_ks.size(); ++i) {
+    if (prefix_ks[i].ndim() != 3 || prefix_ks[i].shape() != prefix_vs[i].shape() ||
+        prefix_ks[i].shape(2) != D || prefix_ks[i].shape(1) != key_cache.shape(2)) {
+      throw std::invalid_argument("cascade_attention_multi: prefix level shape mismatch");
+    }
+    auto pk_c = pav2_cast(prefix_ks[i], dtype, s);
+    auto pv_c = pav2_cast(prefix_vs[i], dtype, s);
+    const int prefix_len = prefix_ks[i].shape(0);
+    const int Pp = std::max(1, (prefix_len + partition_size - 1) / partition_size);
+    auto pp = array::make_arrays(
+        {{B, H, Pp, D}, {B, H, Pp}, {B, H, Pp}}, {float32, float32, float32},
+        std::make_shared<CascadePrefixPartition>(to_stream(s), scale, Pp, partition_size),
+        {q_c, pk_c, pv_c});
+    tmps.push_back(pp[0]); mls.push_back(pp[1]); ess.push_back(pp[2]);
+  }
+  auto sp = array::make_arrays(
+      {{B, H, Ps, D}, {B, H, Ps}, {B, H, Ps}}, {float32, float32, float32},
+      std::make_shared<PagedAttentionV2Partition>(to_stream(s), scale, Ps, partition_size, 0),
+      {q_c, key_c, value_c, table_c, lens_c});
+  tmps.push_back(sp[0]); mls.push_back(sp[1]); ess.push_back(sp[2]);
+
+  return array({B, H, D}, dtype, std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
+               {concatenate(tmps, 2, s), concatenate(mls, 2, s), concatenate(ess, 2, s)});
+}
+
 array paged_attention_v2_fp8(
     const array& q,
     const array& key_cache,
