@@ -640,6 +640,17 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "build_dynamic_tree",
+      &build_dynamic_tree,
+      "parents"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Build draft-tree pointers on device from a (B, N) parent list. Returns
+        [retrieve_next_token, retrieve_next_sibling, positions] (all int32).
+      )");
+
+  m.def(
       "spec_compact",
       &spec_compact,
       "out_tokens"_a,

@@ -611,6 +611,40 @@ kernel void spec_verify_tree(device const int   *draft_tokens         [[buffer(0
     if (lane == 0) { accept_num[b] = num_acc; }
 }
 
+// build_dynamic_tree: device-resident construction of the (first-child, next-sibling, depth) pointers
+// a dynamic draft tree feeds to spec_verify_tree, from a per-node parent list `parents` (B, N) with
+// parents[b,0] = -1 for the root and parents[c] < c (topological). One simdgroup per request; the 32
+// lanes split the N nodes. Cap-free and scratch-free (no last_child[] array): a node c is the first
+// child of p iff no earlier node in [1,c) shares parent p; c's next sibling is the first later node
+// sharing p; positions[c] = depth of c = ancestor count. Mirrors the host spec_build_tree_pointers.
+kernel void build_dynamic_tree(device const int *parents               [[buffer(0)]],  // (B, N)
+                               device int       *retrieve_next_token    [[buffer(1)]],  // (B, N)
+                               device int       *retrieve_next_sibling  [[buffer(2)]],  // (B, N)
+                               device int       *positions              [[buffer(3)]],  // (B, N)
+                               constant int     &N                      [[buffer(4)]],
+                               uint b    [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_simdgroup]]) {
+    const long nb = (long)b * N;
+    for (int i = (int)lane; i < N; i += 32) {           // -1-init; leaf parents / the root stay -1
+        retrieve_next_token[nb + i]   = -1;
+        retrieve_next_sibling[nb + i] = -1;
+    }
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    for (int c = (int)lane; c < N; c += 32) {
+        int d = 0, x = c;                               // positions[c] = depth (ancestor count)
+        while (parents[nb + x] >= 0) { x = parents[nb + x]; d += 1; }
+        positions[nb + c] = d;
+        const int p = parents[nb + c];
+        if (c == 0 || p < 0) { continue; }              // root has no parent pointers to set
+        int sib = -1;                                   // next sibling: first later node sharing p
+        for (int c2 = c + 1; c2 < N; ++c2) { if (parents[nb + c2] == p) { sib = c2; break; } }
+        retrieve_next_sibling[nb + c] = sib;
+        bool isFirst = true;                            // first child of p? (no earlier sibling)
+        for (int c2 = 1; c2 < c; ++c2) { if (parents[nb + c2] == p) { isFirst = false; break; } }
+        if (isFirst) { retrieve_next_token[nb + p] = c; }
+    }
+}
+
 // spec_compact: gather each request's valid tokens (accepted drafts + the recovered/bonus token,
 // vlen = accepted_cnt+1) from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets
 // (exclusive scan of vlen). packed_pos[k] = seq_lens[b] + j is the absolute KV position of the

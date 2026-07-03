@@ -497,6 +497,14 @@ void launch_spec_verify_tree(E& e, typename E::in_t draft_tokens, typename E::in
   e.in(tree_valid, 10);
   e.dispatch(B, 1, 1, 32, 1, 1);
 }
+// build_dynamic_tree: one simdgroup per request (grid B x 32) builds the tree pointers on device.
+template <class E>
+void launch_build_dynamic_tree(E& e, typename E::in_t parents, typename E::out_t rt,
+                               typename E::out_t rs, typename E::out_t positions, int B, int N) {
+  e.pipeline("build_dynamic_tree");
+  e.in(parents, 0); e.out(rt, 1); e.out(rs, 2); e.out(positions, 3); e.bytes(N, 4);
+  e.dispatch(B, 1, 1, 32, 1, 1);
+}
 // spec_compact: single threadgroup (B<=256) exclusive-scan compaction of accepted tokens.
 template <class E>
 void launch_spec_compact(E& e, typename E::in_t out_tokens, typename E::in_t accepted_cnt,

@@ -342,6 +342,11 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
                                          accept_u, int(seed)))
 
 
+def build_dynamic_tree(parents):
+    """Device draft-tree builder -> (retrieve_next_token, retrieve_next_sibling, positions) int32. MPS."""
+    return tuple(_ext.build_dynamic_tree(parents))
+
+
 def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed,
                      tree_valid=None):
     """Speculative tree verification -> (accept_index, accept_token, accept_num) int32, -1-pad. MPS.

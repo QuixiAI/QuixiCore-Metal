@@ -402,6 +402,20 @@ def test_spec_verify_tree_parity(seed, parents):
         _assert_parity(a, b, atol=0)
 
 
+@pytest.mark.parametrize("N", [7, 33, 129])
+def test_build_dynamic_tree_parity(N):
+    rng = np.random.default_rng(300 + N)
+    B = 4
+    parents = np.full((B, N), -1, np.int32)
+    for b in range(B):
+        for c in range(1, N):
+            parents[b, c] = rng.integers(0, c)
+    om = tk.build_dynamic_tree(mx.array(parents))
+    ot = tk.build_dynamic_tree(torch.from_numpy(parents).to("mps"))
+    for a, b in zip(om, ot):
+        _assert_parity(a, b, atol=0)
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (300, 4)])
 def test_spec_compact_parity(B, S):
     rng = np.random.default_rng(B * 7 + S)

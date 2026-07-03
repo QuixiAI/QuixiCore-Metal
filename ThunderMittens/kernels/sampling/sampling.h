@@ -365,6 +365,28 @@ class SpecVerifyTree : public Primitive {
   uint32_t seed_;
 };
 
+/** build_dynamic_tree: device-resident construction of the draft-tree pointers from a per-node parent
+ *  list `parents` (B, N) int (parents[b,0] = -1 root, parents[c] < c). Returns [retrieve_next_token
+ *  (B,N), retrieve_next_sibling (B,N), positions (B,N)] int32 (first-child / next-sibling pointers,
+ *  -1 = none; positions[c] = depth from root). The device analogue of spec_build_tree_pointers. */
+std::vector<array> build_dynamic_tree(const array& parents, StreamOrDevice s = {});
+
+class BuildDynamicTree : public Primitive {
+ public:
+  explicit BuildDynamicTree(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "BuildDynamicTree"; }
+  void print(std::ostream& os) override { os << "BuildDynamicTree"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 /** spec_compact: gather each request's valid tokens (accepted + recovered/bonus, vlen=accepted_cnt+1)
  *  from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets. Returns [packed_tokens
  *  (B*(S+1),) int32, packed_pos (B*(S+1),) int32, cu_accepted (B+1,) int32]; packed_pos[k] =

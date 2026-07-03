@@ -1867,6 +1867,21 @@ static std::vector<at::Tensor> spec_compact_mps(const at::Tensor& out_tokens_in,
   return {packed_tokens, packed_pos, cu_accepted};
 }
 
+static std::vector<at::Tensor> build_dynamic_tree_mps(const at::Tensor& parents_in) {
+  TORCH_CHECK(parents_in.device().is_mps() && parents_in.dim() == 2,
+              "build_dynamic_tree: parents must be (B, N) MPS");
+  const int B = parents_in.size(0), N = parents_in.size(1);
+  auto p = parents_in.to(at::kInt).contiguous();
+  auto i32 = p.options();
+  auto rt = at::empty({B, N}, i32);
+  auto rs = at::empty({B, N}, i32);
+  auto positions = at::empty({B, N}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_build_dynamic_tree(e, p, rt, rs, positions, B, N);
+  });
+  return {rt, rs, positions};
+}
+
 static at::Tensor spec_update_kv_meta_mps(const at::Tensor& seq_lens_in,
                                           const at::Tensor& accepted_cnt_in) {
   TORCH_CHECK(seq_lens_in.device().is_mps() && seq_lens_in.dim() == 1,
@@ -2987,6 +3002,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
   m.def("spec_verify_tree", &spec_verify_tree_mps, "ThunderMittens spec tree verification (MPS)");
   m.def("spec_compact", &spec_compact_mps, "ThunderMittens spec accepted-token compaction (MPS)");
+  m.def("build_dynamic_tree", &build_dynamic_tree_mps, "ThunderMittens device draft-tree pointers (MPS)");
   m.def("spec_update_kv_meta", &spec_update_kv_meta_mps, "ThunderMittens spec KV meta update (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,
         "ThunderMittens speculative linear rejection-sampling verification (MPS)");

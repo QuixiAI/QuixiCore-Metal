@@ -13,8 +13,55 @@ import pytest
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
                 spec_verify_linear, spec_compact, spec_update_kv_meta, spec_verify_tree,
-                spec_build_tree_pointers, min_p_sample, typical_p_sample, apply_token_bitmask,
-                apply_bad_words)
+                spec_build_tree_pointers, build_dynamic_tree, min_p_sample, typical_p_sample,
+                apply_token_bitmask, apply_bad_words)
+
+
+def _random_tree_parents(rng, N):
+    """A random topological parent list: parents[0] = -1, parents[c] in [0, c) for c >= 1."""
+    parents = np.full(N, -1, np.int32)
+    for c in range(1, N):
+        parents[c] = rng.integers(0, c)
+    return parents
+
+
+def _host_positions(parents):
+    N = len(parents)
+    pos = np.zeros(N, np.int32)
+    for c in range(1, N):
+        pos[c] = pos[int(parents[c])] + 1
+    return pos
+
+
+@pytest.mark.parametrize("N", [1, 4, 7, 33, 129])
+def test_build_dynamic_tree(N):
+    rng = np.random.default_rng(100 + N)
+    B = 5
+    parents = np.stack([_random_tree_parents(rng, N) for _ in range(B)]).astype(np.int32)
+    rt, rs, pos = build_dynamic_tree(mx.array(parents))
+    rt, rs, pos = np.array(rt), np.array(rs), np.array(pos)
+    for b in range(B):
+        nt_ref, ns_ref = spec_build_tree_pointers(parents[b], N)
+        pos_ref = _host_positions(parents[b])
+        assert list(rt[b]) == list(nt_ref), (b, N)
+        assert list(rs[b]) == list(ns_ref), (b, N)
+        assert list(pos[b]) == list(pos_ref), (b, N)
+
+
+def test_build_dynamic_tree_feeds_verify():
+    # the device-built pointers drive spec_verify_tree identically to the host-built ones
+    rng = np.random.default_rng(7)
+    B, V, N = 3, 256, 7
+    parents = np.stack([_random_tree_parents(rng, N) for _ in range(B)]).astype(np.int32)
+    draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+    tp = np.abs(rng.standard_normal((B, N, V))).astype(np.float32); tp /= tp.sum(-1, keepdims=True)
+    rt_d, rs_d, _ = build_dynamic_tree(mx.array(parents))
+    rt_h = np.stack([spec_build_tree_pointers(parents[b], N)[0] for b in range(B)])
+    rs_h = np.stack([spec_build_tree_pointers(parents[b], N)[1] for b in range(B)])
+    a = spec_verify_tree(mx.array(draft), mx.array(tp), rt_d, rs_d, 5)
+    c = spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(rt_h), mx.array(rs_h), 5)
+    for x, y in zip(a, c):
+        assert np.array_equal(np.array(x), np.array(y))
 
 
 def _pack_bitmask(allow):

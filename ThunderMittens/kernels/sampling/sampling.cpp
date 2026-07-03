@@ -718,6 +718,39 @@ void SpecVerifyTree::eval_gpu(const std::vector<array>& inputs, std::vector<arra
 }
 TK_BEAM_NO_AUTODIFF(SpecVerifyTree, "SpecVerifyTree")
 
+std::vector<array> build_dynamic_tree(const array& parents, StreamOrDevice s /* = {} */) {
+  if (parents.ndim() != 2) {
+    throw std::invalid_argument("build_dynamic_tree: parents must be (B, N)");
+  }
+  const int B = parents.shape(0);
+  const int N = parents.shape(1);
+  auto p_c = contiguous(astype(parents, int32, s), false, s);
+  return array::make_arrays(
+      {{B, N}, {B, N}, {B, N}}, {int32, int32, int32},
+      std::make_shared<BuildDynamicTree>(to_stream(s)), {p_c});
+}
+
+void BuildDynamicTree::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BuildDynamicTree has no CPU implementation.");
+}
+void BuildDynamicTree::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& parents = inputs[0];
+  auto& rt = outputs[0];
+  auto& rs = outputs[1];
+  auto& positions = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  rt.set_data(allocator::malloc_or_wait(rt.nbytes()));
+  rs.set_data(allocator::malloc_or_wait(rs.nbytes()));
+  positions.set_data(allocator::malloc_or_wait(positions.nbytes()));
+  const int B = parents.shape(0);
+  const int N = parents.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_build_dynamic_tree(enc, parents, rt, rs, positions, B, N);
+}
+TK_BEAM_NO_AUTODIFF(BuildDynamicTree, "BuildDynamicTree")
+
 std::vector<array> spec_compact(
     const array& out_tokens, const array& accepted_cnt, const array& seq_lens,
     StreamOrDevice s /* = {} */) {

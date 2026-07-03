@@ -1264,6 +1264,18 @@ def spec_build_tree_pointers(parents, num_nodes):
     return nxt_tok, nxt_sib
 
 
+def build_dynamic_tree(parents):
+    """Device-resident draft-tree builder: from a per-node parent list `parents` (B, N) int
+    (parents[b,0] = -1 root, parents[c] < c topological) build the pointers spec_verify_tree consumes.
+    Returns (retrieve_next_token (B,N), retrieve_next_sibling (B,N), positions (B,N)) int32:
+    first-child / next-sibling pointers (-1 = none) and positions[c] = depth from the root. The
+    on-device analogue of the host spec_build_tree_pointers. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(parents):
+        return tuple(_torch().build_dynamic_tree(parents))
+    out = _mlx().build_dynamic_tree(parents)
+    return out[0], out[1], out[2]
+
+
 def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed,
                      tree_valid=None):
     """Speculative TREE verification (target-only rejection, TRT-LLM dynamicTree). draft_tokens

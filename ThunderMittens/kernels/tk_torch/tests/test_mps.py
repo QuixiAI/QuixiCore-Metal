@@ -1508,6 +1508,28 @@ def test_spec_verify_tree_wide_and_invalid():
         assert int(at[b, 0]) not in set(range(1, num_sib + 1))
 
 
+@pytest.mark.parametrize("N", [7, 33, 129])
+def test_build_dynamic_tree(N):
+    import numpy as np
+    from tk import spec_build_tree_pointers
+    rng = np.random.default_rng(100 + N)
+    B = 5
+    parents = np.full((B, N), -1, np.int32)
+    for b in range(B):
+        for c in range(1, N):
+            parents[b, c] = rng.integers(0, c)
+    rt, rs, pos = tk_torch.build_dynamic_tree(torch.from_numpy(parents).to("mps"))
+    rt, rs, pos = rt.cpu().numpy(), rs.cpu().numpy(), pos.cpu().numpy()
+    for b in range(B):
+        nt_ref, ns_ref = spec_build_tree_pointers(parents[b], N)
+        pos_ref = np.zeros(N, np.int32)
+        for c in range(1, N):
+            pos_ref[c] = pos_ref[int(parents[b, c])] + 1
+        assert np.array_equal(rt[b], nt_ref)
+        assert np.array_equal(rs[b], ns_ref)
+        assert np.array_equal(pos[b], pos_ref)
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (300, 4)])
 def test_spec_compact_and_kv_meta(B, S):
     import numpy as np
