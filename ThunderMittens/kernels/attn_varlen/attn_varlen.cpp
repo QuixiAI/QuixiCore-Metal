@@ -100,6 +100,65 @@ std::pair<std::vector<array>, std::vector<int>> VarlenBuildWorklist::vmap(
   throw std::runtime_error("VarlenBuildWorklist has no vmap implementation.");
 }
 
+array varlen_pad_q(
+    const array& q_packed, const array& cu_seqlens, const array& pad_off, int total_padded,
+    StreamOrDevice s /* = {} */) {
+  if (q_packed.ndim() != 3 || q_packed.dtype() != bfloat16) {
+    throw std::invalid_argument("varlen_pad_q: q_packed must be (total_q, H, D) bf16");
+  }
+  const int H = q_packed.shape(1), D = q_packed.shape(2);
+  return array({H, total_padded, D}, bfloat16, std::make_shared<VarlenPackGather>(to_stream(s), false),
+               {contiguous(q_packed, false, s), contiguous(astype(cu_seqlens, int32, s), false, s),
+                contiguous(astype(pad_off, int32, s), false, s)});
+}
+
+array varlen_regather_o(
+    const array& o_hm, const array& cu_seqlens, const array& pad_off, int total_q,
+    StreamOrDevice s /* = {} */) {
+  if (o_hm.ndim() != 3 || o_hm.dtype() != bfloat16) {
+    throw std::invalid_argument("varlen_regather_o: o_hm must be (H, total_padded, D) bf16");
+  }
+  const int H = o_hm.shape(0), D = o_hm.shape(2);
+  return array({total_q, H, D}, bfloat16, std::make_shared<VarlenPackGather>(to_stream(s), true),
+               {contiguous(o_hm, false, s), contiguous(astype(cu_seqlens, int32, s), false, s),
+                contiguous(astype(pad_off, int32, s), false, s)});
+}
+
+void VarlenPackGather::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("VarlenPackGather has no CPU implementation.");
+}
+void VarlenPackGather::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& src = inputs[0];
+  auto& cu = inputs[1];
+  auto& po = inputs[2];
+  auto& dst = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dst.set_data(allocator::malloc_or_wait(dst.nbytes()));
+  const int B = cu.shape(0) - 1;
+  int total_q, H, D, total_padded;
+  if (regather_) {          // src o_hm (H, tp, D) -> dst o_packed (total_q, H, D)
+    H = src.shape(0); total_padded = src.shape(1); D = src.shape(2); total_q = dst.shape(0);
+  } else {                  // src q_packed (total_q, H, D) -> dst q_hm (H, tp, D)
+    total_q = src.shape(0); H = src.shape(1); D = src.shape(2); total_padded = dst.shape(1);
+  }
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_varlen_pack_gather(enc, src, cu, po, dst, total_q, B, H, D, total_padded, regather_);
+}
+std::vector<array> VarlenPackGather::jvp(const std::vector<array>&, const std::vector<array>&,
+                                         const std::vector<int>&) {
+  throw std::runtime_error("VarlenPackGather has no jvp implementation.");
+}
+std::vector<array> VarlenPackGather::vjp(const std::vector<array>&, const std::vector<array>&,
+                                         const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("VarlenPackGather has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> VarlenPackGather::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("VarlenPackGather has no vmap implementation.");
+}
+
 void AttnVarlenPrefill::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("AttnVarlenPrefill has no CPU implementation.");
 }

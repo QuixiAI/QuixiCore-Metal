@@ -968,6 +968,16 @@ def test_attn_varlen_prefill(D, H, H_KV):
                 w = np.exp(sc); w /= w.sum()
                 ref[s + j, h] = w @ V[:lim, kvh]
     assert np.abs(on - ref).max() / (np.abs(ref).max() + 1e-6) < 0.03
+    # fully device-resident path (device cu + device Q pad/gather + re-gather) matches the oracle too
+    import tk as _tk
+    max_tiles = int(sum((int(cu[b + 1] - cu[b]) + 7) // 8 for b in range(len(ctxs)))) + 4
+    od = _tk.attn_varlen_prefill_device(
+        torch.from_numpy(q).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(kc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(vc).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(bt).to("mps"), torch.from_numpy(np.array(ctxs, np.int32)).to("mps"),
+        torch.from_numpy(np.array(cu, np.int32)).to("mps"), max_tiles, scale=float(scale))
+    assert np.abs(od.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-6) < 0.03
 
 
 @pytest.mark.parametrize("mode,k", [("argmax", 0), ("categorical", 0), ("topk", 8)])

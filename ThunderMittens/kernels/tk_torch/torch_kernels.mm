@@ -2156,6 +2156,36 @@ static std::vector<at::Tensor> varlen_build_worklist_mps(
   return {qlens, pad_off, tile_seq, tile_local0, n_tiles};
 }
 
+static at::Tensor varlen_pad_q_mps(const at::Tensor& q_in, const at::Tensor& cu_in,
+                                   const at::Tensor& po_in, int64_t total_padded) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.dim() == 3 && q_in.scalar_type() == at::kBFloat16,
+              "varlen_pad_q: q_packed must be (total_q, H, D) bf16 MPS");
+  auto q = q_in.contiguous();
+  auto cu = cu_in.to(at::kInt).contiguous(), po = po_in.to(at::kInt).contiguous();
+  const int total_q = q.size(0), H = q.size(1), D = q.size(2), B = static_cast<int>(cu.size(0)) - 1;
+  auto q_hm = at::empty({H, (long)total_padded, D}, q.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_varlen_pack_gather(e, q, cu, po, q_hm, total_q, B, H, D,
+                                  static_cast<int>(total_padded), false);
+  });
+  return q_hm;
+}
+
+static at::Tensor varlen_regather_o_mps(const at::Tensor& o_in, const at::Tensor& cu_in,
+                                        const at::Tensor& po_in, int64_t total_q) {
+  TORCH_CHECK(o_in.device().is_mps() && o_in.dim() == 3 && o_in.scalar_type() == at::kBFloat16,
+              "varlen_regather_o: o_hm must be (H, total_padded, D) bf16 MPS");
+  auto o = o_in.contiguous();
+  auto cu = cu_in.to(at::kInt).contiguous(), po = po_in.to(at::kInt).contiguous();
+  const int H = o.size(0), total_padded = o.size(1), D = o.size(2), B = static_cast<int>(cu.size(0)) - 1;
+  auto o_packed = at::empty({(long)total_q, H, D}, o.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_varlen_pack_gather(e, o, cu, po, o_packed, static_cast<int>(total_q), B, H, D,
+                                  total_padded, true);
+  });
+  return o_packed;
+}
+
 // Fused LM-head + sampling: token id per row of h without materializing the (T, V) logits.
 static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W_in,
                                      const at::Tensor& bias_in, int64_t mode, int64_t k,
@@ -2964,6 +2994,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
+  m.def("varlen_pad_q", &varlen_pad_q_mps, "ThunderMittens device varlen Q pad/gather (MPS)");
+  m.def("varlen_regather_o", &varlen_regather_o_mps, "ThunderMittens device varlen output re-gather (MPS)");
   m.def("varlen_build_worklist", &varlen_build_worklist_mps,
         "ThunderMittens on-device varlen prefill worklist builder (MPS)");
   m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");

@@ -40,6 +40,38 @@ std::vector<array> varlen_build_worklist(
     int max_tiles,
     StreamOrDevice s = {});
 
+/** Device varlen Q pad/gather: packed q (total_q, H, D) -> padded head-major q_hm (H, total_padded,
+ *  D) via cu_seqlens + pad_off (pad rows written 0). Replaces the host per-batch pad+transpose. */
+array varlen_pad_q(
+    const array& q_packed, const array& cu_seqlens, const array& pad_off, int total_padded,
+    StreamOrDevice s = {});
+
+/** Inverse: head-major output o_hm (H, total_padded, D) -> packed (total_q, H, D). */
+array varlen_regather_o(
+    const array& o_hm, const array& cu_seqlens, const array& pad_off, int total_q,
+    StreamOrDevice s = {});
+
+class VarlenPackGather : public Primitive {
+ public:
+  VarlenPackGather(Stream stream, bool regather) : Primitive(stream), regather_(regather) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "VarlenPackGather"; }
+  void print(std::ostream& os) override { os << "VarlenPackGather"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return regather_ == static_cast<const VarlenPackGather&>(other).regather_;
+  }
+
+ private:
+  bool regather_;
+};
+
 class VarlenBuildWorklist : public Primitive {
  public:
   VarlenBuildWorklist(Stream stream, int max_tiles) : Primitive(stream), max_tiles_(max_tiles) {}

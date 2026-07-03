@@ -1144,6 +1144,32 @@ NB_MODULE(_ext, m) {
         tile_local0, n_tiles] (tile_seq is -1 past n_tiles). max_tiles is a host upper bound.
       )");
 
+  m.def(
+      "varlen_pad_q",
+      &varlen_pad_q,
+      "q_packed"_a,
+      "cu_seqlens"_a,
+      "pad_off"_a,
+      "total_padded"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Device varlen Q pad/gather: packed (total_q,H,D) bf16 -> padded head-major (H,total_padded,D).
+      )");
+
+  m.def(
+      "varlen_regather_o",
+      &varlen_regather_o,
+      "o_hm"_a,
+      "cu_seqlens"_a,
+      "pad_off"_a,
+      "total_q"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Device varlen output re-gather: head-major (H,total_padded,D) bf16 -> packed (total_q,H,D).
+      )");
+
     m.def(
       "lm_head_sample",
       &lm_head_sample,

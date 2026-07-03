@@ -54,6 +54,7 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
     const int gx   = (int)blockIdx.x;   // tile index
     const int head = (int)blockIdx.y;
     const int b    = tile_seq[gx];
+    if (b < 0) { return; }              // sentinel tile past n_tiles (fully device-resident path)
     const int local0 = tile_local0[gx];
     const int ctx  = context_lens[b];
     const int past = ctx - seq_qlen[b];             // cached prefix length (>= 0)
@@ -168,6 +169,65 @@ kernel void varlen_build_worklist(device const int *cu_seqlens [[buffer(0)]],   
     // sentinel-fill unused slots [total_tiles, max_tiles) (disjoint from the emit ranges above)
     for (int i = (int)tid; i < max_tiles; i += (int)nthreads) {
         if (i >= total_tiles) { tile_seq[i] = -1; tile_local0[i] = 0; }
+    }
+}
+
+// Device-resident varlen Q pad/gather: build the padded head-major layout q_hm (H, total_padded, D)
+// that attn_varlen_prefill consumes from packed Q (total_q, H, D). Grids over PADDED positions p so
+// every row is written (real rows gather packed token cu_seqlens[b]+local; pad rows write 0) — no
+// host per-batch pad+transpose, no pre-zero. One threadgroup per padded position; threads stride D.
+[[host_name("varlen_q_pad_gather")]]
+kernel void varlen_q_pad_gather(device const bf16 *q_packed   [[buffer(0)]],   // (total_q, H, D)
+                                device const int  *cu_seqlens [[buffer(1)]],   // (B+1,)
+                                device const int  *pad_off    [[buffer(2)]],   // (B+1,)
+                                device bf16       *q_hm       [[buffer(3)]],   // (H, total_padded, D)
+                                constant int &B [[buffer(4)]], constant int &H [[buffer(5)]],
+                                constant int &D [[buffer(6)]], constant int &total_padded [[buffer(7)]],
+                                uint p [[threadgroup_position_in_grid]],
+                                uint lid [[thread_position_in_threadgroup]],
+                                uint nthreads [[threads_per_threadgroup]]) {
+    threadgroup int s_valid, s_t;
+    if (lid == 0) {
+        int b = B - 1;
+        for (int k = 0; k < B; ++k) { if ((int)p < pad_off[k + 1]) { b = k; break; } }
+        const int i = (int)p - pad_off[b];
+        const int qlen = cu_seqlens[b + 1] - cu_seqlens[b];
+        s_valid = i < qlen ? 1 : 0;
+        s_t = cu_seqlens[b] + i;
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    const int valid = s_valid, t = s_t;
+    for (int h = 0; h < H; ++h) {
+        for (int d = (int)lid; d < D; d += (int)nthreads) {
+            q_hm[((long)h * total_padded + (int)p) * D + d] =
+                valid ? q_packed[((long)t * H + h) * D + d] : bf16(0.0f);
+        }
+    }
+}
+
+// Inverse: gather the head-major output o_hm (H, total_padded, D) back into packed (total_q, H, D).
+[[host_name("varlen_o_regather")]]
+kernel void varlen_o_regather(device const bf16 *o_hm       [[buffer(0)]],   // (H, total_padded, D)
+                              device const int  *cu_seqlens [[buffer(1)]],   // (B+1,)
+                              device const int  *pad_off    [[buffer(2)]],   // (B+1,)
+                              device bf16       *o_packed   [[buffer(3)]],   // (total_q, H, D)
+                              constant int &B [[buffer(4)]], constant int &H [[buffer(5)]],
+                              constant int &D [[buffer(6)]], constant int &total_padded [[buffer(7)]],
+                              uint t [[threadgroup_position_in_grid]],
+                              uint lid [[thread_position_in_threadgroup]],
+                              uint nthreads [[threads_per_threadgroup]]) {
+    threadgroup int s_p;
+    if (lid == 0) {
+        int b = B - 1;
+        for (int k = 0; k < B; ++k) { if ((int)t < cu_seqlens[k + 1]) { b = k; break; } }
+        s_p = pad_off[b] + ((int)t - cu_seqlens[b]);
+    }
+    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    const int p = s_p;
+    for (int h = 0; h < H; ++h) {
+        for (int d = (int)lid; d < D; d += (int)nthreads) {
+            o_packed[((long)t * H + h) * D + d] = o_hm[((long)h * total_padded + p) * D + d];
+        }
     }
 }
 

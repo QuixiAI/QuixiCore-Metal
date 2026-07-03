@@ -214,6 +214,45 @@ def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_l
     return mx.concatenate(outs, axis=0)
 
 
+def varlen_pad_q(q_packed, cu_seqlens, pad_off, total_padded):
+    """Device varlen Q pad/gather: packed q (total_q, H, D) bf16 -> padded head-major q_hm
+    (H, total_padded, D) via cu_seqlens + pad_off (pad rows zeroed). Accepts mlx / torch (MPS)."""
+    if _is_torch(q_packed):
+        return _torch().varlen_pad_q(q_packed, cu_seqlens, pad_off, int(total_padded))
+    return _mlx().varlen_pad_q(q_packed, cu_seqlens, pad_off, int(total_padded))
+
+
+def varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q):
+    """Device varlen output re-gather: head-major o_hm (H, total_padded, D) -> packed (total_q, H, D).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(o_hm):
+        return _torch().varlen_regather_o(o_hm, cu_seqlens, pad_off, int(total_q))
+    return _mlx().varlen_regather_o(o_hm, cu_seqlens, pad_off, int(total_q))
+
+
+def attn_varlen_prefill_device(q_packed, key_cache, value_cache, block_table, context_lens,
+                               cu_seqlens, max_tiles, scale=0.0):
+    """FULLY DEVICE-RESIDENT varlen prefill: builds the tile worklist, pads/gathers Q into the
+    head-major layout, runs the paged-prefill attention, and re-gathers the output back to packed —
+    all on-device from a DEVICE cu_seqlens (B+1,) int, with only ONE scalar readback (total_padded,
+    to size the padded buffer; Metal can't size a grid from device data). Same result as the host
+    attn_varlen_prefill path, but no O(B) host loop / host pad+transpose. B <= 256 (single-threadgroup
+    worklist scan). q_packed (total_q, H, D) bf16. Accepts mlx.array or torch.Tensor (MPS)."""
+    total_q, H, D = q_packed.shape
+    if scale == 0.0:
+        scale = 1.0 / (float(D) ** 0.5)
+    qlens, pad_off, tile_seq, tile_local0, _n_tiles = varlen_build_worklist(cu_seqlens, max_tiles)
+    total_padded = int(pad_off[-1])          # the one unavoidable scalar readback (padded length)
+    q_hm = varlen_pad_q(q_packed, cu_seqlens, pad_off, total_padded)
+    if _is_torch(q_packed):
+        o_hm = _torch().attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
+                                            tile_seq, tile_local0, qlens, float(scale))
+    else:
+        o_hm = _mlx().attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
+                                          tile_seq, tile_local0, qlens, float(scale))
+    return varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q)
+
+
 def rope_kv_insert(k, v, cos, sin, positions, slot_mapping, key_cache, value_cache):
     """Fused RoPE (split-half) on K + paged-KV insert. Returns updated (key_cache, value_cache).
 

@@ -1408,6 +1408,19 @@ void launch_attn_varlen_prefill(E& e, typename E::in_t q_hm, typename E::in_t ke
   e.bytes(block_size, 12); e.bytes(bt_stride, 13); e.bytes(scale, 14);
   e.dispatch(n_tiles, H, 1, 32, 1, 1);
 }
+// Device varlen Q pad/gather (packed -> head-major) and output re-gather (head-major -> packed).
+// bwd=false = pad/gather into q_hm; bwd=true = regather o_hm into o_packed. One threadgroup/token.
+template <class E>
+void launch_varlen_pack_gather(E& e, typename E::in_t src, typename E::in_t cu_seqlens,
+                               typename E::in_t pad_off, typename E::out_t dst, int total_q, int B,
+                               int H, int D, int total_padded, bool regather) {
+  e.pipeline(regather ? "varlen_o_regather" : "varlen_q_pad_gather");
+  e.in(src, 0); e.in(cu_seqlens, 1); e.in(pad_off, 2); e.out(dst, 3);
+  e.bytes(B, 4); e.bytes(H, 5); e.bytes(D, 6); e.bytes(total_padded, 7);
+  int threads = D < 32 ? 32 : (D > 256 ? 256 : D);
+  // pad/gather grids over padded positions (writes every row incl. zero-pad); regather over tokens.
+  e.dispatch(regather ? total_q : total_padded, 1, 1, threads, 1, 1);
+}
 
 // Build the varlen prefill worklist on-device from cu_seqlens. One threadgroup, round32(B) threads.
 template <class E>

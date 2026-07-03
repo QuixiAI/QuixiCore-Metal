@@ -469,6 +469,16 @@ def attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
                                     tile_seq, tile_local0, seq_qlen, float(scale))
 
 
+def varlen_pad_q(q_packed, cu_seqlens, pad_off, total_padded):
+    """Device varlen Q pad/gather: packed (total_q,H,D) bf16 -> padded head-major (H,total_padded,D). MPS."""
+    return _ext.varlen_pad_q(q_packed, cu_seqlens, pad_off, int(total_padded))
+
+
+def varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q):
+    """Device varlen output re-gather: (H,total_padded,D) bf16 -> packed (total_q,H,D). MPS."""
+    return _ext.varlen_regather_o(o_hm, cu_seqlens, pad_off, int(total_q))
+
+
 def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int):
     """Sliding-window causal attention: query i attends keys [max(0, i-window+1), i].
     window <= 0 disables the window. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""

@@ -71,6 +71,35 @@ def _run(cu, ctxs, H, H_KV, D, bs=16, seed=0):
     assert rel < 0.03, f"relerr {rel}"
 
 
+def _run_device(cu, ctxs, H, H_KV, D, bs=16, seed=1):
+    """Fully device-resident path (device cu_seqlens + device Q pad/gather + output re-gather)."""
+    rng = np.random.default_rng(seed)
+    scale = 1.0 / np.sqrt(D)
+    total_q = cu[-1]
+    q = (0.3 * rng.standard_normal((total_q, H, D))).astype(np.float32)
+    kc, vc, bt = _build_cache(rng, ctxs, H_KV, D, bs)
+    cl = np.array(ctxs, np.int32)
+    qlens = np.diff(np.array(cu))
+    max_tiles = int(sum((int(x) + 7) // 8 for x in qlens)) + 4
+    o = tk.attn_varlen_prefill_device(
+        mx.array(q).astype(mx.bfloat16), mx.array(kc).astype(mx.bfloat16),
+        mx.array(vc).astype(mx.bfloat16), mx.array(bt), mx.array(cl),
+        mx.array(np.array(cu, np.int32)), max_tiles, scale=float(scale))
+    mx.eval(o)
+    on = np.array(o.astype(mx.float32))
+    ref = _oracle(q, kc, vc, bt, cu, ctxs, H, H_KV, bs, scale)
+    assert on.shape == (total_q, H, D)
+    rel = np.abs(on - ref).max() / (np.abs(ref).max() + 1e-6)
+    assert rel < 0.03, f"device relerr {rel}"
+
+
+@pytest.mark.parametrize("D", [64, 128])
+def test_prefill_device(D):
+    _run_device([0, 1, 8, 17, 117], [1, 7, 9, 100], H=4, H_KV=2, D=D)   # ragged
+    _run_device([0, 16, 32], [16, 16], H=4, H_KV=4, D=D)               # equal lengths
+    _run_device([0, 4, 20], [40, 60], H=4, H_KV=2, D=D)                # cached prefix
+
+
 @pytest.mark.parametrize("D", [64, 128])
 def test_equal_lengths(D):
     _run([0, 16, 32], [16, 16], H=4, H_KV=4, D=D)
