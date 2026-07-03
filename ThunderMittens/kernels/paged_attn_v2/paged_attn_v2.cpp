@@ -156,6 +156,13 @@ array cascade_attention(
   // Two independent attention states, then a single log-sum-exp merge over the concatenated
   // partitions (shared paged_attention_reduce). Both partition primitives resolve scale<=0 to the
   // same 1/sqrt(D) default, so the two levels are on one consistent scale.
+  // Wave-7 #5 (measure-first): a fused single-dispatch partition that writes prefix + suffix partials
+  // directly into one (Pp+Ps) buffer (dropping the 3 concatenates below) was rejected. The concatenate
+  // overhead measured 5-23% of cascade time (23% only at B=1; ~5-14% for realistic batches), but the
+  // fused write requires decoupling the output-partition STRIDE from the dispatch count and adding a
+  // write OFFSET to the SHARED paged_attention partition kernels -- the hottest, most-tested kernel
+  // family (paged_attention_v2 / cascade / fp8 / multi all route through them). That regression surface
+  // is disproportionate to a 5-23% single-path win; the concatenate cascade is already 210-255 GB/s.
   auto pp = array::make_arrays(
       {{B, H, Pp, D}, {B, H, Pp}, {B, H, Pp}},
       {float32, float32, float32},
