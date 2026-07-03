@@ -1,5 +1,71 @@
 # ThunderMittens — performance status
 
+## Wave-7 close-out (2026-07-03)
+
+Wave 7 closed the full 20-item tail of Wave-6 deferrals (robustness, test gaps, feature
+completeness, one refactor, four measure-first perf items, first-order autograd, bench/docs). All
+dual-backend + parity-tested; full 3-suite regression **2133 passed** and `xcodebuild` SUCCEEDED.
+
+**Perf items (measure-first, keep-if-win) — two prior-wave rejects REVERSED:**
+- **#1 fused norm backward — WIN, reverses the Wave-6 reject below.** New `rms_norm_bwd_fused` /
+  `layernorm_bwd_fused`: one simdgroup per row computes rstd (and mean) in-kernel, writes dX, and
+  accumulates dweight (+ dbias for LN) via `atomic_add_float` in a **single pass**. The dweight-atomic
+  contention the prior wave feared does **not** bite — Apple's native `atomic_float` handles it and
+  the one-pass memory saving dominates. Measured **~2.3–2.5× faster than the old 3-pass hybrid and on
+  par with `mx.fast`'s fused VJP (0.97–1.00×)** across rows 4k–16k, D 2k–8k. Both routers wired to the
+  fused path; the dx-only kernels stay available.
+- **#7 gelu_bwd vec4 — WIN, reverses the Wave-6 "left as-is".** `packed_four` vec4 loads/stores
+  (scalar tail). Measured fp32 ~166–184 → ~352–415 GB/s (2.1–2.3×), bf16 ~88–99 → ~250–344 GB/s
+  (2.8–3.5×). The earlier "tanh-bound, vec4 won't help" call was wrong: the scalar **bf16** element
+  access, not the tanh, was the bottleneck.
+- **#6 beam_build_copy_pairs compaction — REJECT (measured).** The fixed-slot emit is overhead-bound
+  (~130 µs flat from 2k to 262k slots), so a scan + atomic-cursor compaction can't beat the launch/eval
+  floor and would only add contention + nondeterministic ordering. Kept the atomic-free kernel.
+- **#5 cascade single-dispatch fusion — REJECT (measured).** The 3 host concatenates are 5–23% of
+  cascade time (23% only at B=1). A fused write requires decoupling the output stride from the dispatch
+  count + a write-offset in the SHARED paged-attention partition kernels — a regression surface
+  (paged_attention_v2 / cascade / fp8 / multi all route through them) disproportionate to a 5–23%
+  single-path win. Kept the concatenate cascade (already 212–255 GB/s).
+
+**Robustness / correctness (P1):**
+- **#4 spec_compact** now uses the chunked single-threadgroup scan → **any B** (removed the B≤256 cap).
+- **#9 spec_verify_tree** dropped the 64-sibling cap: the residual re-walks `last`'s child chain
+  (exact for any sibling count) + a `tree_valid` first-generation fallback.
+- **#19** Family-A callers validate `K ≤ #candidates` at the host boundary (lm_head `k≤V`,
+  beam `V≥2·beam_width`) so the `masked_topk` `-1`-degenerate round is unreachable.
+- **#11 glu geglu_erf** backward now differentiates the A&S erf approximation itself
+  (`glu_erf_approx_deriv`) → bit-consistent forward/backward pair (tight 3e-5 analytic test).
+
+**Feature completeness (P3):**
+- **#8 exact quant top-p** — new `lm_head_topp_partials_q` emits a per-tile logsumexp so the reduce
+  uses the **true full-vocab normalizer** (not the pool-only approximation); nucleus is exact whenever
+  it fits in the over-selected pool.
+- **#2 build_dynamic_tree** — device-resident draft-tree pointer builder (cap-free, scratch-free)
+  replacing the host serial `spec_build_tree_pointers`.
+- **#3 embedding_backward `method="sorted"`** — atomic-free segment-reduce (argsort + one threadgroup
+  per id) alongside the default atomic scatter; wins under heavy id duplication.
+
+**Refactor (#20):** `masked_topk_local` in `include/ops/group/topk.metal` — the Family-B K-round merge
+shared by the three lm_head partials + beam_topk (emit functor per site).
+
+**Autograd (#10):** `tk.autograd` — first-order differentiable `gelu/glu/rms_norm/layernorm/
+embedding_lookup/dropout` on both backends (MLX `mx.custom_function` vjp → the tk backward; torch
+`autograd.Function`). First order only (the kernels have no CPU path). Gotcha handled:
+`mx.custom_function` passes a mis-shaped `primals` when the forward casts dtype, so each vjp closes
+over the original inputs.
+
+**#16 Xcode unit tests — N/A (confirmed).** The `tests/unit/` harness only tests substrate
+register/shared tile+vec primitives (`warp::tests`/`group::tests`, gated by `TEST_*` leaf flags in
+`testing_flags.hpp`); there is no registration point for kernel-level ops, so sampling/spec/embedding/
+lm_head are inherently Python-tested by design. Nothing to build.
+
+**Test-gap closures (P2):** swiglu_oai clamp-branch gradient (analytic ref, not finite-diff),
+spec_verify_tree residual-distribution histogram (30k rows), cascade_attention_fp8 standalone MPS
+oracle. **Bench (P7):** cascade `full-paged [prefix++suffix]` baseline (#17); numpy `ref=` oracles on
+beam_build_copy_pairs + varlen_build_worklist (#18); torch comprehensive sweep recorded (#15).
+
+---
+
 ## Wave-6 close-out (2026-07-02/03)
 
 New serving/training families landed dual-backend + parity-tested (see the README "Serving &
