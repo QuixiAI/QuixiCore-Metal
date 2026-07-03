@@ -1804,6 +1804,151 @@ def varlen_build_worklist_cases(be, preset, formats):
                    baselines={}, ref=tsref, bytes_moved=float(max_tiles * 4))
 
 
+@register("typical_p_sample")
+def typical_p_sample_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(230)
+    for T, V in _pick(preset, [(256, 32000)], [(256, 32000), (1024, 32000)],
+                      [(256, 128256), (1024, 128256), (2048, 128256)]):
+        lg = be.array(rng.standard_normal((T, V)).astype(np.float32), "f32")
+        yield Case("typical_p_sample", f"T{T}_V{V}", {"T": T, "V": V}, "f32",
+                   target=lambda lg=lg: tk.typical_p_sample(lg, 0.9, temperature=1.0, seed=0),
+                   baselines={}, ref=None, bytes_moved=float(T * V * 4))
+
+
+@register("apply_bad_words")
+def apply_bad_words_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(231)
+    for T, V in _pick(preset, [(256, 32000)], [(256, 32000), (1024, 32000)],
+                      [(512, 128256), (1024, 128256)]):
+        maxbad = 16
+        logits = rng.standard_normal((T, V)).astype(np.float32)
+        bad = rng.integers(0, V, size=(T, maxbad)).astype(np.int32)
+        blen = rng.integers(0, maxbad + 1, size=(T,)).astype(np.int32)
+        lg = be.array(logits, "f32")
+        bad_d, blen_d = be.int_array(bad), be.int_array(blen)
+        yield Case("apply_bad_words", f"T{T}_V{V}", {"T": T, "V": V}, "f32",
+                   target=lambda lg=lg, bad_d=bad_d, blen_d=blen_d:
+                       tk.apply_bad_words(lg, bad_d, blen_d),
+                   baselines={}, ref=None, bytes_moved=float(T * V * 4))
+
+
+@register("dropout")
+def dropout_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(232)
+    for N, D in _pick(preset, [(4096, 4096)], [(4096, 4096), (16384, 4096)],
+                      [(16384, 4096), (65536, 4096), (16384, 11008)]):
+        x_d = be.array(rng.standard_normal((N, D)).astype(np.float32), "bf16")
+        yield Case("dropout", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d: tk.dropout(x_d, 0.1, 0),
+                   baselines={}, ref=None, bytes_moved=float(2 * N * D * 2))
+
+
+@register("adamw")
+def adamw_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(233)
+    for numel in _pick(preset, [4 << 20], [4 << 20, 16 << 20], [16 << 20, 64 << 20]):
+        p_d = be.array(rng.standard_normal((numel,)).astype(np.float32), "f32")
+        g_d = be.array(rng.standard_normal((numel,)).astype(np.float32), "f32")
+        m_d = be.array(np.zeros((numel,), np.float32), "f32")
+        v_d = be.array(np.zeros((numel,), np.float32), "f32")
+        yield Case("adamw", f"numel{numel}", {"numel": numel}, "f32",
+                   target=lambda p_d=p_d, g_d=g_d, m_d=m_d, v_d=v_d:
+                       tk.adamw(p_d, g_d, m_d, v_d, step=1),
+                   baselines={}, ref=None, bytes_moved=float(5 * numel * 4))
+
+
+@register("rms_norm_add")
+def rms_norm_add_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(234)
+    # the fused add+norm forward is register-tile (D in {256,512,768,1024})
+    for N, D in _pick(preset, [(4096, 1024)], [(16384, 1024), (65536, 768)],
+                      [(65536, 1024), (131072, 1024), (65536, 512)]):
+        x_d = be.array(rng.standard_normal((N, D)).astype(np.float32), "bf16")
+        r_d = be.array(rng.standard_normal((N, D)).astype(np.float32), "bf16")
+        w_d = be.array(rng.standard_normal((D,)).astype(np.float32), "bf16")
+        yield Case("rms_norm_add", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d, r_d=r_d, w_d=w_d: tk.rms_norm_add(x_d, r_d, w_d),
+                   baselines={}, ref=None, bytes_moved=float(3 * N * D * 2))
+
+
+@register("embedding_backward")
+def embedding_backward_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(235)
+    # heavy id duplication (small vocab, many tokens) is the sorted path's target regime
+    for T, D, V in _pick(preset, [(8192, 2048, 256)], [(8192, 2048, 256), (32768, 4096, 512)],
+                         [(32768, 4096, 512), (131072, 4096, 1024)]):
+        ids = rng.integers(0, V, size=(T,)).astype(np.int32)
+        ids_d = be.int_array(ids)
+        dY_d = be.array((0.1 * rng.standard_normal((T, D))).astype(np.float32), "bf16")
+        baselines = {"tk.embedding_backward.sorted":
+                     (lambda ids_d=ids_d, dY_d=dY_d, V=V:
+                      tk.embedding_backward(ids_d, dY_d, V, method="sorted"))}
+        yield Case("embedding_backward", f"T{T}_D{D}_V{V}", {"T": T, "D": D, "V": V}, "bf16",
+                   target=lambda ids_d=ids_d, dY_d=dY_d, V=V:
+                       tk.embedding_backward(ids_d, dY_d, V, method="atomic"),
+                   baselines=baselines, ref=None, bytes_moved=float(T * D * 2))
+
+
+@register("spec_verify_tree")
+def spec_verify_tree_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(236)
+    from tk import spec_build_tree_pointers
+    for B, N, V in _pick(preset, [(8, 7, 32000)], [(16, 7, 32000), (32, 15, 32000)],
+                         [(32, 15, 128256), (64, 31, 128256)]):
+        parents = [-1] + [max(0, (c - 1) // 2) for c in range(1, N)]
+        nt, ns = spec_build_tree_pointers(parents, N)
+        nt_b = np.broadcast_to(nt, (B, N)).copy(); ns_b = np.broadcast_to(ns, (B, N)).copy()
+        draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+        tp = np.abs(rng.standard_normal((B, N, V))).astype(np.float32); tp /= tp.sum(-1, keepdims=True)
+        d_d, tp_d = be.int_array(draft), be.array(tp, "f32")
+        nt_d, ns_d = be.int_array(nt_b), be.int_array(ns_b)
+        yield Case("spec_verify_tree", f"B{B}_N{N}_V{V}", {"B": B, "N": N, "V": V}, "f32",
+                   target=lambda d_d=d_d, tp_d=tp_d, nt_d=nt_d, ns_d=ns_d:
+                       tk.spec_verify_tree(d_d, tp_d, nt_d, ns_d, 0),
+                   baselines={}, ref=None, bytes_moved=float(B * N * V * 4))
+
+
+@register("spec_compact")
+def spec_compact_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(237)
+    for B, S in _pick(preset, [(256, 8)], [(256, 8), (1024, 8)], [(1024, 8), (4096, 8)]):
+        Sp1 = S + 1
+        acc = rng.integers(0, S + 1, size=B).astype(np.int32)
+        sl = rng.integers(1, 100, size=B).astype(np.int32)
+        ot = np.full((B, Sp1), -1, np.int32)
+        for b in range(B):
+            for j in range(int(acc[b]) + 1):
+                ot[b, j] = rng.integers(0, 32000)
+        ot_d, acc_d, sl_d = be.int_array(ot), be.int_array(acc), be.int_array(sl)
+        yield Case("spec_compact", f"B{B}_S{S}", {"B": B, "S": S}, "int",
+                   target=lambda ot_d=ot_d, acc_d=acc_d, sl_d=sl_d:
+                       tk.spec_compact(ot_d, acc_d, sl_d),
+                   baselines={}, ref=None, bytes_moved=float(B * Sp1 * 4))
+
+
+@register("build_dynamic_tree")
+def build_dynamic_tree_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(238)
+    for B, N in _pick(preset, [(64, 33)], [(64, 33), (128, 65)], [(128, 129), (256, 129)]):
+        parents = np.full((B, N), -1, np.int32)
+        for b in range(B):
+            for c in range(1, N):
+                parents[b, c] = rng.integers(0, c)
+        p_d = be.int_array(parents)
+        yield Case("build_dynamic_tree", f"B{B}_N{N}", {"B": B, "N": N}, "int",
+                   target=lambda p_d=p_d: tk.build_dynamic_tree(p_d),
+                   baselines={}, ref=None, bytes_moved=float(B * N * 4))
+
+
 # --------------------------------------------------------------------------- runner
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
