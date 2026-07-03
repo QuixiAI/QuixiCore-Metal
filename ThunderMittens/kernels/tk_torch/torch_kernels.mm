@@ -1689,6 +1689,29 @@ static std::vector<at::Tensor> spec_verify_linear_mps(
   return {out_tokens, accepted_cnt};
 }
 
+static std::vector<at::Tensor> spec_verify_tree_mps(const at::Tensor& draft_tokens_in,
+    const at::Tensor& target_probs_in, const at::Tensor& rt_in, const at::Tensor& rs_in,
+    int64_t seed) {
+  TORCH_CHECK(target_probs_in.device().is_mps() && target_probs_in.dim() == 3,
+              "spec_verify_tree: target_probs must be (B, N, V) MPS");
+  const int B = target_probs_in.size(0), N = target_probs_in.size(1), V = target_probs_in.size(2);
+  TORCH_CHECK(draft_tokens_in.dim() == 2 && draft_tokens_in.size(0) == B &&
+              draft_tokens_in.size(1) == N - 1, "spec_verify_tree: draft_tokens must be (B, N-1)");
+  auto dt = draft_tokens_in.to(at::kInt).contiguous();
+  auto tp = target_probs_in.to(at::kFloat).contiguous();
+  auto rt = rt_in.to(at::kInt).contiguous();
+  auto rs = rs_in.to(at::kInt).contiguous();
+  auto i32 = dt.options();
+  auto accept_index = at::empty({B, N}, i32);
+  auto accept_token = at::empty({B, N}, i32);
+  auto accept_num = at::empty({B}, i32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_spec_verify_tree(e, dt, tp, rt, rs, accept_index, accept_token, accept_num, B, N, V,
+                                static_cast<unsigned>(seed));
+  });
+  return {accept_index, accept_token, accept_num};
+}
+
 static std::vector<at::Tensor> spec_compact_mps(const at::Tensor& out_tokens_in,
     const at::Tensor& accepted_cnt_in, const at::Tensor& seq_lens_in) {
   TORCH_CHECK(out_tokens_in.device().is_mps() && out_tokens_in.dim() == 2,
@@ -2789,6 +2812,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("apply_token_bitmask", &apply_token_bitmask_mps, "ThunderMittens grammar bitmask masking (MPS)");
   m.def("apply_bad_words", &apply_bad_words_mps, "ThunderMittens bad/stop-word masking (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
+  m.def("spec_verify_tree", &spec_verify_tree_mps, "ThunderMittens spec tree verification (MPS)");
   m.def("spec_compact", &spec_compact_mps, "ThunderMittens spec accepted-token compaction (MPS)");
   m.def("spec_update_kv_meta", &spec_update_kv_meta_mps, "ThunderMittens spec KV meta update (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,

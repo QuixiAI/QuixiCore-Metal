@@ -583,6 +583,21 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "spec_verify_tree",
+      &spec_verify_tree,
+      "draft_tokens"_a,
+      "target_probs"_a,
+      "retrieve_next_token"_a,
+      "retrieve_next_sibling"_a,
+      "seed"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Speculative tree verification (target-only rejection). Returns [accept_index, accept_token,
+        accept_num] (int32; -1-padded).
+      )");
+
+  m.def(
       "spec_compact",
       &spec_compact,
       "out_tokens"_a,

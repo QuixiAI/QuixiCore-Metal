@@ -12,8 +12,9 @@ import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
-                spec_verify_linear, spec_compact, spec_update_kv_meta, min_p_sample,
-                typical_p_sample, apply_token_bitmask, apply_bad_words)
+                spec_verify_linear, spec_compact, spec_update_kv_meta, spec_verify_tree,
+                spec_build_tree_pointers, min_p_sample, typical_p_sample, apply_token_bitmask,
+                apply_bad_words)
 
 
 def _pack_bitmask(allow):
@@ -128,6 +129,73 @@ def test_apply_token_bitmask(V):
     out = np.array(apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow))))
     np.testing.assert_array_equal(out[allow], logits[allow])   # allowed logits untouched
     assert (out[~allow] < -1e30).all()                         # masked -> -inf sentinel
+
+
+def _rng_uniform_np(seed, a, b):
+    M = np.uint64(0xFFFFFFFF)
+    x = (np.uint64(seed) * np.uint64(0x9E3779B9) + np.uint64(a) * np.uint64(0x85EBCA77)
+         + np.uint64(b) * np.uint64(0xC2B2AE3D)) & M
+    x = (x ^ (x >> np.uint64(16))) & M
+    x = (x * np.uint64(0x7FEB352D)) & M
+    x = (x ^ (x >> np.uint64(15))) & M
+    x = (x * np.uint64(0x846CA68B)) & M
+    x = (x ^ (x >> np.uint64(16))) & M
+    return float(x >> np.uint64(8)) * (1.0 / 16777216.0)
+
+
+def _tree_walk_ref(draft_b, tp_b, nxt_tok, nxt_sib, seed, b, N):
+    last, num_acc, acc_idx, acc_tok, term, tried = 0, 0, [0], [], 0, []
+    for j in range(1, N):
+        fc = int(nxt_tok[last])
+        if fc == -1:
+            term = 1
+            break
+        coin = _rng_uniform_np(seed, b, j)
+        pacc, accepted, child, tried = 0.0, False, fc, []
+        while child != -1:
+            tok = int(draft_b[child - 1])
+            pacc += float(tp_b[last, tok])
+            if coin <= pacc:
+                acc_tok.append(tok); num_acc += 1; acc_idx.append(child); last = child; accepted = True
+                break
+            tried.append(tok); child = int(nxt_sib[child])
+        if not accepted:
+            term = 2
+            break
+    return acc_idx, acc_tok, num_acc, term, last, tried
+
+
+@pytest.mark.parametrize("seed", [1, 7, 42])
+def test_spec_verify_tree(seed):
+    # A fixed 7-node binary-ish tree; peaked target so the coin walk is unambiguous vs the oracle.
+    rng = np.random.default_rng(seed)
+    B, V = 3, 400
+    parents = [-1, 0, 0, 1, 1, 2, 2]           # node -> parent (0 = root)
+    N = len(parents)
+    nxt_tok, nxt_sib = spec_build_tree_pointers(parents, N)
+    draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+    # peaked target dist per node (low-temp softmax of random logits)
+    tp = np.zeros((B, N, V), np.float32)
+    for b in range(B):
+        for n in range(N):
+            lg = 4.0 * rng.standard_normal(V)
+            e = np.exp(lg - lg.max()); tp[b, n] = (e / e.sum()).astype(np.float32)
+    nt_b = np.broadcast_to(nxt_tok, (B, N)).copy()   # shared topology -> per-request (B, N)
+    ns_b = np.broadcast_to(nxt_sib, (B, N)).copy()
+    ai, at, an = spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt_b), mx.array(ns_b), seed)
+    ai, at, an = np.array(ai), np.array(at), np.array(an)
+    for b in range(B):
+        acc_idx, acc_tok, num_acc, term, last, tried = _tree_walk_ref(draft[b], tp[b], nxt_tok,
+                                                                      nxt_sib, seed, b, N)
+        assert an[b] == num_acc, (b, an[b], num_acc)
+        assert list(ai[b, :num_acc + 1]) == acc_idx                 # accepted tree path
+        assert list(at[b, :num_acc]) == acc_tok                     # accepted draft tokens
+        # terminal token validity
+        if term != 0:
+            tok = int(at[b, num_acc])
+            assert tp[b, last, tok] > 0
+            if term == 2:
+                assert tok not in tried                             # residual excludes tried siblings
 
 
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1)])

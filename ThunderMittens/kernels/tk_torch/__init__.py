@@ -342,6 +342,12 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
                                          accept_u, int(seed)))
 
 
+def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed):
+    """Speculative tree verification -> (accept_index, accept_token, accept_num) int32, -1-pad. MPS."""
+    return tuple(_ext.spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
+                                       retrieve_next_sibling, int(seed)))
+
+
 def spec_compact(out_tokens, accepted_cnt, seq_lens):
     """Compact accepted spec tokens -> (packed_tokens, packed_pos, cu_accepted) int32. B<=256. MPS."""
     return tuple(_ext.spec_compact(out_tokens, accepted_cnt, seq_lens))

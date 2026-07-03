@@ -1154,6 +1154,41 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
     return out[0], out[1]
 
 
+def spec_build_tree_pointers(parents, num_nodes):
+    """Host helper: build (retrieve_next_token, retrieve_next_sibling) int32 arrays from a per-node
+    parent list `parents` (len num_nodes, parents[0] = -1 for the root; children keep input order).
+    first-child / next-sibling pointers, -1 = none. Returns two numpy int32 arrays of length
+    num_nodes. Feed these to spec_verify_tree (build once per tree topology on the host)."""
+    import numpy as np
+    nxt_tok = np.full(num_nodes, -1, np.int32)   # first child
+    nxt_sib = np.full(num_nodes, -1, np.int32)   # next sibling
+    last_child = np.full(num_nodes, -1, np.int32)
+    for c in range(1, num_nodes):
+        p = int(parents[c])
+        if last_child[p] < 0:
+            nxt_tok[p] = c
+        else:
+            nxt_sib[last_child[p]] = c
+        last_child[p] = c
+    return nxt_tok, nxt_sib
+
+
+def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed):
+    """Speculative TREE verification (target-only rejection, TRT-LLM dynamicTree). draft_tokens
+    (B, N-1) int (node c>=1 carries draft_tokens[c-1]); target_probs (B, N, V) f32 (target dist AT
+    each node's position); retrieve_next_token / retrieve_next_sibling (B, N) int (first-child /
+    next-sibling pointers, -1=none; use spec_build_tree_pointers). Walks each request's tree from the
+    root accepting the first sibling whose cumulative target prob exceeds a coin, else a residual /
+    bonus correction token. Returns (accept_index (B,N), accept_token (B,N), accept_num (B,)) int32,
+    -1-padded. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(target_probs):
+        return tuple(_torch().spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
+                                               retrieve_next_sibling, int(seed)))
+    out = _mlx().spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
+                                  retrieve_next_sibling, int(seed))
+    return out[0], out[1], out[2]
+
+
 def spec_compact(out_tokens, accepted_cnt, seq_lens):
     """Compact accepted spec tokens: gather each request's valid tokens (accepted drafts + the
     recovered/bonus token, vlen=accepted_cnt+1) from out_tokens (B, S+1) into packed buffers.

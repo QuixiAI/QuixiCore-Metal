@@ -512,6 +512,97 @@ kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  
     if (lane == 0) accepted_cnt[b] = rejected_at;
 }
 
+// Speculative TREE verification (target-only rejection, the TRT-LLM dynamicTree contract). The draft
+// tree has N nodes (node 0 = root = last accepted token); node c>=1 carries draft token
+// draft_tokens[c-1]; retrieve_next_token[i] = i's first child (-1 leaf), retrieve_next_sibling[i] =
+// i's next sibling (-1 none). target_probs[i] is the target dist AT node i's position. Walk depth by
+// depth from the root: draw a coin, accumulate the target prob of the sibling candidate tokens, and
+// accept the FIRST sibling whose cumulative prob exceeds the coin (== sampling the target restricted
+// to the sibling tokens); on that acceptance descend into the sibling. If every sibling is rejected,
+// emit a correction token sampled from the residual target mass (target with the tried sibling
+// tokens removed); at a leaf, emit the bonus token sampled from the full target at the last node.
+// One simdgroup per request: lane 0 walks the (cheap, serial) tree; all 32 lanes cooperatively do
+// the single full-vocab terminal sample via Gumbel-max (== proportional sampling, no cumsum scan).
+// Outputs accept_index (B,N) tree positions (-1 pad), accept_token (B,N) token ids (-1 pad),
+// accept_num (B,) # accepted drafts. Ref: TRT-LLM verifyDynamicTreeRejectionKernel.
+constant int SPEC_TREE_MAX_SIB = 64;   // tried-sibling cap per depth (matches kMaxTriedPerLevel-ish)
+kernel void spec_verify_tree(device const int   *draft_tokens         [[buffer(0)]],  // (B, N-1)
+                             device const float *target_probs         [[buffer(1)]],  // (B, N, V)
+                             device const int   *retrieve_next_token   [[buffer(2)]],  // (B, N)
+                             device const int   *retrieve_next_sibling [[buffer(3)]],  // (B, N)
+                             device int         *accept_index         [[buffer(4)]],  // (B, N)
+                             device int         *accept_token         [[buffer(5)]],  // (B, N)
+                             device int         *accept_num           [[buffer(6)]],  // (B,)
+                             constant int  &N     [[buffer(7)]],
+                             constant int  &V     [[buffer(8)]],
+                             constant uint &seed  [[buffer(9)]],
+                             uint b    [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup int s_num_accepted, s_last, s_term, s_num_tried;
+    threadgroup int s_tried[SPEC_TREE_MAX_SIB];
+    const long nbase = (long)b * N;
+    for (int i = (int)lane; i < N; i += 32) {           // sentinel-fill the outputs
+        accept_index[nbase + i] = -1;
+        accept_token[nbase + i] = -1;
+    }
+    simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        int last = 0, num_acc = 0, term = 0, num_tried = 0;   // term: 0 none, 1 bonus(leaf), 2 residual
+        accept_index[nbase] = 0;
+        for (int j = 1; j < N; ++j) {
+            const int firstChild = retrieve_next_token[nbase + last];
+            if (firstChild == -1) { term = 1; break; }        // leaf -> bonus at `last`
+            const float coin = rng_uniform(seed, (uint)b, (uint)j);
+            float probAcc = 0.0f;
+            bool accepted = false;
+            num_tried = 0;
+            int child = firstChild;
+            device const float *parentProbs = target_probs + (nbase + last) * (long)V;
+            while (child != -1) {
+                const int tok = draft_tokens[(long)b * (N - 1) + (child - 1)];
+                probAcc += parentProbs[tok];
+                if (coin <= probAcc) {
+                    accept_token[nbase + num_acc] = tok;
+                    num_acc += 1;
+                    accept_index[nbase + num_acc] = child;
+                    last = child;
+                    accepted = true;
+                    break;
+                }
+                if (num_tried < SPEC_TREE_MAX_SIB) { s_tried[num_tried++] = tok; }
+                child = retrieve_next_sibling[nbase + child];
+            }
+            if (!accepted) { term = 2; break; }               // residual at `last`, excluding tried
+        }
+        s_num_accepted = num_acc; s_last = last; s_term = term; s_num_tried = num_tried;
+    }
+    simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    const int term = s_term, last = s_last, num_acc = s_num_accepted, num_tried = s_num_tried;
+    if (term != 0) {                                          // cooperative full-vocab terminal sample
+        device const float *tp = target_probs + (nbase + last) * (long)V;
+        float best = SMP_NEG_INF;
+        int   bi   = -1;
+        for (int v = (int)lane; v < V; v += 32) {
+            const float pv = tp[v];
+            if (pv <= 0.0f) { continue; }
+            if (term == 2) {                                  // residual: skip tried sibling tokens
+                bool tried = false;
+                for (int m = 0; m < num_tried; ++m) { if (s_tried[m] == v) { tried = true; } }
+                if (tried) { continue; }
+            }
+            const float g = metal::log(pv) + rng_gumbel(seed + 0x2545F491u, (uint)b, (uint)v);
+            if (g > best || (g == best && v < bi)) { best = g; bi = v; }
+        }
+        float gb = best;
+        int   gi = (bi < 0) ? 0x7fffffff : bi;
+        simd_argmax(gb, gi);
+        if (lane == 0) { accept_token[nbase + num_acc] = (gb == SMP_NEG_INF) ? -1 : gi; }
+    }
+    if (lane == 0) { accept_num[b] = num_acc; }
+}
+
 // spec_compact: gather each request's valid tokens (accepted drafts + the recovered/bonus token,
 // vlen = accepted_cnt+1) from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets
 // (exclusive scan of vlen). packed_pos[k] = seq_lens[b] + j is the absolute KV position of the

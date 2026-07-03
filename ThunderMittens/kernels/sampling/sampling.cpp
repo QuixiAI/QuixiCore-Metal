@@ -658,6 +658,57 @@ void SpecVerifyLinear::eval_gpu(const std::vector<array>& inputs, std::vector<ar
 }
 TK_BEAM_NO_AUTODIFF(SpecVerifyLinear, "SpecVerifyLinear")
 
+std::vector<array> spec_verify_tree(
+    const array& draft_tokens, const array& target_probs, const array& retrieve_next_token,
+    const array& retrieve_next_sibling, uint32_t seed, StreamOrDevice s /* = {} */) {
+  if (target_probs.ndim() != 3) {
+    throw std::invalid_argument("spec_verify_tree: target_probs must be (B, N, V)");
+  }
+  const int B = target_probs.shape(0);
+  const int N = target_probs.shape(1);
+  const int V = target_probs.shape(2);
+  if (draft_tokens.ndim() != 2 || draft_tokens.shape(0) != B || draft_tokens.shape(1) != N - 1) {
+    throw std::invalid_argument("spec_verify_tree: draft_tokens must be (B, N-1)");
+  }
+  if (retrieve_next_token.shape(0) != B || retrieve_next_token.shape(1) != N ||
+      retrieve_next_sibling.shape(0) != B || retrieve_next_sibling.shape(1) != N) {
+    throw std::invalid_argument("spec_verify_tree: retrieve_next_* must be (B, N)");
+  }
+  auto dt_c = contiguous(astype(draft_tokens, int32, s), false, s);
+  auto tp_c = contiguous(astype(target_probs, float32, s), false, s);
+  auto rt_c = contiguous(astype(retrieve_next_token, int32, s), false, s);
+  auto rs_c = contiguous(astype(retrieve_next_sibling, int32, s), false, s);
+  return array::make_arrays(
+      {{B, N}, {B, N}, {B}}, {int32, int32, int32},
+      std::make_shared<SpecVerifyTree>(to_stream(s), seed), {dt_c, tp_c, rt_c, rs_c});
+}
+
+void SpecVerifyTree::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("SpecVerifyTree has no CPU implementation.");
+}
+void SpecVerifyTree::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& draft_tokens = inputs[0];
+  auto& target_probs = inputs[1];
+  auto& rt = inputs[2];
+  auto& rs = inputs[3];
+  auto& accept_index = outputs[0];
+  auto& accept_token = outputs[1];
+  auto& accept_num = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  accept_index.set_data(allocator::malloc_or_wait(accept_index.nbytes()));
+  accept_token.set_data(allocator::malloc_or_wait(accept_token.nbytes()));
+  accept_num.set_data(allocator::malloc_or_wait(accept_num.nbytes()));
+  const int B = target_probs.shape(0);
+  const int N = target_probs.shape(1);
+  const int V = target_probs.shape(2);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_spec_verify_tree(enc, draft_tokens, target_probs, rt, rs, accept_index, accept_token,
+                              accept_num, B, N, V, seed_);
+}
+TK_BEAM_NO_AUTODIFF(SpecVerifyTree, "SpecVerifyTree")
+
 std::vector<array> spec_compact(
     const array& out_tokens, const array& accepted_cnt, const array& seq_lens,
     StreamOrDevice s /* = {} */) {

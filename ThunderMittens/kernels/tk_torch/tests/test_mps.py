@@ -1291,6 +1291,36 @@ def test_merge_multimodal_spans():
     np.testing.assert_allclose(o, ref, atol=1e-5)
 
 
+@pytest.mark.parametrize("seed", [5, 13])
+def test_spec_verify_tree(seed):
+    import numpy as np
+    from tk import spec_build_tree_pointers
+    rng = np.random.default_rng(seed)
+    B, V = 3, 400
+    parents = [-1, 0, 0, 1, 1, 2, 2]
+    N = len(parents)
+    nt, ns = spec_build_tree_pointers(parents, N)
+    nt = np.broadcast_to(nt, (B, N)).copy(); ns = np.broadcast_to(ns, (B, N)).copy()
+    draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+    tp = np.zeros((B, N, V), np.float32)
+    for b in range(B):
+        for n in range(N):
+            lg = 4.0 * rng.standard_normal(V); e = np.exp(lg - lg.max()); tp[b, n] = e / e.sum()
+    ai, at, an = tk_torch.spec_verify_tree(torch.from_numpy(draft).to("mps"),
+                                           torch.from_numpy(tp).to("mps"),
+                                           torch.from_numpy(nt).to("mps"),
+                                           torch.from_numpy(ns).to("mps"), seed)
+    ai, at, an = ai.cpu().numpy(), at.cpu().numpy(), an.cpu().numpy()
+    for b in range(B):
+        na = int(an[b])
+        # accepted path is a valid parent chain with the accepted draft tokens
+        for i in range(na):
+            node = int(ai[b, i + 1])
+            assert parents[node] == int(ai[b, i])
+            assert int(at[b, i]) == int(draft[b, node - 1])
+        assert int(at[b, na]) >= 0 and tp[b, int(ai[b, na]) if na > 0 else 0].sum() > 0
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
 def test_spec_compact_and_kv_meta(B, S):
     import numpy as np

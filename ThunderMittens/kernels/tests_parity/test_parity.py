@@ -352,6 +352,25 @@ def test_apply_token_bitmask_parity(V):
     _assert_parity(om, ot, atol=0)           # masked logits: bit-identical
 
 
+@pytest.mark.parametrize("seed", [3, 11])
+def test_spec_verify_tree_parity(seed):
+    from tk import spec_build_tree_pointers
+    rng = np.random.default_rng(seed)
+    B, V = 3, 400
+    parents = [-1, 0, 0, 1, 1, 2, 2]
+    N = len(parents)
+    nt, ns = spec_build_tree_pointers(parents, N)
+    nt = np.broadcast_to(nt, (B, N)).copy(); ns = np.broadcast_to(ns, (B, N)).copy()
+    draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+    tp = np.abs(rng.standard_normal((B, N, V))).astype(np.float32)
+    tp /= tp.sum(-1, keepdims=True)
+    om = tk.spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt), mx.array(ns), seed)
+    ot = tk.spec_verify_tree(torch.from_numpy(draft).to("mps"), torch.from_numpy(tp).to("mps"),
+                             torch.from_numpy(nt).to("mps"), torch.from_numpy(ns).to("mps"), seed)
+    for a, b in zip(om, ot):                     # accept path + terminal Gumbel-max both deterministic
+        _assert_parity(a, b, atol=0)
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
 def test_spec_compact_parity(B, S):
     rng = np.random.default_rng(B * 7 + S)

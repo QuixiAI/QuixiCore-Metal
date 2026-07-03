@@ -335,6 +335,35 @@ class SpecVerifyLinear : public Primitive {
   uint32_t seed_;
 };
 
+/** Speculative TREE verification (target-only rejection, TRT-LLM dynamicTree). draft_tokens (B,N-1)
+ *  int; target_probs (B,N,V) f32 (dist at each node's position); retrieve_next_token/-sibling (B,N)
+ *  int (first-child / next-sibling pointers, -1 = none), node 0 = root. Returns [accept_index (B,N)
+ *  int32 tree positions, accept_token (B,N) int32 token ids, accept_num (B,) int32], -1-padded. */
+std::vector<array> spec_verify_tree(
+    const array& draft_tokens, const array& target_probs, const array& retrieve_next_token,
+    const array& retrieve_next_sibling, uint32_t seed, StreamOrDevice s = {});
+
+class SpecVerifyTree : public Primitive {
+ public:
+  SpecVerifyTree(Stream stream, uint32_t seed) : Primitive(stream), seed_(seed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "SpecVerifyTree"; }
+  void print(std::ostream& os) override { os << "SpecVerifyTree"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return seed_ == static_cast<const SpecVerifyTree&>(other).seed_;
+  }
+
+ private:
+  uint32_t seed_;
+};
+
 /** spec_compact: gather each request's valid tokens (accepted + recovered/bonus, vlen=accepted_cnt+1)
  *  from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets. Returns [packed_tokens
  *  (B*(S+1),) int32, packed_pos (B*(S+1),) int32, cu_accepted (B+1,) int32]; packed_pos[k] =
