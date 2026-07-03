@@ -1803,12 +1803,12 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
 // Fused LM-head + sampling over quantized (q8_0/q4_0) weights (dequantized on read).
 static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
                                        const at::Tensor& bias_in, int64_t V, int64_t K,
-                                       const std::string& fmt, int64_t mode, double temperature,
-                                       int64_t seed) {
+                                       const std::string& fmt, int64_t mode, int64_t topk,
+                                       double temperature, int64_t seed) {
   TORCH_CHECK(h_in.device().is_mps() && tk_is_float_dtype(h_in),
               "lm_head_sample_q: h must be a float MPS tensor");
   TORCH_CHECK(h_in.dim() == 2 && h_in.size(1) == K, "lm_head_sample_q: h must be (T, K)");
-  TORCH_CHECK(mode == 0 || mode == 1, "lm_head_sample_q: only argmax (0) / categorical (1)");
+  TORCH_CHECK(mode >= 0 && mode <= 2, "lm_head_sample_q: mode 0=argmax, 1=categorical, 2=topk");
   constexpr int TILE_V = 256;
   auto h = h_in.contiguous();
   auto Wq = Wq_in.to(at::kByte).contiguous();
@@ -1816,18 +1816,33 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   const int T = h.size(0);
   const int num_vtiles = (static_cast<int>(V) + TILE_V - 1) / TILE_V;
   const int use_bias = bias.numel() > 1 ? 1 : 0;
-  const int use_gumbel = (mode == 1) ? 1 : 0;
+  const std::string tn = tk_type_name(h);
   auto i32 = h.options().dtype(at::kInt);
   auto f32 = h.options().dtype(at::kFloat);
   auto out = at::empty({T}, i32);
+  const float invtemp = 1.0f / static_cast<float>(temperature);
+  if (mode == 2) {
+    const int k = static_cast<int>(topk);
+    TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample_q: topk k must be in [1, 64]");
+    auto part_val = at::empty({T, num_vtiles, k}, f32);
+    auto part_id = at::empty({T, num_vtiles, k}, i32);
+    tk_encode([&](TorchEncoder& e) {
+      tk::launch_lm_head_topk_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
+                                         static_cast<int>(K), TILE_V, num_vtiles, k, use_bias, T,
+                                         fmt, tn);
+      tk::launch_lm_head_topk_reduce(e, part_val, part_id, out, num_vtiles, k,
+                                     static_cast<unsigned>(seed), invtemp, T);
+    });
+    return out;
+  }
+  const int use_gumbel = (mode == 1) ? 1 : 0;
   auto part_val = at::empty({T, num_vtiles}, f32);
   auto part_id = at::empty({T, num_vtiles}, i32);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_lm_head_argcat_partials_q(e, h, Wq, part_val, part_id, bias, static_cast<int>(V),
-                                         static_cast<int>(K), TILE_V, num_vtiles,
-                                         1.0f / static_cast<float>(temperature),
+                                         static_cast<int>(K), TILE_V, num_vtiles, invtemp,
                                          static_cast<unsigned>(seed), use_gumbel, use_bias, T, fmt,
-                                         tk_type_name(h));
+                                         tn);
     tk::launch_lm_head_argcat_reduce(e, part_val, part_id, out, num_vtiles, T);
   });
   return out;

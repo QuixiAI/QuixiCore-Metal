@@ -153,6 +153,28 @@ def test_quant(fmt, dtype, mode):
             assert tok[t] == P.argmax() or (P.max() - P[tok[t]]) < 1e-2
 
 
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("k", [1, 8, 32])
+def test_quant_topk(fmt, k):
+    # Fused quantized-weight top-k (no logits materialization) vs the dequantize(Wq)@h top-k oracle.
+    from tk.quant import QUANT_FORMATS
+    quant, dequant = QUANT_FORMATS[fmt]
+    T, V, K = 4, 4000, 512
+    rng = np.random.default_rng(21 + k)
+    W = (0.3 * rng.standard_normal((V, K))).astype(np.float32)
+    Wq = quant(W)
+    h = (0.5 * rng.standard_normal((T, K))).astype(np.float32)
+    tok = np.array(tk.lm_head_sample(mx.array(h), mx.array(Wq), mode="topk", k=k, temperature=0.8,
+                                     seed=3, format=fmt))
+    Wdq = dequant(Wq).astype(np.float64)
+    L = h.astype(np.float64) @ Wdq.T
+    for t in range(T):
+        top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
+        assert tok[t] in top or (L[t].max() - L[t, tok[t]]) < 1e-2
+        if k == 1:
+            assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-2
+
+
 if __name__ == "__main__":
     test_argmax("bfloat16", 1, 32000, 2048)
     test_categorical("float32", 4, 32000, 2048)

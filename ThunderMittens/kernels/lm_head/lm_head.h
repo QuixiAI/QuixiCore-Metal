@@ -38,6 +38,7 @@ array lm_head_sample_q(
     int K,
     const std::string& fmt,
     int mode,
+    int k,
     float temperature,
     uint32_t seed,
     StreamOrDevice s = {});
@@ -69,6 +70,37 @@ class LmHeadArgcatPartialsQ : public Primitive {
   int use_gumbel_;
   float invtemp_;
   uint32_t seed_;
+  int use_bias_;
+  int tile_v_;
+  int V_;
+  int K_;
+  std::string fmt_;
+};
+
+class LmHeadTopkPartialsQ : public Primitive {
+ public:
+  LmHeadTopkPartialsQ(Stream stream, int topk, int use_bias, int tile_v, int V, int K,
+                      const std::string& fmt)
+      : Primitive(stream), topk_(topk), use_bias_(use_bias), tile_v_(tile_v), V_(V), K_(K),
+        fmt_(fmt) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadTopkPartialsQ"; }
+  void print(std::ostream& os) override { os << "LmHeadTopkPartialsQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const LmHeadTopkPartialsQ&>(other);
+    return topk_ == o.topk_ && use_bias_ == o.use_bias_ && tile_v_ == o.tile_v_ && V_ == o.V_ &&
+           K_ == o.K_ && fmt_ == o.fmt_;
+  }
+
+ private:
+  int topk_;
   int use_bias_;
   int tile_v_;
   int V_;

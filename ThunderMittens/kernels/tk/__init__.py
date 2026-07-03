@@ -877,7 +877,7 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     fp16/bf16/f32. mode in {"argmax", "categorical", "topk"} (top-p -> matmul + top_p_sample).
 
     format ("q8_0"/"q4_0") selects the fused quantized-weight path: W is the packed weight tensor
-    (dequantized on read, no logits materialization); modes argmax/categorical only.
+    (dequantized on read, no logits materialization); supports argmax/categorical/topk.
     bias is an optional (V,) additive logit bias. Returns (T,) int32 token ids. The Gumbel noise is
     indexed by the global vocab id, so the draw equals the unfused sampler on the same logits + seed.
     Accepts mlx.array or torch.Tensor (MPS).
@@ -892,18 +892,18 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     if format is not None:
         if format not in _LM_QUANT_BLOCK_K:
             raise ValueError(f"lm_head_sample: quant format must be one of {list(_LM_QUANT_BLOCK_K)}")
-        if mode == "topk":
-            raise NotImplementedError("lm_head_sample: topk is not supported for the quant path")
         m = _LM_HEAD_MODES[mode]
         V = W.shape[0]
         K = W.shape[1] * _LM_QUANT_BLOCK_K[format]   # packed Wq is (V, K/block_k, block_bytes)
         if _is_torch(h):
             import torch
             b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
-            return _torch().lm_head_sample_q(h, W, b, V, K, format, m, float(temperature), int(seed))
+            return _torch().lm_head_sample_q(h, W, b, V, K, format, m, int(k), float(temperature),
+                                             int(seed))
         import mlx.core as mx
         b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
-        return _mlx().lm_head_sample_q(h, W, b, V, K, format, m, float(temperature), int(seed))
+        return _mlx().lm_head_sample_q(h, W, b, V, K, format, m, int(k), float(temperature),
+                                       int(seed))
     if fused:
         m = _LM_HEAD_MODES[mode]
         if _is_torch(h):

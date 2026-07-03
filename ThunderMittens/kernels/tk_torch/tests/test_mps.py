@@ -1169,6 +1169,13 @@ def test_lm_head_sample_quant(fmt):
     L = (h.astype(np.float64)) @ dequant(Wq).astype(np.float64).T
     for t in range(T):
         assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-2
+    # fused quant top-k vs the dequant-logits top-k oracle
+    for k in (1, 8):
+        tk_tok = tk.lm_head_sample(hm, torch.from_numpy(Wq).to("mps"), mode="topk", k=k,
+                                   temperature=0.8, seed=3, format=fmt).cpu().numpy()
+        for t in range(T):
+            top = set(int(v) for v in np.argsort(-L[t], kind="stable")[:k])
+            assert tk_tok[t] in top or (L[t].max() - L[t, tk_tok[t]]) < 1e-2
 
 
 @pytest.mark.parametrize("nkm", [(40, 20, 48), (100, 50, 70), (33, 17, 65)])

@@ -418,10 +418,10 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     return _ext.lm_head_sample(h, W, bias, int(mode), int(k), float(temperature), int(seed))
 
 
-def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, temperature, seed):
-    """Fused LM-head + sampling over quantized (q8_0/q4_0) weights. mode 0=argmax, 1=categorical.
-    Returns (T,) int32. MPS."""
-    return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode),
+def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed):
+    """Fused LM-head + sampling over quantized (q8_0/q4_0) weights. mode 0=argmax, 1=categorical,
+    2=topk (topk = k). Returns (T,) int32. MPS."""
+    return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode), int(topk),
                                  float(temperature), int(seed))
 
 

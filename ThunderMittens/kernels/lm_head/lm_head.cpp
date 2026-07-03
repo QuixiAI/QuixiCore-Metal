@@ -84,6 +84,7 @@ array lm_head_sample_q(
     int K,
     const std::string& fmt,
     int mode,
+    int k,
     float temperature,
     uint32_t seed,
     StreamOrDevice s /* = {} */) {
@@ -93,16 +94,30 @@ array lm_head_sample_q(
   if (!(h.dtype() == float32 || h.dtype() == float16 || h.dtype() == bfloat16)) {
     throw std::invalid_argument("lm_head_sample_q: h must be float32/float16/bfloat16");
   }
-  if (mode != 0 && mode != 1) {
-    throw std::invalid_argument("lm_head_sample_q: only argmax (0) / categorical (1) supported");
+  if (mode < 0 || mode > 2) {
+    throw std::invalid_argument("lm_head_sample_q: mode must be 0 (argmax), 1 (categorical), 2 (topk)");
   }
   const int T = h.shape(0);
   const int num_vtiles = (V + LMH_TILE_V - 1) / LMH_TILE_V;
   const int use_bias = bias.size() > 1 ? 1 : 0;
-  const int use_gumbel = (mode == 1) ? 1 : 0;
   auto h_c = contiguous(h, false, s);
   auto Wq_c = contiguous(astype(Wq, uint8, s), false, s);
   auto bias_c = use_bias ? contiguous(astype(bias, float32, s), false, s) : zeros({1}, float32, s);
+
+  if (mode == 2) {
+    if (k < 1 || k > 64 || k > LMH_TILE_V) {
+      throw std::invalid_argument("lm_head_sample_q: topk k must be in [1, min(64, TILE_V)]");
+    }
+    auto parts = array::make_arrays(
+        {{T, num_vtiles, k}, {T, num_vtiles, k}}, {float32, int32},
+        std::make_shared<LmHeadTopkPartialsQ>(to_stream(s), k, use_bias, LMH_TILE_V, V, K, fmt),
+        {h_c, Wq_c, bias_c});
+    return array({T}, int32,
+                 std::make_shared<LmHeadTopkReduce>(to_stream(s), k, 1.0f / temperature, seed),
+                 {parts[0], parts[1]});
+  }
+
+  const int use_gumbel = (mode == 1) ? 1 : 0;
   auto parts = array::make_arrays(
       {{T, num_vtiles}, {T, num_vtiles}}, {float32, int32},
       std::make_shared<LmHeadArgcatPartialsQ>(to_stream(s), use_gumbel, 1.0f / temperature, seed,
@@ -211,6 +226,27 @@ void LmHeadTopkPartials::eval_gpu(const std::vector<array>& inputs, std::vector<
       type_to_name(h));
 }
 
+void LmHeadTopkPartialsQ::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadTopkPartialsQ has no CPU implementation.");
+}
+void LmHeadTopkPartialsQ::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& h = inputs[0];
+  auto& Wq = inputs[1];
+  auto& bias = inputs[2];
+  auto& part_val = outputs[0];
+  auto& part_id = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  part_val.set_data(allocator::malloc_or_wait(part_val.nbytes()));
+  part_id.set_data(allocator::malloc_or_wait(part_id.nbytes()));
+  const int T = h.shape(0);
+  const int num_vtiles = part_val.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_lm_head_topk_partials_q(enc, h, Wq, part_val, part_id, bias, V_, K_, tile_v_,
+                                     num_vtiles, topk_, use_bias_, T, fmt_, type_to_name(h));
+}
+
 // ---------------- topk reduce ----------------
 void LmHeadTopkReduce::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("LmHeadTopkReduce has no CPU implementation.");
@@ -252,6 +288,7 @@ TK_LMH_NO_AUTODIFF(LmHeadArgcatPartials, "LmHeadArgcatPartials")
 TK_LMH_NO_AUTODIFF(LmHeadArgcatPartialsQ, "LmHeadArgcatPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadArgcatReduce, "LmHeadArgcatReduce")
 TK_LMH_NO_AUTODIFF(LmHeadTopkPartials, "LmHeadTopkPartials")
+TK_LMH_NO_AUTODIFF(LmHeadTopkPartialsQ, "LmHeadTopkPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadTopkReduce, "LmHeadTopkReduce")
 
 } // namespace mlx::core

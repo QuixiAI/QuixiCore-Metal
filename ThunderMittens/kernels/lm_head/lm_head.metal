@@ -267,6 +267,93 @@ kernel void lm_head_topk_reduce(device const float *part_val   [[buffer(0)]],   
     if (lane == 0) out_idx[t] = bi;
 }
 
+// Quantized top-k partials: same per-lane top-k as lm_head_topk_partials, but W is packed
+// (V, K/block_k, block_bytes) uchar dequantized on the fly via tk_dequant8<FMT>. Feeds the SAME
+// lm_head_topk_reduce (global merge + Gumbel-max), so the fused quant top-k path avoids ever
+// materializing the (T,V) logits — the point of quant decode.
+template <typename FMT, typename T>
+kernel void lm_head_topk_partials_q(device const T     *h          [[buffer(0)]],
+                                    device const uchar *Wq         [[buffer(1)]],  // packed (V,K)
+                                    device float       *part_val   [[buffer(2)]],
+                                    device int         *part_id    [[buffer(3)]],
+                                    device const float *bias       [[buffer(4)]],
+                                    constant int   &V          [[buffer(5)]],
+                                    constant int   &K          [[buffer(6)]],
+                                    constant int   &TILE_V     [[buffer(7)]],
+                                    constant int   &num_vtiles [[buffer(8)]],
+                                    constant int   &topk       [[buffer(9)]],
+                                    constant int   &use_bias   [[buffer(10)]],
+                                    uint2 tgid [[threadgroup_position_in_grid]],
+                                    uint  lane [[thread_index_in_simdgroup]]) {
+    const int vtile = (int)tgid.x;
+    const int t     = (int)tgid.y;
+    device const T *hrow = h + (long)t * K;
+    const int v0 = vtile * TILE_V;
+    const int v1 = min(v0 + TILE_V, V);
+    const int bpr = K / FMT::block_k;
+    constexpr int MAX_PER_LANE = 2048 / 32;   // TILE_V <= 2048
+    float mine_val[MAX_PER_LANE];
+    int   mine_id[MAX_PER_LANE];
+    bool  used[MAX_PER_LANE];
+    int   nmine = 0;
+    for (int v = v0 + (int)lane; v < v1; v += 32) {
+        device const uchar *wq_row = Wq + (long)v * bpr * FMT::block_bytes;
+        float dot_acc = 0.0f;
+        for (int b = 0; b < bpr; ++b) {
+            device const uchar *base = wq_row + (long)b * FMT::block_bytes;
+            for (int cib = 0; cib < FMT::block_k; cib += 8) {
+                half w8[8];
+                tk_dequant8<FMT>(base, cib, w8);
+                const int koff = b * FMT::block_k + cib;
+                for (int kk = 0; kk < 8; ++kk) dot_acc += float(w8[kk]) * float(hrow[koff + kk]);
+            }
+        }
+        float ls = dot_acc;
+        if (use_bias) ls += bias[v];
+        mine_val[nmine] = ls;
+        mine_id[nmine]  = v;
+        used[nmine]     = false;
+        ++nmine;
+    }
+    const long pbase = ((long)t * num_vtiles + vtile) * topk;
+    for (int kk = 0; kk < topk; ++kk) {
+        float best = LMH_NEG_INF;
+        int   bi   = -1;
+        int   bl   = -1;
+        for (int j = 0; j < nmine; ++j) {
+            if (used[j]) continue;
+            if (mine_val[j] > best || (mine_val[j] == best && mine_id[j] < bi)) {
+                best = mine_val[j]; bi = mine_id[j]; bl = j;
+            }
+        }
+        float gbest = best;
+        int   gid   = (bi < 0) ? 0x7fffffff : bi;
+        simd_argmax(gbest, gid);
+        if (bl >= 0 && bi == gid) used[bl] = true;
+        if (lane == 0) {
+            part_val[pbase + kk] = gbest;
+            part_id[pbase + kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
+        }
+    }
+}
+
+#define instantiate_lm_head_topk_q(hn, FMT, T)                                     \
+  template [[host_name("lm_head_topk_partials_q_" hn)]] [[kernel]] void             \
+  lm_head_topk_partials_q<FMT, T>(device const T *h [[buffer(0)]],                  \
+    device const uchar *Wq [[buffer(1)]], device float *part_val [[buffer(2)]],     \
+    device int *part_id [[buffer(3)]], device const float *bias [[buffer(4)]],      \
+    constant int &V [[buffer(5)]], constant int &K [[buffer(6)]],                   \
+    constant int &TILE_V [[buffer(7)]], constant int &num_vtiles [[buffer(8)]],     \
+    constant int &topk [[buffer(9)]], constant int &use_bias [[buffer(10)]],        \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_lm_head_topk_q("q8_0_float32", q8_0, float)
+instantiate_lm_head_topk_q("q8_0_float16", q8_0, half)
+instantiate_lm_head_topk_q("q8_0_bfloat16", q8_0, bf16)
+instantiate_lm_head_topk_q("q4_0_float32", q4_0, float)
+instantiate_lm_head_topk_q("q4_0_float16", q4_0, half)
+instantiate_lm_head_topk_q("q4_0_bfloat16", q4_0, bf16)
+
 #define instantiate_lm_head(type_name, T)                                          \
   template [[host_name("lm_head_argcat_partials_" #type_name)]] [[kernel]] void     \
   lm_head_argcat_partials<T>(device const T *h [[buffer(0)]], device const T *W [[buffer(1)]], \

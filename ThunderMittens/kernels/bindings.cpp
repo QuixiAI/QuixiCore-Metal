@@ -905,12 +905,14 @@ NB_MODULE(_ext, m) {
       "k"_a,
       "fmt"_a,
       "mode"_a,
+      "topk"_a,
       "temperature"_a,
       "seed"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),
       R"(
-        fused LM-head + sampling over quantized (q8_0/q4_0) weights; mode 0=argmax, 1=categorical
+        fused LM-head + sampling over quantized (q8_0/q4_0) weights; mode 0=argmax, 1=categorical,
+        2=topk (topk = k, reuses the dense top-k reduce). No (T,V) logits materialization.
       )");
 
     m.def(
