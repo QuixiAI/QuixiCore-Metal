@@ -1,5 +1,49 @@
 # ThunderMittens — performance status
 
+## Wave-8 — optimization pass over the Wave-6/7 kernels (2026-07-03)
+
+A measure-first pass over every new kernel. First registered the last unmeasured families in
+`perf/bench_kernels.py` (typical_p, apply_bad_words, dropout, adamw, rms_norm_add, embedding_backward,
+spec_verify_tree, spec_compact, build_dynamic_tree), then benched the whole surface (MLX comprehensive
++ the new quick cases). Finding: the surface is **already near-optimal** (Waves 6/7 did the heavy
+lifting), with two genuine outliers, both fixed.
+
+**Wins (measured, kept):**
+- **typical_p_sample 1.8×** (10.6 → 5.87 ms, T256×V32000). The kernel's cost is the surprise-threshold
+  bisection, and each step re-scans the full vocab with a per-element `exp` (bandwidth-bound at
+  ~100 GB/s). 32 steps resolve tau to `smax/2³²` — pure overkill; **16 steps** give `smax/65536`,
+  far below the V-token surprise spacing, so the kept set is unchanged. (A one-pass mass-histogram +
+  local refine could roughly halve it again — noted as a follow-on; not done, the 1.8× is the safe win.)
+- **dropout fwd+bwd ~1.9×** (2.14 → 1.09 ms, 16384×4096; ~128 → 246 GB/s). Both kernels were scalar
+  one-thread-per-element — the same bf16 scalar-access bottleneck `gelu_bwd` had. `packed_four` vec4
+  with a scalar tail; the keep-mask stays keyed by the element index so it's byte-identical and the
+  backward still recomputes it from the seed.
+
+**Rejects (measured, reverted/kept-as-is):**
+- **adamw vec4 — reject.** Neutral (0.29→0.29, 1.11→1.13 ms). AdamW is dominated by its **four f32
+  moment arrays** (m_in/v_in/m_out/v_out); f32 scalar access is already aligned/efficient, so the
+  bf16-access penalty that made dropout/gelu_bwd vec4 win simply doesn't exist here. Reverted to the
+  simpler scalar kernel.
+- **lm_head (non-quant) at T>1 — documented tradeoff, not a bug.** argmax_T8 is 0.38× vs matmul+argmax
+  because the fused partials re-read W once per token (T× the weight bandwidth) while the dense matmul
+  reads W once. This is the fused path's off-purpose regime: it exists for T=1 decode and for quant
+  weights (lm_head_q topk_q4_0_T8 is ~0.95×, near parity, since on-the-fly dequant offsets the
+  re-reads). Non-quant T>1 should use matmul+sample. Batching T tokens per tile to amortize W would fix
+  it but is a 6-kernel rewrite (argcat/topk/topp × quant/non-quant) of a hot, well-tested family for a
+  narrower regime — deferred.
+
+**Confirmed already near-optimal (no change):** rms_norm_add ~305 GB/s (register-tile fused norm),
+apply_bad_words / min_p / apply_token_bitmask (bandwidth-bound over (T,V), effective BW ~230 GB/s once
+the multi-pass factor is counted), embedding_backward (the **atomic** default is *faster* than the
+sorted path even at V=256 heavy-dup — 0.11 vs 0.57 ms — Apple's native atomic_float wins over the
+argsort+segment overhead; sorted stays available but is rarely the pick), spec_verify_tree/compact and
+build_dynamic_tree (overhead-bound at sub-30 µs), the Wave-7 fused norm backwards (already on par with
+mx.fast), glu/embedding_lookup/gelu_bwd (already 2–3× ahead). The tiny GB/s numbers for
+varlen_build_worklist / beam_build_copy_pairs / beam advance are latency/overhead-bound, not bandwidth
+(already measured + rejected in Wave 7).
+
+---
+
 ## Wave-7 close-out (2026-07-03)
 
 Wave 7 closed the full 20-item tail of Wave-6 deferrals (robustness, test gaps, feature
