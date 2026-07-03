@@ -1666,13 +1666,41 @@ def cascade_attention_cases(be, preset, formats):
         bt_d = be.int_array(np.arange(B * max_blocks, dtype=np.int32).reshape(B, max_blocks))
         cl_d = be.int_array(np.full((B,), ctx, dtype=np.int32))
         scale = 1.0 / np.sqrt(D)
+        # Baseline: the SAME attention with NO prefix sharing — build a full per-request paged cache
+        # holding the shared prefix prepended to each request's suffix, then time paged_attention_v2.
+        # cascade should win by amortizing the shared prefix's KV reads across the batch.
+        full_ctx = pfx + ctx
+        fmax_blocks = (full_ctx + block_size - 1) // block_size
+        fnum_blocks = B * fmax_blocks
+        pk_np = be.to_numpy(pk_d).astype(np.float32)   # (pfx, H_KV, D)
+        pv_np = be.to_numpy(pv_d).astype(np.float32)
+        fk = np.zeros((fnum_blocks, block_size, H_KV, D), np.float32)
+        fv = np.zeros((fnum_blocks, block_size, H_KV, D), np.float32)
+        for b in range(B):                             # prefix ++ this request's suffix, per request
+            seq_k = np.concatenate([pk_np, be.to_numpy(kc_d)[b * max_blocks:(b + 1) * max_blocks]
+                                    .astype(np.float32).reshape(-1, H_KV, D)[:ctx]], axis=0)
+            seq_v = np.concatenate([pv_np, be.to_numpy(vc_d)[b * max_blocks:(b + 1) * max_blocks]
+                                    .astype(np.float32).reshape(-1, H_KV, D)[:ctx]], axis=0)
+            flat_k = fk[b * fmax_blocks:(b + 1) * fmax_blocks].reshape(-1, H_KV, D)
+            flat_v = fv[b * fmax_blocks:(b + 1) * fmax_blocks].reshape(-1, H_KV, D)
+            flat_k[:full_ctx] = seq_k
+            flat_v[:full_ctx] = seq_v
+        fk_d = be.array(fk, "bf16")
+        fv_d = be.array(fv, "bf16")
+        fbt_d = be.int_array(np.arange(fnum_blocks, dtype=np.int32).reshape(B, fmax_blocks))
+        fcl_d = be.int_array(np.full((B,), full_ctx, dtype=np.int32))
         yield Case("cascade_attention", f"B{B}H{H}pfx{pfx}ctx{ctx}",
                    {"B": B, "H": H, "pfx": pfx, "ctx": ctx, "D": D}, "bf16",
                    target=lambda q_d=q_d, pk_d=pk_d, pv_d=pv_d, kc_d=kc_d, vc_d=vc_d, bt_d=bt_d,
                    cl_d=cl_d, scale=scale:
                        tk.cascade_attention(q_d, pk_d, pv_d, kc_d, vc_d, bt_d, cl_d,
                                             scale=float(scale), partition_size=256),
-                   baselines={}, ref=None, bytes_moved=2.0 * B * (pfx + ctx) * H_KV * D * 2)
+                   baselines={"tk.paged_full_prefix++suffix":
+                              (lambda q_d=q_d, fk_d=fk_d, fv_d=fv_d, fbt_d=fbt_d, fcl_d=fcl_d,
+                               scale=scale:
+                               tk.paged_attention_v2(q_d, fk_d, fv_d, fbt_d, fcl_d,
+                                                     scale=float(scale), partition_size=256))},
+                   ref=None, bytes_moved=2.0 * B * (pfx + ctx) * H_KV * D * 2)
 
 
 @register("spec_verify_linear")
@@ -1728,14 +1756,30 @@ def beam_build_copy_pairs_cases(be, preset, formats):
         block_size = 16
         max_blocks = (ctx + block_size - 1) // block_size
         nbeams = B * BM
-        bt_d = be.int_array(np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks))
-        parent_d = be.int_array(rng.integers(0, BM, size=(B, BM)).astype(np.int32))
-        seq_d = be.int_array(np.full((nbeams,), ctx, np.int32))
+        bt = np.arange(nbeams * max_blocks, dtype=np.int32).reshape(nbeams, max_blocks)
+        parent = rng.integers(0, BM, size=(B, BM)).astype(np.int32)
+        seq = np.full((nbeams,), ctx, np.int32)
+        bt_d = be.int_array(bt)
+        parent_d = be.int_array(parent)
+        seq_d = be.int_array(seq)
+        # deterministic numpy oracle: mirror the on-device (src,dst) pair layout (fixed seeds).
+        pref = np.full((nbeams * max_blocks, 2), -1, np.int64)
+        for gid in range(nbeams * max_blocks):
+            gb, c = gid // max_blocks, gid % max_blocks
+            b, k = gb // BM, gb % BM
+            p = int(parent[b, k])
+            if p != k:
+                nblk = (int(seq[gb]) + block_size - 1) // block_size
+                if c < nblk:
+                    s, d = int(bt[b * BM + p, c]), int(bt[gb, c])
+                    if s >= 0 and d >= 0:
+                        pref[gid] = (s, d)
         yield Case("beam_build_copy_pairs", f"B{B}BM{BM}ctx{ctx}", {"B": B, "BM": BM, "ctx": ctx},
                    "int",
                    target=lambda parent_d=parent_d, bt_d=bt_d, seq_d=seq_d:
                        tk.beam_build_copy_pairs(parent_d, bt_d, seq_d, block_size),
-                   baselines={}, ref=None, bytes_moved=float(nbeams * max_blocks * 2 * 8))
+                   out_to_numpy=lambda o: be.to_numpy(o).reshape(-1, 2),
+                   baselines={}, ref=pref, bytes_moved=float(nbeams * max_blocks * 2 * 8))
 
 
 @register("varlen_build_worklist")
@@ -1747,9 +1791,17 @@ def varlen_build_worklist_cases(be, preset, formats):
         cu = np.concatenate([[0], np.cumsum(qlens)]).astype(np.int32)
         max_tiles = int(sum((int(q) + 7) // 8 for q in qlens)) + 4
         cu_d = be.int_array(cu)
+        # deterministic numpy oracle for the tile->seq map (output 2): each length-q sequence emits
+        # ceil(q/8) tiles all tagged with its batch index, then -1-padded to max_tiles.
+        ts = []
+        for b in range(B):
+            ts += [b] * ((int(qlens[b]) + 7) // 8)
+        tsref = np.full(max_tiles, -1, np.int32)
+        tsref[:len(ts)] = np.array(ts, np.int32)
         yield Case("varlen_build_worklist", f"B{B}", {"B": B, "max_tiles": max_tiles}, "int",
                    target=lambda cu_d=cu_d, mt=max_tiles: tk.varlen_build_worklist(cu_d, mt),
-                   baselines={}, ref=None, bytes_moved=float(max_tiles * 4))
+                   out_to_numpy=lambda o: be.to_numpy(o[2]).astype(np.int32),
+                   baselines={}, ref=tsref, bytes_moved=float(max_tiles * 4))
 
 
 # --------------------------------------------------------------------------- runner
