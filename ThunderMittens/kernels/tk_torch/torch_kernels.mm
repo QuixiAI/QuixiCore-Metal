@@ -468,6 +468,26 @@ static at::Tensor embedding_backward_mps(const at::Tensor& token_ids_in, const a
   return dtable;
 }
 
+static at::Tensor embedding_backward_sorted_mps(const at::Tensor& sorted_ids_in,
+    const at::Tensor& perm_in, const at::Tensor& dY_in, int64_t vocab, double scale) {
+  TORCH_CHECK(sorted_ids_in.device().is_mps() && sorted_ids_in.dim() == 1 && perm_in.dim() == 1,
+              "embedding_backward_sorted: sorted_ids / perm must be 1-D MPS tensors");
+  TORCH_CHECK(dY_in.dim() == 2 && tk_is_float_dtype(dY_in),
+              "embedding_backward_sorted: dY must be (num_tok, D) float");
+  auto sorted_ids = sorted_ids_in.to(at::kInt).contiguous();
+  auto perm = perm_in.to(at::kInt).contiguous();
+  auto dY = dY_in.contiguous();
+  const int n_tok = sorted_ids.size(0), D = dY.size(1);
+  TORCH_CHECK(dY.size(0) == n_tok && perm.size(0) == n_tok,
+              "embedding_backward_sorted: num_tok mismatch");
+  auto dtable = at::zeros({(long)vocab, D}, dY.options().dtype(at::kFloat));  // absent ids stay 0
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_embedding_backward_sorted(e, sorted_ids, perm, dY, dtable, D, (int)vocab, n_tok,
+                                         static_cast<float>(scale), tk_type_name(dY));
+  });
+  return dtable;
+}
+
 static at::Tensor build_multimodal_src_mps(const at::Tensor& so_in, const at::Tensor& sl_in,
                                            const at::Tensor& ms_in, int64_t num_tok) {
   TORCH_CHECK(so_in.device().is_mps() && so_in.dim() == 1,
@@ -2954,6 +2974,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("embedding_backward", &embedding_backward_mps,
         "ThunderMittens embedding backward / scatter-add grad (MPS)");
+  m.def("embedding_backward_sorted", &embedding_backward_sorted_mps,
+        "ThunderMittens embedding backward (sorted-segment, atomic-free) (MPS)");
   m.def("build_multimodal_src", &build_multimodal_src_mps,
         "ThunderMittens on-device multimodal src builder (MPS)");
   m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,

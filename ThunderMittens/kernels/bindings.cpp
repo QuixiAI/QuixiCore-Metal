@@ -839,6 +839,21 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "embedding_backward_sorted",
+      &embedding_backward_sorted,
+      "sorted_ids"_a,
+      "perm"_a,
+      "dY"_a,
+      "vocab"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Embedding backward (sorted-segment, atomic-free): accumulate dY into a (vocab, D) fp32 grad
+        table from host-presorted (sorted_ids, perm). Same result as embedding_backward.
+      )");
+
+    m.def(
       "merge_multimodal_spans",
       &merge_multimodal_spans,
       "text"_a,

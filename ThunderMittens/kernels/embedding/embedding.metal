@@ -131,7 +131,47 @@ kernel void embedding_backward(device const int    *token_ids [[buffer(0)]],  //
     }
 }
 
+// Embedding backward (sorted-segment, atomic-free): the tokens are pre-sorted by id on the host
+// (perm = argsort(token_ids), sorted_ids = token_ids[perm]). One threadgroup per sorted position;
+// only the SEGMENT-START position of each id (sorted_ids[i-1] != id) does work, summing dY[perm[j]]
+// over its equal-id run and writing dtable[id] once — so every output row is written by exactly one
+// threadgroup and no atomics are needed. dtable must be zeroed first (ids absent from token_ids keep
+// their zero). Negative / out-of-range ids sort to the front and are skipped. Wins over the atomic
+// scatter when a few ids are heavily duplicated (high atomic contention). Ref: PyTorch
+// embedding_dense_backward sorted-index path.
+template <typename T>
+kernel void embedding_backward_sorted(device const int *sorted_ids [[buffer(0)]],  // (num_tok,) asc
+                                      device const int *perm       [[buffer(1)]],  // (num_tok,)
+                                      device const T   *dY         [[buffer(2)]],  // (num_tok, D)
+                                      device float     *dtable     [[buffer(3)]],  // (vocab, D) zeroed
+                                      constant int   &D           [[buffer(4)]],
+                                      constant int   &vocab       [[buffer(5)]],
+                                      constant int   &n_tok       [[buffer(6)]],
+                                      constant float &scale       [[buffer(7)]],
+                                      uint  i        [[threadgroup_position_in_grid]],
+                                      uint  lid      [[thread_position_in_threadgroup]],
+                                      uint  nthreads [[threads_per_threadgroup]]) {
+    const int id = sorted_ids[i];
+    if (id < 0 || id >= vocab) return;                     // padding / out-of-range: no contribution
+    if ((int)i > 0 && sorted_ids[i - 1] == id) return;     // only the segment start accumulates
+    const long orow = (long)id * D;
+    for (int d = (int)lid; d < D; d += (int)nthreads) {
+        float acc = 0.0f;
+        for (int j = (int)i; j < n_tok && sorted_ids[j] == id; ++j) {
+            acc += float(dY[(long)perm[j] * D + d]);
+        }
+        dtable[orow + d] = acc * scale;                    // sole writer of this row -> no atomics
+    }
+}
+
 #define instantiate_embedding(type_name, T)                                        \
+  template [[host_name("embedding_backward_sorted_" #type_name)]] [[kernel]] void   \
+  embedding_backward_sorted<T>(device const int *sorted_ids [[buffer(0)]],          \
+    device const int *perm [[buffer(1)]], device const T *dY [[buffer(2)]],         \
+    device float *dtable [[buffer(3)]], constant int &D [[buffer(4)]],              \
+    constant int &vocab [[buffer(5)]], constant int &n_tok [[buffer(6)]],           \
+    constant float &scale [[buffer(7)]], uint i [[threadgroup_position_in_grid]],   \
+    uint lid [[thread_position_in_threadgroup]], uint nthreads [[threads_per_threadgroup]]); \
   template [[host_name("embedding_backward_" #type_name)]] [[kernel]] void          \
   embedding_backward<T>(device const int *token_ids [[buffer(0)]],                  \
     device const T *dY [[buffer(1)]], device metal::atomic_float *dtable [[buffer(2)]], \

@@ -977,13 +977,27 @@ def embedding_lookup(token_ids, table, pos_table=None, scale=1.0):
     return _mlx().embedding_lookup(token_ids, table, pt, float(scale))
 
 
-def embedding_backward(token_ids, dY, vocab, scale=1.0):
+def embedding_backward(token_ids, dY, vocab, scale=1.0, method="atomic"):
     """Embedding backward: scatter-add the upstream grad dY (num_tok, D) into a (vocab, D) fp32
     gradient table by token id (dtable[token_ids[t]] += scale*dY[t]). A negative / out-of-range id
     contributes nothing (matches the padding-zeros forward). token_ids (num_tok,) int; dY float.
-    Returns (vocab, D) float32. Matches nn.Embedding autograd. Accepts mlx / torch (MPS)."""
+    Returns (vocab, D) float32. Matches nn.Embedding autograd.
+
+    method="atomic" (default): one relaxed float atomic-add per (token, d); simple, best when ids are
+    mostly distinct. method="sorted": presort tokens by id (argsort) so each id's gradient is summed
+    by a single threadgroup (atomic-free) — wins under heavy id duplication (high atomic contention).
+    Both give the same result. Accepts mlx / torch (MPS)."""
+    if method not in ("atomic", "sorted"):
+        raise ValueError(f"embedding_backward: method must be 'atomic' or 'sorted', got {method!r}")
     if _is_torch(dY):
-        return _torch().embedding_backward(token_ids, dY, int(vocab), float(scale))
+        return _torch().embedding_backward(token_ids, dY, int(vocab), float(scale), method=method)
+    if method == "sorted":
+        import mlx.core as _mx
+        tok = token_ids.astype(_mx.int32)
+        perm = _mx.argsort(tok)
+        sorted_ids = tok[perm]
+        return _mlx().embedding_backward_sorted(sorted_ids, perm, dY, vocab=int(vocab),
+                                                scale=float(scale))
     return _mlx().embedding_backward(token_ids, dY, vocab=int(vocab), scale=float(scale))
 
 

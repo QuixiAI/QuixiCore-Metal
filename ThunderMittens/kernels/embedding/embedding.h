@@ -67,6 +67,44 @@ class EmbeddingBackward : public Primitive {
 };
 
 /**
+ *  Embedding backward (sorted-segment, atomic-free): the tokens are pre-sorted by id on the host
+ *  (perm = argsort(token_ids), sorted_ids = token_ids[perm]); each id's gradient is accumulated by a
+ *  single threadgroup, so no atomics. sorted_ids / perm (num_tok,) int; dY (num_tok, D) float.
+ *  Returns (vocab, D) float32. Same result as embedding_backward; wins under heavy id duplication.
+ **/
+array embedding_backward_sorted(
+    const array& sorted_ids,
+    const array& perm,
+    const array& dY,
+    int vocab,
+    float scale,
+    StreamOrDevice s = {});
+
+class EmbeddingBackwardSorted : public Primitive {
+ public:
+  EmbeddingBackwardSorted(Stream stream, int vocab, float scale)
+      : Primitive(stream), vocab_(vocab), scale_(scale) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "EmbeddingBackwardSorted"; }
+  void print(std::ostream& os) override { os << "EmbeddingBackwardSorted"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const EmbeddingBackwardSorted&>(other);
+    return vocab_ == o.vocab_ && scale_ == o.scale_;
+  }
+
+ private:
+  int vocab_;
+  float scale_;
+};
+
+/**
  *  Build the multimodal `src` map on-device (input to merge_multimodal_spans). span_offsets /
  *  span_lengths / modal_starts (num_spans,) int describe each modal span; returns src (num_tok,)
  *  int32 with src[t] = modal_starts[k]+offset for a token inside span k, else -1.

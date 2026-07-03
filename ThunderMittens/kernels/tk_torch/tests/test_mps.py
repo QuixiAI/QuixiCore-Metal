@@ -1403,17 +1403,18 @@ def test_glu_backward_swiglu_oai_clamp():
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_embedding_backward(dtype):
+@pytest.mark.parametrize("method", ["atomic", "sorted"])
+def test_embedding_backward(dtype, method):
     import numpy as np
     rng = np.random.default_rng(11)
     vocab, D, T = 50, 128, 40
     tok = rng.integers(0, vocab, size=T).astype(np.int32); tok[3] = -1
-    tok[7] = tok[11] = tok[19] = 5                  # duplicate id -> atomic accumulation
+    tok[7] = tok[11] = tok[19] = 5                  # duplicate id -> accumulation
     dY = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
     # vs torch nn.Embedding autograd (padding_idx handled by masking the -1 rows)
     tokt = torch.from_numpy(tok).to("mps")
     dtab = tk_torch.embedding_backward(tokt, torch.from_numpy(dY).to(dtype).to("mps"),
-                                       vocab, scale=1.5).float().cpu().numpy()
+                                       vocab, scale=1.5, method=method).float().cpu().numpy()
     emb = torch.nn.Embedding(vocab, D).to("mps")
     with torch.no_grad():
         emb.weight.copy_(torch.zeros(vocab, D, device="mps"))

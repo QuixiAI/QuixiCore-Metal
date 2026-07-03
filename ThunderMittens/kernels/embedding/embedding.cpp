@@ -108,6 +108,51 @@ void EmbeddingBackward::eval_gpu(const std::vector<array>& inputs, std::vector<a
                                 type_to_name(dY));
 }
 
+array embedding_backward_sorted(
+    const array& sorted_ids,
+    const array& perm,
+    const array& dY,
+    int vocab,
+    float scale,
+    StreamOrDevice s /* = {} */) {
+  if (sorted_ids.ndim() != 1 || perm.ndim() != 1 || perm.shape(0) != sorted_ids.shape(0)) {
+    throw std::invalid_argument("embedding_backward_sorted: sorted_ids / perm must be (num_tok,)");
+  }
+  if (dY.ndim() != 2 || !emb_is_float(dY.dtype()) || dY.shape(0) != sorted_ids.shape(0)) {
+    throw std::invalid_argument(
+        "embedding_backward_sorted: dY must be (num_tok, D) float, num_tok matching");
+  }
+  const int D = dY.shape(1);
+  auto sid_c = contiguous(astype(sorted_ids, int32, s), false, s);
+  auto perm_c = contiguous(astype(perm, int32, s), false, s);
+  auto dY_c = contiguous(dY, false, s);
+  return array(
+      {vocab, D}, float32,
+      std::make_shared<EmbeddingBackwardSorted>(to_stream(s), vocab, scale),
+      {sid_c, perm_c, dY_c});
+}
+
+void EmbeddingBackwardSorted::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("EmbeddingBackwardSorted has no CPU implementation.");
+}
+void EmbeddingBackwardSorted::eval_gpu(const std::vector<array>& inputs,
+                                       std::vector<array>& outputs) {
+  auto& sorted_ids = inputs[0];
+  auto& perm = inputs[1];
+  auto& dY = inputs[2];
+  auto& dtable = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dtable.set_data(allocator::malloc_or_wait(dtable.nbytes()));
+  const int n_tok = sorted_ids.shape(0);
+  const int D = dY.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_embedding_zero_f32(enc, dtable, vocab_ * D);         // zero first (absent ids stay 0)
+  tk::launch_embedding_backward_sorted(enc, sorted_ids, perm, dY, dtable, D, vocab_, n_tok, scale_,
+                                       type_to_name(dY));
+}
+
 array build_multimodal_src(
     const array& span_offsets, const array& span_lengths, const array& modal_starts, int num_tok,
     StreamOrDevice s /* = {} */) {
@@ -200,6 +245,7 @@ void MergeMultimodalSpans::eval_gpu(const std::vector<array>& inputs, std::vecto
 
 TK_EMB_NO_AUTODIFF(EmbeddingLookup, "EmbeddingLookup")
 TK_EMB_NO_AUTODIFF(EmbeddingBackward, "EmbeddingBackward")
+TK_EMB_NO_AUTODIFF(EmbeddingBackwardSorted, "EmbeddingBackwardSorted")
 TK_EMB_NO_AUTODIFF(BuildMultimodalSrc, "BuildMultimodalSrc")
 TK_EMB_NO_AUTODIFF(MergeMultimodalSpans, "MergeMultimodalSpans")
 

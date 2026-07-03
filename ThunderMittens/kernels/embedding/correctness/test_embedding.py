@@ -42,23 +42,54 @@ def test_embedding_lookup_pos():
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
 @pytest.mark.parametrize("D", [64, 128, 256])
-def test_embedding_backward(dtype, D):
+@pytest.mark.parametrize("method", ["atomic", "sorted"])
+def test_embedding_backward(dtype, D, method):
     # scatter-add grad by token id (with duplicates + a padding id) vs the numpy reference.
     rng = np.random.default_rng(D + 7)
     vocab, T = 50, 40
     tok = rng.integers(0, vocab, size=T).astype(np.int32)
     tok[3] = -1                                    # padding id -> no contribution
-    tok[7] = tok[11] = tok[19] = 5                 # duplicate id -> atomic accumulation
+    tok[7] = tok[11] = tok[19] = 5                 # duplicate id -> accumulation
     dY = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
     scale = 1.5
     dtab = np.array(embedding_backward(mx.array(tok), mx.array(dY).astype(_MX[dtype]),
-                                       vocab=vocab, scale=scale).astype(mx.float32))
+                                       vocab=vocab, scale=scale, method=method).astype(mx.float32))
     ref = np.zeros((vocab, D), np.float64)
     for t in range(T):
         if tok[t] >= 0:
             ref[tok[t]] += dY[t].astype(np.float64) * scale
     atol = 1e-4 if dtype == "float32" else 5e-2
     np.testing.assert_allclose(dtab, ref, atol=atol)
+
+
+@pytest.mark.parametrize("method", ["atomic", "sorted"])
+def test_embedding_backward_high_dup(method):
+    # heavy id duplication (only 4 distinct ids over 4096 tokens) + all-negative rows; both methods
+    # must equal the scatter-add reference. This is the regime the sorted (atomic-free) path targets.
+    rng = np.random.default_rng(123)
+    vocab, T, D = 8, 4096, 128
+    tok = rng.integers(0, 4, size=T).astype(np.int32)     # ids 0..3 only -> huge segments
+    tok[rng.integers(0, T, size=64)] = -1                 # scattered padding rows
+    dY = (0.2 * rng.standard_normal((T, D))).astype(np.float32)
+    dtab = np.array(embedding_backward(mx.array(tok), mx.array(dY), vocab=vocab, scale=1.0,
+                                       method=method))
+    ref = np.zeros((vocab, D), np.float64)
+    for t in range(T):
+        if tok[t] >= 0:
+            ref[tok[t]] += dY[t].astype(np.float64)
+    np.testing.assert_allclose(dtab, ref, atol=2e-3)
+
+
+def test_embedding_backward_methods_agree():
+    rng = np.random.default_rng(9)
+    vocab, T, D = 100, 500, 64
+    tok = rng.integers(-2, vocab, size=T).astype(np.int32)   # includes negatives + oob-free dups
+    dY = (0.3 * rng.standard_normal((T, D))).astype(np.float32)
+    a = np.array(embedding_backward(mx.array(tok), mx.array(dY), vocab=vocab, scale=0.7,
+                                    method="atomic"))
+    b = np.array(embedding_backward(mx.array(tok), mx.array(dY), vocab=vocab, scale=0.7,
+                                    method="sorted"))
+    np.testing.assert_allclose(a, b, atol=1e-5)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

@@ -618,6 +618,18 @@ void launch_embedding_backward(E& e, typename E::in_t token_ids, typename E::in_
   e.bytes(D, 3); e.bytes(vocab, 4); e.bytes(n_tok, 5); e.bytes(scale, 6);
   e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
 }
+// embedding backward (sorted-segment, atomic-free): host pre-sorts tokens by id (perm/sorted_ids);
+// the segment-start threadgroup of each id sums its run into dtable (zeroed first). One threadgroup
+// per sorted position; threads stride D.
+template <class E>
+void launch_embedding_backward_sorted(E& e, typename E::in_t sorted_ids, typename E::in_t perm,
+                                      typename E::in_t dY, typename E::out_t dtable, int D, int vocab,
+                                      int n_tok, float scale, const std::string& type_name) {
+  e.pipeline("embedding_backward_sorted_" + type_name);
+  e.in(sorted_ids, 0); e.in(perm, 1); e.in(dY, 2); e.out(dtable, 3);
+  e.bytes(D, 4); e.bytes(vocab, 5); e.bytes(n_tok, 6); e.bytes(scale, 7);
+  e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
+}
 template <class E>
 void launch_merge_multimodal_spans(E& e, typename E::in_t text, typename E::in_t modal,
                                    typename E::in_t src, typename E::out_t out, int D, int n_tok,

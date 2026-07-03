@@ -654,9 +654,18 @@ def embedding_lookup(token_ids, table, pos_table=None, scale: float = 1.0):
     return _ext.embedding_lookup(token_ids, table, pt, float(scale))
 
 
-def embedding_backward(token_ids, dY, vocab, scale: float = 1.0):
+def embedding_backward(token_ids, dY, vocab, scale: float = 1.0, method: str = "atomic"):
     """Embedding backward: scatter-add dY (num_tok, D) rows into a (vocab, D) fp32 grad table by
-    token id (out[token_ids[t]] += scale*dY[t]); padding/oob ids contribute nothing. MPS."""
+    token id (out[token_ids[t]] += scale*dY[t]); padding/oob ids contribute nothing. MPS.
+    method="atomic" (default) = per-element atomic-add; method="sorted" = presort by id so each id is
+    summed by one threadgroup (atomic-free, wins under heavy duplication). Same result."""
+    if method == "sorted":
+        import torch
+        tok = token_ids.to(torch.int32)
+        perm = torch.argsort(tok)
+        return _ext.embedding_backward_sorted(tok[perm], perm, dY, int(vocab), float(scale))
+    if method != "atomic":
+        raise ValueError(f"embedding_backward: method must be 'atomic' or 'sorted', got {method!r}")
     return _ext.embedding_backward(token_ids, dY, int(vocab), float(scale))
 
 
