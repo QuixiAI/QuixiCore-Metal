@@ -1766,6 +1766,26 @@ static at::Tensor min_p_sample_mps(const at::Tensor& logits_in, double min_p, do
   return out;
 }
 
+static at::Tensor typical_p_sample_mps(const at::Tensor& logits_in, double typical_p,
+                                       double temperature, int64_t seed) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "typical_p_sample: logits must be a float MPS tensor");
+  TORCH_CHECK(temperature > 0.0, "typical_p_sample: temperature must be > 0");
+  TORCH_CHECK(typical_p > 0.0 && typical_p <= 1.0, "typical_p_sample: typical_p must be in (0, 1]");
+  auto logits = logits_in.contiguous();
+  const int V = logits.size(-1);
+  const int rows = static_cast<int>(logits.numel() / V);
+  std::vector<int64_t> oshape(logits.sizes().begin(), logits.sizes().end() - 1);
+  if (oshape.empty()) oshape.push_back(1);
+  auto out = at::empty(oshape, logits.options().dtype(at::kInt));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_typical_p_sample(e, logits, out, rows, V, static_cast<float>(typical_p),
+                                static_cast<uint32_t>(seed), 1.0f / static_cast<float>(temperature),
+                                tk_type_name(logits));
+  });
+  return out;
+}
+
 static at::Tensor apply_token_bitmask_mps(const at::Tensor& logits_in, const at::Tensor& bitmask_in) {
   TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
               "apply_token_bitmask: logits must be a float MPS tensor");
@@ -2725,6 +2745,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("top_k_sample", &top_k_sample_mps, "ThunderMittens top-k sampling (MPS)");
   m.def("top_p_sample", &top_p_sample_mps, "ThunderMittens top-p nucleus sampling (MPS)");
   m.def("min_p_sample", &min_p_sample_mps, "ThunderMittens min-p sampling (MPS)");
+  m.def("typical_p_sample", &typical_p_sample_mps, "ThunderMittens typical-p sampling (MPS)");
   m.def("apply_token_bitmask", &apply_token_bitmask_mps, "ThunderMittens grammar bitmask masking (MPS)");
   m.def("apply_bad_words", &apply_bad_words_mps, "ThunderMittens bad/stop-word masking (MPS)");
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");

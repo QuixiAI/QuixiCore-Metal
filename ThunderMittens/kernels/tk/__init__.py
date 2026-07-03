@@ -863,6 +863,16 @@ def min_p_sample(logits, min_p, temperature=1.0, seed=0):
     return _mlx().min_p_sample(logits, min_p, temperature=temperature, seed=seed)
 
 
+def typical_p_sample(logits, typical_p, temperature=1.0, seed=0):
+    """Typical-p (locally-typical) sampling: keep the smallest-surprise tokens (surprise =
+    |(-log p_v) - H|, H = row entropy) until their cumulative prob reaches typical_p, then Gumbel-max
+    sample among them. Returns the token index per row (int32). typical_p in (0, 1]. Accepts
+    mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().typical_p_sample(logits, typical_p, temperature, seed)
+    return _mlx().typical_p_sample(logits, typical_p, temperature=temperature, seed=seed)
+
+
 def apply_token_bitmask(logits, bitmask):
     """Grammar / structured-output masking: set logits[v] = -inf where the packed allow-bitmask bit
     for token v is 0. logits (T, V); bitmask (T, ceil(V/32)) int32 packed words (bit v of row t

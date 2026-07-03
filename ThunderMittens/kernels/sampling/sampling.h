@@ -47,6 +47,12 @@ array min_p_sample(
     const array& logits, float min_p, float temperature = 1.0f, uint32_t seed = 0,
     StreamOrDevice s = {});
 
+/** typical-p (locally-typical) sampling: keep the smallest-surprise tokens |(-log p)-H| until their
+ *  cumulative prob reaches typical_p, Gumbel-max sample among them. typical_p in (0, 1]. */
+array typical_p_sample(
+    const array& logits, float typical_p, float temperature = 1.0f, uint32_t seed = 0,
+    StreamOrDevice s = {});
+
 /** Grammar / structured-output masking: logits[v] = -inf where the packed allow-bitmask bit for v
  *  is 0. logits (T, V); bitmask (T, ceil(V/32)) uint32. Returns masked logits (T, V), same dtype. */
 array apply_token_bitmask(
@@ -187,8 +193,32 @@ class MinPSample : public Primitive {
   }
 
  private:
-  float min_p_;
-  float invtemp_;
+  float min_p_, invtemp_;
+  uint32_t seed_;
+};
+
+class TypicalPSample : public Primitive {
+ public:
+  TypicalPSample(Stream stream, float typ_p, float invtemp, uint32_t seed)
+      : Primitive(stream), typ_p_(typ_p), invtemp_(invtemp), seed_(seed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "TypicalPSample"; }
+  void print(std::ostream& os) override { os << "TypicalPSample"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const TypicalPSample&>(other);
+    return typ_p_ == o.typ_p_ && invtemp_ == o.invtemp_ && seed_ == o.seed_;
+  }
+
+ private:
+  float typ_p_, invtemp_;
   uint32_t seed_;
 };
 

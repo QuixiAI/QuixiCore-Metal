@@ -295,6 +295,15 @@ def test_min_p_sample_parity(min_p):
     _assert_parity(om, ot, atol=0)           # token ids: exact (same Gumbel)
 
 
+@pytest.mark.parametrize("typical_p", [0.3, 0.9])
+def test_typical_p_sample_parity(typical_p):
+    rng = np.random.default_rng(int(typical_p * 100))
+    logits = (rng.standard_normal((4, 500)) * 1.5).astype(np.float32)
+    om = tk.typical_p_sample(_mk(logits, "mlx", "f32"), typical_p, temperature=0.8, seed=9)
+    ot = tk.typical_p_sample(_mk(logits, "torch", "f32"), typical_p, temperature=0.8, seed=9)
+    _assert_parity(om, ot, atol=0)           # token ids: exact (same threshold + Gumbel)
+
+
 @pytest.mark.parametrize("V", [50, 200])
 def test_apply_bad_words_parity(V):
     rng = np.random.default_rng(V + 9)

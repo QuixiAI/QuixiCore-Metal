@@ -465,6 +465,49 @@ void MinPSample::eval_gpu(const std::vector<array>& inputs, std::vector<array>& 
   tk::launch_min_p_sample(enc, logits, out, rows, V, min_p_, seed_, invtemp_, type_to_name(logits));
 }
 
+array typical_p_sample(
+    const array& logits, float typical_p, float temperature /* = 1.0f */, uint32_t seed /* = 0 */,
+    StreamOrDevice s /* = {} */) {
+  if (logits.ndim() < 1) {
+    throw std::invalid_argument("typical_p_sample: logits must have at least 1 dimension");
+  }
+  if (!(logits.dtype() == float32 || logits.dtype() == float16 || logits.dtype() == bfloat16)) {
+    throw std::invalid_argument("typical_p_sample: logits must be float32, float16, or bfloat16");
+  }
+  if (temperature <= 0.0f) {
+    throw std::invalid_argument("typical_p_sample: temperature must be > 0");
+  }
+  if (!(typical_p > 0.0f && typical_p <= 1.0f)) {
+    throw std::invalid_argument("typical_p_sample: typical_p must be in (0, 1]");
+  }
+  auto x = contiguous(logits, false, s);
+  std::vector<int> out_shape(logits.shape().begin(), logits.shape().end() - 1);
+  if (out_shape.empty()) {
+    out_shape.push_back(1);
+  }
+  return array(
+      out_shape, int32,
+      std::make_shared<TypicalPSample>(to_stream(s), typical_p, 1.0f / temperature, seed),
+      {x});
+}
+
+void TypicalPSample::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("TypicalPSample has no CPU implementation.");
+}
+void TypicalPSample::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int V = logits.shape(-1);
+  const int rows = static_cast<int>(logits.size() / V);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_typical_p_sample(enc, logits, out, rows, V, typ_p_, seed_, invtemp_,
+                              type_to_name(logits));
+}
+
 array apply_token_bitmask(const array& logits, const array& bitmask, StreamOrDevice s /* = {} */) {
   if (logits.ndim() < 1) {
     throw std::invalid_argument("apply_token_bitmask: logits must have at least 1 dimension");
@@ -549,6 +592,7 @@ void ApplyBadWords::eval_gpu(const std::vector<array>& inputs, std::vector<array
 }
 
 TK_BEAM_NO_AUTODIFF(MinPSample, "MinPSample")
+TK_BEAM_NO_AUTODIFF(TypicalPSample, "TypicalPSample")
 TK_BEAM_NO_AUTODIFF(ApplyTokenBitmask, "ApplyTokenBitmask")
 TK_BEAM_NO_AUTODIFF(ApplyBadWords, "ApplyBadWords")
 

@@ -251,6 +251,69 @@ kernel void min_p_sample(device const T *logits  [[buffer(0)]],
     if (lane == 0) { out_idx[row] = bi; }
 }
 
+// Typical-p (locally-typical) sampling: keep the tokens whose "surprise" |(-log p_v) - H| is
+// smallest until their cumulative prob reaches typical_p, then Gumbel-max sample among them. H is
+// the row entropy. With p_v = exp(ls_v - mx)/Z: -log p_v = mx + logZ - ls_v, and
+// H = -sum p_v log p_v = mx + logZ - sum p_v ls_v. We bisect a surprise threshold tau (mirroring
+// top_p's threshold search): smallest tau s.t. mass{s_v <= tau} >= typical_p. One simdgroup/row.
+// Ref: HuggingFace TypicalLogitsWarper (from definition; no local kernel reference).
+template <typename T>
+kernel void typical_p_sample(device const T *logits  [[buffer(0)]],
+                             device int     *out_idx [[buffer(1)]],
+                             constant int   &V       [[buffer(2)]],
+                             constant float &typ_p   [[buffer(3)]],
+                             constant uint  &seed    [[buffer(4)]],
+                             constant float &invtemp [[buffer(5)]],
+                             uint row  [[threadgroup_position_in_grid]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * V;
+    float mx = SMP_NEG_INF;
+    for (int i = (int)lane; i < V; i += 32) { mx = max(mx, float(logits[base + i]) * invtemp); }
+    mx = simd_max(mx);
+    float Z = 0.0f, S1 = 0.0f;
+    for (int i = (int)lane; i < V; i += 32) {
+        const float ls = float(logits[base + i]) * invtemp;
+        const float e = exp(ls - mx);
+        Z += e;
+        S1 += e * ls;                          // unnormalized sum e_v * ls_v
+    }
+    Z = simd_sum(Z);
+    S1 = simd_sum(S1);
+    const float logZ = metal::log(Z);
+    const float H = mx + logZ - S1 / Z;        // row entropy
+    // max surprise (upper bisection bound); mass{s<=smax} == 1 >= typ_p always.
+    float smax = 0.0f;
+    for (int i = (int)lane; i < V; i += 32) {
+        const float ls = float(logits[base + i]) * invtemp;
+        smax = max(smax, metal::abs((mx + logZ - ls) - H));
+    }
+    smax = simd_max(smax);
+    // Smallest tau with mass{s_v <= tau} >= typ_p (mass is monotone increasing in tau).
+    float lo = 0.0f, hi = smax;
+    for (int it = 0; it < 32; ++it) {
+        const float mid = 0.5f * (lo + hi);
+        float mass = 0.0f;
+        for (int i = (int)lane; i < V; i += 32) {
+            const float ls = float(logits[base + i]) * invtemp;
+            if (metal::abs((mx + logZ - ls) - H) <= mid) { mass += exp(ls - mx); }
+        }
+        mass = simd_sum(mass) / Z;
+        if (mass >= typ_p) { hi = mid; } else { lo = mid; }
+    }
+    const float tau = hi;
+    // Gumbel-max over the kept set {s_v <= tau}.
+    float best = SMP_NEG_INF;
+    int bi = (int)lane < V ? (int)lane : 0;
+    for (int i = (int)lane; i < V; i += 32) {
+        const float ls = float(logits[base + i]) * invtemp;
+        if (metal::abs((mx + logZ - ls) - H) > tau) { continue; }
+        const float pert = ls + rng_gumbel(seed, (uint)row, (uint)i);
+        if (pert > best || (pert == best && i < bi)) { best = pert; bi = i; }
+    }
+    simd_argmax(best, bi);
+    if (lane == 0) { out_idx[row] = bi; }
+}
+
 // Grammar / structured-output masking: set logits[v] = -inf wherever the packed allow-bitmask bit
 // for token v is 0 (word = bitmask[v>>5]; bit = (word >> (v&31)) & 1). One simdgroup per row; the
 // bitmask is (num_tokens, ceil(V/32)) uint32. Composes before any sampler (like apply_penalty).
@@ -510,6 +573,15 @@ kernel void spec_verify_linear(device const int   *draft_tokens [[buffer(0)]],  
                   device int *out_idx [[buffer(1)]],                          \
                   constant int &V [[buffer(2)]],                              \
                   constant float &min_p [[buffer(3)]],                        \
+                  constant uint &seed [[buffer(4)]],                          \
+                  constant float &invtemp [[buffer(5)]],                      \
+                  uint row [[threadgroup_position_in_grid]],                  \
+                  uint lane [[thread_index_in_simdgroup]]);                   \
+  template [[host_name("typical_p_sample_" #type_name)]] [[kernel]] void       \
+  typical_p_sample<T>(device const T *logits [[buffer(0)]],                   \
+                  device int *out_idx [[buffer(1)]],                          \
+                  constant int &V [[buffer(2)]],                              \
+                  constant float &typ_p [[buffer(3)]],                        \
                   constant uint &seed [[buffer(4)]],                          \
                   constant float &invtemp [[buffer(5)]],                      \
                   uint row [[threadgroup_position_in_grid]],                  \

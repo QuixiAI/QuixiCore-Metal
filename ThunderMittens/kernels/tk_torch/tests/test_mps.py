@@ -1080,6 +1080,27 @@ def test_min_p_sample(min_p):
     assert seen <= kept
 
 
+@pytest.mark.parametrize("typical_p", [0.3, 0.9])
+def test_typical_p_sample(typical_p):
+    import numpy as np
+    rng = np.random.default_rng(int(typical_p * 100))
+    V, invtemp = 400, 1.0 / 0.8
+    logits = (1.5 * rng.standard_normal(V)).astype(np.float32)
+    ls = logits.astype(np.float64) * invtemp
+    ls -= ls.max()
+    p = np.exp(ls); p /= p.sum()
+    logp = np.log(p)
+    H = -(p * logp).sum()
+    surprise = np.abs(-logp - H)
+    order = np.argsort(surprise, kind="stable")
+    cutoff = min(int(np.searchsorted(np.cumsum(p[order]), typical_p)), V - 1)
+    tau = surprise[order[cutoff]]
+    x = torch.from_numpy(logits[None]).to("mps")
+    for s in range(60):
+        tok = int(tk_torch.typical_p_sample(x, typical_p, 0.8, s).cpu().numpy()[0])
+        assert surprise[tok] <= tau + 1e-3
+
+
 @pytest.mark.parametrize("V", [50, 200])
 def test_apply_bad_words(V):
     import numpy as np

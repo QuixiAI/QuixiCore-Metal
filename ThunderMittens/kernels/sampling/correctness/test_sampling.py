@@ -12,7 +12,8 @@ import pytest
 
 from tk import (argmax_sample, sample_categorical, top_k_sample, top_p_sample, apply_penalty,
                 beam_advance, beam_reorder_kv, beam_build_copy_pairs, beam_length_penalty,
-                spec_verify_linear, min_p_sample, apply_token_bitmask, apply_bad_words)
+                spec_verify_linear, min_p_sample, typical_p_sample, apply_token_bitmask,
+                apply_bad_words)
 
 
 def _pack_bitmask(allow):
@@ -127,6 +128,33 @@ def test_apply_token_bitmask(V):
     out = np.array(apply_token_bitmask(mx.array(logits), mx.array(_pack_bitmask(allow))))
     np.testing.assert_array_equal(out[allow], logits[allow])   # allowed logits untouched
     assert (out[~allow] < -1e30).all()                         # masked -> -inf sentinel
+
+
+def _typical_p_kept(logits_row, typical_p, invtemp):
+    ls = logits_row.astype(np.float64) * invtemp
+    ls = ls - ls.max()
+    p = np.exp(ls); p /= p.sum()
+    logp = np.log(p)
+    H = -(p * logp).sum()
+    surprise = np.abs(-logp - H)
+    order = np.argsort(surprise, kind="stable")
+    cum = np.cumsum(p[order])
+    cutoff = min(int(np.searchsorted(cum, typical_p)), len(order) - 1)
+    tau = surprise[order[cutoff]]
+    return surprise, tau
+
+
+@pytest.mark.parametrize("typical_p", [0.2, 0.9])
+def test_typical_p_sample(typical_p):
+    # over many seeds, the sampled token must lie in the numpy typical-p kept set (surprise <= tau).
+    rng = np.random.default_rng(int(typical_p * 100))
+    V, invtemp = 500, 1.0 / 0.8
+    logits = (1.5 * rng.standard_normal(V)).astype(np.float32)
+    surprise, tau = _typical_p_kept(logits, typical_p, invtemp)
+    lg = mx.array(logits[None, :])
+    for seed in range(60):
+        tok = int(np.array(typical_p_sample(lg, typical_p, temperature=0.8, seed=seed))[0])
+        assert surprise[tok] <= tau + 1e-3, (seed, tok, surprise[tok], tau)
 
 
 @pytest.mark.parametrize("V", [50, 200])

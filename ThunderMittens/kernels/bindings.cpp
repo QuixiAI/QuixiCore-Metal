@@ -516,6 +516,19 @@ NB_MODULE(_ext, m) {
       )");
 
   m.def(
+      "typical_p_sample",
+      &typical_p_sample,
+      "logits"_a,
+      "typical_p"_a,
+      nb::kw_only(),
+      "temperature"_a = 1.0f,
+      "seed"_a = 0u,
+      "stream"_a = nb::none(),
+      R"(
+        typical-p sampling: Gumbel-max over the smallest-surprise |(-log p)-H| mass typical_p. int32.
+      )");
+
+  m.def(
       "apply_token_bitmask",
       &apply_token_bitmask,
       "logits"_a,

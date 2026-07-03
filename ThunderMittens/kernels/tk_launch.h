@@ -504,6 +504,15 @@ void launch_min_p_sample(E& e, typename E::in_t logits, typename E::out_t out_id
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 template <class E>
+void launch_typical_p_sample(E& e, typename E::in_t logits, typename E::out_t out_idx, int rows,
+                             int V, float typ_p, uint32_t seed, float invtemp,
+                             const std::string& type_name) {
+  e.pipeline("typical_p_sample_" + type_name);
+  e.in(logits, 0); e.out(out_idx, 1);
+  e.bytes(V, 2); e.bytes(typ_p, 3); e.bytes(seed, 4); e.bytes(invtemp, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
 void launch_apply_token_bitmask(E& e, typename E::in_t logits, typename E::in_t bitmask,
                                 typename E::out_t out, int rows, int V, int num_words,
                                 const std::string& type_name) {

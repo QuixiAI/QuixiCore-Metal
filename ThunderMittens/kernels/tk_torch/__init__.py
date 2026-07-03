@@ -583,6 +583,11 @@ def min_p_sample(logits: torch.Tensor, min_p: float, temperature: float = 1.0, s
     return _ext.min_p_sample(logits, float(min_p), float(temperature), int(seed))
 
 
+def typical_p_sample(logits, typical_p, temperature: float = 1.0, seed: int = 0):
+    """typical-p sampling: Gumbel-max over the smallest-surprise mass typical_p. int32. MPS."""
+    return _ext.typical_p_sample(logits, float(typical_p), float(temperature), int(seed))
+
+
 def embedding_lookup(token_ids, table, pos_table=None, scale: float = 1.0):
     """Token embedding lookup: out[t] = scale*table[token_ids[t]] (+ pos_table[t] if given). MPS."""
     pt = pos_table if pos_table is not None else torch.zeros(1, dtype=table.dtype, device=table.device)
