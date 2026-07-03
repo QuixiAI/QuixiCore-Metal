@@ -66,6 +66,39 @@ class EmbeddingBackward : public Primitive {
   float scale_;
 };
 
+/**
+ *  Build the multimodal `src` map on-device (input to merge_multimodal_spans). span_offsets /
+ *  span_lengths / modal_starts (num_spans,) int describe each modal span; returns src (num_tok,)
+ *  int32 with src[t] = modal_starts[k]+offset for a token inside span k, else -1.
+ **/
+array build_multimodal_src(
+    const array& span_offsets,
+    const array& span_lengths,
+    const array& modal_starts,
+    int num_tok,
+    StreamOrDevice s = {});
+
+class BuildMultimodalSrc : public Primitive {
+ public:
+  BuildMultimodalSrc(Stream stream, int num_tok) : Primitive(stream), num_tok_(num_tok) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "BuildMultimodalSrc"; }
+  void print(std::ostream& os) override { os << "BuildMultimodalSrc"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return num_tok_ == static_cast<const BuildMultimodalSrc&>(other).num_tok_;
+  }
+
+ private:
+  int num_tok_;
+};
+
 class EmbeddingLookup : public Primitive {
  public:
   EmbeddingLookup(Stream stream, float scale, bool use_pos)

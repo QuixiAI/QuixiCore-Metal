@@ -616,6 +616,11 @@ def embedding_backward(token_ids, dY, vocab, scale: float = 1.0):
     return _ext.embedding_backward(token_ids, dY, int(vocab), float(scale))
 
 
+def build_multimodal_src(span_offsets, span_lengths, modal_starts, num_tok):
+    """Build the multimodal src map on-device: src[t]=modal_starts[k]+off in span k, else -1. MPS."""
+    return _ext.build_multimodal_src(span_offsets, span_lengths, modal_starts, int(num_tok))
+
+
 def merge_multimodal_spans(text, modal, src):
     """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. MPS."""
     return _ext.merge_multimodal_spans(text, modal, src)

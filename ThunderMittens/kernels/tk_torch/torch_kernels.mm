@@ -468,6 +468,21 @@ static at::Tensor embedding_backward_mps(const at::Tensor& token_ids_in, const a
   return dtable;
 }
 
+static at::Tensor build_multimodal_src_mps(const at::Tensor& so_in, const at::Tensor& sl_in,
+                                           const at::Tensor& ms_in, int64_t num_tok) {
+  TORCH_CHECK(so_in.device().is_mps() && so_in.dim() == 1,
+              "build_multimodal_src: span_offsets must be (num_spans,) MPS");
+  auto so = so_in.to(at::kInt).contiguous();
+  auto sl = sl_in.to(at::kInt).contiguous();
+  auto ms = ms_in.to(at::kInt).contiguous();
+  const int num_spans = so.size(0);
+  auto src = at::empty({(long)num_tok}, so.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_build_multimodal_src(e, so, sl, ms, src, num_spans, static_cast<int>(num_tok));
+  });
+  return src;
+}
+
 static at::Tensor merge_multimodal_spans_mps(const at::Tensor& text_in, const at::Tensor& modal_in,
                                              const at::Tensor& src_in) {
   TORCH_CHECK(text_in.device().is_mps() && text_in.dim() == 2 && tk_is_float_dtype(text_in),
@@ -2766,6 +2781,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("embedding_backward", &embedding_backward_mps,
         "ThunderMittens embedding backward / scatter-add grad (MPS)");
+  m.def("build_multimodal_src", &build_multimodal_src_mps,
+        "ThunderMittens on-device multimodal src builder (MPS)");
   m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,
         "ThunderMittens multimodal span merge (MPS)");
   m.def("glu", &glu_mps, "ThunderMittens GLU-family activation (MPS)");

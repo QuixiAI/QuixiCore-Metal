@@ -108,6 +108,37 @@ void EmbeddingBackward::eval_gpu(const std::vector<array>& inputs, std::vector<a
                                 type_to_name(dY));
 }
 
+array build_multimodal_src(
+    const array& span_offsets, const array& span_lengths, const array& modal_starts, int num_tok,
+    StreamOrDevice s /* = {} */) {
+  if (span_offsets.ndim() != 1 || span_lengths.shape() != span_offsets.shape() ||
+      modal_starts.shape() != span_offsets.shape()) {
+    throw std::invalid_argument("build_multimodal_src: span_* must be equal-length 1-D");
+  }
+  auto so = contiguous(astype(span_offsets, int32, s), false, s);
+  auto sl = contiguous(astype(span_lengths, int32, s), false, s);
+  auto ms = contiguous(astype(modal_starts, int32, s), false, s);
+  return array({num_tok}, int32, std::make_shared<BuildMultimodalSrc>(to_stream(s), num_tok),
+               {so, sl, ms});
+}
+
+void BuildMultimodalSrc::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("BuildMultimodalSrc has no CPU implementation.");
+}
+void BuildMultimodalSrc::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& so = inputs[0];
+  auto& sl = inputs[1];
+  auto& ms = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int num_spans = so.shape(0);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_build_multimodal_src(enc, so, sl, ms, out, num_spans, num_tok_);
+}
+
 array merge_multimodal_spans(
     const array& text,
     const array& modal,
@@ -169,6 +200,7 @@ void MergeMultimodalSpans::eval_gpu(const std::vector<array>& inputs, std::vecto
 
 TK_EMB_NO_AUTODIFF(EmbeddingLookup, "EmbeddingLookup")
 TK_EMB_NO_AUTODIFF(EmbeddingBackward, "EmbeddingBackward")
+TK_EMB_NO_AUTODIFF(BuildMultimodalSrc, "BuildMultimodalSrc")
 TK_EMB_NO_AUTODIFF(MergeMultimodalSpans, "MergeMultimodalSpans")
 
 } // namespace mlx::core

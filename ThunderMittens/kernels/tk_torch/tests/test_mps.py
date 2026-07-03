@@ -1277,6 +1277,20 @@ def test_embedding_backward(dtype):
     assert np.allclose(dtab, ref, atol=1e-4 if dtype == torch.float32 else 5e-2)
 
 
+def test_build_multimodal_src():
+    import numpy as np
+    so = np.array([5, 15, 30], np.int32); sl = np.array([4, 6, 5], np.int32)
+    ms = np.array([0, 4, 10], np.int32); T = 40
+    src = tk_torch.build_multimodal_src(torch.from_numpy(so).to("mps"),
+                                        torch.from_numpy(sl).to("mps"),
+                                        torch.from_numpy(ms).to("mps"), T).cpu().numpy()
+    ref = np.full(T, -1, np.int32)
+    for k in range(len(so)):
+        for o in range(int(sl[k])):
+            ref[so[k] + o] = ms[k] + o
+    np.testing.assert_array_equal(src, ref)
+
+
 def test_merge_multimodal_spans():
     import numpy as np
     rng = np.random.default_rng(2)

@@ -581,6 +581,16 @@ void launch_embedding_lookup(E& e, typename E::in_t token_ids, typename E::in_t 
   e.bytes(D, 4); e.bytes(vocab, 5); e.bytes(n_tok, 6); e.bytes(scale, 7); e.bytes(use_pos, 8);
   e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
 }
+// build the multimodal src map on-device (one thread per token, scans the spans).
+template <class E>
+void launch_build_multimodal_src(E& e, typename E::in_t span_offsets, typename E::in_t span_lengths,
+                                 typename E::in_t modal_starts, typename E::out_t src, int num_spans,
+                                 int num_tok) {
+  e.pipeline("build_multimodal_src");
+  e.in(span_offsets, 0); e.in(span_lengths, 1); e.in(modal_starts, 2); e.out(src, 3);
+  e.bytes(num_spans, 4); e.bytes(num_tok, 5);
+  e.dispatch((num_tok + 255) / 256, 1, 1, 256, 1, 1);
+}
 // zero a float buffer of n elements (gradient accumulator init).
 template <class E>
 void launch_embedding_zero_f32(E& e, typename E::out_t p, int n) {

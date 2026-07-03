@@ -798,6 +798,19 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "build_multimodal_src",
+      &build_multimodal_src,
+      "span_offsets"_a,
+      "span_lengths"_a,
+      "modal_starts"_a,
+      "num_tok"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Build the multimodal src map on-device: src[t] = modal_starts[k]+off in span k, else -1.
+      )");
+
+    m.def(
       "glu",
       &glu,
       "x"_a,

@@ -290,6 +290,17 @@ def test_embedding_backward_parity():
     _assert_parity(om, ot, atol=1e-5)   # atomic add order differs -> not bit-exact
 
 
+def test_build_multimodal_src_parity():
+    so = np.array([5, 15, 30], np.int32)
+    sl = np.array([4, 6, 5], np.int32)
+    ms = np.array([0, 4, 10], np.int32)
+    T = 40
+    om = tk.build_multimodal_src(mx.array(so), mx.array(sl), mx.array(ms), T)
+    ot = tk.build_multimodal_src(torch.from_numpy(so).to("mps"), torch.from_numpy(sl).to("mps"),
+                                 torch.from_numpy(ms).to("mps"), T)
+    _assert_parity(om, ot, atol=0)
+
+
 def test_merge_multimodal_spans_parity():
     rng = np.random.default_rng(3)
     T, M, D = 16, 6, 128

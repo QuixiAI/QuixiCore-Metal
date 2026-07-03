@@ -917,6 +917,16 @@ def embedding_backward(token_ids, dY, vocab, scale=1.0):
     return _mlx().embedding_backward(token_ids, dY, vocab=int(vocab), scale=float(scale))
 
 
+def build_multimodal_src(span_offsets, span_lengths, modal_starts, num_tok):
+    """Build the multimodal `src` map on-device (the input to merge_multimodal_spans), removing the
+    host span loop. Span k covers text positions [span_offsets[k], +span_lengths[k]) and maps them to
+    modal rows [modal_starts[k], +span_lengths[k]); returns src (num_tok,) int32 with
+    src[t] = modal_starts[k]+offset for a token in span k, else -1. Accepts mlx / torch (MPS)."""
+    if _is_torch(span_offsets):
+        return _torch().build_multimodal_src(span_offsets, span_lengths, modal_starts, int(num_tok))
+    return _mlx().build_multimodal_src(span_offsets, span_lengths, modal_starts, int(num_tok))
+
+
 def merge_multimodal_spans(text, modal, src):
     """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. text (num_tok, D),
     modal (num_modal, D) same dtype, src (num_tok,) int (-1 keeps the text embedding, >=0 gathers a

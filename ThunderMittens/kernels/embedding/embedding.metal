@@ -78,6 +78,28 @@ kernel void merge_multimodal_spans(device const T   *text  [[buffer(0)]],   // (
     }
 }
 
+// Build the multimodal `src` map on-device (the input to merge_multimodal_spans), removing the host
+// loop over image/audio spans. Span k covers text positions [span_offsets[k], +span_lengths[k]) and
+// maps them to modal rows [modal_starts[k], +span_lengths[k]); so for a token t inside span k at
+// offset o, src[t] = modal_starts[k] + o, else -1 (keep the text embedding). One thread per token
+// (scans the few spans). Ref: the host span->modal index list built in the merge_multimodal docstring.
+kernel void build_multimodal_src(device const int *span_offsets [[buffer(0)]],  // (num_spans,)
+                                 device const int *span_lengths [[buffer(1)]],  // (num_spans,)
+                                 device const int *modal_starts [[buffer(2)]],  // (num_spans,)
+                                 device int       *src          [[buffer(3)]],  // (num_tok,)
+                                 constant int &num_spans        [[buffer(4)]],
+                                 constant int &num_tok          [[buffer(5)]],
+                                 uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= num_tok) { return; }
+    const int t = (int)gid;
+    int s = -1;
+    for (int k = 0; k < num_spans; ++k) {
+        const int o = t - span_offsets[k];
+        if (o >= 0 && o < span_lengths[k]) { s = modal_starts[k] + o; break; }
+    }
+    src[gid] = s;
+}
+
 // Zero a float buffer (the gradient accumulator, before the atomic scatter-add). One thread/elem.
 kernel void embedding_zero_f32(device float *p [[buffer(0)]],
                                constant int  &n [[buffer(1)]],

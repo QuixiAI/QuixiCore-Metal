@@ -7,7 +7,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import embedding_backward, embedding_lookup, merge_multimodal_spans
+from tk import (embedding_backward, embedding_lookup, merge_multimodal_spans,
+                build_multimodal_src)
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -76,6 +77,31 @@ def test_merge_multimodal_spans(dtype):
     ref = np.where(src[:, None] >= 0, modal[np.clip(src, 0, M - 1)], text)
     atol = 1e-4 if dtype == "float32" else 3e-2
     np.testing.assert_allclose(o, ref, atol=atol)
+
+
+def test_build_multimodal_src():
+    # device src builder vs the host span loop, then the full build->merge pipeline.
+    rng = np.random.default_rng(9)
+    T, M, D = 40, 20, 64
+    # 3 non-overlapping modal spans
+    span_off = np.array([5, 15, 30], np.int32)
+    span_len = np.array([4, 6, 5], np.int32)
+    modal_start = np.array([0, 4, 10], np.int32)
+    src_ref = np.full(T, -1, np.int32)
+    for k in range(len(span_off)):
+        for o in range(int(span_len[k])):
+            src_ref[span_off[k] + o] = modal_start[k] + o
+    src = np.array(build_multimodal_src(mx.array(span_off), mx.array(span_len),
+                                        mx.array(modal_start), T))
+    np.testing.assert_array_equal(src, src_ref)
+    # full pipeline: build src on device -> merge
+    text = (0.3 * rng.standard_normal((T, D))).astype(np.float32)
+    modal = (0.3 * rng.standard_normal((M, D))).astype(np.float32)
+    o = np.array(merge_multimodal_spans(mx.array(text), mx.array(modal),
+                                        build_multimodal_src(mx.array(span_off), mx.array(span_len),
+                                                             mx.array(modal_start), T)))
+    ref = np.where(src_ref[:, None] >= 0, modal[np.clip(src_ref, 0, M - 1)], text)
+    np.testing.assert_allclose(o, ref, atol=1e-5)
 
 
 if __name__ == "__main__":
