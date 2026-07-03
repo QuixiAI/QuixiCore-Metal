@@ -2115,3 +2115,46 @@ def test_gelu_backward():
     torch.nn.functional.gelu(xt, approximate="tanh").backward(torch.tensor(dy))
     dx = tk.gelu_backward(torch.from_numpy(x).to("mps"), torch.from_numpy(dy).to("mps"))
     assert np.abs(dx.float().cpu().numpy() - xt.grad.numpy()).max() / (np.abs(xt.grad.numpy()).max() + 1e-9) < 1e-4
+
+
+# --- First-order autograd (Wave-7 #10, torch autograd.Function wrappers) ---
+def test_autograd_torch_all_ops():
+    import tk
+    from tk import autograd as tka
+    bf = torch.bfloat16
+    def rn(*s): return torch.randn(*s, device="mps", dtype=bf)
+    def close(a, b, t=4e-2): return torch.max(torch.abs(a.float() - b.float())).item() < t
+
+    # gelu
+    x = rn(8, 256).requires_grad_(); g = rn(8, 256)
+    tka.gelu(x).backward(g)
+    assert close(x.grad, tk.gelu_backward(x.detach(), g))
+
+    # glu (grad wrt x and gate)
+    x = rn(8, 256).requires_grad_(); ga = rn(8, 256).requires_grad_(); g = rn(8, 256)
+    tka.glu(x, ga, mode="swiglu").backward(g)
+    da, db = tk.glu_backward(x.detach(), ga.detach(), g, mode="swiglu")
+    assert close(x.grad, da) and close(ga.grad, db)
+
+    # rms_norm (grad wrt x and weight)
+    x = rn(8, 256).requires_grad_(); w = rn(256).requires_grad_(); g = rn(8, 256)
+    tka.rms_norm(x, w).backward(g)
+    dx, dw = tk.rms_norm_backward(x.detach(), w.detach(), g)
+    assert close(x.grad, dx) and close(w.grad, dw)
+
+    # layernorm (grad wrt x, weight, bias)
+    x = rn(8, 256).requires_grad_(); w = rn(256).requires_grad_(); b = rn(256).requires_grad_(); g = rn(8, 256)
+    tka.layernorm(x, w, b).backward(g)
+    dx, dw, db = tk.layernorm_backward(x.detach(), w.detach(), g)
+    assert close(x.grad, dx) and close(w.grad, dw) and close(b.grad, db)
+
+    # dropout (grad wrt x recomputes the same seed/p mask)
+    x = rn(8, 256).requires_grad_(); g = rn(8, 256)
+    tka.dropout(x, 0.3, 7).backward(g)
+    assert close(x.grad, tk.dropout_backward(g, 0.3, 7))
+
+    # embedding_lookup (grad wrt table)
+    tok = torch.randint(0, 50, (40,), device="mps", dtype=torch.int32)
+    tab = rn(50, 64).requires_grad_(); ce = rn(40, 64)
+    tka.embedding_lookup(tok, tab).backward(ce)
+    assert close(tab.grad.float(), tk.embedding_backward(tok, ce, 50))

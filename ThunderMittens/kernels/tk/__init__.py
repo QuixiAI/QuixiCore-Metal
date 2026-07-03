@@ -1827,3 +1827,7 @@ def qmm(wq, x, w_format="q8_0", act=None):
         import mlx.core as mx
         xq = x.astype(mx.float16)
     return qgemm(wq, xq, w_format)
+
+
+# First-order autograd wrappers (opt-in differentiable ops, both backends). See tk/autograd.py.
+from . import autograd  # noqa: E402,F401
