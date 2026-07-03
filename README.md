@@ -15,7 +15,7 @@ Hand-tuned tile kernels that **beat Apple's own optimized primitives** — and, 
 allows, change the complexity class entirely. All numbers are measured median per-call latency on an
 **Apple M4 Max** (40-core GPU, ~546 GB/s), MLX backend, `speedup = baseline_ms / tk_ms`, reproducible
 via `perf/bench_kernels.py`. ~40 kernel families ship on **two backends** (MLX + PyTorch/MPS) from one
-metallib, cross-checked by 1,798 correctness + parity tests.
+metallib, cross-checked by 2,133 correctness + parity + MPS tests.
 
 ### Faster than the framework's own tuned kernels
 
@@ -28,6 +28,8 @@ metallib, cross-checked by 1,798 correctness + parity tests.
 | **softmax** | 16384 × 768 | `mx.softmax` | **2.9×** |
 | **causal attention** | 1×8×2048×128 | `scaled_dot_product_attention` | **3.9×** |
 | **fused add + rms_norm** | 4096 × 1024 | `add` + `mx.fast.rms_norm` | **1.9×** |
+| **rms_norm backward** (fused 1-pass) | 65536 × 512 | `mx.fast.rms_norm` VJP | **1.5×** |
+| **layernorm backward** (fused 1-pass) | 65536 × 512 | `mx.fast.layer_norm` VJP | **1.6×** |
 | **matmul** | 4096×4096×32 (thin-K) | `mx.matmul` | **1.8×** |
 
 ### Algorithmic & serving wins
@@ -51,7 +53,7 @@ block-sparse masks compose on the paged-decode path; the Mamba-2/linear-attentio
 between an O(N²) kernel (small N) and a linear-time chunked pipeline (D∈{64,128}) at measured
 crossovers.
 
-### Serving & training kernels (Waves 5–6)
+### Serving & training kernels (Waves 5–8)
 
 A full serving + training surface, all dual-backend (MLX + PyTorch-MPS from one metallib) and
 cross-backend parity-tested:
@@ -59,23 +61,35 @@ cross-backend parity-tested:
 - **Sampling / decoding** — top-k, top-p, min-p, **typical-p**, categorical, argmax (fused Gumbel-max,
   seed-reproducible on host); grammar **allow-bitmask** + **bad/stop-word** masking; repetition /
   presence / frequency penalties; fused quantized LM-head sampling (argmax / categorical / top-k /
-  **top-p nucleus**, no `(T,V)` logits materialization).
-- **Speculative decoding** — linear (vLLM) **and tree** rejection verification, plus device-resident
-  `spec_compact` / `spec_update_kv_meta` post-processing (no host readback between verify and KV append).
+  **exact top-p nucleus** — true full-vocab normalizer, no `(T,V)` logits materialization).
+- **Speculative decoding** — linear (vLLM) **and dynamic-tree** rejection verification (exact for any
+  sibling count, first-generation `tree_valid` fallback), a device-resident **tree-pointer builder**,
+  plus `spec_compact` / `spec_update_kv_meta` post-processing (no host readback between verify and KV append).
 - **Beam search** — single-pass advance, on-device KV reorder (copy-path **and** zero-copy
   block-table remap), device copy-pair builder.
 - **Attention** — cascade / shared-prefix decode, **N-level** (multi shared prefix) with an optional
   **fp8 prefix**, over the paged-v2 partition/reduce; **fully device-resident varlen prefill** (device
   Q pad/gather + output re-gather, no host pad/transpose loop).
-- **Multimodal / embeddings** — token embedding lookup **+ backward** (atomic scatter-add), on-device
-  multimodal `src` builder + span merge.
-- **Training** — RMSNorm / LayerNorm / GELU **backward**, fused-add-RMSNorm backward, GLU-family
-  backward (all 6 modes), **dropout** (mask-free, seed-reproducible), and a fused **AdamW** step.
+- **Multimodal / embeddings** — token embedding lookup **+ backward** (atomic scatter-add *and* an
+  atomic-free sorted-segment variant), on-device multimodal `src` builder + span merge.
+- **Training** — RMSNorm / LayerNorm / GELU **backward** (single-pass fused, rstd/mean computed
+  in-kernel), fused-add-RMSNorm backward, GLU-family backward (all 6 modes), **dropout** (mask-free,
+  seed-reproducible), and a fused **AdamW** step — all reachable through **first-order autograd** on
+  both backends (MLX `mx.custom_function`, PyTorch `autograd.Function`).
 
-Measured Wave-6 perf wins (MLX, M-series): **embedding_lookup 8.0×** and **merge_multimodal_spans
-11.9×** (threadgroup-per-token + vec4; embedding is now 2.3× *faster* than the framework gather),
-**beam KV reorder ~1.45×** (vec4 cache clone/copy). See `perf/optimization_status.md` for the full
-sweep + the honest rejects.
+Measured perf wins (MLX, M4 Max), across the optimization passes — see `perf/optimization_status.md`
+for the full sweep + the honest rejects:
+
+- **Fused single-pass norm backward** — one kernel computes rstd/mean in-kernel, writes dX, and
+  accumulates dweight/dbias via `atomic_add_float`: **~2.3–2.5× over the old 3-pass hybrid**, on par
+  with (up to ~1.6× over) `mx.fast`'s fused VJP.
+- **gelu backward** vec4 **2.1–3.5×**, **dropout** fwd/bwd vec4 **~1.9×**, **typical-p sampling
+  1.8×** (trimmed the surprise-bisection's redundant full-vocab re-scans).
+- **embedding_lookup 8.0×** and **merge_multimodal_spans 11.9×** (threadgroup-per-token + vec4;
+  embedding is now 2.3× *faster* than the framework gather), **beam KV reorder ~1.45×**.
+
+The passes are honest about rejects: fused-write cascade, copy-pair compaction, and `adamw` vec4 were
+all built or prototyped, measured to not win, and reverted/documented.
 
 ## Prerequisites (all paths)
 
