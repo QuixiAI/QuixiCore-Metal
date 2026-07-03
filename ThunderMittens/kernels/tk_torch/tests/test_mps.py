@@ -1114,6 +1114,29 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_embedding_backward(dtype):
+    import numpy as np
+    rng = np.random.default_rng(11)
+    vocab, D, T = 50, 128, 40
+    tok = rng.integers(0, vocab, size=T).astype(np.int32); tok[3] = -1
+    tok[7] = tok[11] = tok[19] = 5                  # duplicate id -> atomic accumulation
+    dY = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+    # vs torch nn.Embedding autograd (padding_idx handled by masking the -1 rows)
+    tokt = torch.from_numpy(tok).to("mps")
+    dtab = tk_torch.embedding_backward(tokt, torch.from_numpy(dY).to(dtype).to("mps"),
+                                       vocab, scale=1.5).float().cpu().numpy()
+    emb = torch.nn.Embedding(vocab, D).to("mps")
+    with torch.no_grad():
+        emb.weight.copy_(torch.zeros(vocab, D, device="mps"))
+    safe = torch.from_numpy(np.where(tok >= 0, tok, 0)).to("mps")
+    out = emb(safe) * 1.5
+    mask = torch.from_numpy((tok >= 0).astype(np.float32)).to("mps")[:, None]
+    (out * torch.from_numpy(dY).to("mps") * mask).sum().backward()
+    ref = emb.weight.grad.float().cpu().numpy()
+    assert np.allclose(dtab, ref, atol=1e-4 if dtype == torch.float32 else 5e-2)
+
+
 def test_merge_multimodal_spans():
     import numpy as np
     rng = np.random.default_rng(2)

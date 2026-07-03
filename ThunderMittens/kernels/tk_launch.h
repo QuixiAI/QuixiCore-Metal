@@ -528,6 +528,24 @@ void launch_embedding_lookup(E& e, typename E::in_t token_ids, typename E::in_t 
   e.bytes(D, 4); e.bytes(vocab, 5); e.bytes(n_tok, 6); e.bytes(scale, 7); e.bytes(use_pos, 8);
   e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
 }
+// zero a float buffer of n elements (gradient accumulator init).
+template <class E>
+void launch_embedding_zero_f32(E& e, typename E::out_t p, int n) {
+  e.pipeline("embedding_zero_f32");
+  e.out(p, 0); e.bytes(n, 1);
+  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+}
+// embedding backward: atomic scatter-add dY rows into dtable (vocab,D) fp32 (zeroed first) by
+// token id. One threadgroup per token; threads stride D.
+template <class E>
+void launch_embedding_backward(E& e, typename E::in_t token_ids, typename E::in_t dY,
+                               typename E::out_t dtable, int D, int vocab, int n_tok, float scale,
+                               const std::string& type_name) {
+  e.pipeline("embedding_backward_" + type_name);
+  e.in(token_ids, 0); e.in(dY, 1); e.out(dtable, 2);
+  e.bytes(D, 3); e.bytes(vocab, 4); e.bytes(n_tok, 5); e.bytes(scale, 6);
+  e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
+}
 template <class E>
 void launch_merge_multimodal_spans(E& e, typename E::in_t text, typename E::in_t modal,
                                    typename E::in_t src, typename E::out_t out, int D, int n_tok,

@@ -68,6 +68,46 @@ void EmbeddingLookup::eval_gpu(const std::vector<array>& inputs, std::vector<arr
                               use_pos_ ? 1 : 0, type_to_name(table));
 }
 
+array embedding_backward(
+    const array& token_ids,
+    const array& dY,
+    int vocab,
+    float scale,
+    StreamOrDevice s /* = {} */) {
+  if (token_ids.ndim() != 1) {
+    throw std::invalid_argument("embedding_backward: token_ids must be (num_tok,)");
+  }
+  if (dY.ndim() != 2 || !emb_is_float(dY.dtype()) || dY.shape(0) != token_ids.shape(0)) {
+    throw std::invalid_argument("embedding_backward: dY must be (num_tok, D) float, num_tok matching");
+  }
+  const int D = dY.shape(1);
+  auto tok_c = contiguous(astype(token_ids, int32, s), false, s);
+  auto dY_c = contiguous(dY, false, s);
+  return array(
+      {vocab, D}, float32,
+      std::make_shared<EmbeddingBackward>(to_stream(s), vocab, scale),
+      {tok_c, dY_c});
+}
+
+void EmbeddingBackward::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("EmbeddingBackward has no CPU implementation.");
+}
+void EmbeddingBackward::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& token_ids = inputs[0];
+  auto& dY = inputs[1];
+  auto& dtable = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dtable.set_data(allocator::malloc_or_wait(dtable.nbytes()));
+  const int n_tok = token_ids.shape(0);
+  const int D = dY.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_embedding_zero_f32(enc, dtable, vocab_ * D);         // zero the accumulator first
+  tk::launch_embedding_backward(enc, token_ids, dY, dtable, D, vocab_, n_tok, scale_,
+                                type_to_name(dY));
+}
+
 array merge_multimodal_spans(
     const array& text,
     const array& modal,
@@ -128,6 +168,7 @@ void MergeMultimodalSpans::eval_gpu(const std::vector<array>& inputs, std::vecto
   }
 
 TK_EMB_NO_AUTODIFF(EmbeddingLookup, "EmbeddingLookup")
+TK_EMB_NO_AUTODIFF(EmbeddingBackward, "EmbeddingBackward")
 TK_EMB_NO_AUTODIFF(MergeMultimodalSpans, "MergeMultimodalSpans")
 
 } // namespace mlx::core

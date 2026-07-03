@@ -215,6 +215,18 @@ def test_embedding_lookup_parity():
     _assert_parity(om, ot, atol=0)
 
 
+def test_embedding_backward_parity():
+    rng = np.random.default_rng(19)
+    vocab, D, T = 60, 128, 40
+    tok = rng.integers(0, vocab, size=T).astype(np.int32); tok[3] = -1
+    tok[7] = tok[11] = tok[19] = 5                  # duplicate id -> atomic accumulation
+    dY = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+    om = tk.embedding_backward(mx.array(tok), _mk(dY, "mlx", "f32"), vocab, scale=1.5)
+    ot = tk.embedding_backward(torch.from_numpy(tok).to("mps"), _mk(dY, "torch", "f32"),
+                               vocab, scale=1.5)
+    _assert_parity(om, ot, atol=1e-5)   # atomic add order differs -> not bit-exact
+
+
 def test_merge_multimodal_spans_parity():
     rng = np.random.default_rng(3)
     T, M, D = 16, 6, 128

@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import embedding_lookup, merge_multimodal_spans
+from tk import embedding_backward, embedding_lookup, merge_multimodal_spans
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -37,6 +37,27 @@ def test_embedding_lookup_pos():
     o = np.array(embedding_lookup(mx.array(tok), mx.array(table), pos_table=mx.array(pos), scale=1.0))
     ref = table[tok] + pos
     np.testing.assert_allclose(o, ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("D", [64, 128, 256])
+def test_embedding_backward(dtype, D):
+    # scatter-add grad by token id (with duplicates + a padding id) vs the numpy reference.
+    rng = np.random.default_rng(D + 7)
+    vocab, T = 50, 40
+    tok = rng.integers(0, vocab, size=T).astype(np.int32)
+    tok[3] = -1                                    # padding id -> no contribution
+    tok[7] = tok[11] = tok[19] = 5                 # duplicate id -> atomic accumulation
+    dY = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+    scale = 1.5
+    dtab = np.array(embedding_backward(mx.array(tok), mx.array(dY).astype(_MX[dtype]),
+                                       vocab=vocab, scale=scale).astype(mx.float32))
+    ref = np.zeros((vocab, D), np.float64)
+    for t in range(T):
+        if tok[t] >= 0:
+            ref[tok[t]] += dY[t].astype(np.float64) * scale
+    atol = 1e-4 if dtype == "float32" else 5e-2
+    np.testing.assert_allclose(dtab, ref, atol=atol)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

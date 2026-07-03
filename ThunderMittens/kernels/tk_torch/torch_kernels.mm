@@ -409,6 +409,25 @@ static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at:
   return out;
 }
 
+static at::Tensor embedding_backward_mps(const at::Tensor& token_ids_in, const at::Tensor& dY_in,
+                                         int64_t vocab, double scale) {
+  TORCH_CHECK(token_ids_in.device().is_mps() && token_ids_in.dim() == 1,
+              "embedding_backward: token_ids must be a 1-D MPS tensor");
+  TORCH_CHECK(dY_in.dim() == 2 && tk_is_float_dtype(dY_in),
+              "embedding_backward: dY must be (num_tok, D) float");
+  auto token_ids = token_ids_in.to(at::kInt).contiguous();
+  auto dY = dY_in.contiguous();
+  const int n_tok = token_ids.size(0), D = dY.size(1);
+  TORCH_CHECK(dY.size(0) == n_tok, "embedding_backward: dY num_tok must match token_ids");
+  // at::zeros gives the zeroed fp32 accumulator (no separate zero kernel needed on torch).
+  auto dtable = at::zeros({(long)vocab, D}, dY.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_embedding_backward(e, token_ids, dY, dtable, D, (int)vocab, n_tok,
+                                  static_cast<float>(scale), tk_type_name(dY));
+  });
+  return dtable;
+}
+
 static at::Tensor merge_multimodal_spans_mps(const at::Tensor& text_in, const at::Tensor& modal_in,
                                              const at::Tensor& src_in) {
   TORCH_CHECK(text_in.device().is_mps() && text_in.dim() == 2 && tk_is_float_dtype(text_in),
@@ -2576,6 +2595,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu", &gelu_mps, "ThunderMittens GELU (MPS)");
   m.def("gelu_bwd", &gelu_bwd_mps, "ThunderMittens GELU backward (MPS)");
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
+  m.def("embedding_backward", &embedding_backward_mps,
+        "ThunderMittens embedding backward / scatter-add grad (MPS)");
   m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,
         "ThunderMittens multimodal span merge (MPS)");
   m.def("glu", &glu_mps, "ThunderMittens GLU-family activation (MPS)");

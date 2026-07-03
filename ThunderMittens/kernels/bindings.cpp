@@ -664,6 +664,19 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "embedding_backward",
+      &embedding_backward,
+      "token_ids"_a,
+      "dY"_a,
+      "vocab"_a,
+      "scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Embedding backward: scatter-add dY rows into a (vocab, D) fp32 grad table by token id.
+      )");
+
+    m.def(
       "merge_multimodal_spans",
       &merge_multimodal_spans,
       "text"_a,

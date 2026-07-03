@@ -30,6 +30,42 @@ array merge_multimodal_spans(
     const array& src,
     StreamOrDevice s = {});
 
+/**
+ *  Embedding backward: scatter-add the upstream grad dY (num_tok, D) into a (vocab, D) fp32 gradient
+ *  table by token id (out[token_ids[t]] += scale * dY[t]). token_ids (num_tok,) int; dY float. A
+ *  negative / out-of-range id contributes nothing. Returns (vocab, D) float32.
+ **/
+array embedding_backward(
+    const array& token_ids,
+    const array& dY,
+    int vocab,
+    float scale,
+    StreamOrDevice s = {});
+
+class EmbeddingBackward : public Primitive {
+ public:
+  EmbeddingBackward(Stream stream, int vocab, float scale)
+      : Primitive(stream), vocab_(vocab), scale_(scale) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "EmbeddingBackward"; }
+  void print(std::ostream& os) override { os << "EmbeddingBackward"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const EmbeddingBackward&>(other);
+    return vocab_ == o.vocab_ && scale_ == o.scale_;
+  }
+
+ private:
+  int vocab_;
+  float scale_;
+};
+
 class EmbeddingLookup : public Primitive {
  public:
   EmbeddingLookup(Stream stream, float scale, bool use_pos)

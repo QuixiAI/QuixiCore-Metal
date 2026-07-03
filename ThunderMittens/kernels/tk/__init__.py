@@ -835,6 +835,16 @@ def embedding_lookup(token_ids, table, pos_table=None, scale=1.0):
     return _mlx().embedding_lookup(token_ids, table, pt, float(scale))
 
 
+def embedding_backward(token_ids, dY, vocab, scale=1.0):
+    """Embedding backward: scatter-add the upstream grad dY (num_tok, D) into a (vocab, D) fp32
+    gradient table by token id (dtable[token_ids[t]] += scale*dY[t]). A negative / out-of-range id
+    contributes nothing (matches the padding-zeros forward). token_ids (num_tok,) int; dY float.
+    Returns (vocab, D) float32. Matches nn.Embedding autograd. Accepts mlx / torch (MPS)."""
+    if _is_torch(dY):
+        return _torch().embedding_backward(token_ids, dY, int(vocab), float(scale))
+    return _mlx().embedding_backward(token_ids, dY, vocab=int(vocab), scale=float(scale))
+
+
 def merge_multimodal_spans(text, modal, src):
     """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. text (num_tok, D),
     modal (num_modal, D) same dtype, src (num_tok,) int (-1 keeps the text embedding, >=0 gathers a

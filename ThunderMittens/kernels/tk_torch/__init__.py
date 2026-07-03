@@ -565,6 +565,12 @@ def embedding_lookup(token_ids, table, pos_table=None, scale: float = 1.0):
     return _ext.embedding_lookup(token_ids, table, pt, float(scale))
 
 
+def embedding_backward(token_ids, dY, vocab, scale: float = 1.0):
+    """Embedding backward: scatter-add dY (num_tok, D) rows into a (vocab, D) fp32 grad table by
+    token id (out[token_ids[t]] += scale*dY[t]); padding/oob ids contribute nothing. MPS."""
+    return _ext.embedding_backward(token_ids, dY, int(vocab), float(scale))
+
+
 def merge_multimodal_spans(text, modal, src):
     """Multimodal span merge: out[t] = modal[src[t]] if src[t] >= 0 else text[t]. MPS."""
     return _ext.merge_multimodal_spans(text, modal, src)

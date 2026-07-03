@@ -78,7 +78,45 @@ kernel void merge_multimodal_spans(device const T   *text  [[buffer(0)]],   // (
     }
 }
 
+// Zero a float buffer (the gradient accumulator, before the atomic scatter-add). One thread/elem.
+kernel void embedding_zero_f32(device float *p [[buffer(0)]],
+                               constant int  &n [[buffer(1)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if ((int)gid < n) p[gid] = 0.0f;
+}
+
+// Embedding backward (atomic scatter-add): dtable[token_ids[t]*D + d] += scale * dY[t*D + d].
+// dtable (vocab, D) fp32 must be zeroed first (embedding_zero_f32). Tokens sharing an id scatter
+// into the same row concurrently, so the accumulate is a relaxed device float atomic-add (P1a).
+// A padding / out-of-range id contributes nothing. One threadgroup per token, threads stride D.
+template <typename T>
+kernel void embedding_backward(device const int    *token_ids [[buffer(0)]],  // (num_tok,)
+                               device const T      *dY        [[buffer(1)]],  // (num_tok, D)
+                               device metal::atomic_float *dtable [[buffer(2)]],  // (vocab, D) zeroed
+                               constant int   &D           [[buffer(3)]],
+                               constant int   &vocab       [[buffer(4)]],
+                               constant int   &n_tok       [[buffer(5)]],
+                               constant float &scale       [[buffer(6)]],
+                               uint  t        [[threadgroup_position_in_grid]],
+                               uint  lid      [[thread_position_in_threadgroup]],
+                               uint  nthreads [[threads_per_threadgroup]]) {
+    const int tok = token_ids[t];
+    if (tok < 0 || tok >= vocab) return;
+    const long trow = (long)tok * D;
+    const long drow = (long)t * D;
+    for (int d = (int)lid; d < D; d += (int)nthreads) {
+        atomic_add_float(dtable, trow + d, float(dY[drow + d]) * scale);
+    }
+}
+
 #define instantiate_embedding(type_name, T)                                        \
+  template [[host_name("embedding_backward_" #type_name)]] [[kernel]] void          \
+  embedding_backward<T>(device const int *token_ids [[buffer(0)]],                  \
+    device const T *dY [[buffer(1)]], device metal::atomic_float *dtable [[buffer(2)]], \
+    constant int &D [[buffer(3)]], constant int &vocab [[buffer(4)]],               \
+    constant int &n_tok [[buffer(5)]], constant float &scale [[buffer(6)]],         \
+    uint t [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], \
+    uint nthreads [[threads_per_threadgroup]]);                                     \
   template [[host_name("embedding_lookup_" #type_name)]] [[kernel]] void            \
   embedding_lookup<T>(device const int *token_ids [[buffer(0)]],                    \
     device const T *table [[buffer(1)]], device const T *pos_table [[buffer(2)]],   \
