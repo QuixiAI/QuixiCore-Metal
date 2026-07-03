@@ -475,6 +475,28 @@ static at::Tensor glu_mps(const at::Tensor& x_in, const at::Tensor& gate_in,
   return out;
 }
 
+static std::tuple<at::Tensor, at::Tensor> glu_bwd_mps(const at::Tensor& x_in,
+    const at::Tensor& gate_in, const at::Tensor& dc_in, const std::string& mode,
+    double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps() && gate_in.device().is_mps() && dc_in.device().is_mps(),
+              "glu_backward: x, gate, dc must be MPS tensors");
+  TORCH_CHECK(x_in.sizes() == gate_in.sizes() && x_in.sizes() == dc_in.sizes(),
+              "glu_backward: x, gate, dc must have the same shape");
+  TORCH_CHECK(valid_glu_mode(mode), "glu_backward: unsupported mode ", mode);
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kHalf ||
+              x_in.scalar_type() == at::kBFloat16,
+              "glu_backward: dtype must be float32, float16, or bfloat16");
+  auto x = x_in.contiguous(), gate = gate_in.contiguous(), dc = dc_in.to(x_in.scalar_type()).contiguous();
+  auto da = at::empty_like(x), db = at::empty_like(x);
+  const uint32_t n = static_cast<uint32_t>(x.numel());
+  const std::string tn = tk_type_name(x);
+  const float alpha_f = static_cast<float>(alpha), limit_f = static_cast<float>(limit);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_glu_bwd(e, x, gate, dc, da, db, n, mode, tn, alpha_f, limit_f);
+  });
+  return {da, db};
+}
+
 static at::Tensor hadamard_mps(const at::Tensor& x_in, double scale) {
   TORCH_CHECK(x_in.device().is_mps(), "hadamard: x must be an MPS tensor");
   TORCH_CHECK(x_in.numel() > 0 && x_in.dim() > 0,
@@ -2600,6 +2622,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("merge_multimodal_spans", &merge_multimodal_spans_mps,
         "ThunderMittens multimodal span merge (MPS)");
   m.def("glu", &glu_mps, "ThunderMittens GLU-family activation (MPS)");
+  m.def("glu_backward", &glu_bwd_mps, "ThunderMittens GLU-family backward (MPS)");
   m.def("hadamard", &hadamard_mps, "ThunderMittens Hadamard/FWHT (MPS)");
   m.def("kv_cache_scatter", &kv_cache_scatter_mps, "ThunderMittens KV cache scatter (MPS)");
   m.def("kv_cache_gather", &kv_cache_gather_mps, "ThunderMittens KV cache gather (MPS)");

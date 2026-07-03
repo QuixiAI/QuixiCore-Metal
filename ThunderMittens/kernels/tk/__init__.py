@@ -457,6 +457,16 @@ def glu(x, gate, mode="swiglu", alpha=1.0, limit=1.0e20):
     return _mlx().glu(x, gate, mode=mode, alpha=alpha, limit=limit)
 
 
+def glu_backward(x, gate, dc, mode="swiglu", alpha=1.0, limit=1.0e20):
+    """GLU-family backward: given the upstream grad dc (wrt out=act(x)*gate), returns (da, db) =
+    grads wrt x, gate. da = dc*gate*act'(x), db = dc*act(x). mode in reglu/geglu/swiglu/swiglu_oai/
+    geglu_erf/geglu_quick. Matches the gradient of the tk glu forward. Accepts mlx / torch (MPS)."""
+    if _is_torch(x):
+        return _torch().glu_backward(x, gate, dc, mode, alpha, limit)
+    out = _mlx().glu_backward(x, gate, dc, mode=mode, alpha=alpha, limit=limit)
+    return out[0], out[1]
+
+
 def reglu(x, gate):
     return glu(x, gate, mode="reglu")
 

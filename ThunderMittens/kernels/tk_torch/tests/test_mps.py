@@ -1114,6 +1114,28 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+@pytest.mark.parametrize("mode", ["swiglu", "geglu", "reglu"])
+def test_glu_backward(mode):
+    # tk glu_backward vs torch autograd of the canonical activation (validates the formula).
+    import numpy as np
+    rng = np.random.default_rng(5)
+    x_np = rng.standard_normal((4, 512)).astype(np.float32)
+    g_np = rng.standard_normal((4, 512)).astype(np.float32)
+    dc_np = rng.standard_normal((4, 512)).astype(np.float32)
+    x = torch.from_numpy(x_np).to("mps").requires_grad_(True)
+    g = torch.from_numpy(g_np).to("mps").requires_grad_(True)
+    act = {"swiglu": F.silu, "geglu": lambda t: F.gelu(t, approximate="tanh"),
+           "reglu": F.relu}[mode]
+    (act(x) * g * torch.from_numpy(dc_np).to("mps")).sum().backward()
+    da, db = tk_torch.glu_backward(torch.from_numpy(x_np).to("mps"),
+                                   torch.from_numpy(g_np).to("mps"),
+                                   torch.from_numpy(dc_np).to("mps"), mode=mode)
+    # reglu has a kink at 0 -> autograd subgradient can disagree with the kernel there; mask it out
+    m = torch.from_numpy((np.abs(x_np) > 1e-3).astype(np.float32)).to("mps")
+    assert torch.allclose(da * m, x.grad * m, atol=1e-3)
+    assert torch.allclose(db, g.grad, atol=1e-3)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_embedding_backward(dtype):
     import numpy as np

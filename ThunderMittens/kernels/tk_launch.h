@@ -874,6 +874,18 @@ void launch_glu(E& e, typename E::in_t x, typename E::in_t gate, typename E::out
   const uint32_t nthreads = (n + 3) / 4;
   e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
+// GLU backward: da@3, db@4 outputs; da = dc*b*act'(a), db = dc*act(a). vec4 like the forward.
+template <class E>
+void launch_glu_bwd(E& e, typename E::in_t x, typename E::in_t gate, typename E::in_t dc,
+                    typename E::out_t da, typename E::out_t db, uint32_t n, const std::string& mode,
+                    const std::string& type_name, float alpha, float limit) {
+  e.pipeline("glu_bwd_" + mode + "_" + type_name);
+  e.in(x, 0); e.in(gate, 1); e.in(dc, 2); e.out(da, 3); e.out(db, 4);
+  e.bytes(n, 5); e.bytes(alpha, 6); e.bytes(limit, 7);
+  constexpr int threads = 256;
+  const uint32_t nthreads = (n + 3) / 4;
+  e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
 
 // ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2 nrows@3. D in {64,128,256,512}.
 //        One simdgroup per R rows (R=2 at D=64, else 1): in-register + simd_shuffle_xor

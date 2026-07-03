@@ -257,6 +257,12 @@ def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",
     return _ext.glu(x, gate, mode, float(alpha), float(limit))
 
 
+def glu_backward(x: torch.Tensor, gate: torch.Tensor, dc: torch.Tensor, mode: str = "swiglu",
+                 alpha: float = 1.0, limit: float = 1.0e20):
+    """GLU-family backward. Returns (da, db) = grads wrt x, gate given upstream grad dc. MPS."""
+    return tuple(_ext.glu_backward(x, gate, dc, mode, float(alpha), float(limit)))
+
+
 def reglu(x: torch.Tensor, gate: torch.Tensor):
     return glu(x, gate, "reglu")
 

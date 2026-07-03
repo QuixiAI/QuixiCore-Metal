@@ -66,3 +66,27 @@ def test_glu_matches_reference(shape, dtype, mode):
         dtype,
         mx.max(mx.abs(got.astype(mx.float32) - exp.astype(mx.float32))).item(),
     )
+
+
+@pytest.mark.parametrize("mode", MODES)
+def test_glu_backward_finite_diff(mode):
+    # tk glu_backward vs central finite-difference of the tk forward (self-consistent gradient check).
+    from tk import glu_backward
+    mx.random.seed(3)
+    shape = (4, 512)
+    x = mx.random.normal(shape).astype(mx.float32)
+    gate = mx.random.normal(shape).astype(mx.float32)
+    dc = mx.random.normal(shape).astype(mx.float32)
+    alpha, limit = 1.0, 1.0e20   # no clamp active -> smooth (swiglu_oai clamp indicator is trivial)
+    da, db = glu_backward(x, gate, dc, mode=mode, alpha=alpha, limit=limit)
+    h = 1e-3
+    dfx = (glu(x + h, gate, mode=mode, alpha=alpha, limit=limit)
+           - glu(x - h, gate, mode=mode, alpha=alpha, limit=limit)) / (2 * h)
+    dfg = (glu(x, gate + h, mode=mode, alpha=alpha, limit=limit)
+           - glu(x, gate - h, mode=mode, alpha=alpha, limit=limit)) / (2 * h)
+    da_fd, db_fd = dc * dfx, dc * dfg
+    mask = mx.abs(x) > 0.05      # skip the reglu kink at x=0 (central-diff invalid there)
+    mx.eval(da, db, da_fd, db_fd, mask)
+    for got, ref in ((da, da_fd), (db, db_fd)):
+        err = mx.max(mx.abs((got - ref) * mask)).item()
+        assert err < 2e-2, (mode, err)

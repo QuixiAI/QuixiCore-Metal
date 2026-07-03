@@ -215,6 +215,21 @@ def test_embedding_lookup_parity():
     _assert_parity(om, ot, atol=0)
 
 
+@pytest.mark.parametrize("mode", ["reglu", "geglu", "swiglu", "swiglu_oai", "geglu_erf",
+                                  "geglu_quick"])
+def test_glu_backward_parity(mode):
+    rng = np.random.default_rng(31)
+    x = rng.standard_normal((4, 512)).astype(np.float32)
+    g = rng.standard_normal((4, 512)).astype(np.float32)
+    dc = rng.standard_normal((4, 512)).astype(np.float32)
+    dam, dbm = tk.glu_backward(_mk(x, "mlx", "f32"), _mk(g, "mlx", "f32"),
+                               _mk(dc, "mlx", "f32"), mode=mode, alpha=1.3, limit=2.5)
+    dat, dbt = tk.glu_backward(_mk(x, "torch", "f32"), _mk(g, "torch", "f32"),
+                               _mk(dc, "torch", "f32"), mode=mode, alpha=1.3, limit=2.5)
+    _assert_parity(dam, dat, atol=1e-5)
+    _assert_parity(dbm, dbt, atol=1e-5)
+
+
 def test_embedding_backward_parity():
     rng = np.random.default_rng(19)
     vocab, D, T = 60, 128, 40

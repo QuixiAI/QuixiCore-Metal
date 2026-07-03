@@ -703,6 +703,21 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "glu_backward",
+      &glu_backward,
+      "x"_a,
+      "gate"_a,
+      "dc"_a,
+      nb::kw_only(),
+      "mode"_a = "swiglu",
+      "alpha"_a = 1.0f,
+      "limit"_a = 1.0e20f,
+      "stream"_a = nb::none(),
+      R"(
+        GLU-family backward: returns (da, db) = grads wrt x, gate given upstream grad dc.
+      )");
+
+    m.def(
       "hadamard",
       &hadamard,
       "x"_a,
