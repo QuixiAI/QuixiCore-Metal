@@ -607,7 +607,8 @@ kernel void spec_verify_tree(device const int   *draft_tokens         [[buffer(0
 // vlen = accepted_cnt+1) from out_tokens (B, S+1) into a packed buffer with cu_accepted offsets
 // (exclusive scan of vlen). packed_pos[k] = seq_lens[b] + j is the absolute KV position of the
 // j-th token. packed_* are sized B*(S+1) (upper bound); cu_accepted[B] holds the real total, unused
-// tail is -1. Single threadgroup (B <= 256). Ref: vLLM rejection_sampler parse_output.
+// tail is -1. Single-threadgroup CHUNKED scan (each thread owns a contiguous batch chunk, so ANY B
+// works — not capped by the thread count). Ref: vLLM rejection_sampler parse_output.
 kernel void spec_compact(device const int *out_tokens   [[buffer(0)]],   // (B, S+1)
                          device const int *accepted_cnt [[buffer(1)]],   // (B,)
                          device const int *seq_lens     [[buffer(2)]],   // (B,)
@@ -619,18 +620,25 @@ kernel void spec_compact(device const int *out_tokens   [[buffer(0)]],   // (B, 
                          uint tid [[thread_index_in_threadgroup]],
                          uint nthreads [[threads_per_threadgroup]]) {
     threadgroup int sg_sums[8];    // nthreads/32 <= 8
-    int vlen = 0, sl = 0;
-    if ((int)tid < B) { vlen = accepted_cnt[tid] + 1; sl = seq_lens[tid]; }
+    const int chunk = (B + (int)nthreads - 1) / (int)nthreads;
+    int lo = (int)tid * chunk; if (lo > B) { lo = B; }
+    int hi = lo + chunk;       if (hi > B) { hi = B; }
+    int local_vlen = 0;                                  // pass 1: per-thread chunk total
+    for (int b = lo; b < hi; ++b) { local_vlen += accepted_cnt[b] + 1; }
     int total = 0;
-    const int off = mittens::threadgroup_exclusive_scan_i32(vlen, tid, nthreads, sg_sums, total);
-    if ((int)tid < B) {
-        cu_accepted[tid] = off;
-        for (int j = 0; j < vlen; ++j) {                 // disjoint range [off, off+vlen)
-            packed_tokens[off + j] = out_tokens[(long)tid * Sp1 + j];
-            packed_pos[off + j]    = sl + j;
+    const int base = mittens::threadgroup_exclusive_scan_i32(local_vlen, tid, nthreads, sg_sums, total);
+    if (tid == 0) { cu_accepted[B] = total; }
+    int run = base;                                      // pass 2: re-walk chunk emitting from base
+    for (int b = lo; b < hi; ++b) {
+        const int vlen = accepted_cnt[b] + 1;
+        const int sl = seq_lens[b];
+        cu_accepted[b] = run;
+        for (int j = 0; j < vlen; ++j) {                 // disjoint range [run, run+vlen)
+            packed_tokens[run + j] = out_tokens[(long)b * Sp1 + j];
+            packed_pos[run + j]    = sl + j;
         }
+        run += vlen;
     }
-    if (tid == 0) cu_accepted[B] = total;
     const int cap = B * Sp1;
     for (int i = (int)tid; i < cap; i += (int)nthreads) {  // sentinel-fill the unused tail
         if (i >= total) { packed_tokens[i] = -1; packed_pos[i] = -1; }

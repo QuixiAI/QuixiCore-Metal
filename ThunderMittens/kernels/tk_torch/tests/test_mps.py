@@ -1412,7 +1412,7 @@ def test_spec_verify_tree(seed):
         assert int(at[b, na]) >= 0 and tp[b, int(ai[b, na]) if na > 0 else 0].sum() > 0
 
 
-@pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (300, 4)])
 def test_spec_compact_and_kv_meta(B, S):
     import numpy as np
     rng = np.random.default_rng(B * 10 + S)

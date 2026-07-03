@@ -716,10 +716,7 @@ std::vector<array> spec_compact(
     throw std::invalid_argument("spec_compact: out_tokens must be (B, S+1)");
   }
   const int B = out_tokens.shape(0);
-  const int Sp1 = out_tokens.shape(1);
-  if (B > 256) {
-    throw std::invalid_argument("spec_compact: B must be <= 256 (single-threadgroup scan)");
-  }
+  const int Sp1 = out_tokens.shape(1);   // chunked single-threadgroup scan: any B
   if (accepted_cnt.ndim() != 1 || accepted_cnt.shape(0) != B || seq_lens.shape(0) != B) {
     throw std::invalid_argument("spec_compact: accepted_cnt / seq_lens must be (B,)");
   }

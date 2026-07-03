@@ -395,7 +395,7 @@ def test_spec_verify_tree_parity(seed):
         _assert_parity(a, b, atol=0)
 
 
-@pytest.mark.parametrize("B,S", [(3, 4), (8, 5)])
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (300, 4)])
 def test_spec_compact_parity(B, S):
     rng = np.random.default_rng(B * 7 + S)
     Sp1 = S + 1

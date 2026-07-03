@@ -1849,8 +1849,7 @@ static std::vector<at::Tensor> spec_compact_mps(const at::Tensor& out_tokens_in,
     const at::Tensor& accepted_cnt_in, const at::Tensor& seq_lens_in) {
   TORCH_CHECK(out_tokens_in.device().is_mps() && out_tokens_in.dim() == 2,
               "spec_compact: out_tokens must be (B, S+1) MPS");
-  const int B = out_tokens_in.size(0), Sp1 = out_tokens_in.size(1);
-  TORCH_CHECK(B <= 256, "spec_compact: B must be <= 256");
+  const int B = out_tokens_in.size(0), Sp1 = out_tokens_in.size(1);   // chunked scan: any B
   auto ot = out_tokens_in.to(at::kInt).contiguous();
   auto ac = accepted_cnt_in.to(at::kInt).contiguous();
   auto sl = seq_lens_in.to(at::kInt).contiguous();

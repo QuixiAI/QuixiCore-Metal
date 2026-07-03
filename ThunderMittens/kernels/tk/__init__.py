@@ -1284,8 +1284,8 @@ def spec_compact(out_tokens, accepted_cnt, seq_lens):
     """Compact accepted spec tokens: gather each request's valid tokens (accepted drafts + the
     recovered/bonus token, vlen=accepted_cnt+1) from out_tokens (B, S+1) into packed buffers.
     Returns (packed_tokens (B*(S+1),), packed_pos (B*(S+1),), cu_accepted (B+1,)), all int32:
-    packed_pos[k] = seq_lens[b]+j (absolute KV position), cu_accepted[B] = total, tail = -1. B<=256.
-    Ref: vLLM rejection_sampler parse_output. Accepts mlx.array or torch.Tensor (MPS)."""
+    packed_pos[k] = seq_lens[b]+j (absolute KV position), cu_accepted[B] = total, tail = -1. Any B
+    (chunked scan). Ref: vLLM rejection_sampler parse_output. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(out_tokens):
         return tuple(_torch().spec_compact(out_tokens, accepted_cnt, seq_lens))
     out = _mlx().spec_compact(out_tokens, accepted_cnt, seq_lens)

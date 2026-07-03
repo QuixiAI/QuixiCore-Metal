@@ -198,7 +198,7 @@ def test_spec_verify_tree(seed):
                 assert tok not in tried                             # residual excludes tried siblings
 
 
-@pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1)])
+@pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1), (300, 4), (1000, 6)])
 def test_spec_compact_and_kv_meta(B, S):
     rng = np.random.default_rng(B * 10 + S)
     Sp1 = S + 1
