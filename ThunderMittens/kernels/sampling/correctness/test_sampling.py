@@ -261,6 +261,39 @@ def test_spec_verify_tree_invalid():
         assert int(ai[b, 0]) == 0 and int(ai[b, 1]) == -1          # only root position set
 
 
+def test_spec_verify_tree_residual_distribution():
+    # An always-rejecting tree: the root target puts ZERO mass on the sibling draft tokens, so every
+    # sibling is rejected (cumprob 0 < coin) and the correction is sampled from the residual = target
+    # restricted to the non-sibling tokens (renormalized). Histogram over many seeded rows (each row
+    # b has an independent RNG stream) and assert the empirical residual dist matches that target.
+    rng = np.random.default_rng(2024)
+    V = 24
+    siblings = [3, 8, 15]                         # tokens excluded from the residual (target mass 0)
+    N = len(siblings) + 1                         # root + one child per sibling
+    parents = [-1] + [0] * len(siblings)
+    nxt_tok, nxt_sib = spec_build_tree_pointers(parents, N)
+    # reference residual dist: softmax over the non-sibling tokens, 0 on siblings
+    logits = rng.standard_normal(V)
+    for t in siblings:
+        logits[t] = -np.inf
+    ref = np.exp(logits - logits.max()); ref = (ref / ref.sum()).astype(np.float32)
+    assert np.allclose(ref[siblings], 0.0)
+    B = 30000
+    draft = np.broadcast_to(np.array(siblings, np.int32), (B, N - 1)).copy()
+    tp = np.zeros((B, N, V), np.float32)
+    tp[:, 0, :] = ref                            # root dist; child nodes never reached (all rejected)
+    tp[:, 1:, siblings[0]] = 1.0                 # arbitrary valid dist at unreached nodes
+    nt_b = np.broadcast_to(nxt_tok, (B, N)).copy(); ns_b = np.broadcast_to(nxt_sib, (B, N)).copy()
+    ai, at, an = spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt_b), mx.array(ns_b), 7)
+    an = np.array(an); at = np.array(at)
+    assert np.all(an == 0)                        # every row rejected all siblings -> residual
+    tokens = at[:, 0]
+    assert not np.isin(tokens, siblings).any()    # residual never a sibling (exact exclusion)
+    hist = np.bincount(tokens, minlength=V).astype(np.float64) / B
+    # sampling tolerance: max per-token abs error a few sigma over B draws
+    assert np.max(np.abs(hist - ref)) < 0.01, (np.max(np.abs(hist - ref)),)
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1), (300, 4), (1000, 6)])
 def test_spec_compact_and_kv_meta(B, S):
     rng = np.random.default_rng(B * 10 + S)
