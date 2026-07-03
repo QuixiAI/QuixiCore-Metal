@@ -237,24 +237,9 @@ kernel void lm_head_topk_reduce(device const float *part_val   [[buffer(0)]],   
     const long base = (long)t * ncand;
     int   chosen_id[LMH_MAX_K];
     float chosen_val[LMH_MAX_K];
-    for (int kk = 0; kk < topk; ++kk) {
-        float best = LMH_NEG_INF;
-        int   bi   = -1;
-        for (int j = (int)lane; j < ncand; j += 32) {
-            const int id = part_id[base + j];
-            if (id < 0) continue;
-            bool taken = false;
-            for (int m = 0; m < kk; ++m) if (chosen_id[m] == id) taken = true;
-            if (taken) continue;
-            const float v = part_val[base + j];
-            if (v > best || (v == best && id < bi)) { best = v; bi = id; }
-        }
-        float gbest = best;
-        int   gid   = (bi < 0) ? 0x7fffffff : bi;
-        simd_argmax(gbest, gid);
-        chosen_id[kk]  = (gbest == LMH_NEG_INF) ? -1 : gid;
-        chosen_val[kk] = gbest;
-    }
+    // K masked-argmax rounds over the merged per-tile partial winners (Family-A helper).
+    stored_cand cand{part_val, part_id, base};
+    masked_topk(cand, ncand, topk, lane, LMH_NEG_INF, chosen_id, chosen_val);
     // Gumbel-max among the k winners (global vocab id in the noise stream).
     float best = LMH_NEG_INF;
     int   bi   = chosen_id[0];

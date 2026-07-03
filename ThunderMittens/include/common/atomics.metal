@@ -39,4 +39,11 @@ static METAL_FUNC void atomic_max_float(device metal::atomic_uint *p, float v) {
     metal::atomic_fetch_max_explicit(p, float_to_orderable_uint(v), metal::memory_order_relaxed);
 }
 
+/** table[idx] += v  (relaxed device atomic float). Metal 3.1 native float atomics — used by the
+ *  gradient scatter-add paths (embedding backward and any dW/dtable accumulation). idx is `long`
+ *  because gradient tables (vocab*D) can exceed int range. */
+static METAL_FUNC void atomic_add_float(device metal::atomic_float *table, long idx, float v) {
+    metal::atomic_fetch_add_explicit(&table[idx], v, metal::memory_order_relaxed);
+}
+
 } // namespace mittens

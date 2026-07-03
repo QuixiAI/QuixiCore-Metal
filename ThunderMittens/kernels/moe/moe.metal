@@ -34,25 +34,9 @@ kernel void moe_route_topk(device const T *logits       [[buffer(0)]],
     int chosen_id[MOE_MAX_K];
     float chosen_logit[MOE_MAX_K];
 
-    for (int k = 0; k < K; ++k) {
-        float best = MOE_NEG_INF;
-        int bi = (int)lane < E ? (int)lane : 0;
-        for (int i = (int)lane; i < E; i += 32) {
-            bool taken = false;
-            for (int j = 0; j < k; ++j) {
-                if (chosen_id[j] == i) { taken = true; }
-            }
-            if (taken) { continue; }
-            const float v = float(logits[base + i]);
-            if (v > best || (v == best && i < bi)) {
-                best = v;
-                bi = i;
-            }
-        }
-        simd_argmax(best, bi);   // all lanes now hold the k-th expert (P1)
-        chosen_id[k] = bi;
-        chosen_logit[k] = best;
-    }
+    // K masked-argmax rounds over the E experts (Family-A helper).
+    indexed_cand<T> cand{logits, base};
+    masked_topk(cand, E, K, lane, MOE_NEG_INF, chosen_id, chosen_logit);
 
     // softmax over the k selected logits (= renormalized top-k of the full softmax)
     float m = MOE_NEG_INF;

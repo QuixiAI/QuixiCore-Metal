@@ -83,25 +83,9 @@ kernel void top_k_sample(device const T *logits  [[buffer(0)]],
     int chosen_id[SAMPLE_MAX_K];
     float chosen_logit[SAMPLE_MAX_K];
 
-    for (int k = 0; k < K; ++k) {
-        float best = SMP_NEG_INF;
-        int bi = (int)lane < V ? (int)lane : 0;
-        for (int i = (int)lane; i < V; i += 32) {
-            bool taken = false;
-            for (int j = 0; j < k; ++j) {
-                if (chosen_id[j] == i) { taken = true; }
-            }
-            if (taken) { continue; }
-            const float v = float(logits[base + i]);
-            if (v > best || (v == best && i < bi)) {
-                best = v;
-                bi = i;
-            }
-        }
-        simd_argmax(best, bi);    // all lanes hold the k-th token
-        chosen_id[k] = bi;
-        chosen_logit[k] = best;
-    }
+    // K masked-argmax rounds over the full vocab (Family-A helper).
+    indexed_cand<T> cand{logits, base};
+    masked_topk(cand, V, K, lane, SMP_NEG_INF, chosen_id, chosen_logit);
 
     // Gumbel-max among the k selected tokens.
     float best = SMP_NEG_INF;
@@ -281,10 +265,9 @@ kernel void apply_token_bitmask(device const T    *logits    [[buffer(0)]],   //
                                 uint lane [[thread_index_in_simdgroup]]) {
     const long lbase = (long)row * V;
     const long mbase = (long)row * num_words;
+    device const uint *mask_row = bitmask + mbase;
     for (int v = (int)lane; v < V; v += 32) {
-        const uint word = bitmask[mbase + (v >> 5)];
-        const bool allowed = ((word >> (v & 31)) & 1u) != 0u;
-        out[lbase + v] = allowed ? logits[lbase + v] : T(SMP_NEG_INF);
+        out[lbase + v] = token_allowed(mask_row, v) ? logits[lbase + v] : T(SMP_NEG_INF);
     }
 }
 
@@ -365,26 +348,19 @@ kernel void beam_select(device const float *cand_score   [[buffer(0)]],  // (B*B
                         uint lane [[thread_index_in_simdgroup]]) {
     const int ncand = BM * two_bm;
     const long row0 = (long)b * BM;   // first beam row of batch b
-    int chosen[16];                   // BM <= 16 selected flat candidate indices
-    for (int k = 0; k < BM; ++k) {
-        float best = SMP_NEG_INF;
-        int bc = -1;
-        for (int c = (int)lane; c < ncand; c += 32) {
-            bool taken = false;
-            for (int mchosen = 0; mchosen < k; ++mchosen) if (chosen[mchosen] == c) taken = true;
-            if (taken) continue;
-            const int i = c / two_bm, j = c - i * two_bm;
-            const float sc = cand_score[(row0 + i) * two_bm + j];
-            if (sc > best || (sc == best && c < bc)) { best = sc; bc = c; }
-        }
-        int gc = (bc < 0) ? 0x7fffffff : bc;
-        simd_argmax(best, gc);
-        chosen[k] = gc;
-        if (lane == 0) {
+    int   chosen[16];                 // BM <= 16 selected flat candidate indices
+    float chosen_sc[16];              // ... and their scores (new_cum)
+    // The score of flat candidate c is cand_score[(row0 + c/two_bm)*two_bm + c%two_bm] ==
+    // cand_score[row0*two_bm + c], so this is a plain indexed scan (Family-A helper).
+    indexed_cand<float> cand{cand_score, row0 * two_bm};
+    masked_topk(cand, ncand, BM, lane, SMP_NEG_INF, chosen, chosen_sc);
+    if (lane == 0) {
+        for (int k = 0; k < BM; ++k) {
+            const int gc = chosen[k];
             const int i = gc / two_bm, j = gc - i * two_bm;
             next_token[(long)b * BM + k] = cand_token[(row0 + i) * two_bm + j];
             parent_beam[(long)b * BM + k] = i;
-            new_cum[(long)b * BM + k] = best;
+            new_cum[(long)b * BM + k] = chosen_sc[k];
         }
     }
 }
