@@ -1778,6 +1778,7 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> beam_advance_mps(
   const int B = cum_in.size(0), BR = logits_in.size(0), V = logits_in.size(1);
   TORCH_CHECK(BR == B * BM, "beam_advance: logits rows must equal B * beam_width");
   const int two_bm = 2 * BM;
+  TORCH_CHECK(V >= two_bm, "beam_advance: vocab size V must be >= 2 * beam_width");
   auto logits = logits_in.contiguous();
   auto cum = cum_in.to(at::kFloat).contiguous().view({BR});
   auto f32 = logits.options().dtype(at::kFloat);
@@ -2213,6 +2214,7 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
 
   if (mode == 2) {
     TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample: topk k must be in [1, 64]");
+    TORCH_CHECK(k <= V, "lm_head_sample: topk k must be <= vocab size V");
     auto part_val = at::empty({T, num_vtiles, static_cast<long>(k)}, f32);
     auto part_id = at::empty({T, num_vtiles, static_cast<long>(k)}, i32);
     tk_encode([&](TorchEncoder& e) {
@@ -2261,6 +2263,7 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   if (mode == 2 || mode == 3) {
     const int k = static_cast<int>(topk);
     TORCH_CHECK(k >= 1 && k <= 64 && k <= TILE_V, "lm_head_sample_q: k must be in [1, 64]");
+    TORCH_CHECK(k <= static_cast<int>(V), "lm_head_sample_q: k must be <= vocab size V");
     TORCH_CHECK(mode != 3 || (top_p > 0.0 && top_p <= 1.0),
                 "lm_head_sample_q: topp requires top_p in (0, 1]");
     auto part_val = at::empty({T, num_vtiles, k}, f32);

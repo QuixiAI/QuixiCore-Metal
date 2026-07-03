@@ -343,6 +343,9 @@ std::vector<array> beam_advance(
     throw std::invalid_argument("beam_advance: logits rows must equal B * beam_width");
   }
   const int two_bm = 2 * beam_width;
+  if (logits.shape(1) < two_bm) {
+    throw std::invalid_argument("beam_advance: vocab size V must be >= 2 * beam_width");
+  }
   auto logits_c = contiguous(logits, false, s);
   auto cum_c = contiguous(astype(reshape(cum_log_probs, {BR}, s), float32, s), false, s);
 

@@ -198,6 +198,15 @@ def test_spec_verify_tree(seed):
                 assert tok not in tried                             # residual excludes tried siblings
 
 
+def test_family_a_topk_bounds_validation():
+    # Family-A masked-topk callers reject K > #candidates (out-of-contract) instead of emitting -1.
+    with pytest.raises(Exception):                     # top_k_sample: k > V
+        top_k_sample(mx.zeros((2, 8), mx.float32), k=16)
+    with pytest.raises(Exception):                     # beam_advance: V < 2*beam_width
+        beam_advance(mx.zeros((3, 4), mx.float32), mx.zeros((1, 3), mx.float32), 3)
+    top_k_sample(mx.zeros((2, 8), mx.float32), k=8)     # k == V is allowed (boundary)
+
+
 @pytest.mark.parametrize("num_sib", [70, 200])
 def test_spec_verify_tree_wide(num_sib):
     # A star tree: root (node 0) with `num_sib` children (>64), all distinct draft tokens. The root's

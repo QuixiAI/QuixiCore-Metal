@@ -57,6 +57,9 @@ array lm_head_sample(
     if (k > LMH_TILE_V) {
       throw std::invalid_argument("lm_head_sample: topk k must be <= TILE_V (256)");
     }
+    if (k > V) {
+      throw std::invalid_argument("lm_head_sample: topk k must be <= vocab size V");
+    }
     auto parts = array::make_arrays(
         {{T, num_vtiles, k}, {T, num_vtiles, k}}, {float32, int32},
         std::make_shared<LmHeadTopkPartials>(to_stream(s), k, use_bias, LMH_TILE_V),
@@ -109,6 +112,9 @@ array lm_head_sample_q(
   if (mode == 2 || mode == 3) {
     if (k < 1 || k > 64 || k > LMH_TILE_V) {
       throw std::invalid_argument("lm_head_sample_q: k (topk / topp candidate cap) in [1, min(64, TILE_V)]");
+    }
+    if (k > V) {
+      throw std::invalid_argument("lm_head_sample_q: k must be <= vocab size V");
     }
     if (mode == 3 && !(top_p > 0.0f && top_p <= 1.0f)) {
       throw std::invalid_argument("lm_head_sample_q: topp requires top_p in (0, 1]");
