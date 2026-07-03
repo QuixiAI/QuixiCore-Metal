@@ -707,6 +707,24 @@ def cascade_attention(q, prefix_k, prefix_v, key_cache, value_cache, block_table
         scale=scale, partition_size=partition_size)
 
 
+def cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
+                          k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3"):
+    """Cascade attention over a uint8 fp8 (e4m3/e5m2) SHARED prefix (per-kv-head dequant on read) +
+    the regular (bf16/fp16) paged suffix, merged in one reduce. Fp8-compresses the large shared
+    system prompt while keeping the suffix in the native cache dtype. prefix_k/prefix_v uint8;
+    k_scale/v_scale a plain float (per-tensor, broadcast) or a (num_kv_heads,) array (per-head).
+    fmt 'e4m3' (default) or 'e5m2'. Accepts mlx.array or torch.Tensor (MPS)."""
+    H_KV = key_cache.shape[2]
+    k_scale, v_scale = _scale_vec(k_scale, H_KV, q), _scale_vec(v_scale, H_KV, q)
+    if _is_torch(q):
+        return _torch().cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache,
+                                              block_table, context_lens, k_scale, v_scale, scale,
+                                              partition_size, _fmt_code(fmt))
+    return _mlx().cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_table,
+                                        context_lens, k_scale, v_scale, scale=scale,
+                                        partition_size=partition_size, fmt=_fmt_code(fmt))
+
+
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
                            k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3", window=0):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA/MQA aware.

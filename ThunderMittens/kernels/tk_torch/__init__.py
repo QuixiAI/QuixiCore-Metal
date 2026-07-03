@@ -529,6 +529,16 @@ def cascade_attention_multi(q, prefix_ks, prefix_vs, key_cache, value_cache, blo
                                         block_table, context_lens, float(scale), int(partition_size))
 
 
+def cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
+                          k_scale, v_scale, scale: float = 0.0, partition_size: int = 512,
+                          fmt: int = 0):
+    """Cascade over a uint8 fp8 shared prefix (per-kv-head dequant on read) + regular paged suffix.
+    k_scale/v_scale (num_kv_heads,) float, fmt 0=e4m3 / 1=e5m2. MPS tensors."""
+    return _ext.cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_table,
+                                      context_lens, k_scale, v_scale, float(scale),
+                                      int(partition_size), int(fmt))
+
+
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
                            k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3", window=0):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA aware. MPS.

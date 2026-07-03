@@ -84,6 +84,50 @@ array cascade_attention_multi(
 
 // --- internal primitives (not bound directly) ---
 
+// fp8 cascade over a uint8 shared prefix (fp8 prefix partition + regular paged suffix).
+array cascade_attention_fp8(
+    const array& q,
+    const array& prefix_k,
+    const array& prefix_v,
+    const array& key_cache,
+    const array& value_cache,
+    const array& block_table,
+    const array& context_lens,
+    const array& k_scale,
+    const array& v_scale,
+    float scale = 0.0f,
+    int partition_size = 512,
+    int fmt = 0,
+    StreamOrDevice s = {});
+
+class CascadePrefixPartitionFp8 : public Primitive {
+ public:
+  CascadePrefixPartitionFp8(Stream stream, float scale, int num_partitions, int partition_size,
+                            int fmt)
+      : Primitive(stream), scale_(scale), num_partitions_(num_partitions),
+        partition_size_(partition_size), fmt_(fmt) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "CascadePrefixPartitionFp8"; }
+  void print(std::ostream& os) override { os << "CascadePrefixPartitionFp8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const CascadePrefixPartitionFp8&>(other);
+    return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
+        partition_size_ == o.partition_size_ && fmt_ == o.fmt_;
+  }
+
+ private:
+  float scale_;
+  int num_partitions_, partition_size_, fmt_;
+};
+
 class CascadePrefixPartition : public Primitive {
  public:
   CascadePrefixPartition(Stream stream, float scale, int num_partitions, int partition_size)

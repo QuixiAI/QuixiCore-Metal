@@ -374,6 +374,28 @@ NB_MODULE(_ext, m) {
         concatenated + one log-sum-exp reduce == full softmax over [level0 ++ ... ++ suffix].
       )");
 
+  m.def(
+      "cascade_attention_fp8",
+      &cascade_attention_fp8,
+      "q"_a,
+      "prefix_k"_a,
+      "prefix_v"_a,
+      "key_cache"_a,
+      "value_cache"_a,
+      "block_table"_a,
+      "context_lens"_a,
+      "k_scale"_a,
+      "v_scale"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "partition_size"_a = 512,
+      "fmt"_a = 0,
+      "stream"_a = nb::none(),
+      R"(
+        Cascade over a uint8 fp8 (e4m3/e5m2) shared prefix (per-kv-head dequant on read) + the
+        regular paged suffix, merged in one reduce. k_scale/v_scale are (num_kv_heads,) float.
+      )");
+
     m.def(
       "paged_attention_v2_fp8",
       &paged_attention_v2_fp8,

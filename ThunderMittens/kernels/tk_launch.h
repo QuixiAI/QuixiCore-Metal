@@ -1337,6 +1337,22 @@ void launch_paged_attention_partition_fp8(
   e.in(k_scale, 15); e.in(v_scale, 16); e.bytes(fmt, 17); e.bytes(window, 18);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
+// fp8 cascade prefix partition (uint8 shared prefix KV + per-kv-head dequant on read).
+template <class E>
+void launch_cascade_prefix_partition_fp8(
+    E& e, typename E::in_t q, typename E::in_t prefix_k, typename E::in_t prefix_v,
+    typename E::out_t tmp_out, typename E::out_t max_logits, typename E::out_t exp_sums,
+    int batch, int num_heads, int num_kv_heads, int head_size, int prefix_len, float scale,
+    int num_partitions, int partition_size, typename E::in_t k_scale, typename E::in_t v_scale,
+    int fmt, const std::string& type_name) {
+  e.pipeline("cascade_prefix_partition_fp8_" + type_name + "_" + std::to_string(head_size));
+  e.in(q, 0); e.in(prefix_k, 1); e.in(prefix_v, 2);
+  e.out(tmp_out, 3); e.out(max_logits, 4); e.out(exp_sums, 5);
+  e.bytes(prefix_len, 6); e.bytes(scale, 7); e.bytes(num_heads, 8); e.bytes(num_kv_heads, 9);
+  e.bytes(num_partitions, 10); e.bytes(partition_size, 11);
+  e.in(k_scale, 12); e.in(v_scale, 13); e.bytes(fmt, 14);
+  e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
+}
 
 // ----- Paged attention v2 reduce: tmp_out@0 max_logits@1 exp_sums@2 (fp32) -> out@3 ;
 //        num_heads@4 num_partitions@5 ; grid (H, B, 1), 32 threads. LSE merge over partitions. -----

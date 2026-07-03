@@ -509,6 +509,32 @@ def test_cascade_attention_multi_parity(plens):
     _assert_parity(om, ot, atol=1e-5)
 
 
+@pytest.mark.parametrize("fmt", ["e4m3", "e5m2"])
+def test_cascade_attention_fp8_parity(fmt):
+    rng = np.random.default_rng(len(fmt) + 3)
+    B, H, H_KV, D, plen, num_blocks, bs = 2, 4, 2, 64, 12, 8, 4
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    # shared fp8 prefix codes (encode once on MLX -> the SAME uint8 fed to both backends)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    qmax = 448.0 if fmt == "e4m3" else 57344.0
+    ks = float(np.abs(pk).max() / qmax); vs = float(np.abs(pv).max() / qmax)
+    pkc, pvc = tk.kv_cache_scatter_fp8(mx.array(pk).astype(mx.bfloat16), mx.array(pv).astype(mx.bfloat16),
+                                       mx.array(np.arange(plen, dtype=np.int64)), 1, plen, ks, vs, fmt=fmt)
+    pk8 = np.array(pkc).reshape(plen, H_KV, D); pv8 = np.array(pvc).reshape(plen, H_KV, D)
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], np.int32); cl = np.array([10, 16], np.int32)
+    args = lambda be: (_mk(q, be, "bf16"), mx.array(pk8) if be == "mlx" else torch.from_numpy(pk8).to("mps"),
+                       mx.array(pv8) if be == "mlx" else torch.from_numpy(pv8).to("mps"),
+                       _mk(kc, be, "bf16"), _mk(vc, be, "bf16"),
+                       mx.array(bt) if be == "mlx" else torch.from_numpy(bt).to("mps"),
+                       mx.array(cl) if be == "mlx" else torch.from_numpy(cl).to("mps"))
+    om = tk.cascade_attention_fp8(*args("mlx"), ks, vs, partition_size=8, fmt=fmt)
+    ot = tk.cascade_attention_fp8(*args("torch"), ks, vs, partition_size=8, fmt=fmt)
+    _assert_parity(om, ot, atol=2e-2)          # bf16 out + fp8 prefix; same kernels, ~fp16 accum order
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_rms_norm_parity(shape):
     D = shape[-1]

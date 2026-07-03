@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 from tk import (paged_attention_v2, kv_cache_scatter_fp8, paged_attention_v2_fp8,
-                cascade_attention)
+                cascade_attention, cascade_attention_fp8)
 from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
 
 _MX = {"float32": mx.float32, "bfloat16": mx.bfloat16}
@@ -230,6 +230,39 @@ def test_cascade_attention_multi(D, plens):
     pv_all = np.concatenate(pvs, axis=0)
     ref = _cascade_ref(q, pk_all, pv_all, kc, vc, bt, cl, scale)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-5)
+
+
+@pytest.mark.parametrize("fmt,qmax,decode",
+                         [("e4m3", 448.0, _e4m3_decode_arr), ("e5m2", 57344.0, _e5m2_decode_arr)])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("plen", [7, 16])
+def test_cascade_attention_fp8(fmt, qmax, decode, D, plen):
+    """fp8 shared prefix + regular paged suffix == full attn over [dequant(prefix) ++ suffix]."""
+    rng = np.random.default_rng(80 + D + plen + len(fmt))
+    B, H, H_KV, num_blocks, bs, ps = 2, 4, 2, 8, 4, 8
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+    ks = float(np.abs(pk).max() / qmax); vs = float(np.abs(pv).max() / qmax)
+    # fp8-encode the contiguous prefix via a single-block scatter, reshape back to (plen, H_KV, D)
+    pkc, pvc = kv_cache_scatter_fp8(mx.array(pk).astype(mx.bfloat16), mx.array(pv).astype(mx.bfloat16),
+                                   mx.array(np.arange(plen, dtype=np.int64)), 1, plen, ks, vs, fmt=fmt)
+    pk8 = pkc.reshape(plen, H_KV, D); pv8 = pvc.reshape(plen, H_KV, D)
+    got = cascade_attention_fp8(mx.array(q).astype(mx.bfloat16), pk8, pv8,
+                                mx.array(kc).astype(mx.bfloat16), mx.array(vc).astype(mx.bfloat16),
+                                mx.array(bt), mx.array(cl), ks, vs, scale=0.0, partition_size=ps, fmt=fmt)
+    mx.eval(got)
+    pk_deq = decode(np.array(pk8)) * ks; pv_deq = decode(np.array(pv8)) * vs
+    q_bf = np.array(mx.array(q).astype(mx.bfloat16).astype(mx.float32))
+    kc_bf = np.array(mx.array(kc).astype(mx.bfloat16).astype(mx.float32))
+    vc_bf = np.array(mx.array(vc).astype(mx.bfloat16).astype(mx.float32))
+    ref = _cascade_ref(q_bf, pk_deq, pv_deq, kc_bf, vc_bf, bt, cl, scale)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-2, rtol=3e-3)
 
 
 if __name__ == "__main__":
