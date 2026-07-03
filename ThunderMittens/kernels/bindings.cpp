@@ -630,6 +630,7 @@ NB_MODULE(_ext, m) {
       "target_probs"_a,
       "retrieve_next_token"_a,
       "retrieve_next_sibling"_a,
+      "tree_valid"_a,
       "seed"_a,
       nb::kw_only(),
       "stream"_a = nb::none(),

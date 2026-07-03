@@ -1264,19 +1264,29 @@ def spec_build_tree_pointers(parents, num_nodes):
     return nxt_tok, nxt_sib
 
 
-def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed):
+def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed,
+                     tree_valid=None):
     """Speculative TREE verification (target-only rejection, TRT-LLM dynamicTree). draft_tokens
     (B, N-1) int (node c>=1 carries draft_tokens[c-1]); target_probs (B, N, V) f32 (target dist AT
     each node's position); retrieve_next_token / retrieve_next_sibling (B, N) int (first-child /
     next-sibling pointers, -1=none; use spec_build_tree_pointers). Walks each request's tree from the
     root accepting the first sibling whose cumulative target prob exceeds a coin, else a residual /
-    bonus correction token. Returns (accept_index (B,N), accept_token (B,N), accept_num (B,)) int32,
-    -1-padded. Accepts mlx.array or torch.Tensor (MPS)."""
+    bonus correction token (exact for any sibling count). tree_valid (B,) int (optional, default all
+    ones): where 0 the request has no tree this step, so it samples the target root token with
+    accept_num=0 (TRT-LLM first-generation fallback). Returns (accept_index (B,N), accept_token
+    (B,N), accept_num (B,)) int32, -1-padded. Accepts mlx.array or torch.Tensor (MPS)."""
+    B = target_probs.shape[0]
     if _is_torch(target_probs):
+        import torch
+        if tree_valid is None:
+            tree_valid = torch.ones(B, dtype=torch.int32, device=target_probs.device)
         return tuple(_torch().spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
-                                               retrieve_next_sibling, int(seed)))
+                                               retrieve_next_sibling, int(seed), tree_valid))
+    import mlx.core as _mx
+    if tree_valid is None:
+        tree_valid = _mx.ones((B,), dtype=_mx.int32)
     out = _mlx().spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
-                                  retrieve_next_sibling, int(seed))
+                                  retrieve_next_sibling, tree_valid, int(seed))
     return out[0], out[1], out[2]
 
 

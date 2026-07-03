@@ -337,11 +337,12 @@ class SpecVerifyLinear : public Primitive {
 
 /** Speculative TREE verification (target-only rejection, TRT-LLM dynamicTree). draft_tokens (B,N-1)
  *  int; target_probs (B,N,V) f32 (dist at each node's position); retrieve_next_token/-sibling (B,N)
- *  int (first-child / next-sibling pointers, -1 = none), node 0 = root. Returns [accept_index (B,N)
- *  int32 tree positions, accept_token (B,N) int32 token ids, accept_num (B,) int32], -1-padded. */
+ *  int (first-child / next-sibling pointers, -1 = none), node 0 = root; tree_valid (B,) int (0 =
+ *  no tree exists this step -> sample the target root token, accept_num=0). Returns [accept_index
+ *  (B,N) int32 tree positions, accept_token (B,N) int32 token ids, accept_num (B,) int32], -1-padded. */
 std::vector<array> spec_verify_tree(
     const array& draft_tokens, const array& target_probs, const array& retrieve_next_token,
-    const array& retrieve_next_sibling, uint32_t seed, StreamOrDevice s = {});
+    const array& retrieve_next_sibling, const array& tree_valid, uint32_t seed, StreamOrDevice s = {});
 
 class SpecVerifyTree : public Primitive {
  public:

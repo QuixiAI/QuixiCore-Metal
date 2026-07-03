@@ -1824,23 +1824,26 @@ static std::vector<at::Tensor> spec_verify_linear_mps(
 
 static std::vector<at::Tensor> spec_verify_tree_mps(const at::Tensor& draft_tokens_in,
     const at::Tensor& target_probs_in, const at::Tensor& rt_in, const at::Tensor& rs_in,
-    int64_t seed) {
+    const at::Tensor& tree_valid_in, int64_t seed) {
   TORCH_CHECK(target_probs_in.device().is_mps() && target_probs_in.dim() == 3,
               "spec_verify_tree: target_probs must be (B, N, V) MPS");
   const int B = target_probs_in.size(0), N = target_probs_in.size(1), V = target_probs_in.size(2);
   TORCH_CHECK(draft_tokens_in.dim() == 2 && draft_tokens_in.size(0) == B &&
               draft_tokens_in.size(1) == N - 1, "spec_verify_tree: draft_tokens must be (B, N-1)");
+  TORCH_CHECK(tree_valid_in.dim() == 1 && tree_valid_in.size(0) == B,
+              "spec_verify_tree: tree_valid must be (B,)");
   auto dt = draft_tokens_in.to(at::kInt).contiguous();
   auto tp = target_probs_in.to(at::kFloat).contiguous();
   auto rt = rt_in.to(at::kInt).contiguous();
   auto rs = rs_in.to(at::kInt).contiguous();
+  auto tv = tree_valid_in.to(at::kInt).contiguous();
   auto i32 = dt.options();
   auto accept_index = at::empty({B, N}, i32);
   auto accept_token = at::empty({B, N}, i32);
   auto accept_num = at::empty({B}, i32);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_spec_verify_tree(e, dt, tp, rt, rs, accept_index, accept_token, accept_num, B, N, V,
-                                static_cast<unsigned>(seed));
+    tk::launch_spec_verify_tree(e, dt, tp, rt, rs, accept_index, accept_token, accept_num, tv, B, N,
+                                V, static_cast<unsigned>(seed));
   });
   return {accept_index, accept_token, accept_num};
 }

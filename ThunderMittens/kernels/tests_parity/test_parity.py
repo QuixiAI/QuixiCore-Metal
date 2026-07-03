@@ -376,21 +376,27 @@ def test_apply_token_bitmask_parity(V):
     _assert_parity(om, ot, atol=0)           # masked logits: bit-identical
 
 
-@pytest.mark.parametrize("seed", [3, 11])
-def test_spec_verify_tree_parity(seed):
+@pytest.mark.parametrize("seed,parents", [
+    (3, [-1, 0, 0, 1, 1, 2, 2]),
+    (11, [-1, 0, 0, 1, 1, 2, 2]),
+    (5, [-1] + [0] * 130),                       # wide star: 130 siblings (>64), exercises no-cap residual
+])
+def test_spec_verify_tree_parity(seed, parents):
     from tk import spec_build_tree_pointers
     rng = np.random.default_rng(seed)
     B, V = 3, 400
-    parents = [-1, 0, 0, 1, 1, 2, 2]
     N = len(parents)
     nt, ns = spec_build_tree_pointers(parents, N)
     nt = np.broadcast_to(nt, (B, N)).copy(); ns = np.broadcast_to(ns, (B, N)).copy()
     draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
     tp = np.abs(rng.standard_normal((B, N, V))).astype(np.float32)
     tp /= tp.sum(-1, keepdims=True)
-    om = tk.spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt), mx.array(ns), seed)
+    tv = rng.integers(0, 2, size=B).astype(np.int32)      # mixed valid/invalid rows
+    om = tk.spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt), mx.array(ns), seed,
+                             tree_valid=mx.array(tv))
     ot = tk.spec_verify_tree(torch.from_numpy(draft).to("mps"), torch.from_numpy(tp).to("mps"),
-                             torch.from_numpy(nt).to("mps"), torch.from_numpy(ns).to("mps"), seed)
+                             torch.from_numpy(nt).to("mps"), torch.from_numpy(ns).to("mps"), seed,
+                             tree_valid=torch.from_numpy(tv).to("mps"))
     for a, b in zip(om, ot):                     # accept path + terminal Gumbel-max both deterministic
         _assert_parity(a, b, atol=0)
 

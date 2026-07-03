@@ -342,14 +342,20 @@ def spec_verify_linear(draft_tokens, draft_probs, target_probs, bonus_tokens, ac
                                          accept_u, int(seed)))
 
 
-def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed):
-    """Speculative tree verification -> (accept_index, accept_token, accept_num) int32, -1-pad. MPS."""
+def spec_verify_tree(draft_tokens, target_probs, retrieve_next_token, retrieve_next_sibling, seed,
+                     tree_valid=None):
+    """Speculative tree verification -> (accept_index, accept_token, accept_num) int32, -1-pad. MPS.
+    tree_valid (B,) int optional (default all ones); where 0 the request samples the target root
+    token (accept_num=0). Exact for any sibling count."""
+    import torch
+    if tree_valid is None:
+        tree_valid = torch.ones(target_probs.shape[0], dtype=torch.int32, device=target_probs.device)
     return tuple(_ext.spec_verify_tree(draft_tokens, target_probs, retrieve_next_token,
-                                       retrieve_next_sibling, int(seed)))
+                                       retrieve_next_sibling, tree_valid, int(seed)))
 
 
 def spec_compact(out_tokens, accepted_cnt, seq_lens):
-    """Compact accepted spec tokens -> (packed_tokens, packed_pos, cu_accepted) int32. B<=256. MPS."""
+    """Compact accepted spec tokens -> (packed_tokens, packed_pos, cu_accepted) int32. Any B. MPS."""
     return tuple(_ext.spec_compact(out_tokens, accepted_cnt, seq_lens))
 
 

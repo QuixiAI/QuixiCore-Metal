@@ -1412,6 +1412,31 @@ def test_spec_verify_tree(seed):
         assert int(at[b, na]) >= 0 and tp[b, int(ai[b, na]) if na > 0 else 0].sum() > 0
 
 
+def test_spec_verify_tree_wide_and_invalid():
+    import numpy as np
+    from tk import spec_build_tree_pointers
+    # wide star: 130 siblings (>64), root one-hot on w=0 (not a sibling) -> every sibling rejected,
+    # residual must exclude ALL siblings and land on w. Row 1 is tree_valid=0 (samples the root).
+    B, V, num_sib, seed = 3, 1024, 130, 5
+    N = num_sib + 1
+    parents = [-1] + [0] * num_sib
+    nt, ns = spec_build_tree_pointers(parents, N)
+    nt = np.broadcast_to(nt, (B, N)).copy(); ns = np.broadcast_to(ns, (B, N)).copy()
+    draft = np.broadcast_to(np.arange(1, num_sib + 1, dtype=np.int32), (B, N - 1)).copy()
+    tp = np.zeros((B, N, V), np.float32); tp[:, :, 0] = 1.0        # one-hot on token 0 everywhere
+    tv = np.array([1, 0, 1], np.int32)
+    ai, at, an = tk_torch.spec_verify_tree(torch.from_numpy(draft).to("mps"),
+                                           torch.from_numpy(tp).to("mps"),
+                                           torch.from_numpy(nt).to("mps"),
+                                           torch.from_numpy(ns).to("mps"), seed,
+                                           tree_valid=torch.from_numpy(tv).to("mps"))
+    ai, at, an = ai.cpu().numpy(), at.cpu().numpy(), an.cpu().numpy()
+    for b in range(B):
+        assert int(an[b]) == 0                                     # rejected-all (valid) or skipped (invalid)
+        assert int(at[b, 0]) == 0                                  # residual/root token = 0, excludes siblings
+        assert int(at[b, 0]) not in set(range(1, num_sib + 1))
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (300, 4)])
 def test_spec_compact_and_kv_meta(B, S):
     import numpy as np

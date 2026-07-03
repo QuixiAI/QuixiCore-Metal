@@ -660,7 +660,8 @@ TK_BEAM_NO_AUTODIFF(SpecVerifyLinear, "SpecVerifyLinear")
 
 std::vector<array> spec_verify_tree(
     const array& draft_tokens, const array& target_probs, const array& retrieve_next_token,
-    const array& retrieve_next_sibling, uint32_t seed, StreamOrDevice s /* = {} */) {
+    const array& retrieve_next_sibling, const array& tree_valid, uint32_t seed,
+    StreamOrDevice s /* = {} */) {
   if (target_probs.ndim() != 3) {
     throw std::invalid_argument("spec_verify_tree: target_probs must be (B, N, V)");
   }
@@ -674,13 +675,17 @@ std::vector<array> spec_verify_tree(
       retrieve_next_sibling.shape(0) != B || retrieve_next_sibling.shape(1) != N) {
     throw std::invalid_argument("spec_verify_tree: retrieve_next_* must be (B, N)");
   }
+  if (tree_valid.ndim() != 1 || tree_valid.shape(0) != B) {
+    throw std::invalid_argument("spec_verify_tree: tree_valid must be (B,)");
+  }
   auto dt_c = contiguous(astype(draft_tokens, int32, s), false, s);
   auto tp_c = contiguous(astype(target_probs, float32, s), false, s);
   auto rt_c = contiguous(astype(retrieve_next_token, int32, s), false, s);
   auto rs_c = contiguous(astype(retrieve_next_sibling, int32, s), false, s);
+  auto tv_c = contiguous(astype(tree_valid, int32, s), false, s);
   return array::make_arrays(
       {{B, N}, {B, N}, {B}}, {int32, int32, int32},
-      std::make_shared<SpecVerifyTree>(to_stream(s), seed), {dt_c, tp_c, rt_c, rs_c});
+      std::make_shared<SpecVerifyTree>(to_stream(s), seed), {dt_c, tp_c, rt_c, rs_c, tv_c});
 }
 
 void SpecVerifyTree::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -691,6 +696,7 @@ void SpecVerifyTree::eval_gpu(const std::vector<array>& inputs, std::vector<arra
   auto& target_probs = inputs[1];
   auto& rt = inputs[2];
   auto& rs = inputs[3];
+  auto& tree_valid = inputs[4];
   auto& accept_index = outputs[0];
   auto& accept_token = outputs[1];
   auto& accept_num = outputs[2];
@@ -705,7 +711,7 @@ void SpecVerifyTree::eval_gpu(const std::vector<array>& inputs, std::vector<arra
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_spec_verify_tree(enc, draft_tokens, target_probs, rt, rs, accept_index, accept_token,
-                              accept_num, B, N, V, seed_);
+                              accept_num, tree_valid, B, N, V, seed_);
 }
 TK_BEAM_NO_AUTODIFF(SpecVerifyTree, "SpecVerifyTree")
 

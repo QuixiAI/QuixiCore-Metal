@@ -488,12 +488,13 @@ template <class E>
 void launch_spec_verify_tree(E& e, typename E::in_t draft_tokens, typename E::in_t target_probs,
                              typename E::in_t retrieve_next_token,
                              typename E::in_t retrieve_next_sibling, typename E::out_t accept_index,
-                             typename E::out_t accept_token, typename E::out_t accept_num, int B,
-                             int N, int V, unsigned seed) {
+                             typename E::out_t accept_token, typename E::out_t accept_num,
+                             typename E::in_t tree_valid, int B, int N, int V, unsigned seed) {
   e.pipeline("spec_verify_tree");
   e.in(draft_tokens, 0); e.in(target_probs, 1); e.in(retrieve_next_token, 2);
   e.in(retrieve_next_sibling, 3); e.out(accept_index, 4); e.out(accept_token, 5);
   e.out(accept_num, 6); e.bytes(N, 7); e.bytes(V, 8); e.bytes(seed, 9);
+  e.in(tree_valid, 10);
   e.dispatch(B, 1, 1, 32, 1, 1);
 }
 // spec_compact: single threadgroup (B<=256) exclusive-scan compaction of accepted tokens.

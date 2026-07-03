@@ -198,6 +198,60 @@ def test_spec_verify_tree(seed):
                 assert tok not in tried                             # residual excludes tried siblings
 
 
+@pytest.mark.parametrize("num_sib", [70, 200])
+def test_spec_verify_tree_wide(num_sib):
+    # A star tree: root (node 0) with `num_sib` children (>64), all distinct draft tokens. The root's
+    # target is one-hot on a token w NOT in the draft set, so every sibling is rejected (cumprob 0 <
+    # coin) -> residual. The correction must exclude ALL siblings (exact, no 64-cap) and land on w.
+    B, V, seed = 2, 1024, 5
+    N = num_sib + 1
+    parents = [-1] + [0] * num_sib
+    nxt_tok, nxt_sib = spec_build_tree_pointers(parents, N)
+    nt_b = np.broadcast_to(nxt_tok, (B, N)).copy()
+    ns_b = np.broadcast_to(nxt_sib, (B, N)).copy()
+    tp = np.zeros((B, N, V), np.float32)
+    draft = np.zeros((B, N - 1), np.int32)
+    w = np.zeros(B, np.int64)
+    for b in range(B):
+        # distinct draft tokens in [1, num_sib], reserve token w=0 for the correction (not a sibling)
+        draft[b] = np.arange(1, num_sib + 1, dtype=np.int32)
+        w[b] = 0
+        tp[b, :, w[b]] = 1.0                                        # one-hot on w at every node
+    ai, at, an = spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt_b), mx.array(ns_b), seed)
+    ai, at, an = np.array(ai), np.array(at), np.array(an)
+    for b in range(B):
+        assert an[b] == 0, (b, an[b])                              # all siblings rejected
+        tok = int(at[b, 0])
+        assert tok == int(w[b]), (b, tok, w[b])                    # residual excludes every sibling -> w
+        assert tok not in set(draft[b].tolist())
+
+
+def test_spec_verify_tree_invalid():
+    # tree_valid=0 rows skip the walk and sample the target root; accept_num=0, one-hot -> that token.
+    B, V, seed = 4, 512, 3
+    parents = [-1, 0, 0, 1]
+    N = len(parents)
+    nxt_tok, nxt_sib = spec_build_tree_pointers(parents, N)
+    nt_b = np.broadcast_to(nxt_tok, (B, N)).copy()
+    ns_b = np.broadcast_to(nxt_sib, (B, N)).copy()
+    rng = np.random.default_rng(seed)
+    draft = rng.integers(0, V, size=(B, N - 1)).astype(np.int32)
+    tp = np.zeros((B, N, V), np.float32)
+    root_tok = np.array([11, 22, 33, 44], np.int64)
+    for b in range(B):
+        tp[b, 0, root_tok[b]] = 1.0                                # one-hot root
+        for n in range(1, N):
+            tp[b, n, rng.integers(0, V)] = 1.0
+    tree_valid = mx.array(np.array([0, 1, 0, 1], np.int32))
+    ai, at, an = spec_verify_tree(mx.array(draft), mx.array(tp), mx.array(nt_b), mx.array(ns_b), seed,
+                                  tree_valid=tree_valid)
+    ai, at, an = np.array(ai), np.array(at), np.array(an)
+    for b in [0, 2]:                                               # invalid rows
+        assert an[b] == 0, (b, an[b])
+        assert int(at[b, 0]) == int(root_tok[b]), (b, at[b, 0], root_tok[b])
+        assert int(ai[b, 0]) == 0 and int(ai[b, 1]) == -1          # only root position set
+
+
 @pytest.mark.parametrize("B,S", [(3, 4), (8, 5), (1, 1), (300, 4), (1000, 6)])
 def test_spec_compact_and_kv_meta(B, S):
     rng = np.random.default_rng(B * 10 + S)
