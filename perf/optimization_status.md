@@ -431,3 +431,33 @@ is that they were built perf-first and there is no shippable win left:
   245–466 W-GB/s), attn_q 32-row KV tiles (complexity vs niche kernel),
   matmul_custom small-shape routing (calibration kernel), fp16 LUT decoders
   (bit-tricks already exact + cheap).
+
+## Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips)
+
+Full run: `perf/results/2026-07-02/235051-mlx-comprehensive/`. First measurement of the
+Wave-5 serving/training kernels (they shipped correctness-first, un-profiled).
+
+### Wins landed (measure-and-keep)
+- **embedding_lookup 8.0×** (1.817 → 0.227 ms, T4096·D4096·V128256) — now **2.3× faster than
+  the framework gather** (was 3.5× slower). **merge_multimodal_spans 11.9×** (7.478 → 0.626 ms).
+  Cause: the flat one-thread-per-element kernels did two integer divides per element (t=gid/D,
+  d=gid%D) and scalar loads. Fix: one threadgroup per token (row base hoisted, zero per-element
+  division) + `packed_four` vec4 row load/store when D%4==0, scalar tail otherwise.
+- **beam_reorder_kv ~1.45×** (6.11 → 4.12 ms; 12.27 → 8.47 ms) — vec4'd `kv_cache_clone` (the
+  full-cache copy that dominates the reorder) and `kv_cache_copy_blocks`. The clone is the driver;
+  the block copy alone moved ~2%. The direct kv-copy path also benefits.
+
+### Rejected / documented tradeoffs (this pass)
+- **rms_norm / layernorm backward: 5–6× slower than `mx.fast.*_norm` vjp** (e.g. rms_norm_bwd
+  N65536·D1024 8.9 ms vs 1.6 ms). NOT a kernel-speed bug — the router computes rstd/dweight/dbias
+  as *separate framework reductions* and only the per-row dX as the tk kernel (multi-pass, ~3× the
+  traffic), while `mx.fast` fuses the whole VJP in one pass. Matching it needs a fully-fused
+  backward kernel (rstd+dX in one pass, dweight via `atomic_add_float`/second reduction). Deferred:
+  large effort against a hand-tuned builtin on the less-latency-critical training path; the current
+  path is correct (matches torch autograd ~1e-2..1e-7) and reuses the dX kernel.
+- **gelu_bwd**: compute-bound (per-element `precise::tanh` + cubic), no per-element division; already
+  76–131 GB/s. vec4 wouldn't move the tanh-dominated cost — left as-is.
+- **cascade_attention** already 212–255 GB/s; **beam_build_copy_pairs / varlen_build_worklist**
+  already sub-20 µs (fixed-slot / single-threadgroup scan) — not hotspots.
+- **min_p / apply_token_bitmask / spec_verify_linear** run at 46–756 GB/s over the (T,V) logits —
+  bandwidth-bound and already near the floor for a full-vocab pass.
