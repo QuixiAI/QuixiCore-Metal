@@ -980,7 +980,8 @@ void launch_dropout(E& e, typename E::in_t x, typename E::out_t out, uint32_t se
   const float inv_keep = 1.0f / (1.0f - p);
   e.bytes(inv_keep, 4); e.bytes(n, 5);
   constexpr int threads = 256;
-  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+  const uint32_t nthreads = (n + 3) / 4;              // one thread per 4 elements (vec4)
+  e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
 template <class E>
 void launch_gelu_bwd(E& e, typename E::in_t x, typename E::in_t dy, typename E::out_t dx, int n,
