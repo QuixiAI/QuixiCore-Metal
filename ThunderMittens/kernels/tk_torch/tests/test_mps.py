@@ -296,6 +296,53 @@ def test_cascade_attention_multi(plens):
     assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
 
 
+@pytest.mark.parametrize("fmt,qmax", [("e4m3", 448.0), ("e5m2", 57344.0)])
+@pytest.mark.parametrize("D,plen", [(64, 7), (128, 16)])
+def test_cascade_attention_fp8(fmt, qmax, D, plen):
+    # fp8 shared prefix (dequant-on-read) + regular bf16 paged suffix == full attn over
+    # [dequant(prefix) ++ suffix]. Mirrors the MLX oracle test on the same metallib.
+    import numpy as np
+    from tk.quant import _e4m3_decode_arr, _e5m2_decode_arr
+    decode = _e4m3_decode_arr if fmt == "e4m3" else _e5m2_decode_arr
+    fmt_code = 0 if fmt == "e4m3" else 1
+    rng = np.random.default_rng(80 + D + plen + len(fmt))
+    B, H, H_KV, num_blocks, bs, ps = 2, 4, 2, 8, 4, 8
+    group = H // H_KV
+    scale = 1.0 / math.sqrt(D)
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    pk = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    pv = (0.2 * rng.normal(size=(plen, H_KV, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, bs, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], np.int32); cl = np.array([10, 16], np.int32)
+    ks = float(np.abs(pk).max() / qmax); vs = float(np.abs(pv).max() / qmax)
+    bf16 = lambda a: torch.from_numpy(a).to(torch.bfloat16).to("mps")
+    # fp8-encode the contiguous prefix via a single-block scatter, reshape back to (plen, H_KV, D)
+    pkc, pvc = tk_torch.kv_cache_scatter_fp8(bf16(pk), bf16(pv),
+        torch.from_numpy(np.arange(plen, dtype=np.int64)).to("mps"), 1, plen, ks, vs, fmt=fmt)
+    pk8 = pkc.reshape(plen, H_KV, D); pv8 = pvc.reshape(plen, H_KV, D)
+    ksv = torch.full((H_KV,), ks, dtype=torch.float32).to("mps")
+    vsv = torch.full((H_KV,), vs, dtype=torch.float32).to("mps")
+    got = tk_torch.cascade_attention_fp8(bf16(q), pk8, pv8, bf16(kc), bf16(vc),
+                                         torch.from_numpy(bt).to("mps"), torch.from_numpy(cl).to("mps"),
+                                         ksv, vsv, 0.0, ps, fmt_code)
+    pk_deq = decode(pk8.cpu().numpy()) * ks; pv_deq = decode(pv8.cpu().numpy()) * vs
+    q_bf = bf16(q).float().cpu().numpy()
+    kc_bf = bf16(kc).float().cpu().numpy(); vc_bf = bf16(vc).float().cpu().numpy()
+    ref = np.zeros_like(q)
+    for b in range(B):
+        for h in range(H):
+            kvh = h // group; sc, vlist = [], []
+            for t in range(plen):
+                sc.append(float(np.dot(q_bf[b, h], pk_deq[t, kvh]) * scale)); vlist.append(pv_deq[t, kvh])
+            for t in range(int(cl[b])):
+                blk = bt[b, t // bs]; slot = t % bs
+                sc.append(float(np.dot(q_bf[b, h], kc_bf[blk, slot, kvh]) * scale)); vlist.append(vc_bf[blk, slot, kvh])
+            s = np.array(sc, np.float32); p = np.exp(s - s.max()); p /= p.sum()
+            ref[b, h] = np.sum(p[:, None] * np.stack(vlist), axis=0)
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.03
+
+
 @pytest.mark.parametrize("window", [1, 16, 640])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_paged_attention_v2_window(window, fp8):
