@@ -1114,6 +1114,32 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+@pytest.mark.parametrize("D", [256, 1024])
+def test_rms_norm_add_backward(D):
+    # fused residual-add + RMSNorm backward (router composition) vs torch autograd.
+    import numpy as np
+    from tk import rms_norm_add_backward
+    rng = np.random.default_rng(D + 1)
+    N, eps = 64, 1e-5
+    x_np = rng.standard_normal((N, D)).astype(np.float32)
+    r_np = rng.standard_normal((N, D)).astype(np.float32)
+    w_np = rng.standard_normal(D).astype(np.float32)
+    dout = rng.standard_normal((N, D)).astype(np.float32)
+    dres = 0.3 * rng.standard_normal((N, D)).astype(np.float32)
+    x = torch.from_numpy(x_np).to("mps").requires_grad_(True)
+    r = torch.from_numpy(r_np).to("mps").requires_grad_(True)
+    w = torch.from_numpy(w_np).to("mps")
+    h = x + r
+    out = F.rms_norm(h, (D,), w, eps)
+    (out * torch.from_numpy(dout).to("mps")).sum().backward(retain_graph=True)
+    (h * torch.from_numpy(dres).to("mps")).sum().backward()      # grad into residual output
+    dx, dresidual, dweight = rms_norm_add_backward(
+        torch.from_numpy(x_np + r_np).to("mps"), w,
+        torch.from_numpy(dout).to("mps"), dresidual=torch.from_numpy(dres).to("mps"), eps=eps)
+    assert torch.allclose(dx, x.grad, atol=2e-3)
+    assert torch.allclose(dresidual, r.grad, atol=2e-3)
+
+
 @pytest.mark.parametrize("mode", ["swiglu", "geglu", "reglu"])
 def test_glu_backward(mode):
     # tk glu_backward vs torch autograd of the canonical activation (validates the formula).

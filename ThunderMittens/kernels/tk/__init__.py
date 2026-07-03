@@ -420,6 +420,18 @@ def rms_norm_backward(x, weight, dy, eps=1e-5):
     return mx.reshape(dx, x.shape), dw
 
 
+def rms_norm_add_backward(hidden, weight, dout, dresidual=None, eps=1e-5):
+    """Backward of the fused residual-add + RMSNorm (rms_norm_add forward: out = rms_norm(x+residual)*w,
+    residual_out = x+residual). Pass `hidden` = the saved x+residual. Since residual_out == hidden and
+    hidden = x + residual, the grad wrt x and wrt residual are identical: dhidden = rms_norm_bwd_dx(
+    hidden, w, dout) (+ dresidual if a grad flows into the residual output). Returns (dx, dresidual,
+    dweight) with dx IS dresidual. Ref: Liger fused_add_rms_norm. Accepts mlx / torch (MPS)."""
+    dx, dweight = rms_norm_backward(hidden, weight, dout, eps=eps)
+    if dresidual is not None:
+        dx = dx + dresidual   # the residual-output branch passes straight through to hidden
+    return dx, dx, dweight
+
+
 def softmax(x):
     """Softmax over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):

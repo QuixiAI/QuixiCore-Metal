@@ -151,3 +151,28 @@ if __name__ == "__main__":
         test_rms_norm_add(shp)
         test_layernorm_add(shp)
         print("ok", shp)
+
+
+@pytest.mark.parametrize("D", [256, 1024])
+def test_rms_norm_add_backward(D):
+    # tk.rms_norm_add_backward vs numpy autograd of the fused residual-add + RMSNorm.
+    from tk import rms_norm_add_backward
+    rng = np.random.default_rng(D + 3)
+    N, eps = 64, 1e-5
+    x = rng.standard_normal((N, D)).astype(np.float32)
+    res = rng.standard_normal((N, D)).astype(np.float32)
+    w = rng.standard_normal(D).astype(np.float32)
+    dout = rng.standard_normal((N, D)).astype(np.float32)
+    dres = 0.3 * rng.standard_normal((N, D)).astype(np.float32)   # grad into the residual output
+    h = (x + res).astype(np.float64)
+    rstd = 1.0 / np.sqrt((h ** 2).mean(-1, keepdims=True) + eps)
+    # dh from the rms path: rstd*(w*dout) - (rstd^3/D)*h*sum(w*dout*h)
+    wd = w.astype(np.float64) * dout.astype(np.float64)
+    dh_rms = rstd * wd - (rstd ** 3 / D) * h * (wd * h).sum(-1, keepdims=True)
+    dh = dh_rms + dres.astype(np.float64)        # + residual-output branch
+    dw_ref = (dout.astype(np.float64) * h * rstd).sum(0)
+    dx, dresidual, dweight = rms_norm_add_backward(mx.array(h.astype(np.float32)), mx.array(w),
+                                                   mx.array(dout), dresidual=mx.array(dres), eps=eps)
+    assert np.allclose(np.array(dx), dh, atol=2e-3)
+    assert np.allclose(np.array(dresidual), dh, atol=2e-3)       # dx IS dresidual
+    assert np.allclose(np.array(dweight), dw_ref, atol=2e-3)
