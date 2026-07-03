@@ -162,6 +162,10 @@ kernel void kv_cache_copy_blocks(device const T *key_src [[buffer(0)]],
 // downstream kv_cache_copy_blocks kernel already skips. A child beam k with parent p (== per-batch-
 // local parent_beam[b,k]) copies parent block bt[b*BM+p, c] -> bt[gb, c] for c < ceil(sl/block_size);
 // p == k (kept its own history) or an out-of-range/negative slot -> sentinel. One thread per slot.
+// Wave-7 #6 (measure-first): a scan + atomic-cursor compaction of only the real pairs was rejected --
+// this kernel is overhead-bound (~130 us floor, flat from 2k to 262k slots), so compacting the output
+// cannot beat the launch/eval floor and would only add atomic contention + nondeterministic ordering
+// while the downstream kv_cache_copy_blocks already skips sentinels cheaply. Kept as-is.
 kernel void beam_build_copy_pairs(device const int  *parent_beam [[buffer(0)]],   // (B, BM)
                                   device const int  *block_table [[buffer(1)]],   // (B*BM, max_blocks)
                                   device const int  *seq_lens    [[buffer(2)]],   // (B*BM,)
