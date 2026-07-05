@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 9: the sampler zoo (2026-07-05)
+
+New kernels/sampling/sampling_transforms.metal (+ transforms.cpp/.h): 11 transforms on the
+one-simdgroup-per-row substrate — quadratic/smoothing, top-nsigma, top-A (log-space exact),
+epsilon-cutoff, eta-cutoff (typical_p's S1 entropy trick, one fewer pass than the reference),
+XTC (on-device coin at a non-token RNG counter; e-domain comparisons, no division), skew
+(index-order CDF pow via simd_prefix_exclusive_sum — verified metal-forge contract, no sort;
+exllamav2 sorted-CDF variant deferred), top-k renorm (masked_topk, ties -> smaller id),
+top-p renorm (32-iter bisection, deliberately tighter than the reference's 5), no-repeat-
+ngram (per-lane history starts, benign -inf scatters), and DRY (faithful reference loop with
+the O(max_ngram) inner unwind parallelized via first-violation simd_min; shared breakers
+list + launch-uniform scalars per TM convention).
+
+- Tests: exact-SET oracles on margin-safe 1/64-grid logits + property tests; DRY/ngram vs
+  direct python transcriptions of the reference loops; 11 new + 87-test sampling regression
+  green. Parity: 1e-4 on O(10) logit values (last-ulp fast-math between the two metallib
+  compilers; set flips would read ~1e30), probs-domain 1e-6.
+- Perf: bandwidth-bound as expected — quadratic/nsigma ~0.32 ms at (256, 32000) (~206 GB/s,
+  2 passes), top_a/eta ~0.60 (3 passes), xtc 0.75 (4 passes), DRY 0.18 (copy + uniform scan).
+
 ## Wave-9 — gap port, kernel 8: fused act->quant epilogues (2026-07-05)
 
 New kernels/act_quant/ + two substrate additions: tk_e2m1_encode (fp4 nearest-of-16, tie

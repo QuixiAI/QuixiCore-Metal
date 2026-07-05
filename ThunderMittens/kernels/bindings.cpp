@@ -72,6 +72,7 @@
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
 #include "sampling/sampling.h"
+#include "sampling/transforms.h"
 #include "moe/moe.h"
 #include "softmax/softmax.h"
 #include "rotary/rotary.h"
@@ -526,6 +527,52 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def("quadratic_transform", &quadratic_transform,
+      "logits"_a, "factor"_a, "curve"_a = 1.0f, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(quadratic/smoothing logit transform (factor 0 = identity).)");
+    m.def("top_nsigma_mask", &top_nsigma_mask,
+      "logits"_a, "nsigma"_a, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(top-nsigma: mask logits below max - nsigma*std.)");
+    m.def("top_a_mask", &top_a_mask,
+      "logits"_a, "top_a"_a, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(top-A: mask probs below top_a * pmax^2 (log-space exact).)");
+    m.def("epsilon_cutoff_mask", &epsilon_cutoff_mask,
+      "logits"_a, "epsilon"_a, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(epsilon cutoff: mask probs below epsilon (argmax survives).)");
+    m.def("eta_cutoff_mask", &eta_cutoff_mask,
+      "logits"_a, "eta"_a, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(eta sampling: mask probs below min(eta, sqrt(eta)*exp(-entropy)).)");
+    m.def("xtc_mask", &xtc_mask,
+      "logits"_a, "threshold"_a, "probability"_a, "seed"_a = 0, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(XTC: with on-device coin `probability`, remove all probs >= threshold except the
+         least likely of them.)");
+    m.def("skew_transform", &skew_transform,
+      "probs"_a, "skew"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(skew: pow(index-order CDF, exp(skew)) reshaping over probability rows.)");
+    m.def("top_k_renorm", &top_k_renorm,
+      "probs"_a, "k"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(keep the top-k probs, renormalize to 1, zero elsewhere (k <= 64).)");
+    m.def("top_p_renorm", &top_p_renorm,
+      "probs"_a, "p"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(keep the smallest prob set with mass >= p (bisection, no sort), renormalize.)");
+    m.def("no_repeat_ngram_mask", &no_repeat_ngram_mask,
+      "logits"_a, "prev_tokens"_a, "lens"_a, "ngram_size"_a, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(ban tokens completing an already-seen ngram_size-gram (n >= 2).)");
+    m.def("dry_penalty", &dry_penalty,
+      "logits"_a, "prev_tokens"_a, "lens"_a, "breakers"_a, "multiplier"_a,
+      "base"_a = 1.75f, "allowed_length"_a = 2, "range"_a = 0, "max_ngram"_a = 64,
+      "max_occurrences"_a = 64, "early_exit_match_len"_a = 64, "temperature"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DRY repetition penalty: penalize tokens extending repeated suffixes by
+         multiplier*base^(match_len+1-allowed_length). breakers (NB,) int32, pad -1.)");
 
     m.def(
       "silu_mul_quant_fp8", &silu_mul_quant_fp8,

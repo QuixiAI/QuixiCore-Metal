@@ -791,6 +791,111 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+
+def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
+    """Quadratic / smoothing sampling transform: diff = l - max; diff -= diff^2(s*diff - k)
+    with k = factor(3-curve)/2, s = factor(curve-1)/2; factor 0 = identity. Writes tempered
+    logits. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().quadratic_transform(logits, factor, curve, temperature)
+    return _mlx().quadratic_transform(logits, float(factor), float(curve), float(temperature))
+
+
+def top_nsigma_mask(logits, nsigma, temperature=1.0):
+    """Top-nsigma sampling: mask logits below max - nsigma * stddev (finite logits assumed —
+    compose BEFORE other -inf masks). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().top_nsigma_mask(logits, nsigma, temperature)
+    return _mlx().top_nsigma_mask(logits, float(nsigma), float(temperature))
+
+
+def top_a_mask(logits, top_a, temperature=1.0):
+    """Top-A sampling: mask tokens with prob < top_a * pmax^2 (computed in log space, no
+    softmax materialization; the argmax always survives). Accepts mlx/torch (MPS)."""
+    if _is_torch(logits):
+        return _torch().top_a_mask(logits, top_a, temperature)
+    return _mlx().top_a_mask(logits, float(top_a), float(temperature))
+
+
+def epsilon_cutoff_mask(logits, epsilon, temperature=1.0):
+    """Epsilon cutoff: mask tokens with prob < epsilon; the argmax (and exact ties) always
+    survive. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().epsilon_cutoff_mask(logits, epsilon, temperature)
+    return _mlx().epsilon_cutoff_mask(logits, float(epsilon), float(temperature))
+
+
+def eta_cutoff_mask(logits, eta, temperature=1.0):
+    """Eta sampling: mask tokens with prob < min(eta, sqrt(eta) * exp(-entropy)).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().eta_cutoff_mask(logits, eta, temperature)
+    return _mlx().eta_cutoff_mask(logits, float(eta), float(temperature))
+
+
+def xtc_mask(logits, threshold, probability, seed=0, temperature=1.0):
+    """XTC (exclude top choices): with an on-device per-row coin < probability, remove every
+    token with prob >= threshold EXCEPT the least likely such token (keeps output diverse
+    without touching the tail). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().xtc_mask(logits, threshold, probability, seed, temperature)
+    return _mlx().xtc_mask(logits, float(threshold), float(probability), int(seed),
+                           float(temperature))
+
+
+def skew_transform(probs, skew):
+    """Skew sampling over PROBS: out_i = pow(cdf_i, exp(skew)) - pow(cdf_{i-1}, exp(skew)) on
+    the index-order CDF (metal-forge contract; diverges from exllamav2's sorted-CDF skew,
+    which needs a sort — deferred). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(probs):
+        return _torch().skew_transform(probs, skew)
+    return _mlx().skew_transform(probs, float(skew))
+
+
+def top_k_renorm(probs, k):
+    """Keep the top-k probabilities (ties -> smaller id), renormalize to sum 1, zero the rest
+    (spec-decode distribution utility; k <= 64). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(probs):
+        return _torch().top_k_renorm(probs, k)
+    return _mlx().top_k_renorm(probs, int(k))
+
+
+def top_p_renorm(probs, p):
+    """Keep the smallest set of probabilities with mass >= p (32-iter threshold bisection —
+    no sort), renormalize to 1, zero the rest. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(probs):
+        return _torch().top_p_renorm(probs, p)
+    return _mlx().top_p_renorm(probs, float(p))
+
+
+def no_repeat_ngram_mask(logits, prev_tokens, lens, ngram_size, temperature=1.0):
+    """Ban every token that would complete an already-seen ngram_size-gram of the history
+    (prev_tokens (rows, L) int32 + lens (rows,)); n >= 2. Accepts mlx/torch (MPS)."""
+    if _is_torch(logits):
+        return _torch().no_repeat_ngram_mask(logits, prev_tokens, lens, ngram_size, temperature)
+    return _mlx().no_repeat_ngram_mask(logits, prev_tokens, lens, int(ngram_size),
+                                       float(temperature))
+
+
+def dry_penalty(logits, prev_tokens, lens, breakers, multiplier, base=1.75,
+                allowed_length=2, range=0, max_ngram=64, max_occurrences=64,
+                early_exit_match_len=64, temperature=1.0):
+    """DRY ("don't repeat yourself") penalty: for each earlier occurrence of the last token
+    whose preceding context matches the current suffix (length match_len, reset by
+    sequence breakers), penalize the token that followed it by
+    multiplier * base^(match_len+1 - allowed_length), min'd into the logit. breakers is a
+    single (NB,) int32 list (pad -1), shared across rows (TM scalar-param convention).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().dry_penalty(logits, prev_tokens, lens, breakers, multiplier, base,
+                                    allowed_length, range, max_ngram, max_occurrences,
+                                    early_exit_match_len, temperature)
+    return _mlx().dry_penalty(logits, prev_tokens, lens, breakers, float(multiplier),
+                              float(base), int(allowed_length), int(range), int(max_ngram),
+                              int(max_occurrences), int(early_exit_match_len),
+                              float(temperature))
+
+
 def rms_norm_add_int8(x, residual, weight, eps=1e-5):
     """Fused residual-add + RMSNorm + dynamic per-row int8 (the W8A8 residual-stream epilogue;
     int8 sibling of rms_norm_add_fp8 dynamic). Returns (codes i8, x+residual, scale (rows,)).

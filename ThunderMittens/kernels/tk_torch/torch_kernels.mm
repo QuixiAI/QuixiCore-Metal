@@ -1841,6 +1841,112 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// sampler-zoo logit/prob transforms (one simdgroup per row; see sampling_transforms.metal).
+static void st_shape(const at::Tensor& x, int& rows, int& V, const char* name) {
+  TORCH_CHECK(x.device().is_mps() && x.dim() == 2 && tk_is_float_dtype(x),
+              std::string(name) + ": input must be a float (rows, V) MPS tensor");
+  rows = x.size(0); V = x.size(1);
+}
+static float st_invtemp(double t) { return 1.0f / std::max((float)t, 1e-6f); }
+
+static at::Tensor quadratic_transform_mps(const at::Tensor& x_in, double factor, double curve,
+                                          double temperature) {
+  int rows, V; st_shape(x_in, rows, V, "quadratic_transform");
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quadratic_transform(e, x, out, rows, V, (float)factor, (float)curve,
+                                   st_invtemp(temperature), tk_type_name(x));
+  });
+  return out;
+}
+static at::Tensor logit_mask1_mps(const char* kernel, const at::Tensor& x_in, double p0,
+                                  double temperature) {
+  int rows, V; st_shape(x_in, rows, V, kernel);
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  const std::string k = std::string(kernel) + "_" + tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_logit_mask1(e, k, x, out, rows, V, (float)p0, st_invtemp(temperature));
+  });
+  return out;
+}
+static at::Tensor top_nsigma_mask_mps(const at::Tensor& x, double p, double t) {
+  return logit_mask1_mps("top_nsigma_mask", x, p, t); }
+static at::Tensor top_a_mask_mps(const at::Tensor& x, double p, double t) {
+  return logit_mask1_mps("top_a_mask", x, p, t); }
+static at::Tensor epsilon_cutoff_mask_mps(const at::Tensor& x, double p, double t) {
+  return logit_mask1_mps("epsilon_cutoff_mask", x, p, t); }
+static at::Tensor eta_cutoff_mask_mps(const at::Tensor& x, double p, double t) {
+  return logit_mask1_mps("eta_cutoff_mask", x, p, t); }
+static at::Tensor xtc_mask_mps(const at::Tensor& x_in, double threshold, double probability,
+                               int64_t seed, double temperature) {
+  int rows, V; st_shape(x_in, rows, V, "xtc_mask");
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_xtc_mask(e, x, out, rows, V, (float)threshold, (float)probability,
+                        st_invtemp(temperature), (uint32_t)seed, tk_type_name(x));
+  });
+  return out;
+}
+static at::Tensor skew_transform_mps(const at::Tensor& x_in, double skew) {
+  int rows, V; st_shape(x_in, rows, V, "skew_transform");
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  const std::string k = "skew_transform_" + tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_prob_transform1(e, k, x, out, rows, V, (float)skew);
+  });
+  return out;
+}
+static at::Tensor top_k_renorm_mps(const at::Tensor& x_in, int64_t k) {
+  int rows, V; st_shape(x_in, rows, V, "top_k_renorm");
+  TORCH_CHECK(k > 0 && k <= 64, "top_k_renorm: 1 <= k <= 64");
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_top_k_renorm(e, x, out, rows, V, (int)k, tk_type_name(x));
+  });
+  return out;
+}
+static at::Tensor top_p_renorm_mps(const at::Tensor& x_in, double p) {
+  int rows, V; st_shape(x_in, rows, V, "top_p_renorm");
+  auto x = x_in.contiguous(); auto out = at::empty_like(x);
+  const std::string k = "top_p_renorm_probs_" + tk_type_name(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_prob_transform1(e, k, x, out, rows, V, (float)p);
+  });
+  return out;
+}
+static at::Tensor no_repeat_ngram_mask_mps(const at::Tensor& x_in, const at::Tensor& prev_in,
+                                           const at::Tensor& lens_in, int64_t ngram,
+                                           double temperature) {
+  int rows, V; st_shape(x_in, rows, V, "no_repeat_ngram_mask");
+  TORCH_CHECK(ngram >= 2, "no_repeat_ngram_mask: ngram_size >= 2");
+  auto x = x_in.contiguous();
+  auto prev = prev_in.to(at::kInt).contiguous(), lens = lens_in.to(at::kInt).contiguous();
+  auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_no_repeat_ngram_mask(e, x, prev, lens, out, rows, V, (int)prev.size(1),
+                                    (int)ngram, st_invtemp(temperature), tk_type_name(x));
+  });
+  return out;
+}
+static at::Tensor dry_penalty_mps(const at::Tensor& x_in, const at::Tensor& prev_in,
+                                  const at::Tensor& lens_in, const at::Tensor& breakers_in,
+                                  double multiplier, double base, int64_t allowed,
+                                  int64_t range, int64_t max_ngram, int64_t max_occ,
+                                  int64_t early_exit, double temperature) {
+  int rows, V; st_shape(x_in, rows, V, "dry_penalty");
+  auto x = x_in.contiguous();
+  auto prev = prev_in.to(at::kInt).contiguous(), lens = lens_in.to(at::kInt).contiguous();
+  auto brk = breakers_in.to(at::kInt).contiguous();
+  auto out = at::empty_like(x);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_dry_penalty(e, x, prev, lens, brk, out, rows, V, (int)prev.size(1),
+                           (int)brk.size(0), (float)multiplier, (float)base, (int)allowed,
+                           (int)range, (int)max_ngram, (int)max_occ, (int)early_exit,
+                           st_invtemp(temperature), tk_type_name(x));
+  });
+  return out;
+}
+
 // per-group / azp activation quantizers + azp-corrected W8A8 GEMM.
 static std::tuple<at::Tensor, at::Tensor> quantize_per_group_fp8_mps(
     const at::Tensor& x_in, int64_t group_size, bool ue8m0) {
@@ -3483,6 +3589,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("quadratic_transform", &quadratic_transform_mps, "quadratic logit transform (MPS)");
+  m.def("top_nsigma_mask", &top_nsigma_mask_mps, "top-nsigma mask (MPS)");
+  m.def("top_a_mask", &top_a_mask_mps, "top-A mask (MPS)");
+  m.def("epsilon_cutoff_mask", &epsilon_cutoff_mask_mps, "epsilon-cutoff mask (MPS)");
+  m.def("eta_cutoff_mask", &eta_cutoff_mask_mps, "eta-cutoff mask (MPS)");
+  m.def("xtc_mask", &xtc_mask_mps, "XTC mask (MPS)");
+  m.def("skew_transform", &skew_transform_mps, "skew prob transform (MPS)");
+  m.def("top_k_renorm", &top_k_renorm_mps, "top-k renormalized probs (MPS)");
+  m.def("top_p_renorm", &top_p_renorm_mps, "top-p renormalized probs (MPS)");
+  m.def("no_repeat_ngram_mask", &no_repeat_ngram_mask_mps, "no-repeat-ngram mask (MPS)");
+  m.def("dry_penalty", &dry_penalty_mps, "DRY repetition penalty (MPS)");
   m.def("rms_norm_add_int8_dyn", &rms_norm_add_int8_dyn_mps,
         "fused add + rms_norm + dynamic per-row int8 (MPS)");
   m.def("silu_mul_quant_fp8", &silu_mul_quant_fp8_mps,

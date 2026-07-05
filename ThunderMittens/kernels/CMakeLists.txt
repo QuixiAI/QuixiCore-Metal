@@ -54,6 +54,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/paged_attn_v2/paged_attn_v2.cpp
     ${CMAKE_CURRENT_LIST_DIR}/quant_rt/quant_rt.cpp
     ${CMAKE_CURRENT_LIST_DIR}/sampling/sampling.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/sampling/transforms.cpp
     ${CMAKE_CURRENT_LIST_DIR}/moe/moe.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.cpp
     ${CMAKE_CURRENT_LIST_DIR}/attn_varlen/attn_varlen.cpp
@@ -122,6 +123,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/paged_attn_v2/paged_attn_v2.metal
         ${CMAKE_CURRENT_LIST_DIR}/quant_rt/quant_rt.metal
         ${CMAKE_CURRENT_LIST_DIR}/sampling/sampling.metal
+        ${CMAKE_CURRENT_LIST_DIR}/sampling/sampling_transforms.metal
         ${CMAKE_CURRENT_LIST_DIR}/moe/moe.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_causal/attn_causal.metal
         ${CMAKE_CURRENT_LIST_DIR}/attn_varlen/attn_varlen.metal

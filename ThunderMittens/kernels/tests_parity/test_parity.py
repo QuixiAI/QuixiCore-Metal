@@ -676,6 +676,33 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_sampler_transforms_parity():
+    rng = np.random.default_rng(61)
+    # margin-safe grid logits: no token within float-epsilon of a threshold
+    x = (np.round(rng.standard_normal((8, 300)) * 3 * 64) / 64).astype(np.float32)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    for fn, args in [(tk.quadratic_transform, (0.3, 1.5)), (tk.top_nsigma_mask, (1.5,)),
+                     (tk.top_a_mask, (0.2,)), (tk.epsilon_cutoff_mask, (3e-3,)),
+                     (tk.eta_cutoff_mask, (2e-3,))]:
+        # last-ulp fast-math reassociation differs between the two metallib compilers on
+        # O(10) logit values; a masked-set flip would show as ~1e30, not 1e-4
+        _assert_parity(fn(mx.array(x), *args), fn(t(x), *args), atol=1e-4)
+    _assert_parity(tk.xtc_mask(mx.array(x), 0.1, 1.0, seed=7),
+                   tk.xtc_mask(t(x), 0.1, 1.0, seed=7), atol=1e-4)
+    p = rng.random((8, 300)).astype(np.float32)
+    p /= p.sum(1, keepdims=True)
+    _assert_parity(tk.skew_transform(mx.array(p), 0.7), tk.skew_transform(t(p), 0.7), atol=1e-6)
+    _assert_parity(tk.top_k_renorm(mx.array(p), 12), tk.top_k_renorm(t(p), 12), atol=1e-6)
+    _assert_parity(tk.top_p_renorm(mx.array(p), 0.8), tk.top_p_renorm(t(p), 0.8), atol=1e-6)
+    prev = rng.integers(0, 12, (8, 40)).astype(np.int32)
+    lens = rng.integers(6, 41, 8).astype(np.int32)
+    brk = np.array([3, -1], np.int32)
+    _assert_parity(tk.no_repeat_ngram_mask(mx.array(x), mx.array(prev), mx.array(lens), 3),
+                   tk.no_repeat_ngram_mask(t(x), t(prev), t(lens), 3), atol=1e-6)
+    _assert_parity(tk.dry_penalty(mx.array(x), mx.array(prev), mx.array(lens), mx.array(brk), 1.2),
+                   tk.dry_penalty(t(x), t(prev), t(lens), t(brk), 1.2), atol=1e-5)
+
+
 def test_act_quant_parity():
     rng = np.random.default_rng(60)
     x = rng.standard_normal((16, 512)).astype(np.float32)

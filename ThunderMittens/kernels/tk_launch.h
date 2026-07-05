@@ -2229,6 +2229,73 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// ----- sampler-zoo transforms (sampling_transforms.metal): one simdgroup per row;
+//        x@0 -> out@1 ; V@2 ; kind-specific scalars follow. grid (rows,1,1), 32 thr. -----
+template <class E>
+void launch_quadratic_transform(E& e, typename E::in_t x, typename E::out_t out, int rows,
+                                int V, float factor, float curve, float invtemp,
+                                const std::string& tn) {
+  e.pipeline("quadratic_transform_" + tn);
+  e.in(x, 0); e.out(out, 1); e.bytes(V, 2);
+  e.bytes(factor, 3); e.bytes(curve, 4); e.bytes(invtemp, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+// shared shape for nsigma / top_a / epsilon / eta: one float param + invtemp
+template <class E>
+void launch_logit_mask1(E& e, const std::string& kernel, typename E::in_t x,
+                        typename E::out_t out, int rows, int V, float p0, float invtemp) {
+  e.pipeline(kernel);
+  e.in(x, 0); e.out(out, 1); e.bytes(V, 2); e.bytes(p0, 3); e.bytes(invtemp, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_xtc_mask(E& e, typename E::in_t x, typename E::out_t out, int rows, int V,
+                     float threshold, float probability, float invtemp, uint32_t seed,
+                     const std::string& tn) {
+  e.pipeline("xtc_mask_" + tn);
+  e.in(x, 0); e.out(out, 1); e.bytes(V, 2);
+  e.bytes(threshold, 3); e.bytes(probability, 4); e.bytes(invtemp, 5); e.bytes(seed, 6);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+// shared shape for skew / top_p_renorm: one float param, probs domain
+template <class E>
+void launch_prob_transform1(E& e, const std::string& kernel, typename E::in_t x,
+                            typename E::out_t out, int rows, int V, float p0) {
+  e.pipeline(kernel);
+  e.in(x, 0); e.out(out, 1); e.bytes(V, 2); e.bytes(p0, 3);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_top_k_renorm(E& e, typename E::in_t x, typename E::out_t out, int rows, int V,
+                         int K, const std::string& tn) {
+  e.pipeline("top_k_renorm_probs_" + tn);
+  e.in(x, 0); e.out(out, 1); e.bytes(V, 2); e.bytes(K, 3);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_no_repeat_ngram_mask(E& e, typename E::in_t x, typename E::in_t prev,
+                                 typename E::in_t lens, typename E::out_t out, int rows,
+                                 int V, int L, int ngram, float invtemp,
+                                 const std::string& tn) {
+  e.pipeline("no_repeat_ngram_mask_" + tn);
+  e.in(x, 0); e.in(prev, 1); e.in(lens, 2); e.out(out, 3);
+  e.bytes(V, 4); e.bytes(L, 5); e.bytes(ngram, 6); e.bytes(invtemp, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_dry_penalty(E& e, typename E::in_t x, typename E::in_t prev, typename E::in_t lens,
+                        typename E::in_t breakers, typename E::out_t out, int rows, int V,
+                        int L, int NB, float multiplier, float base, int allowed, int range,
+                        int max_ngram, int max_occ, int early_exit, float invtemp,
+                        const std::string& tn) {
+  e.pipeline("dry_penalty_" + tn);
+  e.in(x, 0); e.in(prev, 1); e.in(lens, 2); e.in(breakers, 3); e.out(out, 4);
+  e.bytes(V, 5); e.bytes(L, 6); e.bytes(NB, 7);
+  e.bytes(multiplier, 8); e.bytes(base, 9); e.bytes(allowed, 10); e.bytes(range, 11);
+  e.bytes(max_ngram, 12); e.bytes(max_occ, 13); e.bytes(early_exit, 14); e.bytes(invtemp, 15);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
 // ----- fused act->quant epilogues (act_quant): x@0(activated) gate@1 -> codes@2 scale@3 ;
 //        one simdgroup per row; mode 0 swiglu / 1 swiglu_oai (alpha, limit). -----
 template <class E>

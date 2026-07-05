@@ -1342,6 +1342,33 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("logit_transforms")
+def logit_transform_cases(be, preset, formats):
+    """Sampler-zoo transforms: bandwidth-bound (T,V) passes; ms + GB/s (2*T*V*4)."""
+    tk = be.tk()
+    rng = np.random.default_rng(35)
+    shapes = _pick(preset, [(256, 32000)], [(256, 32000), (1024, 32000)],
+                   [(256, 128256), (1024, 128256), (2048, 128256)])
+    for T, V in shapes:
+        x = rng.standard_normal((T, V)).astype(np.float32)
+        x_d = be.array(x, "f32")
+        prev = rng.integers(0, 512, (T, 256)).astype(np.int32)
+        lens = np.full(T, 256, np.int32)
+        brk = np.array([-1], np.int32)
+        prev_d, lens_d, brk_d = be.int_array(prev), be.int_array(lens), be.int_array(brk)
+        for name, thunk in [
+            ("quadratic", lambda x_d=x_d: tk.quadratic_transform(x_d, 0.3, 1.5)),
+            ("nsigma", lambda x_d=x_d: tk.top_nsigma_mask(x_d, 1.5)),
+            ("top_a", lambda x_d=x_d: tk.top_a_mask(x_d, 0.2)),
+            ("eta", lambda x_d=x_d: tk.eta_cutoff_mask(x_d, 2e-3)),
+            ("xtc", lambda x_d=x_d: tk.xtc_mask(x_d, 0.1, 1.0, seed=7)),
+            ("dry_L256", lambda x_d=x_d, p=prev_d, l=lens_d, b=brk_d:
+                 tk.dry_penalty(x_d, p, l, b, 1.2)),
+        ]:
+            yield Case("logit_transforms", f"{name}_T{T}_V{V}", {"T": T, "V": V}, "f32",
+                       target=thunk, baselines={}, ref=None, bytes_moved=2.0 * T * V * 4)
+
+
 @register("act_quant")
 def act_quant_cases(be, preset, formats):
     """Fused gated-activation -> quant vs the unfused glu -> quantize_per_token chain

@@ -45,6 +45,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "paged_attn_v2", "paged_attn_v2.metal"),
     os.path.join(_KERNELS, "quant_rt", "quant_rt.metal"),
     os.path.join(_KERNELS, "sampling", "sampling.metal"),
+    os.path.join(_KERNELS, "sampling", "sampling_transforms.metal"),
     os.path.join(_KERNELS, "moe", "moe.metal"),
     os.path.join(_KERNELS, "attn_causal", "attn_causal.metal"),
     os.path.join(_KERNELS, "attn_varlen", "attn_varlen.metal"),
@@ -604,6 +605,69 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
+
+
+
+def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
+    """Quadratic/smoothing logit transform (factor 0 = identity). MPS."""
+    return _ext.quadratic_transform(logits, float(factor), float(curve), float(temperature))
+
+
+def top_nsigma_mask(logits, nsigma, temperature=1.0):
+    """Top-nsigma: mask logits below max - nsigma*std. MPS."""
+    return _ext.top_nsigma_mask(logits, float(nsigma), float(temperature))
+
+
+def top_a_mask(logits, top_a, temperature=1.0):
+    """Top-A: mask probs below top_a * pmax^2. MPS."""
+    return _ext.top_a_mask(logits, float(top_a), float(temperature))
+
+
+def epsilon_cutoff_mask(logits, epsilon, temperature=1.0):
+    """Epsilon cutoff: mask probs below epsilon (argmax survives). MPS."""
+    return _ext.epsilon_cutoff_mask(logits, float(epsilon), float(temperature))
+
+
+def eta_cutoff_mask(logits, eta, temperature=1.0):
+    """Eta sampling: mask probs below min(eta, sqrt(eta)*exp(-entropy)). MPS."""
+    return _ext.eta_cutoff_mask(logits, float(eta), float(temperature))
+
+
+def xtc_mask(logits, threshold, probability, seed=0, temperature=1.0):
+    """XTC: with on-device coin, remove probs >= threshold except the least likely. MPS."""
+    return _ext.xtc_mask(logits, float(threshold), float(probability), int(seed),
+                         float(temperature))
+
+
+def skew_transform(probs, skew):
+    """Skew: pow(index-order CDF, exp(skew)) over probability rows. MPS."""
+    return _ext.skew_transform(probs, float(skew))
+
+
+def top_k_renorm(probs, k):
+    """Keep top-k probs, renormalize, zero elsewhere (k <= 64). MPS."""
+    return _ext.top_k_renorm(probs, int(k))
+
+
+def top_p_renorm(probs, p):
+    """Keep the top-p mass (bisection, no sort), renormalize. MPS."""
+    return _ext.top_p_renorm(probs, float(p))
+
+
+def no_repeat_ngram_mask(logits, prev_tokens, lens, ngram_size, temperature=1.0):
+    """Ban tokens completing an already-seen ngram (n >= 2). MPS."""
+    return _ext.no_repeat_ngram_mask(logits, prev_tokens, lens, int(ngram_size),
+                                     float(temperature))
+
+
+def dry_penalty(logits, prev_tokens, lens, breakers, multiplier, base=1.75,
+                allowed_length=2, range=0, max_ngram=64, max_occurrences=64,
+                early_exit_match_len=64, temperature=1.0):
+    """DRY repetition penalty (breakers (NB,) int32, pad -1). MPS."""
+    return _ext.dry_penalty(logits, prev_tokens, lens, breakers, float(multiplier),
+                            float(base), int(allowed_length), int(range), int(max_ngram),
+                            int(max_occurrences), int(early_exit_match_len),
+                            float(temperature))
 
 
 def rms_norm_add_int8(x, residual, weight, eps=1e-5):

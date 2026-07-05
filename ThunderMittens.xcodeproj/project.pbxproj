@@ -160,6 +160,7 @@
 				kernels/kv_cache/kv_cache.cpp,
 				kernels/quant_rt/quant_rt.cpp,
 				kernels/sampling/sampling.cpp,
+				kernels/sampling/transforms.cpp,
 				kernels/moe/moe.cpp,
 				kernels/rotary/rotary.cpp,
 				kernels/softmax/softmax.cpp,
