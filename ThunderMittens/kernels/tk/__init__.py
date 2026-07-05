@@ -1908,6 +1908,62 @@ def sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids, target_probs, 
                                           inv_q, draft_probs=draft_probs)
 
 
+def eagle_prepare_inputs_padded(cu_num_draft_tokens, valid_sampled_tokens_count,
+                               query_start_loc):
+    """EAGLE draft-input prep: from the ragged draft counts + how many were sampled valid,
+    compute rejected = num_draft>0 ? num_draft+1-valid_count : 0, token_indices_to_sample =
+    query_start_loc[r+1]-1 - rejected, and num_rejected. Returns (token_indices_to_sample (B,),
+    num_rejected (B,)) int32. cu/query_start_loc (B+1,). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(cu_num_draft_tokens):
+        return tuple(_torch().eagle_prepare_inputs_padded(cu_num_draft_tokens,
+                                                          valid_sampled_tokens_count, query_start_loc))
+    out = _mlx().eagle_prepare_inputs_padded(cu_num_draft_tokens, valid_sampled_tokens_count,
+                                             query_start_loc)
+    return out[0], out[1]
+
+
+def eagle_prepare_next_token_padded(sampled_token_ids, discard_request_mask,
+                                    backup_next_token_ids, vocab_size):
+    """EAGLE next-seed token: per request, the last valid sampled token (!= -1 and < vocab),
+    or backup if none / discarded. sampled_token_ids (B, num_sampled). Returns
+    (next_token_ids (B,), valid_sampled_tokens_count (B,)) int32. Accepts mlx/torch (MPS)."""
+    if _is_torch(sampled_token_ids):
+        return tuple(_torch().eagle_prepare_next_token_padded(sampled_token_ids,
+                                                             discard_request_mask,
+                                                             backup_next_token_ids, int(vocab_size)))
+    out = _mlx().eagle_prepare_next_token_padded(sampled_token_ids, discard_request_mask,
+                                                 backup_next_token_ids, int(vocab_size))
+    return out[0], out[1]
+
+
+def eagle_step_slot_mapping_metadata(positions, block_table, seq_lens, block_size, max_model_len,
+                                     pad_id, input_batch_size=-1):
+    """EAGLE step: build the paged-KV write slot for the next draft position — new_pos =
+    min(pos+1, max_model_len); block-table lookup -> slot; advance seq_lens; requests beyond the
+    real batch pad with pad_id. positions/block_table/seq_lens (B, ...). Returns
+    (out_clamped_positions (ib,), out_slot_mapping (ib,), new_seq_lens (B,)) int32. Accepts
+    mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(positions):
+        return tuple(_torch().eagle_step_slot_mapping_metadata(positions, block_table, seq_lens,
+                                                              int(block_size), int(max_model_len),
+                                                              int(pad_id), int(input_batch_size)))
+    out = _mlx().eagle_step_slot_mapping_metadata(positions, block_table, seq_lens, int(block_size),
+                                                  int(max_model_len), int(pad_id),
+                                                  int(input_batch_size))
+    return out[0], out[1], out[2]
+
+
+def eagle_expand_int32(input, cu_num_tokens, total, replace_from=-1, replace_to=-1):
+    """EAGLE broadcast: expand the per-request scalar input[r] across its ragged token span
+    [cu[r], cu[r+1]) with a replace_from -> replace_to substitution. Returns (total,) int32.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(input):
+        return _torch().eagle_expand_int32(input, cu_num_tokens, int(total), int(replace_from),
+                                           int(replace_to))
+    return _mlx().eagle_expand_int32(input, cu_num_tokens, int(total), int(replace_from),
+                                     int(replace_to))
+
+
 def spec_update_kv_meta(seq_lens, accepted_cnt):
     """Post-verify KV length: new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32.
     Accepts mlx.array or torch.Tensor (MPS)."""

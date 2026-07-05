@@ -2810,6 +2810,56 @@ static at::Tensor sample_recovered_tokens_mps(
   return out;
 }
 
+// EAGLE input-prep metadata builders (int32, per request).
+static std::vector<at::Tensor> eagle_prepare_inputs_padded_mps(
+    const at::Tensor& cu_in, const at::Tensor& vc_in, const at::Tensor& qsl_in) {
+  const int B = cu_in.size(0) - 1;
+  auto cu = cu_in.to(at::kInt).contiguous(), vc = vc_in.to(at::kInt).contiguous();
+  auto qsl = qsl_in.to(at::kInt).contiguous();
+  auto ti = at::empty({B}, cu.options()), nr = at::empty({B}, cu.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_eagle_prepare_inputs_padded(e, cu, vc, qsl, ti, nr, B);
+  });
+  return {ti, nr};
+}
+static std::vector<at::Tensor> eagle_prepare_next_token_padded_mps(
+    const at::Tensor& si_in, const at::Tensor& dm_in, const at::Tensor& bk_in, int64_t vocab) {
+  const int B = si_in.size(0), ns = si_in.size(1);
+  auto si = si_in.to(at::kInt).contiguous(), dm = dm_in.to(at::kByte).contiguous();
+  auto bk = bk_in.to(at::kInt).contiguous();
+  auto nt = at::empty({B}, si.options()), vc = at::empty({B}, si.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_eagle_prepare_next_token_padded(e, si, dm, bk, nt, vc, (int)vocab, ns, B);
+  });
+  return {nt, vc};
+}
+static std::vector<at::Tensor> eagle_step_slot_mapping_metadata_mps(
+    const at::Tensor& pos_in, const at::Tensor& bt_in, const at::Tensor& sl_in,
+    int64_t block_size, int64_t max_model_len, int64_t pad_id, int64_t input_batch_size) {
+  const int B = pos_in.size(0), stride = bt_in.size(1);
+  const int ib = input_batch_size < 0 ? B : (int)input_batch_size;
+  auto pos = pos_in.to(at::kInt).contiguous(), bt = bt_in.to(at::kInt).contiguous();
+  auto sl = sl_in.to(at::kInt).contiguous();
+  auto cp = at::empty({ib}, pos.options()), sm = at::empty({ib}, pos.options());
+  auto nsl = at::empty({B}, pos.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_eagle_step_slot_mapping_metadata(e, pos, bt, sl, cp, sm, nsl, (int)block_size,
+                                                (int)max_model_len, (int)pad_id, B, ib, stride,
+                                                stride);
+  });
+  return {cp, sm, nsl};
+}
+static at::Tensor eagle_expand_int32_mps(const at::Tensor& in_in, const at::Tensor& cu_in,
+                                         int64_t total, int64_t rf, int64_t rt) {
+  const int B = cu_in.size(0) - 1;
+  auto in = in_in.to(at::kInt).contiguous(), cu = cu_in.to(at::kInt).contiguous();
+  auto out = at::empty({total}, cu.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_eagle_expand_int32(e, out, in, cu, (int)rf, (int)rt, B);
+  });
+  return out;
+}
+
 static std::vector<at::Tensor> build_dynamic_tree_mps(const at::Tensor& parents_in) {
   TORCH_CHECK(parents_in.device().is_mps() && parents_in.dim() == 2,
               "build_dynamic_tree: parents must be (B, N) MPS");
@@ -4125,6 +4175,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("cu_num_draft_tokens"), pybind11::arg("draft_token_ids"),
         pybind11::arg("target_probs"), pybind11::arg("inv_q"),
         pybind11::arg("draft_probs") = c10::nullopt);
+  m.def("eagle_prepare_inputs_padded", &eagle_prepare_inputs_padded_mps, "EAGLE prep inputs (MPS)");
+  m.def("eagle_prepare_next_token_padded", &eagle_prepare_next_token_padded_mps,
+        "EAGLE next seed token (MPS)");
+  m.def("eagle_step_slot_mapping_metadata", &eagle_step_slot_mapping_metadata_mps,
+        "EAGLE step slot mapping (MPS)");
+  m.def("eagle_expand_int32", &eagle_expand_int32_mps, "EAGLE ragged broadcast (MPS)");
   m.def("build_dynamic_tree", &build_dynamic_tree_mps, "ThunderMittens device draft-tree pointers (MPS)");
   m.def("spec_update_kv_meta", &spec_update_kv_meta_mps, "ThunderMittens spec KV meta update (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,

@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-10 K5: EAGLE spec-decode input-prep builders (2026-07-05)
+
+Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with
+EAGLE's draft-input plumbing (zero prior TM coverage): eagle_prepare_inputs_padded (rejected =
+num_draft>0 ? num_draft+1-valid : 0; token_indices_to_sample, num_rejected),
+eagle_prepare_next_token_padded (next seed = last valid sampled or backup),
+eagle_step_slot_mapping_metadata (new_pos = min(pos+1, max_len); block-table -> paged slot;
+advance seq_lens; pad beyond the real batch), eagle_expand_int32 (broadcast a per-request scalar
+across its ragged token span with a replace substitution). Integer, one thread/request; TM int32;
+cu_* (B+1,) leading-0. One EagleMeta primitive (kind selector). Completes TM's spec-decode
+surface (verify + rejection + EAGLE prep).
+
+- Tests: each builder vs a direct python transcription (exact int32, incl. padded input_batch
+  and exceed-max-len paths); 5 green + parity atol=0. Overhead-bound integer kernels — no bench.
+- Deferred (documented): copy_and_expand_eagle_inputs (the full padded-batch layout builder) —
+  the four builders above cover the metadata a draft step needs.
+
+Wave-10 COMPLETE: K1 norm->quant matrix, K2 fp8 KV gather+scale-update, K3 DeepSeek indexer,
+K4 rejection samplers, K5 EAGLE prep. All credited to AlpinDale / metal-forge.
+
 ## Wave-10 K4: vLLM v1 ragged rejection samplers (2026-07-05)
 
 Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with the

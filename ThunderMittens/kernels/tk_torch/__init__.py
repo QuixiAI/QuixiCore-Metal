@@ -398,6 +398,33 @@ def spec_compact(out_tokens, accepted_cnt, seq_lens):
     return tuple(_ext.spec_compact(out_tokens, accepted_cnt, seq_lens))
 
 
+def eagle_prepare_inputs_padded(cu_num_draft_tokens, valid_sampled_tokens_count, query_start_loc):
+    """EAGLE prep -> (token_indices_to_sample, num_rejected) int32. MPS."""
+    return tuple(_ext.eagle_prepare_inputs_padded(cu_num_draft_tokens, valid_sampled_tokens_count,
+                                                  query_start_loc))
+
+
+def eagle_prepare_next_token_padded(sampled_token_ids, discard_request_mask,
+                                    backup_next_token_ids, vocab_size):
+    """EAGLE next seed token -> (next_token_ids, valid_sampled_tokens_count) int32. MPS."""
+    return tuple(_ext.eagle_prepare_next_token_padded(sampled_token_ids, discard_request_mask,
+                                                      backup_next_token_ids, int(vocab_size)))
+
+
+def eagle_step_slot_mapping_metadata(positions, block_table, seq_lens, block_size, max_model_len,
+                                     pad_id, input_batch_size=-1):
+    """EAGLE step slot -> (out_clamped_positions, out_slot_mapping, new_seq_lens) int32. MPS."""
+    return tuple(_ext.eagle_step_slot_mapping_metadata(positions, block_table, seq_lens,
+                                                       int(block_size), int(max_model_len),
+                                                       int(pad_id), int(input_batch_size)))
+
+
+def eagle_expand_int32(input, cu_num_tokens, total, replace_from=-1, replace_to=-1):
+    """EAGLE ragged broadcast -> (total,) int32. MPS."""
+    return _ext.eagle_expand_int32(input, cu_num_tokens, int(total), int(replace_from),
+                                   int(replace_to))
+
+
 def spec_update_kv_meta(seq_lens, accepted_cnt):
     """new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32. MPS."""
     return _ext.spec_update_kv_meta(seq_lens, accepted_cnt)

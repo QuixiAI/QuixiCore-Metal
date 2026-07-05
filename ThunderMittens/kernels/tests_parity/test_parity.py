@@ -1447,6 +1447,38 @@ def test_norm_quant_wave10_parity(shape):
     _assert_parity(sm, st, atol=1e-4)
 
 
+def test_eagle_prep_parity():
+    rng = np.random.default_rng(15)
+    B, S, nblk, bs, ml = 8, 5, 8, 16, 200
+    lens = rng.integers(0, S + 1, B)
+    cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    valid = rng.integers(0, S + 1, B).astype(np.int32)
+    qsl = np.concatenate([[0], np.cumsum(rng.integers(1, S + 2, B))]).astype(np.int32)
+    sampled = rng.integers(-1, 205, (B, 4)).astype(np.int32)
+    discard = (rng.random(B) > 0.7).astype(np.uint8)
+    backup = rng.integers(0, 200, B).astype(np.int32)
+    pos = rng.integers(0, ml + 5, B).astype(np.int32)
+    bt = rng.integers(0, 100, (B, nblk)).astype(np.int32)
+    sl = rng.integers(1, ml, B).astype(np.int32)
+    inp = rng.integers(-1, 50, B).astype(np.int32)
+    total = int(cu[-1])
+    ml_ = lambda a: _mk(a, "mlx")
+    to = lambda a: _mk(a, "torch")
+    tim, nrm = tk.eagle_prepare_inputs_padded(ml_(cu), ml_(valid), ml_(qsl))
+    tit, nrt = tk.eagle_prepare_inputs_padded(to(cu), to(valid), to(qsl))
+    _assert_parity(tim, tit, atol=0); _assert_parity(nrm, nrt, atol=0)
+    ntm, vcm = tk.eagle_prepare_next_token_padded(ml_(sampled), ml_(discard), ml_(backup), 200)
+    ntt, vct = tk.eagle_prepare_next_token_padded(to(sampled), to(discard), to(backup), 200)
+    _assert_parity(ntm, ntt, atol=0); _assert_parity(vcm, vct, atol=0)
+    cpm, smm, nsm = tk.eagle_step_slot_mapping_metadata(ml_(pos), ml_(bt), ml_(sl), bs, ml, -1)
+    cpt, smt, nst = tk.eagle_step_slot_mapping_metadata(to(pos), to(bt), to(sl), bs, ml, -1)
+    _assert_parity(smm, smt, atol=0); _assert_parity(nsm, nst, atol=0)
+    em = tk.eagle_expand_int32(ml_(inp), ml_(cu), total, -1, 99) if total > 0 else None
+    if total > 0:
+        et = tk.eagle_expand_int32(to(inp), to(cu), total, -1, 99)
+        _assert_parity(em, et, atol=0)
+
+
 def test_rejection_samplers_parity():
     rng = np.random.default_rng(14)
     B, V, S = 8, 200, 5

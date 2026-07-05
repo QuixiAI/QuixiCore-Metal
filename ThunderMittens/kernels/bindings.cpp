@@ -959,6 +959,23 @@ NB_MODULE(_ext, m) {
       "draft_probs"_a = nb::none(),
       nb::kw_only(), "stream"_a = nb::none(),
       R"(recovered token per draft position: argmax(max(0,p-q) * inv_q). Returns (total,) int32.)");
+  m.def("eagle_prepare_inputs_padded", &eagle_prepare_inputs_padded,
+      "cu_num_draft_tokens"_a, "valid_sampled_tokens_count"_a, "query_start_loc"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(EAGLE prep: [token_indices_to_sample, num_rejected] int32.)");
+  m.def("eagle_prepare_next_token_padded", &eagle_prepare_next_token_padded,
+      "sampled_token_ids"_a, "discard_request_mask"_a, "backup_next_token_ids"_a, "vocab_size"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(EAGLE next-seed token: [next_token_ids, valid_sampled_tokens_count] int32.)");
+  m.def("eagle_step_slot_mapping_metadata", &eagle_step_slot_mapping_metadata,
+      "positions"_a, "block_table"_a, "seq_lens"_a, "block_size"_a, "max_model_len"_a, "pad_id"_a,
+      "input_batch_size"_a = -1,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(EAGLE step slot: [out_clamped_positions, out_slot_mapping, new_seq_lens] int32.)");
+  m.def("eagle_expand_int32", &eagle_expand_int32,
+      "input"_a, "cu_num_tokens"_a, "total"_a, "replace_from"_a, "replace_to"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(broadcast input[r] across [cu[r],cu[r+1]) with replace_from->replace_to. (total,) int32.)");
 
   m.def(
       "spec_update_kv_meta",

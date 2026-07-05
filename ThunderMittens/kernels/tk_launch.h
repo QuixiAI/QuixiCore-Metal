@@ -778,6 +778,54 @@ void launch_sample_recovered_tokens(E& e, typename E::out_t out, typename E::in_
   e.dispatch(total, 1, 1, 32, 1, 1);
 }
 
+// ----- EAGLE input-prep metadata builders. One thread/request; cu (B+1,). -----
+template <class E>
+void launch_eagle_prepare_inputs_padded(E& e, typename E::in_t cu, typename E::in_t valid_count,
+                                        typename E::in_t query_start_loc,
+                                        typename E::out_t token_indices, typename E::out_t num_rej,
+                                        int num_reqs) {
+  e.pipeline("eagle_prepare_inputs_padded");
+  e.in(cu, 0); e.in(valid_count, 1); e.in(query_start_loc, 2); e.out(token_indices, 3);
+  e.out(num_rej, 4); e.bytes(num_reqs, 5);
+  e.dispatch((num_reqs + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_eagle_prepare_next_token_padded(E& e, typename E::in_t sampled_ids,
+                                            typename E::in_t discard, typename E::in_t backup,
+                                            typename E::out_t next_token_ids,
+                                            typename E::out_t valid_count, int vocab_size,
+                                            int num_sampled, int num_reqs) {
+  e.pipeline("eagle_prepare_next_token_padded");
+  e.in(sampled_ids, 0); e.in(discard, 1); e.in(backup, 2); e.out(next_token_ids, 3);
+  e.out(valid_count, 4); e.bytes(vocab_size, 5); e.bytes(num_sampled, 6); e.bytes(num_reqs, 7);
+  e.dispatch((num_reqs + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_eagle_step_slot_mapping_metadata(E& e, typename E::in_t positions,
+                                             typename E::in_t block_table, typename E::in_t seq_lens,
+                                             typename E::out_t out_clamped_pos,
+                                             typename E::out_t out_slot_mapping,
+                                             typename E::out_t new_seq_lens, int block_size,
+                                             int max_model_len, int pad_id, int batch_size,
+                                             int input_batch_size, int block_table_stride,
+                                             int n_blocks_per_req) {
+  e.pipeline("eagle_step_slot_mapping_metadata");
+  e.in(positions, 0); e.in(block_table, 1); e.in(seq_lens, 2); e.out(out_clamped_pos, 3);
+  e.out(out_slot_mapping, 4); e.out(new_seq_lens, 5); e.bytes(block_size, 6);
+  e.bytes(max_model_len, 7); e.bytes(pad_id, 8); e.bytes(batch_size, 9);
+  e.bytes(input_batch_size, 10); e.bytes(block_table_stride, 11); e.bytes(n_blocks_per_req, 12);
+  e.dispatch((input_batch_size + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_eagle_expand_int32(E& e, typename E::out_t output, typename E::in_t input,
+                               typename E::in_t cu, int replace_from, int replace_to,
+                               int batch_size) {
+  e.pipeline("eagle_expand_int32");
+  e.out(output, 0); e.in(input, 1); e.in(cu, 2); e.bytes(replace_from, 3); e.bytes(replace_to, 4);
+  e.bytes(batch_size, 5);
+  e.dispatch((batch_size + 255) / 256, 1, 1, 256, 1, 1);
+}
+
 // ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
 //        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----
 template <class E>

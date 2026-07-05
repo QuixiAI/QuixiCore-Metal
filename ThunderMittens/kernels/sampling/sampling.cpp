@@ -850,6 +850,89 @@ void RejectionSampler::eval_gpu(const std::vector<array>& inputs, std::vector<ar
 }
 TK_BEAM_NO_AUTODIFF(RejectionSampler, "RejectionSampler")
 
+// ---- EAGLE input-prep metadata builders ----
+std::vector<array> eagle_prepare_inputs_padded(
+    const array& cu, const array& valid_count, const array& query_start_loc, StreamOrDevice s) {
+  const int B = cu.shape(0) - 1;
+  return array::make_arrays(
+      {{B}, {B}}, {int32, int32},
+      std::make_shared<EagleMeta>(to_stream(s), 0, B, 0, 0, 0, 0),
+      {contiguous(astype(cu, int32, s), false, s),
+       contiguous(astype(valid_count, int32, s), false, s),
+       contiguous(astype(query_start_loc, int32, s), false, s)});
+}
+
+std::vector<array> eagle_prepare_next_token_padded(
+    const array& sampled_ids, const array& discard, const array& backup, int vocab_size,
+    StreamOrDevice s) {
+  if (sampled_ids.ndim() != 2) {
+    throw std::invalid_argument("eagle_prepare_next_token_padded: sampled_token_ids (B, ns)");
+  }
+  const int B = sampled_ids.shape(0);
+  const int ns = sampled_ids.shape(1);
+  return array::make_arrays(
+      {{B}, {B}}, {int32, int32},
+      std::make_shared<EagleMeta>(to_stream(s), 1, vocab_size, ns, B, 0, 0),
+      {contiguous(astype(sampled_ids, int32, s), false, s),
+       contiguous(astype(discard, uint8, s), false, s),
+       contiguous(astype(backup, int32, s), false, s)});
+}
+
+std::vector<array> eagle_step_slot_mapping_metadata(
+    const array& positions, const array& block_table, const array& seq_lens, int block_size,
+    int max_model_len, int pad_id, int input_batch_size, StreamOrDevice s) {
+  if (block_table.ndim() != 2) {
+    throw std::invalid_argument("eagle_step_slot_mapping_metadata: block_table (B, n_blocks)");
+  }
+  const int B = positions.shape(0);
+  const int ib = input_batch_size < 0 ? B : input_batch_size;
+  const int stride = block_table.shape(1);
+  return array::make_arrays(
+      {{ib}, {ib}, {B}}, {int32, int32, int32},
+      std::make_shared<EagleMeta>(to_stream(s), 2, block_size, max_model_len, pad_id, B, ib),
+      {contiguous(astype(positions, int32, s), false, s),
+       contiguous(astype(block_table, int32, s), false, s),
+       contiguous(astype(seq_lens, int32, s), false, s)});
+  (void)stride;
+}
+
+array eagle_expand_int32(
+    const array& input, const array& cu, int total, int replace_from, int replace_to,
+    StreamOrDevice s) {
+  const int B = cu.shape(0) - 1;
+  return array(
+      {total}, int32,
+      std::make_shared<EagleMeta>(to_stream(s), 3, replace_from, replace_to, B, 0, 0),
+      {contiguous(astype(input, int32, s), false, s),
+       contiguous(astype(cu, int32, s), false, s)});
+}
+
+void EagleMeta::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("EagleMeta has no CPU implementation.");
+}
+void EagleMeta::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  for (auto& o : outputs) o.set_data(allocator::malloc_or_wait(o.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  if (kind_ == 0) {
+    tk::launch_eagle_prepare_inputs_padded(enc, inputs[0], inputs[1], inputs[2], outputs[0],
+                                           outputs[1], p0_);
+  } else if (kind_ == 1) {
+    tk::launch_eagle_prepare_next_token_padded(enc, inputs[0], inputs[1], inputs[2], outputs[0],
+                                               outputs[1], p0_, p1_, p2_);
+  } else if (kind_ == 2) {
+    const int stride = inputs[1].shape(1);   // block_table (B, n_blocks)
+    tk::launch_eagle_step_slot_mapping_metadata(enc, inputs[0], inputs[1], inputs[2], outputs[0],
+                                                outputs[1], outputs[2], p0_, p1_, p2_, p3_, p4_,
+                                                stride, stride);
+  } else {
+    tk::launch_eagle_expand_int32(enc, outputs[0], inputs[0], inputs[1], p0_, p1_, p2_);
+  }
+}
+TK_BEAM_NO_AUTODIFF(EagleMeta, "EagleMeta")
+
 std::vector<array> spec_compact(
     const array& out_tokens, const array& accepted_cnt, const array& seq_lens,
     StreamOrDevice s /* = {} */) {

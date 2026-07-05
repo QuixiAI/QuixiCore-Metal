@@ -485,6 +485,58 @@ class RejectionSampler : public Primitive {
   int kind_, s1_, no_draft_probs_, has_is_greedy_;
 };
 
+// ---- EAGLE spec-decode input-prep metadata builders (spec_decode.metal). Integer, per request. ----
+
+/** eagle_prepare_inputs_padded: rejected = num_draft>0 ? num_draft+1-valid_count : 0;
+ *  token_indices_to_sample[r] = query_start_loc[r+1]-1 - rejected; num_rejected[r] = rejected.
+ *  Returns [token_indices_to_sample (B,), num_rejected (B,)] int32. cu/qsl are (B+1,). */
+std::vector<array> eagle_prepare_inputs_padded(
+    const array& cu_num_draft_tokens, const array& valid_sampled_tokens_count,
+    const array& query_start_loc, StreamOrDevice s = {});
+
+/** eagle_prepare_next_token_padded: next seed token = last valid sampled (or backup if none /
+ *  discarded). Returns [next_token_ids (B,), valid_sampled_tokens_count (B,)] int32. */
+std::vector<array> eagle_prepare_next_token_padded(
+    const array& sampled_token_ids, const array& discard_request_mask,
+    const array& backup_next_token_ids, int vocab_size, StreamOrDevice s = {});
+
+/** eagle_step_slot_mapping_metadata: build the paged-KV write slot for the next draft step.
+ *  Returns [out_clamped_positions (input_bs,), out_slot_mapping (input_bs,), new_seq_lens (B,)]
+ *  int32. positions/block_table/seq_lens are (B, ...); input_batch_size defaults to B. */
+std::vector<array> eagle_step_slot_mapping_metadata(
+    const array& positions, const array& block_table, const array& seq_lens, int block_size,
+    int max_model_len, int pad_id, int input_batch_size = -1, StreamOrDevice s = {});
+
+/** eagle_expand_int32: broadcast input[r] across [cu[r], cu[r+1]) with replace_from->replace_to.
+ *  Returns output (total,) int32. cu is (B+1,); total is the output length. */
+array eagle_expand_int32(
+    const array& input, const array& cu_num_tokens, int total, int replace_from, int replace_to,
+    StreamOrDevice s = {});
+
+class EagleMeta : public Primitive {
+ public:
+  EagleMeta(Stream stream, int kind, int p0, int p1, int p2, int p3, int p4)
+      : Primitive(stream), kind_(kind), p0_(p0), p1_(p1), p2_(p2), p3_(p3), p4_(p4) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "EagleMeta"; }
+  void print(std::ostream& os) override { os << "EagleMeta[" << kind_ << "]"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const EagleMeta&>(other);
+    return kind_ == o.kind_ && p0_ == o.p0_ && p1_ == o.p1_ && p2_ == o.p2_ && p3_ == o.p3_ &&
+           p4_ == o.p4_;
+  }
+
+ private:
+  int kind_, p0_, p1_, p2_, p3_, p4_;
+};
+
 class BeamTopkPartials : public Primitive {
  public:
   BeamTopkPartials(Stream stream, int two_bm) : Primitive(stream), two_bm_(two_bm) {}

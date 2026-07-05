@@ -823,6 +823,96 @@ kernel void sample_recovered_tokens(device int *out              [[buffer(0)]], 
     if (lane == 0) { out[token] = best_id; }
 }
 
+// ---------------------------------------------------------------------------
+// EAGLE speculative-decode input-prep metadata builders (spec_decode.metal; credit AlpinDale).
+// Integer, one thread per request. cu_* are (B+1,) with a leading 0; all ids/counts int32.
+// ---------------------------------------------------------------------------
+kernel void eagle_prepare_inputs_padded(device const int *cu           [[buffer(0)]],  // (B+1,)
+                                        device const int *valid_count  [[buffer(1)]],  // (B,)
+                                        device const int *query_start_loc [[buffer(2)]],  // (B+1,)
+                                        device int *token_indices_to_sample [[buffer(3)]],  // (B,)
+                                        device int *num_rejected       [[buffer(4)]],  // (B,)
+                                        constant int &num_reqs         [[buffer(5)]],
+                                        uint req [[thread_position_in_grid]]) {
+    if ((int)req >= num_reqs) { return; }
+    const int num_draft = cu[req + 1] - cu[req];
+    const int rejected = num_draft > 0 ? num_draft + 1 - valid_count[req] : 0;
+    const int q_last = query_start_loc[req + 1] - 1;
+    token_indices_to_sample[req] = q_last - rejected;
+    num_rejected[req] = rejected;
+}
+
+// select the next/bonus seed token per request: last valid sampled token (or backup if none /
+// discarded); also emit valid_sampled_tokens_count.
+kernel void eagle_prepare_next_token_padded(device const int *sampled_ids [[buffer(0)]],  // (B, ns)
+                                            device const uchar *discard   [[buffer(1)]],  // (B,)
+                                            device const int *backup      [[buffer(2)]],  // (B,)
+                                            device int *next_token_ids    [[buffer(3)]],  // (B,)
+                                            device int *valid_count       [[buffer(4)]],  // (B,)
+                                            constant int &vocab_size      [[buffer(5)]],
+                                            constant int &num_sampled     [[buffer(6)]],
+                                            constant int &num_reqs        [[buffer(7)]],
+                                            uint req [[thread_position_in_grid]]) {
+    if ((int)req >= num_reqs) { return; }
+    device const int *row = sampled_ids + (long)req * num_sampled;
+    int vc = 0, last = -1;
+    for (int pos = 0; pos < num_sampled; ++pos) {
+        const int tok = row[pos];
+        if (tok != -1 && tok < vocab_size) { vc += 1; last = tok; }
+    }
+    if (discard[req] != 0) {
+        next_token_ids[req] = backup[req];
+        valid_count[req] = 0;
+    } else {
+        next_token_ids[req] = vc > 0 ? last : backup[req];
+        valid_count[req] = vc;
+    }
+}
+
+// build the paged-KV write slot for the next draft step: new_pos = min(pos+1, max_len);
+// block-table lookup -> slot; advance seq_lens; pad requests beyond the real batch with pad_id.
+kernel void eagle_step_slot_mapping_metadata(device const int *positions [[buffer(0)]],  // (B,)
+                                             device const int *block_table [[buffer(1)]],  // (B, nblk)
+                                             device const int *seq_lens  [[buffer(2)]],  // (B,)
+                                             device int *out_clamped_pos [[buffer(3)]],  // (ib,)
+                                             device int *out_slot_mapping [[buffer(4)]],  // (ib,)
+                                             device int *new_seq_lens    [[buffer(5)]],  // (B,)
+                                             constant int &block_size    [[buffer(6)]],
+                                             constant int &max_model_len [[buffer(7)]],
+                                             constant int &pad_id        [[buffer(8)]],
+                                             constant int &batch_size    [[buffer(9)]],
+                                             constant int &input_batch_size [[buffer(10)]],
+                                             constant int &block_table_stride [[buffer(11)]],
+                                             constant int &n_blocks_per_req [[buffer(12)]],
+                                             uint req [[thread_position_in_grid]]) {
+    if ((int)req >= input_batch_size) { return; }
+    if ((int)req >= batch_size) { out_slot_mapping[req] = pad_id; return; }
+    const int new_position = positions[req] + 1;
+    const bool exceeds = new_position >= max_model_len;
+    const int clamped = exceeds ? 0 : new_position;
+    out_clamped_pos[req] = clamped;
+    int block_number = metal::min(clamped / block_size, n_blocks_per_req - 1);
+    const int block_id = block_table[(long)req * block_table_stride + block_number];
+    const int slot = block_id * block_size + (clamped % block_size);
+    out_slot_mapping[req] = exceeds ? pad_id : slot;
+    new_seq_lens[req] = exceeds ? 1 : metal::min(seq_lens[req] + 1, max_model_len);
+}
+
+// broadcast a per-request scalar across its ragged token span [cu[req], cu[req+1]) with a
+// replace_from -> replace_to substitution.
+kernel void eagle_expand_int32(device int *output       [[buffer(0)]],  // (total,)
+                               device const int *input   [[buffer(1)]],  // (B,)
+                               device const int *cu       [[buffer(2)]],  // (B+1,)
+                               constant int &replace_from [[buffer(3)]],
+                               constant int &replace_to   [[buffer(4)]],
+                               constant int &batch_size   [[buffer(5)]],
+                               uint req [[thread_position_in_grid]]) {
+    if ((int)req >= batch_size) { return; }
+    int value = input[req];
+    if (value == replace_from) { value = replace_to; }
+    for (int i = cu[req]; i < cu[req + 1]; ++i) { output[i] = value; }
+}
+
 #define instantiate_beam(type_name, T)                                          \
   template [[host_name("beam_topk_partials_" #type_name)]] [[kernel]] void       \
   beam_topk_partials<T>(device const T *logits [[buffer(0)]],                    \
