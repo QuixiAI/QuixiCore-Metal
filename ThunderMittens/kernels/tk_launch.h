@@ -741,6 +741,43 @@ void launch_spec_update_kv_meta(E& e, typename E::in_t seq_lens, typename E::in_
   e.dispatch((B + 255) / 256, 1, 1, 256, 1, 1);
 }
 
+// ----- vLLM v1 ragged rejection samplers. out (B, S1) int32; cu (B+1,); one thread/request
+//        for greedy/random, one simdgroup/draft-token for recovered. -----
+template <class E>
+void launch_rejection_greedy_sample(E& e, typename E::out_t out, typename E::in_t cu,
+                                    typename E::in_t draft_ids, typename E::in_t target_argmax,
+                                    typename E::in_t bonus_ids, typename E::in_t is_greedy,
+                                    int B, int S1, int has_is_greedy) {
+  e.pipeline("rejection_greedy_sample");
+  e.out(out, 0); e.in(cu, 1); e.in(draft_ids, 2); e.in(target_argmax, 3); e.in(bonus_ids, 4);
+  e.in(is_greedy, 5); e.bytes(B, 6); e.bytes(S1, 7); e.bytes(has_is_greedy, 8);
+  e.dispatch((B + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_rejection_random_sample(E& e, typename E::out_t out, typename E::in_t cu,
+                                    typename E::in_t draft_ids, typename E::in_t draft_probs,
+                                    typename E::in_t target_probs, typename E::in_t bonus_ids,
+                                    typename E::in_t recovered_ids, typename E::in_t uniform_probs,
+                                    typename E::in_t is_greedy, int B, int S1, int V,
+                                    int no_draft_probs, int has_is_greedy) {
+  e.pipeline("rejection_random_sample");
+  e.out(out, 0); e.in(cu, 1); e.in(draft_ids, 2); e.in(draft_probs, 3); e.in(target_probs, 4);
+  e.in(bonus_ids, 5); e.in(recovered_ids, 6); e.in(uniform_probs, 7); e.in(is_greedy, 8);
+  e.bytes(B, 9); e.bytes(S1, 10); e.bytes(V, 11); e.bytes(no_draft_probs, 12);
+  e.bytes(has_is_greedy, 13);
+  e.dispatch((B + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_sample_recovered_tokens(E& e, typename E::out_t out, typename E::in_t cu,
+                                    typename E::in_t draft_ids, typename E::in_t draft_probs,
+                                    typename E::in_t target_probs, typename E::in_t inv_q,
+                                    int B, int total, int V, int no_draft_probs) {
+  e.pipeline("sample_recovered_tokens");
+  e.out(out, 0); e.in(cu, 1); e.in(draft_ids, 2); e.in(draft_probs, 3); e.in(target_probs, 4);
+  e.in(inv_q, 5); e.bytes(B, 6); e.bytes(total, 7); e.bytes(V, 8); e.bytes(no_draft_probs, 9);
+  e.dispatch(total, 1, 1, 32, 1, 1);
+}
+
 // ----- top_p_sample: logits@0 -> out_idx@1(i32) ; V@2(i32) p@3(f32) seed@4(u32) invtemp@5(f32) ;
 //        grid (rows,1,1), 32 thr. Gumbel-max sampling from the nucleus (cumulative prob >= p). -----
 template <class E>

@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <optional>
+
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 
@@ -429,6 +431,58 @@ class SpecUpdateKvMeta : public Primitive {
   const char* name() const { return "SpecUpdateKvMeta"; }
   void print(std::ostream& os) override { os << "SpecUpdateKvMeta"; }
   bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+// ---- vLLM v1 ragged rejection samplers (spec_decode.metal). cu_num_draft_tokens (B+1,) int32
+// with a leading 0; all ids int32; external-noise buffers (uniform_probs, inv_q). ----
+
+/** Greedy verify (argmax match): accept while draft_id == target_argmax, else stop; all-accept
+ *  appends bonus. Returns out (B, max_draft+1) int32 (cleared to -1). */
+array rejection_greedy_sample(
+    const array& cu_num_draft_tokens, const array& draft_token_ids, const array& target_argmax,
+    const array& bonus_token_ids, int max_draft,
+    const std::optional<array>& is_greedy = std::nullopt, StreamOrDevice s = {});
+
+/** Stochastic verify: accept iff uniform <= p_target/q_draft; on reject emit the precomputed
+ *  recovered_token_ids and stop; all-accept appends bonus. draft_probs optional (no_draft_probs
+ *  -> q=1). Returns out (B, max_draft+1) int32. */
+array rejection_random_sample(
+    const array& cu_num_draft_tokens, const array& draft_token_ids, const array& target_probs,
+    const array& bonus_token_ids, const array& recovered_token_ids, const array& uniform_probs,
+    int max_draft, const std::optional<array>& draft_probs = std::nullopt,
+    const std::optional<array>& is_greedy = std::nullopt, StreamOrDevice s = {});
+
+/** Recovered token per draft position: argmax_v (max(0, p_target - q_draft) * inv_q[req, v]).
+ *  inv_q (B, V) is the per-request exponential-race noise. Returns out (total_draft,) int32. */
+array sample_recovered_tokens(
+    const array& cu_num_draft_tokens, const array& draft_token_ids, const array& target_probs,
+    const array& inv_q, const std::optional<array>& draft_probs = std::nullopt,
+    StreamOrDevice s = {});
+
+class RejectionSampler : public Primitive {
+ public:
+  // kind: 0 greedy, 1 random, 2 recovered.
+  RejectionSampler(Stream stream, int kind, int s1, int no_draft_probs, int has_is_greedy)
+      : Primitive(stream), kind_(kind), s1_(s1), no_draft_probs_(no_draft_probs),
+        has_is_greedy_(has_is_greedy) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "RejectionSampler"; }
+  void print(std::ostream& os) override { os << "RejectionSampler[" << kind_ << "]"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const RejectionSampler&>(other);
+    return kind_ == o.kind_ && s1_ == o.s1_ && no_draft_probs_ == o.no_draft_probs_ &&
+           has_is_greedy_ == o.has_is_greedy_;
+  }
+
+ private:
+  int kind_, s1_, no_draft_probs_, has_is_greedy_;
 };
 
 class BeamTopkPartials : public Primitive {

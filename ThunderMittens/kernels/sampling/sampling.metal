@@ -703,6 +703,126 @@ kernel void spec_update_kv_meta(device const int *seq_lens     [[buffer(0)]],  /
     if ((int)gid < B) { new_seq_lens[gid] = seq_lens[gid] + accepted_cnt[gid] + 1; }
 }
 
+// ---------------------------------------------------------------------------
+// vLLM v1 ragged rejection samplers (metal-forge sequence/spec_decode.metal; credit AlpinDale).
+// Variable drafts/request via cu_num_draft_tokens (B+1,) with a leading 0. TM int32 ids;
+// external-noise buffers (uniform_probs, inv_q) match the vLLM contract. Output (B, S1) int32
+// with S1 = max_draft + 1, each row cleared to -1 then the accepted prefix + (bonus|recovered)
+// written. is_greedy gates per request (skip when the mask disagrees with the sampler kind).
+// ---------------------------------------------------------------------------
+kernel void rejection_greedy_sample(device int *out              [[buffer(0)]],  // (B, S1)
+                                    device const int *cu          [[buffer(1)]],  // (B+1,)
+                                    device const int *draft_ids   [[buffer(2)]],  // (total,)
+                                    device const int *target_argmax [[buffer(3)]],  // (total,)
+                                    device const int *bonus_ids   [[buffer(4)]],  // (B,)
+                                    device const uchar *is_greedy [[buffer(5)]],  // (B,)/placeholder
+                                    constant int &B               [[buffer(6)]],
+                                    constant int &S1              [[buffer(7)]],
+                                    constant int &has_is_greedy   [[buffer(8)]],
+                                    uint req [[thread_position_in_grid]]) {
+    if ((int)req >= B) { return; }
+    device int *row = out + (long)req * S1;
+    for (int i = 0; i < S1; ++i) { row[i] = -1; }
+    if (has_is_greedy != 0 && is_greedy[req] == 0) { return; }
+    const int start = cu[req], nd = cu[req + 1] - start;
+    bool rejected = false;
+    for (int pos = 0; pos < nd; ++pos) {
+        const int tid = target_argmax[start + pos];
+        row[pos] = tid;
+        if (draft_ids[start + pos] != tid) { rejected = true; break; }
+    }
+    if (!rejected) { row[nd] = bonus_ids[req]; }
+}
+
+// stochastic accept: u <= p_target/q_draft; recovered token is a precomputed input
+// (sample_recovered_tokens). no_draft_probs treats q = 1.
+kernel void rejection_random_sample(device int *out              [[buffer(0)]],  // (B, S1)
+                                    device const int *cu          [[buffer(1)]],  // (B+1,)
+                                    device const int *draft_ids   [[buffer(2)]],  // (total,)
+                                    device const float *draft_probs [[buffer(3)]], // (total, V)
+                                    device const float *target_probs [[buffer(4)]], // (total, V)
+                                    device const int *bonus_ids   [[buffer(5)]],  // (B,)
+                                    device const int *recovered_ids [[buffer(6)]], // (total,)
+                                    device const float *uniform_probs [[buffer(7)]], // (total,)
+                                    device const uchar *is_greedy [[buffer(8)]],
+                                    constant int &B               [[buffer(9)]],
+                                    constant int &S1              [[buffer(10)]],
+                                    constant int &V               [[buffer(11)]],
+                                    constant int &no_draft_probs  [[buffer(12)]],
+                                    constant int &has_is_greedy   [[buffer(13)]],
+                                    uint req [[thread_position_in_grid]]) {
+    if ((int)req >= B) { return; }
+    device int *row = out + (long)req * S1;
+    for (int i = 0; i < S1; ++i) { row[i] = -1; }
+    if (has_is_greedy != 0 && is_greedy[req] != 0) { return; }
+    const int start = cu[req], nd = cu[req + 1] - start;
+    bool rejected = false;
+    for (int pos = 0; pos < nd; ++pos) {
+        const int ti = start + pos;
+        const int draft_id = draft_ids[ti];
+        const float p = target_probs[(long)ti * V + draft_id];
+        const float q = no_draft_probs != 0 ? 1.0f : draft_probs[(long)ti * V + draft_id];
+        const float ratio = q > 0.0f ? p / q : 0.0f;
+        if (ratio >= uniform_probs[ti]) {
+            row[pos] = draft_id;
+        } else {
+            row[pos] = recovered_ids[ti];
+            rejected = true;
+            break;
+        }
+    }
+    if (!rejected) { row[nd] = bonus_ids[req]; }
+}
+
+// recovered token = argmax_v (max(0, p_target - q_draft) * inv_q[req, v]); one simdgroup per
+// draft token, 32 lanes scan vocab, (val, id) reduced with smaller-id tie-break. inv_q is the
+// per-request exponential-race noise (argmax(residual * inv_q) == argmax(log residual + gumbel)).
+kernel void sample_recovered_tokens(device int *out              [[buffer(0)]],  // (total,)
+                                    device const int *cu          [[buffer(1)]],  // (B+1,)
+                                    device const int *draft_ids   [[buffer(2)]],  // (total,)
+                                    device const float *draft_probs [[buffer(3)]], // (total, V)
+                                    device const float *target_probs [[buffer(4)]], // (total, V)
+                                    device const float *inv_q     [[buffer(5)]],  // (B, V)
+                                    constant int &B               [[buffer(6)]],
+                                    constant int &total           [[buffer(7)]],
+                                    constant int &V               [[buffer(8)]],
+                                    constant int &no_draft_probs  [[buffer(9)]],
+                                    uint token [[threadgroup_position_in_grid]],
+                                    uint lane  [[thread_index_in_simdgroup]]) {
+    if ((int)token >= total) { return; }
+    int lo = 0, hi = B;                     // which request owns this draft token
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (cu[mid] <= (int)token) lo = mid; else hi = mid - 1;
+    }
+    const int req = lo;
+    const int draft_id = draft_ids[token];
+    device const float *tt = target_probs + (long)token * V;
+    device const float *td = draft_probs + (long)token * V;
+    device const float *iq = inv_q + (long)req * V;
+
+    float best_val = -1.0f;
+    int best_id = V;
+    for (int v = (int)lane; v < V; v += 32) {
+        float prob;
+        if (no_draft_probs != 0) {
+            prob = (v == draft_id) ? 0.0f : tt[v];
+        } else {
+            const float diff = tt[v] - td[v];
+            prob = diff > 0.0f ? diff : 0.0f;
+        }
+        const float val = prob * iq[v];
+        if (val > best_val || (val == best_val && v < best_id)) { best_val = val; best_id = v; }
+    }
+    // simd reduction over 32 lanes, (val, id) with smaller-id tie-break
+    for (uint off = 16; off > 0; off >>= 1) {
+        const float ov = metal::simd_shuffle_down(best_val, off);
+        const int oi = metal::simd_shuffle_down(best_id, off);
+        if (ov > best_val || (ov == best_val && oi < best_id)) { best_val = ov; best_id = oi; }
+    }
+    if (lane == 0) { out[token] = best_id; }
+}
+
 #define instantiate_beam(type_name, T)                                          \
   template [[host_name("beam_topk_partials_" #type_name)]] [[kernel]] void       \
   beam_topk_partials<T>(device const T *logits [[buffer(0)]],                    \

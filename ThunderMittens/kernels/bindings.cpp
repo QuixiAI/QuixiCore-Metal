@@ -943,6 +943,23 @@ NB_MODULE(_ext, m) {
         Compact accepted spec tokens: returns [packed_tokens, packed_pos, cu_accepted] (all int32).
       )");
 
+  m.def("rejection_greedy_sample", &rejection_greedy_sample,
+      "cu_num_draft_tokens"_a, "draft_token_ids"_a, "target_argmax"_a, "bonus_token_ids"_a,
+      "max_draft"_a, "is_greedy"_a = nb::none(),
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(vLLM greedy rejection verify. Returns out (B, max_draft+1) int32.)");
+  m.def("rejection_random_sample", &rejection_random_sample,
+      "cu_num_draft_tokens"_a, "draft_token_ids"_a, "target_probs"_a, "bonus_token_ids"_a,
+      "recovered_token_ids"_a, "uniform_probs"_a, "max_draft"_a, "draft_probs"_a = nb::none(),
+      "is_greedy"_a = nb::none(),
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(vLLM stochastic rejection verify (u <= p/q). Returns out (B, max_draft+1) int32.)");
+  m.def("sample_recovered_tokens", &sample_recovered_tokens,
+      "cu_num_draft_tokens"_a, "draft_token_ids"_a, "target_probs"_a, "inv_q"_a,
+      "draft_probs"_a = nb::none(),
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(recovered token per draft position: argmax(max(0,p-q) * inv_q). Returns (total,) int32.)");
+
   m.def(
       "spec_update_kv_meta",
       &spec_update_kv_meta,

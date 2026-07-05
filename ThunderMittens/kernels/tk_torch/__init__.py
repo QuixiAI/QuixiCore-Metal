@@ -403,6 +403,29 @@ def spec_update_kv_meta(seq_lens, accepted_cnt):
     return _ext.spec_update_kv_meta(seq_lens, accepted_cnt)
 
 
+def rejection_greedy_sample(cu_num_draft_tokens, draft_token_ids, target_argmax, bonus_token_ids,
+                            max_draft, is_greedy=None):
+    """vLLM greedy rejection verify -> out (B, max_draft+1) int32. MPS."""
+    return _ext.rejection_greedy_sample(cu_num_draft_tokens, draft_token_ids, target_argmax,
+                                        bonus_token_ids, int(max_draft), is_greedy)
+
+
+def rejection_random_sample(cu_num_draft_tokens, draft_token_ids, target_probs, bonus_token_ids,
+                            recovered_token_ids, uniform_probs, max_draft, draft_probs=None,
+                            is_greedy=None):
+    """vLLM stochastic rejection verify -> out (B, max_draft+1) int32. MPS."""
+    return _ext.rejection_random_sample(cu_num_draft_tokens, draft_token_ids, target_probs,
+                                        bonus_token_ids, recovered_token_ids, uniform_probs,
+                                        int(max_draft), draft_probs, is_greedy)
+
+
+def sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids, target_probs, inv_q,
+                            draft_probs=None):
+    """Recovered token per draft position -> (total_draft,) int32. MPS."""
+    return _ext.sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids, target_probs, inv_q,
+                                        draft_probs)
+
+
 def beam_build_copy_pairs(parent_beam: torch.Tensor, block_table: torch.Tensor,
                           seq_lens: torch.Tensor, block_size: int):
     """Build the (src,dst) block-copy pairs for a beam KV reorder on-device (no host readback).

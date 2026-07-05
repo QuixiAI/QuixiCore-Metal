@@ -1,5 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
 
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -750,6 +751,104 @@ void BuildDynamicTree::eval_gpu(const std::vector<array>& inputs, std::vector<ar
   tk::launch_build_dynamic_tree(enc, parents, rt, rs, positions, B, N);
 }
 TK_BEAM_NO_AUTODIFF(BuildDynamicTree, "BuildDynamicTree")
+
+// ---- vLLM v1 ragged rejection samplers ----
+namespace {
+array rj_dummy_f(StreamOrDevice s) { return zeros({1}, float32, s); }
+array rj_dummy_u8(StreamOrDevice s) { return astype(zeros({1}, s), uint8, s); }
+}  // namespace
+
+array rejection_greedy_sample(
+    const array& cu, const array& draft_ids, const array& target_argmax,
+    const array& bonus_ids, int max_draft, const std::optional<array>& is_greedy,
+    StreamOrDevice s) {
+  if (cu.ndim() != 1 || cu.shape(0) < 2) {
+    throw std::invalid_argument("rejection_greedy_sample: cu_num_draft_tokens must be (B+1,)");
+  }
+  const int B = cu.shape(0) - 1;
+  const int S1 = max_draft + 1;
+  return array(
+      {B, S1}, int32,
+      std::make_shared<RejectionSampler>(to_stream(s), 0, S1, 0, is_greedy.has_value() ? 1 : 0),
+      {contiguous(astype(cu, int32, s), false, s),
+       contiguous(astype(draft_ids, int32, s), false, s),
+       contiguous(astype(target_argmax, int32, s), false, s),
+       contiguous(astype(bonus_ids, int32, s), false, s),
+       is_greedy ? contiguous(astype(*is_greedy, uint8, s), false, s) : rj_dummy_u8(s)});
+}
+
+array rejection_random_sample(
+    const array& cu, const array& draft_ids, const array& target_probs, const array& bonus_ids,
+    const array& recovered_ids, const array& uniform_probs, int max_draft,
+    const std::optional<array>& draft_probs, const std::optional<array>& is_greedy,
+    StreamOrDevice s) {
+  if (cu.ndim() != 1 || cu.shape(0) < 2 || target_probs.ndim() != 2) {
+    throw std::invalid_argument(
+        "rejection_random_sample: cu (B+1,), target_probs (total, V)");
+  }
+  const int B = cu.shape(0) - 1;
+  const int S1 = max_draft + 1;
+  const int no_draft_probs = draft_probs.has_value() ? 0 : 1;
+  return array(
+      {B, S1}, int32,
+      std::make_shared<RejectionSampler>(to_stream(s), 1, S1, no_draft_probs,
+                                         is_greedy.has_value() ? 1 : 0),
+      {contiguous(astype(cu, int32, s), false, s),
+       contiguous(astype(draft_ids, int32, s), false, s),
+       draft_probs ? contiguous(astype(*draft_probs, float32, s), false, s) : rj_dummy_f(s),
+       contiguous(astype(target_probs, float32, s), false, s),
+       contiguous(astype(bonus_ids, int32, s), false, s),
+       contiguous(astype(recovered_ids, int32, s), false, s),
+       contiguous(astype(uniform_probs, float32, s), false, s),
+       is_greedy ? contiguous(astype(*is_greedy, uint8, s), false, s) : rj_dummy_u8(s)});
+}
+
+array sample_recovered_tokens(
+    const array& cu, const array& draft_ids, const array& target_probs, const array& inv_q,
+    const std::optional<array>& draft_probs, StreamOrDevice s) {
+  if (cu.ndim() != 1 || cu.shape(0) < 2 || target_probs.ndim() != 2 || inv_q.ndim() != 2) {
+    throw std::invalid_argument(
+        "sample_recovered_tokens: cu (B+1,), target_probs (total, V), inv_q (B, V)");
+  }
+  const int total = draft_ids.shape(0);
+  const int no_draft_probs = draft_probs.has_value() ? 0 : 1;
+  return array(
+      {total}, int32,
+      std::make_shared<RejectionSampler>(to_stream(s), 2, 0, no_draft_probs, 0),
+      {contiguous(astype(cu, int32, s), false, s),
+       contiguous(astype(draft_ids, int32, s), false, s),
+       draft_probs ? contiguous(astype(*draft_probs, float32, s), false, s) : rj_dummy_f(s),
+       contiguous(astype(target_probs, float32, s), false, s),
+       contiguous(astype(inv_q, float32, s), false, s)});
+}
+
+void RejectionSampler::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("RejectionSampler has no CPU implementation.");
+}
+void RejectionSampler::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  const int B = inputs[0].shape(0) - 1;
+  if (kind_ == 0) {
+    tk::launch_rejection_greedy_sample(enc, out, inputs[0], inputs[1], inputs[2], inputs[3],
+                                       inputs[4], B, s1_, has_is_greedy_);
+  } else if (kind_ == 1) {
+    const int V = inputs[3].shape(1);
+    tk::launch_rejection_random_sample(enc, out, inputs[0], inputs[1], inputs[2], inputs[3],
+                                       inputs[4], inputs[5], inputs[6], inputs[7], B, s1_, V,
+                                       no_draft_probs_, has_is_greedy_);
+  } else {
+    const int total = inputs[1].shape(0);
+    const int V = inputs[3].shape(1);
+    tk::launch_sample_recovered_tokens(enc, out, inputs[0], inputs[1], inputs[2], inputs[3],
+                                       inputs[4], B, total, V, no_draft_probs_);
+  }
+}
+TK_BEAM_NO_AUTODIFF(RejectionSampler, "RejectionSampler")
 
 std::vector<array> spec_compact(
     const array& out_tokens, const array& accepted_cnt, const array& seq_lens,

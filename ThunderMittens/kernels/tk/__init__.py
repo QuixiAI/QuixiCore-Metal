@@ -1865,6 +1865,49 @@ def spec_compact(out_tokens, accepted_cnt, seq_lens):
     return out[0], out[1], out[2]
 
 
+def rejection_greedy_sample(cu_num_draft_tokens, draft_token_ids, target_argmax,
+                            bonus_token_ids, max_draft, is_greedy=None):
+    """vLLM v1 ragged greedy rejection verify: accept while draft_id == target_argmax, else stop;
+    all-accept appends the bonus token. cu_num_draft_tokens (B+1,) int32 with a leading 0; all
+    ids int32. is_greedy (B,) uint8 optional gate. Returns out (B, max_draft+1) int32, each row
+    cleared to -1. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(cu_num_draft_tokens):
+        return _torch().rejection_greedy_sample(cu_num_draft_tokens, draft_token_ids,
+                                                target_argmax, bonus_token_ids, max_draft, is_greedy)
+    return _mlx().rejection_greedy_sample(cu_num_draft_tokens, draft_token_ids, target_argmax,
+                                          bonus_token_ids, int(max_draft), is_greedy=is_greedy)
+
+
+def rejection_random_sample(cu_num_draft_tokens, draft_token_ids, target_probs, bonus_token_ids,
+                            recovered_token_ids, uniform_probs, max_draft, draft_probs=None,
+                            is_greedy=None):
+    """vLLM v1 ragged stochastic rejection verify: accept iff uniform <= p_target/q_draft (per
+    draft token), else emit the precomputed recovered_token_ids and stop; all-accept appends the
+    bonus. draft_probs optional (absent -> q=1). target_probs/draft_probs (total, V); uniform_probs
+    (total,) host-generated. Returns out (B, max_draft+1) int32. Accepts mlx/torch (MPS)."""
+    if _is_torch(cu_num_draft_tokens):
+        return _torch().rejection_random_sample(cu_num_draft_tokens, draft_token_ids, target_probs,
+                                                bonus_token_ids, recovered_token_ids, uniform_probs,
+                                                max_draft, draft_probs, is_greedy)
+    return _mlx().rejection_random_sample(cu_num_draft_tokens, draft_token_ids, target_probs,
+                                          bonus_token_ids, recovered_token_ids, uniform_probs,
+                                          int(max_draft), draft_probs=draft_probs, is_greedy=is_greedy)
+
+
+def sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids, target_probs, inv_q,
+                            draft_probs=None):
+    """Sample the recovered token for each draft position from the adjusted residual:
+    argmax_v (max(0, p_target - q_draft) * inv_q[req, v]) — inv_q (B, V) is the per-request
+    exponential-race noise (equivalent to argmax(log residual + gumbel)). Produces the
+    recovered_token_ids that rejection_random_sample consumes. Returns (total_draft,) int32.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(cu_num_draft_tokens):
+        return _torch().sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids,
+                                                target_probs, inv_q, draft_probs)
+    return _mlx().sample_recovered_tokens(cu_num_draft_tokens, draft_token_ids, target_probs,
+                                          inv_q, draft_probs=draft_probs)
+
+
 def spec_update_kv_meta(seq_lens, accepted_cnt):
     """Post-verify KV length: new_seq_lens[b] = seq_lens[b] + accepted_cnt[b] + 1. Returns (B,) int32.
     Accepts mlx.array or torch.Tensor (MPS)."""

@@ -1,5 +1,22 @@
 # ThunderMittens — performance status
 
+## Wave-10 K4: vLLM v1 ragged rejection samplers (2026-07-05)
+
+Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with the
+vLLM v1 ragged rejection pipeline TM's dense spec_verify_linear didn't cover:
+rejection_greedy_sample (argmax-match verify, no probs — no prior TM analogue),
+rejection_random_sample (stochastic u <= p_target/q_draft, recovered token a precomputed input),
+sample_recovered_tokens (argmax of max(0, p_t - q_d) * inv_q via a 32-lane simd reduction with
+smaller-id tie-break). Variable drafts/request via cu_num_draft_tokens (B+1,) with a leading 0;
+TM int32 ids; external-noise buffers (uniform_probs, inv_q) match the vLLM contract (host-
+generated, seed-reproducible). Output (B, max_draft+1) cleared to -1. One RejectionSampler
+primitive (kind selector). is_greedy per-request gate; no_draft_probs -> q=1.
+
+- Tests: each kernel vs a direct python transcription of the reference loop (exact int ids),
+  incl. the two-kernel pipeline (sample_recovered -> rejection_random); 6 green + parity atol=0.
+- Overhead-bound integer kernels (like the existing spec_verify_* / build_dynamic_tree) — no
+  bench entry.
+
 ## Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache (2026-07-05)
 
 New kernels/indexer/ (metal-forge indexer_k_quant_and_cache; credit AlpinDale). Quantizes the

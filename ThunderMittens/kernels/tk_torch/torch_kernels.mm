@@ -2759,6 +2759,57 @@ static std::vector<at::Tensor> spec_compact_mps(const at::Tensor& out_tokens_in,
   return {packed_tokens, packed_pos, cu_accepted};
 }
 
+// vLLM v1 ragged rejection samplers (int32 ids, external-noise buffers).
+static at::Tensor rejection_greedy_sample_mps(
+    const at::Tensor& cu_in, const at::Tensor& draft_in, const at::Tensor& targ_in,
+    const at::Tensor& bonus_in, int64_t max_draft, const c10::optional<at::Tensor>& greedy_in) {
+  TORCH_CHECK(cu_in.device().is_mps() && cu_in.dim() == 1 && cu_in.size(0) >= 2,
+              "rejection_greedy_sample: cu_num_draft_tokens must be (B+1,) MPS");
+  const int B = cu_in.size(0) - 1, S1 = max_draft + 1;
+  auto cu = cu_in.to(at::kInt).contiguous(), draft = draft_in.to(at::kInt).contiguous();
+  auto targ = targ_in.to(at::kInt).contiguous(), bonus = bonus_in.to(at::kInt).contiguous();
+  const bool hg = greedy_in.has_value();
+  auto greedy = hg ? greedy_in->to(at::kByte).contiguous() : at::zeros({1}, cu.options().dtype(at::kByte));
+  auto out = at::empty({B, S1}, cu.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rejection_greedy_sample(e, out, cu, draft, targ, bonus, greedy, B, S1, hg ? 1 : 0);
+  });
+  return out;
+}
+static at::Tensor rejection_random_sample_mps(
+    const at::Tensor& cu_in, const at::Tensor& draft_in, const at::Tensor& tp_in,
+    const at::Tensor& bonus_in, const at::Tensor& rec_in, const at::Tensor& unif_in,
+    int64_t max_draft, const c10::optional<at::Tensor>& dp_in,
+    const c10::optional<at::Tensor>& greedy_in) {
+  const int B = cu_in.size(0) - 1, S1 = max_draft + 1, V = tp_in.size(1);
+  auto cu = cu_in.to(at::kInt).contiguous(), draft = draft_in.to(at::kInt).contiguous();
+  auto tp = tp_in.to(at::kFloat).contiguous(), bonus = bonus_in.to(at::kInt).contiguous();
+  auto rec = rec_in.to(at::kInt).contiguous(), unif = unif_in.to(at::kFloat).contiguous();
+  const bool ndp = !dp_in.has_value(), hg = greedy_in.has_value();
+  auto dp = ndp ? at::zeros({1}, tp.options()) : dp_in->to(at::kFloat).contiguous();
+  auto greedy = hg ? greedy_in->to(at::kByte).contiguous() : at::zeros({1}, cu.options().dtype(at::kByte));
+  auto out = at::empty({B, S1}, cu.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rejection_random_sample(e, out, cu, draft, dp, tp, bonus, rec, unif, greedy, B,
+                                       S1, V, ndp ? 1 : 0, hg ? 1 : 0);
+  });
+  return out;
+}
+static at::Tensor sample_recovered_tokens_mps(
+    const at::Tensor& cu_in, const at::Tensor& draft_in, const at::Tensor& tp_in,
+    const at::Tensor& iq_in, const c10::optional<at::Tensor>& dp_in) {
+  const int B = cu_in.size(0) - 1, total = draft_in.size(0), V = tp_in.size(1);
+  auto cu = cu_in.to(at::kInt).contiguous(), draft = draft_in.to(at::kInt).contiguous();
+  auto tp = tp_in.to(at::kFloat).contiguous(), iq = iq_in.to(at::kFloat).contiguous();
+  const bool ndp = !dp_in.has_value();
+  auto dp = ndp ? at::zeros({1}, tp.options()) : dp_in->to(at::kFloat).contiguous();
+  auto out = at::empty({total}, cu.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_sample_recovered_tokens(e, out, cu, draft, dp, tp, iq, B, total, V, ndp ? 1 : 0);
+  });
+  return out;
+}
+
 static std::vector<at::Tensor> build_dynamic_tree_mps(const at::Tensor& parents_in) {
   TORCH_CHECK(parents_in.device().is_mps() && parents_in.dim() == 2,
               "build_dynamic_tree: parents must be (B, N) MPS");
@@ -4060,6 +4111,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("beam_advance", &beam_advance_mps, "ThunderMittens beam-search advance (MPS)");
   m.def("spec_verify_tree", &spec_verify_tree_mps, "ThunderMittens spec tree verification (MPS)");
   m.def("spec_compact", &spec_compact_mps, "ThunderMittens spec accepted-token compaction (MPS)");
+  m.def("rejection_greedy_sample", &rejection_greedy_sample_mps, "vLLM greedy rejection (MPS)",
+        pybind11::arg("cu_num_draft_tokens"), pybind11::arg("draft_token_ids"),
+        pybind11::arg("target_argmax"), pybind11::arg("bonus_token_ids"),
+        pybind11::arg("max_draft"), pybind11::arg("is_greedy") = c10::nullopt);
+  m.def("rejection_random_sample", &rejection_random_sample_mps, "vLLM random rejection (MPS)",
+        pybind11::arg("cu_num_draft_tokens"), pybind11::arg("draft_token_ids"),
+        pybind11::arg("target_probs"), pybind11::arg("bonus_token_ids"),
+        pybind11::arg("recovered_token_ids"), pybind11::arg("uniform_probs"),
+        pybind11::arg("max_draft"), pybind11::arg("draft_probs") = c10::nullopt,
+        pybind11::arg("is_greedy") = c10::nullopt);
+  m.def("sample_recovered_tokens", &sample_recovered_tokens_mps, "recovered token sampler (MPS)",
+        pybind11::arg("cu_num_draft_tokens"), pybind11::arg("draft_token_ids"),
+        pybind11::arg("target_probs"), pybind11::arg("inv_q"),
+        pybind11::arg("draft_probs") = c10::nullopt);
   m.def("build_dynamic_tree", &build_dynamic_tree_mps, "ThunderMittens device draft-tree pointers (MPS)");
   m.def("spec_update_kv_meta", &spec_update_kv_meta_mps, "ThunderMittens spec KV meta update (MPS)");
   m.def("spec_verify_linear", &spec_verify_linear_mps,

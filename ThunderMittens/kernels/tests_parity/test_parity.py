@@ -1447,6 +1447,35 @@ def test_norm_quant_wave10_parity(shape):
     _assert_parity(sm, st, atol=1e-4)
 
 
+def test_rejection_samplers_parity():
+    rng = np.random.default_rng(14)
+    B, V, S = 8, 200, 5
+    lens = rng.integers(1, S + 1, B)
+    cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    total = int(cu[-1])
+    draft = rng.integers(0, V, total).astype(np.int32)
+    targ = rng.integers(0, V, total).astype(np.int32)
+    tp = rng.random((total, V)).astype(np.float32); tp /= tp.sum(1, keepdims=True)
+    dp = rng.random((total, V)).astype(np.float32); dp /= dp.sum(1, keepdims=True)
+    bonus = rng.integers(0, V, B).astype(np.int32)
+    rec = rng.integers(0, V, total).astype(np.int32)
+    unif = rng.random(total).astype(np.float32)
+    iq = (rng.random((B, V)) + 0.5).astype(np.float32)
+    ml = lambda a: _mk(a, "mlx")
+    to = lambda a: _mk(a, "torch")
+    gm = tk.rejection_greedy_sample(ml(cu), ml(draft), ml(targ), ml(bonus), S)
+    gt = tk.rejection_greedy_sample(to(cu), to(draft), to(targ), to(bonus), S)
+    _assert_parity(gm, gt, atol=0)
+    rm = tk.rejection_random_sample(ml(cu), ml(draft), ml(tp), ml(bonus), ml(rec), ml(unif), S,
+                                    draft_probs=ml(dp))
+    rt = tk.rejection_random_sample(to(cu), to(draft), to(tp), to(bonus), to(rec), to(unif), S,
+                                    draft_probs=to(dp))
+    _assert_parity(rm, rt, atol=0)
+    sm = tk.sample_recovered_tokens(ml(cu), ml(draft), ml(tp), ml(iq), draft_probs=ml(dp))
+    st = tk.sample_recovered_tokens(to(cu), to(draft), to(tp), to(iq), draft_probs=to(dp))
+    _assert_parity(sm, st, atol=0)
+
+
 def test_indexer_parity():
     rng = np.random.default_rng(13)
     T, num_slots, head_dim, qbs = 16, 20, 128, 128
