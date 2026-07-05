@@ -791,6 +791,52 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def rms_norm_add_int8(x, residual, weight, eps=1e-5):
+    """Fused residual-add + RMSNorm + dynamic per-row int8 (the W8A8 residual-stream epilogue;
+    int8 sibling of rms_norm_add_fp8 dynamic). Returns (codes i8, x+residual, scale (rows,)).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().rms_norm_add_int8(x, residual, weight, eps)
+    out = _mlx().rms_norm_add_int8_dyn(x, residual, weight, float(eps))
+    return out[0], out[1], out[2]
+
+
+def silu_mul_quant_fp8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated activation -> dynamic per-token fp8 e4m3: act = silu(x)*gate ("swiglu") or
+    the gpt-oss clamped variant ("swiglu_oai", alpha/limit); codes = e4m3(act/scale) with
+    scale = rowmax|act|/448 — the (rows, D) bf16 intermediate never hits memory. Feeds
+    qgemm_fp8_scaled. Returns (codes u8, scale (rows,)). Accepts mlx.array or torch (MPS)."""
+    mode = {"swiglu": 0, "swiglu_oai": 1}[act]
+    if _is_torch(x):
+        return _torch().silu_mul_quant_fp8(x, gate, act=act, alpha=alpha, limit=limit)
+    out = _mlx().silu_mul_quant_fp8(x, gate, mode, float(alpha), float(limit))
+    return out[0], out[1]
+
+
+def silu_mul_quant_int8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated activation -> dynamic per-token symmetric int8 (feeds qgemm_w8a8).
+    Returns (codes i8, scale (rows,)). Accepts mlx.array or torch.Tensor (MPS)."""
+    mode = {"swiglu": 0, "swiglu_oai": 1}[act]
+    if _is_torch(x):
+        return _torch().silu_mul_quant_int8(x, gate, act=act, alpha=alpha, limit=limit)
+    out = _mlx().silu_mul_quant_int8(x, gate, mode, float(alpha), float(limit))
+    return out[0], out[1]
+
+
+def silu_mul_quant_fp8_group(x, gate, group_size=128, ue8m0=False, act="swiglu",
+                             alpha=1.702, limit=7.0):
+    """Fused gated activation -> per-group fp8 (canonical group 128, the block-quant GEMM
+    activation layout; ue8m0 rounds scales up to powers of two). Returns
+    (codes u8, scale (rows, D/G)). Accepts mlx.array or torch.Tensor (MPS)."""
+    mode = {"swiglu": 0, "swiglu_oai": 1}[act]
+    if _is_torch(x):
+        return _torch().silu_mul_quant_fp8_group(x, gate, group_size=group_size, ue8m0=ue8m0,
+                                                 act=act, alpha=alpha, limit=limit)
+    out = _mlx().silu_mul_quant_fp8_group(x, gate, group_size, bool(ue8m0), mode,
+                                          float(alpha), float(limit))
+    return out[0], out[1]
+
+
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
     """Per-group dynamic fp8 e4m3 along the last axis (canonical group 128 — the activation
     side of block-quantized GEMMs). Returns (codes u8, scale (rows, D/G) f32); ue8m0 rounds

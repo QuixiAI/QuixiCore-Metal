@@ -67,6 +67,7 @@
 #include "qk_norm_rope/qk_norm_rope.h"
 #include "selective_scan/selective_scan.h"
 #include "gdn/gdn.h"
+#include "act_quant/act_quant.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -261,6 +262,11 @@ NB_MODULE(_ext, m) {
       "x"_a, "residual"_a, "weight"_a, "eps"_a, "scale"_a,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(fused residual-add + rms_norm + static-scale fp8. Returns (codes uint8, x+residual).)");
+    m.def(
+      "rms_norm_add_int8_dyn", &rms_norm_add_int8_dyn,
+      "x"_a, "residual"_a, "weight"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + rms_norm + dynamic per-row int8. Returns (codes, x+residual, scale).)");
     m.def(
       "rms_norm_add_fp8_dyn", &rms_norm_add_fp8_dyn,
       "x"_a, "residual"_a, "weight"_a, "eps"_a,
@@ -520,6 +526,26 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def(
+      "silu_mul_quant_fp8", &silu_mul_quant_fp8,
+      "x"_a, "gate"_a, "mode"_a = 0, "alpha"_a = 1.702f, "limit"_a = 7.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused gated-activation -> dynamic per-token fp8: returns (codes u8, scale (rows,)).
+         mode 0 swiglu, 1 swiglu_oai (gpt-oss).)");
+
+    m.def(
+      "silu_mul_quant_int8", &silu_mul_quant_int8,
+      "x"_a, "gate"_a, "mode"_a = 0, "alpha"_a = 1.702f, "limit"_a = 7.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused gated-activation -> dynamic per-token int8 (feeds qgemm_w8a8).)");
+
+    m.def(
+      "silu_mul_quant_fp8_group", &silu_mul_quant_fp8_group,
+      "x"_a, "gate"_a, "group_size"_a = 128, "ue8m0"_a = false, "mode"_a = 0,
+      "alpha"_a = 1.702f, "limit"_a = 7.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused gated-activation -> per-group fp8 (scale (rows, D/G); ue8m0 = 2^k scales).)");
 
     m.def(
       "quantize_per_group_fp8", &quantize_per_group_fp8,

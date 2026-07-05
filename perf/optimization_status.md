@@ -1,5 +1,24 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 8: fused act->quant epilogues (2026-07-05)
+
+New kernels/act_quant/ + two substrate additions: tk_e2m1_encode (fp4 nearest-of-16, tie
+behavior matching the host packer's argmin — unblocks device fp4 epilogues later) and the
+glu_eval lift into include/common/glu_eval.metal (one activation definition shared by
+kernels/glu and act_quant; glu suite re-run green). Kernels: silu_mul_quant_{fp8,int8}
+(per-token dynamic, feeding qgemm_fp8_scaled / qgemm_w8a8), silu_mul_quant_fp8_group
+(per-group-128 + ue8m0, feeding block-quant GEMMs), each with mode 0 swiglu / 1 gpt-oss
+swiglu_oai via the shared glu_eval; plus rms_norm_add_int8_dyn (int8 sibling of the fp8
+residual-stream epilogue). Two-pass amax+encode, activation recomputed (memory-bound).
+
+- Tests: reconstruction-bound oracles (exp() between input and code makes bit-exact-vs-numpy
+  the wrong contract), power-of-two/coverage checks for ue8m0, fused-vs-unfused composition
+  (>= 95% identical codes, rest off-by-one from bf16-vs-fp32 activation rounding), 91 tests
+  green incl. full glu/add_norm regression. Parity codes off-by-one max (separately compiled
+  metallibs round exp differently at borderlines — same rationale as the qgemm tolerance).
+- Perf: int8 epilogue T=4096 D=2880: 0.251 ms vs 0.321 ms for swiglu -> quantize_per_token
+  (1.28x, the eliminated bf16 round-trip); T=512: 0.034 vs 0.036 ms.
+
 ## Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant (2026-07-05)
 
 quant_rt extensions: quantize_per_group_fp8/int8 (group-wise dynamic quant along the row,

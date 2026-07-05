@@ -42,6 +42,7 @@ inline std::string rope_q_kernel_name(const std::string& t, int D) {
 }
 inline std::string rms_norm_add_fp8_kernel_name(int D) { return "rms_norm_add_fp8_" + std::to_string(D); }
 inline std::string rms_norm_add_fp8_dyn_kernel_name(int D) { return "rms_norm_add_fp8_dyn_" + std::to_string(D); }
+inline std::string rms_norm_add_int8_dyn_kernel_name(int D) { return "rms_norm_add_int8_dyn_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_kernel_name(int D) { return "layernorm_add_fp8_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_dyn_kernel_name(int D) { return "layernorm_add_fp8_dyn_" + std::to_string(D); }
 inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" + t; }
@@ -902,6 +903,15 @@ void launch_rms_norm_add_fp8_dyn(E& e, typename E::in_t x, typename E::in_t r, t
                                  typename E::out_t codes, typename E::out_t res_out,
                                  typename E::out_t scale, uint32_t M, int D, float eps) {
   e.pipeline(rms_norm_add_fp8_dyn_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4); e.out(scale, 5);
+  e.bytes(M, 6); e.bytes(eps, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_rms_norm_add_int8_dyn(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                 typename E::out_t codes, typename E::out_t res_out,
+                                 typename E::out_t scale, uint32_t M, int D, float eps) {
+  e.pipeline(rms_norm_add_int8_dyn_kernel_name(D));
   e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4); e.out(scale, 5);
   e.bytes(M, 6); e.bytes(eps, 7);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
@@ -2217,6 +2227,40 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
   e.bytes(N, 4); e.bytes(K, 5);
   e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// ----- fused act->quant epilogues (act_quant): x@0(activated) gate@1 -> codes@2 scale@3 ;
+//        one simdgroup per row; mode 0 swiglu / 1 swiglu_oai (alpha, limit). -----
+template <class E>
+void launch_silu_mul_quant_fp8(E& e, typename E::in_t x, typename E::in_t gate,
+                               typename E::out_t codes, typename E::out_t scale, int rows,
+                               int D, int mode, float alpha, float limit,
+                               const std::string& type_name) {
+  e.pipeline("silu_mul_quant_fp8_" + type_name);
+  e.in(x, 0); e.in(gate, 1); e.out(codes, 2); e.out(scale, 3);
+  e.bytes(D, 4); e.bytes(mode, 5); e.bytes(alpha, 6); e.bytes(limit, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_silu_mul_quant_int8(E& e, typename E::in_t x, typename E::in_t gate,
+                                typename E::out_t codes, typename E::out_t scale, int rows,
+                                int D, int mode, float alpha, float limit,
+                                const std::string& type_name) {
+  e.pipeline("silu_mul_quant_int8_" + type_name);
+  e.in(x, 0); e.in(gate, 1); e.out(codes, 2); e.out(scale, 3);
+  e.bytes(D, 4); e.bytes(mode, 5); e.bytes(alpha, 6); e.bytes(limit, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_silu_mul_quant_fp8_group(E& e, typename E::in_t x, typename E::in_t gate,
+                                     typename E::out_t codes, typename E::out_t scale,
+                                     int rows, int D, int G, int ue8m0, int mode, float alpha,
+                                     float limit, const std::string& type_name) {
+  e.pipeline("silu_mul_quant_fp8_group_" + type_name);
+  e.in(x, 0); e.in(gate, 1); e.out(codes, 2); e.out(scale, 3);
+  e.bytes(D, 4); e.bytes(G, 5); e.bytes(ue8m0, 6); e.bytes(mode, 7);
+  e.bytes(alpha, 8); e.bytes(limit, 9);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- per-group / azp activation quantizers (quant_rt): one simdgroup per row. -----

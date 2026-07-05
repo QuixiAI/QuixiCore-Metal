@@ -210,6 +210,54 @@ kernel void rms_norm_add_fp8_dyn(device   bf16  *x        [[buffer(0)]],
     }
 }
 
+// int8 sibling of rms_norm_add_fp8_dyn (dynamic per-row symmetric int8 for W8A8).
+template <int D>
+kernel void rms_norm_add_int8_dyn(device   bf16  *x        [[buffer(0)]],
+                                 device   bf16  *residual [[buffer(1)]],
+                                 device   bf16  *weight   [[buffer(2)]],
+                                 device   char  *codes    [[buffer(3)]],
+                                 device   bf16  *res_out  [[buffer(4)]],
+                                 device   float *scale    [[buffer(5)]],
+                                 constant uint  &M        [[buffer(6)]],
+                                 constant float &eps      [[buffer(7)]],
+                                 uint3 blockIdx [[threadgroup_position_in_grid]],
+                                 uint  laneId   [[thread_index_in_simdgroup]]) {
+    static_assert(D % TILE_DIM == 0, "D must be divisible by 8");
+    const int row = blockIdx.x;
+    using row_gl = gl<bf16, 1, 1, -1, D>;
+    using vec_gl = gl<bf16, 1, 1,  1, D>;
+    row_gl gl_x(x, nullptr, nullptr, M, nullptr);
+    row_gl gl_r(residual, nullptr, nullptr, M, nullptr);
+    row_gl gl_ro(res_out, nullptr, nullptr, M, nullptr);
+    vec_gl gl_w(weight, nullptr, nullptr, nullptr, nullptr);
+
+    using vecD = rv_fl<D>;
+    vecD xv, rv, wv, sq;
+    load(xv, gl_x, {0, 0, row, 0}, laneId);
+    load(rv, gl_r, {0, 0, row, 0}, laneId);
+    load(wv, gl_w, {0, 0, 0,   0}, laneId);
+    add(xv, xv, rv);
+    store(gl_ro, xv, {0, 0, row, 0}, laneId);
+    float ms = 0.f;
+    mul(sq, xv, xv); sum(ms, sq, laneId); ms /= (float)D;
+    mul(xv, xv, metal::rsqrt(ms + eps));
+    mul(xv, xv, wv);
+
+    float amax = 0.f;
+    #pragma clang loop unroll(full)
+    for (int w = 0; w < vecD::outer_dim; ++w) amax = metal::max(amax, metal::fabs(xv[w][0]));
+    amax = metal::simd_max(amax);
+    const float s = amax / 127.0f;
+    const float inv_scale = s > 0.f ? 1.f / s : 0.f;
+    if (laneId == 0) scale[row] = s;
+
+    device char *op = codes + (long)row * D;
+    #pragma clang loop unroll(full)
+    for (int w = 0; w < vecD::outer_dim; ++w) {
+        op[w * 32 + laneId] = tk_int8_encode(xv[w][0] * inv_scale);
+    }
+}
+
 template <int D>
 kernel void layernorm_add_fp8(device   bf16  *x         [[buffer(0)]],
                               device   bf16  *residual  [[buffer(1)]],
@@ -349,7 +397,18 @@ kernel void layernorm_add_fp8_dyn(device   bf16  *x        [[buffer(0)]],
                              constant uint &M [[buffer(6)]],                    \
                              constant float &eps [[buffer(7)]],                 \
                              uint3 blockIdx [[threadgroup_position_in_grid]],   \
-                             uint laneId [[thread_index_in_simdgroup]]);
+                             uint laneId [[thread_index_in_simdgroup]]);        \
+  template [[host_name("rms_norm_add_int8_dyn_" #DVAL)]] [[kernel]] void        \
+  rms_norm_add_int8_dyn<DVAL>(device bf16 *x [[buffer(0)]],                     \
+                              device bf16 *residual [[buffer(1)]],              \
+                              device bf16 *weight [[buffer(2)]],                \
+                              device char *codes [[buffer(3)]],                 \
+                              device bf16 *res_out [[buffer(4)]],               \
+                              device float *scale [[buffer(5)]],                \
+                              constant uint &M [[buffer(6)]],                   \
+                              constant float &eps [[buffer(7)]],                \
+                              uint3 blockIdx [[threadgroup_position_in_grid]],  \
+                              uint laneId [[thread_index_in_simdgroup]]);
 
 #define instantiate_layernorm_add_fp8(DVAL)                                     \
   template [[host_name("layernorm_add_fp8_" #DVAL)]] [[kernel]] void            \

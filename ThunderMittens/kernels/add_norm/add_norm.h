@@ -51,6 +51,10 @@ std::vector<array> rms_norm_add_fp8(
     StreamOrDevice s = {});
 std::vector<array> rms_norm_add_fp8_dyn(
     const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s = {});
+/** int8 sibling of rms_norm_add_fp8_dyn (dynamic per-row symmetric int8, feeds qgemm_w8a8).
+ *  Returns (codes int8, x+residual, scale (rows,) f32). */
+std::vector<array> rms_norm_add_int8_dyn(
+    const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s = {});
 std::vector<array> layernorm_add_fp8(
     const array& x, const array& residual, const array& weight, const array& bias, float eps,
     float scale, StreamOrDevice s = {});
@@ -64,8 +68,10 @@ std::vector<array> layernorm_add_fp8_dyn(
 
 class AddNormFp8 : public Primitive {
  public:
-  AddNormFp8(Stream stream, bool layernorm, bool dynamic, float eps, float inv_scale)
-    : Primitive(stream), layernorm_(layernorm), dynamic_(dynamic), eps_(eps), inv_scale_(inv_scale) {};
+  AddNormFp8(Stream stream, bool layernorm, bool dynamic, float eps, float inv_scale,
+             bool int8q = false)
+    : Primitive(stream), layernorm_(layernorm), dynamic_(dynamic), eps_(eps),
+      inv_scale_(inv_scale), int8_(int8q) {};
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -80,12 +86,13 @@ class AddNormFp8 : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const AddNormFp8&>(other);
     return layernorm_ == o.layernorm_ && dynamic_ == o.dynamic_ && eps_ == o.eps_ &&
-        inv_scale_ == o.inv_scale_;
+        inv_scale_ == o.inv_scale_ && int8_ == o.int8_;
   }
 
  private:
   bool layernorm_, dynamic_;
   float eps_, inv_scale_;
+  bool int8_;
 };
 
 class RMSNormAdd : public Primitive {

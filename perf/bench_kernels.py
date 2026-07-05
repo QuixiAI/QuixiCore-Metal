@@ -1342,6 +1342,27 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("act_quant")
+def act_quant_cases(be, preset, formats):
+    """Fused gated-activation -> quant vs the unfused glu -> quantize_per_token chain
+    (the fusion win = eliminating the (rows, D) bf16 intermediate round-trip)."""
+    tk = be.tk()
+    rng = np.random.default_rng(34)
+    shapes = _pick(preset, [(512, 2048)], [(512, 2880), (4096, 2880)],
+                   [(512, 2880), (4096, 2880), (4096, 11008)])
+    for T, D in shapes:
+        x = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+        g = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+        x_d, g_d = be.array(x, "bf16"), be.array(g, "bf16")
+        baselines = {"glu_then_quant":
+                     lambda x_d=x_d, g_d=g_d:
+                         tk.quantize_per_token_int8(tk.swiglu(x_d, g_d))[0]}
+        yield Case("act_quant", f"int8_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   target=lambda x_d=x_d, g_d=g_d: tk.silu_mul_quant_int8(x_d, g_d)[0],
+                   baselines=baselines, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+
+
 @register("gdn")
 def gdn_cases(be, preset, formats):
     """GatedDeltaNet recurrence (Qwen3-Next mixer). Sequential over time per (req, hv, dv)

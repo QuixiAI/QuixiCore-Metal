@@ -152,6 +152,7 @@
 				kernels/qk_norm_rope/qk_norm_rope.cpp,
 				kernels/selective_scan/selective_scan.cpp,
 				kernels/gdn/gdn.cpp,
+				kernels/act_quant/act_quant.cpp,
 				kernels/mla/mla.cpp,
 				kernels/paged_attn_v2/paged_attn_v2.cpp,
 				kernels/hadamard/hadamard.cpp,

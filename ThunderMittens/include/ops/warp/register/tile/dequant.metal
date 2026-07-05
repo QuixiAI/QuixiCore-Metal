@@ -290,6 +290,20 @@ METAL_FUNC half tk_e5m2_decode(uchar v) {
 //     decoders above; standard OCP layouts so tk_e4m3_decode/tk_e5m2_decode invert them). ---
 
 // float -> e4m3 (1-4-3, bias 7, max finite 448). NaN/overflow clamp to ±448 (0x7E).
+// Encode float -> fp4 e2m1 code (4 bits: sign + {0,.5,1,1.5,2,3,4,6}). Nearest-decoded-value
+// with ties -> the LOWEST code index, matching the host packer's np.argmin over the same
+// code order (tk/quant.py _nearest with _E2M1_CODES = arange(16): positives 0..7 first).
+METAL_FUNC uchar tk_e2m1_encode(float v) {
+    float best = INFINITY;
+    uchar bc = 0;
+    #pragma clang loop unroll(full)
+    for (int c = 0; c < 16; ++c) {
+        const float d = metal::abs(v - float(tk_e2m1_decode((uint)c)));
+        if (d < best) { best = d; bc = (uchar)c; }
+    }
+    return bc;
+}
+
 METAL_FUNC uchar tk_e4m3_encode(float x) {
     const uint sign = (x < 0.0f) ? 0x80u : 0x00u;
     float a = metal::fabs(x);

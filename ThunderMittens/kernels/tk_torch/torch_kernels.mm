@@ -349,6 +349,79 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> rms_norm_add_fp8_dyn_mps(
   });
   return {codes, res_out, scale};
 }
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> rms_norm_add_int8_dyn_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, double eps) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_add_int8_dyn(e, x, r, w, codes, res_out, scale, M, D, static_cast<float>(eps));
+  });
+  return {codes, res_out, scale};
+}
+
+// fused gated-activation -> dynamic quant epilogues (buffer order matches tk.glu(x, gate)).
+static std::tuple<at::Tensor, at::Tensor> silu_mul_quant_fp8_mps(
+    const at::Tensor& x_in, const at::Tensor& gate_in, int64_t mode, double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in) && x_in.sizes() == gate_in.sizes(),
+              "silu_mul_quant_fp8: x/gate must be same-shape float MPS tensors");
+  auto x = x_in.contiguous(), gate = gate_in.to(x_in.scalar_type()).contiguous();
+  const int D = x.size(-1);
+  const int rows = x.numel() / D;
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_silu_mul_quant_fp8(e, x, gate, codes, scale, rows, D, (int)mode,
+                                  (float)alpha, (float)limit, tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor> silu_mul_quant_int8_mps(
+    const at::Tensor& x_in, const at::Tensor& gate_in, int64_t mode, double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in) && x_in.sizes() == gate_in.sizes(),
+              "silu_mul_quant_int8: x/gate must be same-shape float MPS tensors");
+  auto x = x_in.contiguous(), gate = gate_in.to(x_in.scalar_type()).contiguous();
+  const int D = x.size(-1);
+  const int rows = x.numel() / D;
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_silu_mul_quant_int8(e, x, gate, codes, scale, rows, D, (int)mode,
+                                   (float)alpha, (float)limit, tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor> silu_mul_quant_fp8_group_mps(
+    const at::Tensor& x_in, const at::Tensor& gate_in, int64_t group_size, bool ue8m0,
+    int64_t mode, double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in) && x_in.sizes() == gate_in.sizes(),
+              "silu_mul_quant_fp8_group: x/gate must be same-shape float MPS tensors");
+  auto x = x_in.contiguous(), gate = gate_in.to(x_in.scalar_type()).contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(group_size > 0 && group_size % 4 == 0 && D % group_size == 0,
+              "silu_mul_quant_fp8_group: bad group_size");
+  const int rows = x.numel() / D;
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kByte));
+  auto sshape = x.sizes().vec(); sshape.back() = D / group_size;
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_silu_mul_quant_fp8_group(e, x, gate, codes, scale, rows, D, (int)group_size,
+                                        ue8m0 ? 1 : 0, (int)mode, (float)alpha, (float)limit,
+                                        tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
 static std::tuple<at::Tensor, at::Tensor> layernorm_add_fp8_mps(
     const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, const at::Tensor& b_in,
     double eps, double scale) {
@@ -3410,6 +3483,21 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("rms_norm_add_int8_dyn", &rms_norm_add_int8_dyn_mps,
+        "fused add + rms_norm + dynamic per-row int8 (MPS)");
+  m.def("silu_mul_quant_fp8", &silu_mul_quant_fp8_mps,
+        "fused gated-activation -> per-token fp8 (MPS)", pybind11::arg("x"),
+        pybind11::arg("gate"), pybind11::arg("mode") = 0, pybind11::arg("alpha") = 1.702,
+        pybind11::arg("limit") = 7.0);
+  m.def("silu_mul_quant_int8", &silu_mul_quant_int8_mps,
+        "fused gated-activation -> per-token int8 (MPS)", pybind11::arg("x"),
+        pybind11::arg("gate"), pybind11::arg("mode") = 0, pybind11::arg("alpha") = 1.702,
+        pybind11::arg("limit") = 7.0);
+  m.def("silu_mul_quant_fp8_group", &silu_mul_quant_fp8_group_mps,
+        "fused gated-activation -> per-group fp8 (MPS)", pybind11::arg("x"),
+        pybind11::arg("gate"), pybind11::arg("group_size") = 128,
+        pybind11::arg("ue8m0") = false, pybind11::arg("mode") = 0,
+        pybind11::arg("alpha") = 1.702, pybind11::arg("limit") = 7.0);
   m.def("quantize_per_group_fp8", &quantize_per_group_fp8_mps,
         "per-group dynamic fp8 quant (MPS)", pybind11::arg("x"),
         pybind11::arg("group_size") = 128, pybind11::arg("ue8m0") = false);

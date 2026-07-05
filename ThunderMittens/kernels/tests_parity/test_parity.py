@@ -676,6 +676,29 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_act_quant_parity():
+    rng = np.random.default_rng(60)
+    x = rng.standard_normal((16, 512)).astype(np.float32)
+    g = rng.standard_normal((16, 512)).astype(np.float32)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    # exp() sits between input and code and the two backends' metallibs are compiled by
+    # different toolchains -> borderline codes may flip by one step (same rationale as the
+    # qgemm parity tolerance). Codes: off-by-one max; scales: last-ulp fp32.
+    for fn, kwargs in [(tk.silu_mul_quant_fp8, {}), (tk.silu_mul_quant_int8, {}),
+                       (tk.silu_mul_quant_fp8_group, {"group_size": 128, "ue8m0": True}),
+                       (tk.silu_mul_quant_fp8, {"act": "swiglu_oai"})]:
+        cm, sm = fn(mx.array(x), mx.array(g), **kwargs)
+        ct, st = fn(t(x), t(g), **kwargs)
+        _assert_parity(cm, ct, atol=1)
+        _assert_parity(sm, st, atol=1e-5)
+    cm, am, scm = tk.rms_norm_add_int8(mx.array(x).astype(mx.bfloat16),
+                                       mx.array(g).astype(mx.bfloat16),
+                                       mx.ones((512,), dtype=mx.bfloat16))
+    ct, at2, sct = tk.rms_norm_add_int8(t(x).to(torch.bfloat16), t(g).to(torch.bfloat16),
+                                        torch.ones(512, dtype=torch.bfloat16, device="mps"))
+    _assert_parity(cm, ct, atol=1)
+
+
 def test_quant_group_azp_parity():
     rng = np.random.default_rng(59)
     x = rng.standard_normal((17, 256)).astype(np.float32)

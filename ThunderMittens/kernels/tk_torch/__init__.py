@@ -33,6 +33,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "qk_norm_rope", "qk_norm_rope.metal"),
     os.path.join(_KERNELS, "selective_scan", "selective_scan.metal"),
     os.path.join(_KERNELS, "gdn", "gdn.metal"),
+    os.path.join(_KERNELS, "act_quant", "act_quant.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -603,6 +604,31 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
+
+
+def rms_norm_add_int8(x, residual, weight, eps=1e-5):
+    """Fused add + rms_norm + dynamic per-row int8. Returns (codes i8, x+residual, scale). MPS."""
+    return tuple(_ext.rms_norm_add_int8_dyn(x, residual, weight, float(eps)))
+
+
+_ACTQ_MODES = {"swiglu": 0, "swiglu_oai": 1}
+
+
+def silu_mul_quant_fp8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated-activation -> dynamic per-token fp8. Returns (codes u8, scale). MPS."""
+    return tuple(_ext.silu_mul_quant_fp8(x, gate, _ACTQ_MODES[act], float(alpha), float(limit)))
+
+
+def silu_mul_quant_int8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated-activation -> dynamic per-token int8 (feeds qgemm_w8a8). MPS."""
+    return tuple(_ext.silu_mul_quant_int8(x, gate, _ACTQ_MODES[act], float(alpha), float(limit)))
+
+
+def silu_mul_quant_fp8_group(x, gate, group_size=128, ue8m0=False, act="swiglu",
+                             alpha=1.702, limit=7.0):
+    """Fused gated-activation -> per-group fp8 (scale (rows, D/G); ue8m0 = 2^k scales). MPS."""
+    return tuple(_ext.silu_mul_quant_fp8_group(x, gate, group_size, ue8m0,
+                                               _ACTQ_MODES[act], float(alpha), float(limit)))
 
 
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):

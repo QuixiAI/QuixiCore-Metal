@@ -177,6 +177,19 @@ std::vector<array> rms_norm_add_fp8_dyn(
       std::make_shared<AddNormFp8>(to_stream(s), false, true, eps, 0.0f), {x, residual, weight});
 }
 
+std::vector<array> rms_norm_add_int8_dyn(
+    const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "rms_norm_add_int8_dyn");
+  if (weight.ndim() != 1 || weight.shape(0) != D || weight.dtype() != bfloat16) {
+    throw std::invalid_argument("rms_norm_add_int8_dyn: weight must be bfloat16 (D,)");
+  }
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_scale_shape(x)}, {int8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), false, true, eps, 0.0f, true),
+      {x, residual, weight});
+}
+
 std::vector<array> layernorm_add_fp8(
     const array& x, const array& residual, const array& weight, const array& bias, float eps,
     float scale, StreamOrDevice s) {
@@ -241,7 +254,11 @@ void AddNormFp8::eval_gpu(
     if (dynamic_) {
       auto& scale = outputs[2];
       scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
-      tk::launch_rms_norm_add_fp8_dyn(enc, x, residual, weight, codes, res_out, scale, M, D, eps_);
+      if (int8_) {
+        tk::launch_rms_norm_add_int8_dyn(enc, x, residual, weight, codes, res_out, scale, M, D, eps_);
+      } else {
+        tk::launch_rms_norm_add_fp8_dyn(enc, x, residual, weight, codes, res_out, scale, M, D, eps_);
+      }
     } else {
       tk::launch_rms_norm_add_fp8(enc, x, residual, weight, codes, res_out, M, D, eps_, inv_scale_);
     }
