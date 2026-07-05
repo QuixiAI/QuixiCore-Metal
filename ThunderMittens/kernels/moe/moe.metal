@@ -59,6 +59,154 @@ kernel void moe_route_topk(device const T *logits       [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// DeepSeek-style grouped (node-limited) routing with bias-corrected selection
+// (HF DeepSeek-V3 "noaux_tc"): score = scoring(logit); biased = score + bias[e] is used for
+// SELECTION ONLY (group ranking and expert top-k); the emitted weight comes from the
+// UNBIASED score, optionally renormalized over the selected set, then scaled by
+// routed_scaling_factor. Group stage: each group is ranked by the sum of its top-2 biased
+// scores; the top `topk_group` groups survive; experts outside them are masked.
+// One simdgroup per token; scored/biased staged in threadgroup (E <= 512, n_group <= 32,
+// K <= MOE_MAX_K). scoring_func: 0 = softmax, 1 = sigmoid (DeepSeek-V3/Kimi-K2),
+// 2 = sqrt(softplus) . n_group <= 1 or topk_group >= n_group skips the group stage.
+// Output contract identical to moe_route_topk -> drops into moe_permute/moe_mlp unchanged.
+// ---------------------------------------------------------------------------
+
+constant int MOE_MAX_GROUPS = 32;
+constant int MOE_MAX_E_GROUPED = 512;
+
+// masked_topk candidate functors over the threadgroup staging arrays
+struct moe_group_cand {
+    threadgroup const float *gs;
+    METAL_FUNC void operator()(int idx, thread int &id, thread float &v, thread bool &valid) const {
+        id = idx; v = gs[idx]; valid = true;
+    }
+};
+struct moe_masked_expert_cand {
+    threadgroup const float *biased;
+    int experts_per_group;
+    uint sel_mask;
+    METAL_FUNC void operator()(int idx, thread int &id, thread float &v, thread bool &valid) const {
+        id = idx;
+        v = biased[idx];
+        valid = ((sel_mask >> (idx / experts_per_group)) & 1u) != 0u;
+    }
+};
+
+METAL_FUNC float moe_softplus(float x) {
+    return (x > 20.0f) ? x : metal::log(1.0f + metal::exp(x));
+}
+
+template <typename T>
+kernel void moe_route_grouped(device const T *logits        [[buffer(0)]],
+                              device const float *bias      [[buffer(1)]],  // (E,) selection bias
+                              device int     *topk_ids      [[buffer(2)]],
+                              device float   *topk_weights  [[buffer(3)]],
+                              constant int   &E             [[buffer(4)]],
+                              constant int   &n_group       [[buffer(5)]],
+                              constant int   &topk_group    [[buffer(6)]],
+                              constant int   &K             [[buffer(7)]],
+                              constant int   &renormalize   [[buffer(8)]],
+                              constant float &routed_scaling_factor [[buffer(9)]],
+                              constant int   &scoring_func  [[buffer(10)]],
+                              constant int   &has_bias      [[buffer(11)]],
+                              uint token [[threadgroup_position_in_grid]],
+                              uint lane  [[thread_index_in_simdgroup]]) {
+    threadgroup float scored[MOE_MAX_E_GROUPED];
+    threadgroup float biased[MOE_MAX_E_GROUPED];
+    threadgroup float group_scores[MOE_MAX_GROUPS];
+    const long base = (long)token * E;
+
+    if (scoring_func == 0) {              // softmax over the full row
+        float lm = MOE_NEG_INF;
+        for (int i = (int)lane; i < E; i += 32) lm = max(lm, float(logits[base + i]));
+        lm = simd_max(lm);
+        float ls = 0.0f;
+        for (int i = (int)lane; i < E; i += 32) ls += exp(float(logits[base + i]) - lm);
+        ls = simd_sum(ls);
+        const float inv = 1.0f / ls;
+        for (int i = (int)lane; i < E; i += 32) {
+            const float sc = exp(float(logits[base + i]) - lm) * inv;
+            scored[i] = sc;
+            biased[i] = sc + (has_bias != 0 ? bias[i] : 0.0f);
+        }
+    } else {
+        for (int i = (int)lane; i < E; i += 32) {
+            const float x = float(logits[base + i]);
+            const float sc = (scoring_func == 1) ? 1.0f / (1.0f + metal::exp(-x))
+                                                 : metal::sqrt(moe_softplus(x));
+            scored[i] = sc;
+            biased[i] = sc + (has_bias != 0 ? bias[i] : 0.0f);
+        }
+    }
+    metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    uint sel_mask = 0xFFFFFFFFu;
+    if (n_group > 1 && topk_group < n_group) {
+        const int epg = E / n_group;
+        if ((int)lane < n_group) {        // lane g ranks group g by its top-2 biased sum
+            float b0 = MOE_NEG_INF, b1 = MOE_NEG_INF;
+            for (int j = 0; j < epg; ++j) {
+                const float v = biased[(int)lane * epg + j];
+                if (v > b0)      { b1 = b0; b0 = v; }
+                else if (v > b1) { b1 = v; }
+            }
+            group_scores[lane] = b0 + ((epg > 1) ? b1 : 0.0f);
+        }
+        metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+        int gsel[MOE_MAX_GROUPS];
+        float gval[MOE_MAX_GROUPS];
+        moe_group_cand gc{group_scores};
+        masked_topk(gc, n_group, topk_group, lane, MOE_NEG_INF, gsel, gval);
+        sel_mask = 0u;
+        for (int g = 0; g < topk_group; ++g) {
+            if (gsel[g] >= 0) sel_mask |= (1u << (uint)gsel[g]);
+        }
+    }
+
+    int chosen_id[MOE_MAX_K];
+    float chosen_val[MOE_MAX_K];
+    moe_masked_expert_cand ec{biased, E / max(n_group, 1), sel_mask};
+    masked_topk(ec, E, K, lane, MOE_NEG_INF, chosen_id, chosen_val);
+
+    // weights from the UNBIASED scores of the selected experts
+    float w[MOE_MAX_K];
+    float wsum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+        w[k] = (chosen_id[k] >= 0) ? scored[chosen_id[k]] : 0.0f;
+        wsum += w[k];
+    }
+    const float denom = (renormalize != 0 && wsum > 0.0f) ? wsum : 1.0f;
+    if (lane == 0) {
+        const long ob = (long)token * K;
+        for (int k = 0; k < K; ++k) {
+            topk_ids[ob + k] = chosen_id[k];
+            topk_weights[ob + k] = (w[k] / denom) * routed_scaling_factor;
+        }
+    }
+}
+
+#define instantiate_moe_route_grouped(type_name, T)                                  \
+  template [[host_name("moe_route_grouped_" #type_name)]] [[kernel]] void            \
+  moe_route_grouped<T>(device const T *logits [[buffer(0)]],                          \
+                       device const float *bias [[buffer(1)]],                        \
+                       device int *topk_ids [[buffer(2)]],                            \
+                       device float *topk_weights [[buffer(3)]],                      \
+                       constant int &E [[buffer(4)]],                                 \
+                       constant int &n_group [[buffer(5)]],                           \
+                       constant int &topk_group [[buffer(6)]],                        \
+                       constant int &K [[buffer(7)]],                                 \
+                       constant int &renormalize [[buffer(8)]],                       \
+                       constant float &routed_scaling_factor [[buffer(9)]],           \
+                       constant int &scoring_func [[buffer(10)]],                     \
+                       constant int &has_bias [[buffer(11)]],                         \
+                       uint token [[threadgroup_position_in_grid]],                   \
+                       uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_moe_route_grouped(float32, float)
+instantiate_moe_route_grouped(float16, half)
+instantiate_moe_route_grouped(bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
 // MoE permute pipeline (P3 atomics + offset scan). Groups the T*K (token, k-slot)
 // routing rows by expert id so each expert's tokens are contiguous for the GEMM.
 //

@@ -1,5 +1,22 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing (2026-07-05)
+
+moe_route_grouped: HF DeepSeek-V3 "noaux_tc" semantics — sigmoid / softmax / sqrt-softplus
+scoring, e_score_correction_bias for SELECTION only, per-group top-2-sum ranking, top
+`topk_group` groups, expert top-k among survivors, weights from UNBIASED scores
+(renormalize + routed_scaling_factor). One simdgroup/token over threadgroup-staged
+scored/biased (E <= 512, n_group <= 32), both selection levels via the existing masked_topk
+butterfly — barrier-free vs the reference's 256-thread tree-reduce design. Output contract
+== moe_route_topk, so it drops into moe_permute/moe_mlp unchanged.
+
+- Tests: 9 oracle tests (DeepSeek-V3 256/8/4/8, Kimi-K2 384/1/8, all scorings, ids-exact
+  with explicit-tie and bias-flips-selection-not-weights fixtures, group-mask exclusion);
+  cross-backend parity ids atol=0.
+- Perf: T=4096/E=256 grouped 0.1442 ms vs plain moe_route_topk 0.1430 ms — within noise;
+  the reference's E=256 bitonic fast path is confirmed unnecessary on this geometry (skipped
+  as planned).
+
 ## Wave-9 — gap port, kernel 2: attention softcap + sinks (2026-07-05)
 
 Gemma-2/3 logit soft-capping (runtime scalar, <=0 off) and gpt-oss attention sinks

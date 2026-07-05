@@ -791,6 +791,33 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,
+                      routed_scaling_factor=1.0, scoring="sigmoid"):
+    """DeepSeek-style grouped (node-limited) MoE routing (HF noaux_tc semantics).
+
+    score = scoring(logit) ("softmax" | "sigmoid" | "softplus_sqrt"); selection uses
+    score + bias[e] (the e_score_correction_bias; optional); each group is ranked by the sum
+    of its top-2 biased scores and only the best `topk_group` groups keep their experts; the
+    emitted weight is the UNBIASED score, renormalized over the selected set when
+    `renormalize`, times routed_scaling_factor. Returns (ids int32, weights f32), (T, k).
+    E <= 512, E % n_group == 0, n_group <= 32, k <= 16. DeepSeek-V3: E=256, n_group=8,
+    topk_group=4, k=8, scoring="sigmoid". Output contract == moe_route_topk (feeds
+    moe_permute / moe_mlp unchanged). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().moe_route_grouped(logits, k, n_group, topk_group, bias=bias,
+                                          renormalize=renormalize,
+                                          routed_scaling_factor=routed_scaling_factor,
+                                          scoring=scoring)
+    import mlx.core as mx
+    sf = {"softmax": 0, "sigmoid": 1, "softplus_sqrt": 2}[scoring]
+    has_bias = bias is not None
+    if bias is None:
+        bias = mx.zeros((1,), dtype=mx.float32)
+    return _mlx().moe_route_grouped(logits, bias, has_bias, int(k), int(n_group),
+                                    int(topk_group), bool(renormalize),
+                                    float(routed_scaling_factor), sf)
+
+
 def moe_permute(topk_ids, num_experts):
     """Group T*k routing rows by expert. Returns (sorted_row_idx, offsets, inv_idx) int32.
 

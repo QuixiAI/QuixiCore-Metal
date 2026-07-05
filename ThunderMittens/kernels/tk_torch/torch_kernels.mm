@@ -1768,6 +1768,42 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// DeepSeek-style grouped routing (noaux_tc). Returns (topk_ids int32, topk_weights f32).
+static std::tuple<at::Tensor, at::Tensor> moe_route_grouped_mps(
+    const at::Tensor& logits_in, const c10::optional<at::Tensor>& bias_in, int64_t k,
+    int64_t n_group, int64_t topk_group, bool renormalize, double routed_scaling_factor,
+    int64_t scoring_func) {
+  TORCH_CHECK(logits_in.device().is_mps() && logits_in.dim() == 2 && tk_is_float_dtype(logits_in),
+              "moe_route_grouped: logits must be a float (T,E) MPS tensor");
+  auto logits = logits_in.contiguous();
+  const int T = logits.size(0), E = logits.size(1);
+  TORCH_CHECK(E <= 512 && n_group >= 1 && n_group <= 32 && E % n_group == 0,
+              "moe_route_grouped: need E <= 512, 1 <= n_group <= 32, E % n_group == 0");
+  TORCH_CHECK(topk_group >= 1 && topk_group <= n_group, "moe_route_grouped: bad topk_group");
+  TORCH_CHECK(k > 0 && k <= 16 && k <= E, "moe_route_grouped: require 1 <= k <= min(16, E)");
+  TORCH_CHECK(scoring_func >= 0 && scoring_func <= 2, "moe_route_grouped: bad scoring_func");
+  const bool has_bias = bias_in.has_value();
+  at::Tensor bias;
+  if (has_bias) {
+    TORCH_CHECK(bias_in->dim() == 1 && bias_in->size(0) == E,
+                "moe_route_grouped: bias must be (E,)");
+    bias = bias_in->to(at::kFloat).contiguous();
+  } else {
+    bias = at::zeros({1}, logits.options().dtype(at::kFloat));
+  }
+  auto ids = at::empty({T, (int64_t)k}, logits.options().dtype(at::kInt));
+  auto weights = at::empty({T, (int64_t)k}, logits.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_route_grouped(e, logits, bias, ids, weights, T, E,
+                                 static_cast<int>(n_group), static_cast<int>(topk_group),
+                                 static_cast<int>(k), renormalize ? 1 : 0,
+                                 static_cast<float>(routed_scaling_factor),
+                                 static_cast<int>(scoring_func), has_bias ? 1 : 0,
+                                 tk_type_name(logits));
+  });
+  return {ids, weights};
+}
+
 // Quantized grouped expert GEMMs: Wq is the packed (E, N_out, row_bytes) uint8 expert stack
 // (quant groups along K — tk.quant.quantize_expert_stack layout), contracted as A @ Wq^T.
 // bias: pass a 1-element dummy with has_bias=false when absent. bf16 activations only.
@@ -3175,6 +3211,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("moe_route_grouped", &moe_route_grouped_mps,
+        "ThunderMittens DeepSeek-style grouped MoE routing (MPS)",
+        pybind11::arg("logits"), pybind11::arg("bias"), pybind11::arg("k"),
+        pybind11::arg("n_group"), pybind11::arg("topk_group"), pybind11::arg("renormalize"),
+        pybind11::arg("routed_scaling_factor"), pybind11::arg("scoring_func"));
   m.def("moe_grouped_gemm_rect_q", &moe_grouped_gemm_rect_q_mps, "ThunderMittens quantized grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu_q", &moe_grouped_gemm_swiglu_q_mps, "ThunderMittens quantized fused SwiGLU expert GEMM1 (MPS)");
   m.def("moe_finalize", &moe_finalize_mps, "ThunderMittens MoE finalize reduce (MPS)");

@@ -602,6 +602,15 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     return _ext.moe_route_topk(logits, int(k))
 
 
+def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,
+                      routed_scaling_factor=1.0, scoring="sigmoid"):
+    """DeepSeek-style grouped routing (noaux_tc): scoring + bias-corrected selection, group
+    top-2 ranking, weights from unbiased scores. Returns (ids int32, weights f32). MPS."""
+    sf = {"softmax": 0, "sigmoid": 1, "softplus_sqrt": 2}[scoring]
+    return _ext.moe_route_grouped(logits, bias, int(k), int(n_group), int(topk_group),
+                                  bool(renormalize), float(routed_scaling_factor), sf)
+
+
 def moe_permute(topk_ids: torch.Tensor, num_experts: int):
     """Group T*k routing rows by expert. Returns (sorted_row_idx, offsets, inv_idx) int32. MPS."""
     return _ext.moe_permute(topk_ids, int(num_experts))

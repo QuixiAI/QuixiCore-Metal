@@ -19,6 +19,18 @@ namespace mlx::core {
 std::vector<array> moe_route_topk(const array& logits, int k, StreamOrDevice s = {});
 
 /**
+ *  DeepSeek-style grouped (node-limited) routing with bias-corrected selection (HF "noaux_tc").
+ *  score = scoring(logit) (0 softmax / 1 sigmoid / 2 sqrt-softplus); selection uses
+ *  score + bias[e] (bias optional); groups ranked by their top-2 biased sum, top `topk_group`
+ *  survive; top-k experts among survivors. Emitted weight = UNBIASED score, optionally
+ *  renormalized over the selected set, x routed_scaling_factor. Returns (ids int32,
+ *  weights float32), both (num_tokens, k). E <= 512, E % n_group == 0, n_group <= 32, k <= 16.
+ **/
+std::vector<array> moe_route_grouped(
+    const array& logits, const array& bias, bool has_bias, int k, int n_group, int topk_group,
+    bool renormalize, float routed_scaling_factor, int scoring_func, StreamOrDevice s = {});
+
+/**
  *  MoE permute: group the T*K routing rows by expert id. topk_ids is (num_tokens, k)
  *  int32. Returns 5 int32 arrays [sorted_row_idx (T*K), offsets (E+1), inv_idx (T*K),
  *  counts (E, scratch), cursor (E, scratch)] — callers use the first three. A flat
@@ -109,6 +121,42 @@ class MoeRouteTopk : public Primitive {
 
  private:
   int k_;
+};
+
+class MoeRouteGrouped : public Primitive {
+ public:
+  MoeRouteGrouped(Stream stream, int k, int n_group, int topk_group, bool renormalize,
+                  float routed_scaling_factor, int scoring_func, bool has_bias)
+      : Primitive(stream), k_(k), n_group_(n_group), topk_group_(topk_group),
+        renormalize_(renormalize), routed_scaling_factor_(routed_scaling_factor),
+        scoring_func_(scoring_func), has_bias_(has_bias) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeRouteGrouped"; }
+  void print(std::ostream& os) override { os << "MoeRouteGrouped"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MoeRouteGrouped&>(other);
+    return k_ == o.k_ && n_group_ == o.n_group_ && topk_group_ == o.topk_group_ &&
+           renormalize_ == o.renormalize_ &&
+           routed_scaling_factor_ == o.routed_scaling_factor_ &&
+           scoring_func_ == o.scoring_func_ && has_bias_ == o.has_bias_;
+  }
+
+ private:
+  int k_;
+  int n_group_;
+  int topk_group_;
+  bool renormalize_;
+  float routed_scaling_factor_;
+  int scoring_func_;
+  bool has_bias_;
 };
 
 class MoePadSchedule : public Primitive {

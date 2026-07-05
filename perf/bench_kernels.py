@@ -1342,6 +1342,29 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("moe_route")
+def moe_route_cases(be, preset, formats):
+    """DeepSeek grouped routing vs the plain top-k router (same T,E,K): the grouped kernel
+    adds scoring + bias + a two-level masked_topk; success = within noise of moe_route_topk."""
+    tk = be.tk()
+    rng = np.random.default_rng(30)
+    shapes = _pick(preset, [(512, 64, 4, 2, 4)],
+                   [(512, 256, 8, 4, 8), (4096, 256, 8, 4, 8)],
+                   [(512, 256, 8, 4, 8), (4096, 256, 8, 4, 8), (4096, 384, 1, 1, 8)])
+    for T, E, n_group, topk_group, K in shapes:
+        logits = rng.standard_normal((T, E)).astype(np.float32)
+        bias = (0.1 * rng.standard_normal(E)).astype(np.float32)
+        lg_d, b_d = be.array(logits, "f32"), be.array(bias, "f32")
+        yield Case("moe_route", f"grouped_T{T}_E{E}_g{n_group}_k{K}",
+                   {"T": T, "E": E, "g": n_group, "K": K}, "f32",
+                   target=lambda lg_d=lg_d, b_d=b_d, K=K, g=n_group, tg=topk_group:
+                       tk.moe_route_grouped(lg_d, K, g, tg, bias=b_d, scoring="sigmoid",
+                                            routed_scaling_factor=2.5),
+                   baselines={"moe_route_topk":
+                              lambda lg_d=lg_d, K=K: tk.moe_route_topk(lg_d, K)},
+                   ref=None, bytes_moved=2.0 * T * E * 4)
+
+
 @register("moe_q")
 def moe_q_cases(be, preset, formats):
     """Quantized grouped expert GEMMs vs the dense bf16 grouped GEMM. Decode-shape MoE is

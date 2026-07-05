@@ -38,6 +38,67 @@ std::vector<array> moe_route_topk(const array& logits, int k, StreamOrDevice s /
       {x});
 }
 
+std::vector<array> moe_route_grouped(
+    const array& logits, const array& bias, bool has_bias, int k, int n_group, int topk_group,
+    bool renormalize, float routed_scaling_factor, int scoring_func, StreamOrDevice s) {
+  if (logits.ndim() != 2) {
+    throw std::invalid_argument("moe_route_grouped: logits must be (num_tokens, num_experts)");
+  }
+  if (!(logits.dtype() == float32 || logits.dtype() == float16 || logits.dtype() == bfloat16)) {
+    throw std::invalid_argument("moe_route_grouped: logits must be float32/float16/bfloat16");
+  }
+  const int T = logits.shape(0), E = logits.shape(1);
+  if (E > 512) {
+    throw std::invalid_argument("moe_route_grouped: num_experts must be <= 512");
+  }
+  if (n_group < 1 || n_group > 32 || E % n_group != 0) {
+    throw std::invalid_argument("moe_route_grouped: need 1 <= n_group <= 32 and E % n_group == 0");
+  }
+  if (topk_group < 1 || topk_group > n_group) {
+    throw std::invalid_argument("moe_route_grouped: need 1 <= topk_group <= n_group");
+  }
+  if (k <= 0 || k > 16 || k > E) {
+    throw std::invalid_argument("moe_route_grouped: require 1 <= k <= min(16, num_experts)");
+  }
+  if (scoring_func < 0 || scoring_func > 2) {
+    throw std::invalid_argument("moe_route_grouped: scoring_func must be 0, 1 or 2");
+  }
+  if (has_bias && (bias.ndim() != 1 || bias.shape(0) != E)) {
+    throw std::invalid_argument("moe_route_grouped: bias must be (num_experts,)");
+  }
+  auto x = contiguous(logits, false, s);
+  auto b = contiguous(astype(bias, float32, s), false, s);
+  return array::make_arrays(
+      {{T, k}, {T, k}},
+      {int32, float32},
+      std::make_shared<MoeRouteGrouped>(to_stream(s), k, n_group, topk_group, renormalize,
+                                        routed_scaling_factor, scoring_func, has_bias),
+      {x, b});
+}
+
+void MoeRouteGrouped::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeRouteGrouped has no CPU implementation.");
+}
+
+void MoeRouteGrouped::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& logits = inputs[0];
+  auto& bias = inputs[1];
+  auto& ids = outputs[0];
+  auto& weights = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  ids.set_data(allocator::malloc_or_wait(ids.nbytes()));
+  weights.set_data(allocator::malloc_or_wait(weights.nbytes()));
+  const int T = logits.shape(0);
+  const int E = logits.shape(1);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_route_grouped(enc, logits, bias, ids, weights, T, E, n_group_, topk_group_,
+                               k_, renormalize_ ? 1 : 0, routed_scaling_factor_, scoring_func_,
+                               has_bias_ ? 1 : 0, type_to_name(logits));
+}
+
 void MoeRouteTopk::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("MoeRouteTopk has no CPU implementation.");
 }
@@ -579,6 +640,7 @@ TK_MOE_NO_AUTODIFF(MoeFinalize, "MoeFinalize")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemm, "MoeGroupedGemm")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmRect, "MoeGroupedGemmRect")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwiglu, "MoeGroupedGemmSwiglu")
+TK_MOE_NO_AUTODIFF(MoeRouteGrouped, "MoeRouteGrouped")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmRectQ, "MoeGroupedGemmRectQ")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwigluQ, "MoeGroupedGemmSwigluQ")
 

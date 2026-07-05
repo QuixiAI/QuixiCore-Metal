@@ -676,6 +676,22 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+@pytest.mark.parametrize("E,n_group,topk_group,K", [(256, 8, 4, 8), (64, 4, 2, 4)])
+def test_moe_route_grouped_parity(E, n_group, topk_group, K):
+    rng = np.random.default_rng(55)
+    T = 32
+    logits = rng.standard_normal((T, E)).astype(np.float32)
+    bias = (0.1 * rng.standard_normal(E)).astype(np.float32)
+    im, wm = tk.moe_route_grouped(mx.array(logits), K, n_group, topk_group,
+                                  bias=mx.array(bias), scoring="sigmoid",
+                                  routed_scaling_factor=2.5)
+    it, wt = tk.moe_route_grouped(torch.from_numpy(logits).to("mps"), K, n_group, topk_group,
+                                  bias=torch.from_numpy(bias).to("mps"), scoring="sigmoid",
+                                  routed_scaling_factor=2.5)
+    _assert_parity(im, it, atol=0)          # same metallib -> identical expert ids
+    _assert_parity(wm, wt, atol=1e-6)
+
+
 @pytest.mark.parametrize("E,K", [(8, 2), (64, 4)])
 def test_moe_route_topk_parity(E, K):
     rng = np.random.default_rng(0)

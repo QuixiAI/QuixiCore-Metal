@@ -519,6 +519,15 @@ NB_MODULE(_ext, m) {
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
 
     m.def(
+      "moe_route_grouped", &moe_route_grouped,
+      "logits"_a, "bias"_a, "has_bias"_a, "k"_a, "n_group"_a, "topk_group"_a,
+      "renormalize"_a, "routed_scaling_factor"_a, "scoring_func"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek-style grouped routing (noaux_tc): sigmoid/softmax/sqrt-softplus scoring,
+         bias-corrected selection, group top-2 ranking, weights from unbiased scores.
+         Returns (ids int32, weights f32).)");
+
+    m.def(
       "moe_grouped_gemm_rect_q", &moe_grouped_gemm_rect_q,
       "A"_a, "Wq"_a, "expert_of_tile"_a, "bias"_a, "has_bias"_a, "K_dim"_a, "N_out"_a,
       "format"_a, nb::kw_only(), "stream"_a = nb::none(),

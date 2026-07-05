@@ -50,6 +50,7 @@ inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_
 inline std::string moe_grouped_gemm_kernel_name(const std::string& t) { return "moe_grouped_gemm_" + t; }
 inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { return "moe_grouped_gemm_rect_" + t; }
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
+inline std::string moe_route_grouped_kernel_name(const std::string& t) { return "moe_route_grouped_" + t; }
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
 inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
@@ -424,6 +425,25 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// ----- moe_route_grouped (DeepSeek noaux_tc): logits@0 bias@1(f32,(E,)) -> topk_ids@2(i32)
+//        topk_weights@3(f32) ; E@4 n_group@5 topk_group@6 K@7 renormalize@8
+//        routed_scaling_factor@9(f32) scoring_func@10 (0 softmax/1 sigmoid/2 sqrt-softplus)
+//        has_bias@11 ; grid (T,1,1), 32 thr. bias read only when has_bias (pass any small
+//        f32 buffer as placeholder otherwise). Output contract == moe_route_topk. -----
+template <class Enc>
+void launch_moe_route_grouped(Enc& e, typename Enc::in_t logits, typename Enc::in_t bias,
+                              typename Enc::out_t topk_ids, typename Enc::out_t topk_weights,
+                              int T, int E, int n_group, int topk_group, int K, int renormalize,
+                              float routed_scaling_factor, int scoring_func, int has_bias,
+                              const std::string& type_name) {
+  e.pipeline(moe_route_grouped_kernel_name(type_name));
+  e.in(logits, 0); e.in(bias, 1); e.out(topk_ids, 2); e.out(topk_weights, 3);
+  e.bytes(E, 4); e.bytes(n_group, 5); e.bytes(topk_group, 6); e.bytes(K, 7);
+  e.bytes(renormalize, 8); e.bytes(routed_scaling_factor, 9); e.bytes(scoring_func, 10);
+  e.bytes(has_bias, 11);
+  e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
 // ----- Quantized grouped expert GEMMs (weight-only quant, bf16 activations). Wq is the packed
