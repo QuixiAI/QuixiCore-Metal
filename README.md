@@ -1,6 +1,10 @@
 # ThunderMittens
 
-ThunderMittens is an Apple Metal Shading Language (MSL) port for the [ThunderKittens](github.com/HazyResearch/ThunderKittens/) framework.
+ThunderMittens is [QuixiAI](https://github.com/QuixiAI)'s Apple Metal Shading Language (MSL) fork of
+[ThunderKittens](https://github.com/HazyResearch/ThunderKittens/) — the tile-based GPU-kernel framework
+from HazyResearch. This fork brings the substrate to Apple Silicon and extends it with a large set of
+serving, training, and model-architecture kernels running on **two backends** (MLX + PyTorch/MPS) from
+one metallib.
 
 <div align="center" >
     <img src="assets/mittens.jpeg" height=350 alt="ThunderKittens logo" style="margin-bottom:px"/> 
@@ -27,6 +31,7 @@ metallib, cross-checked by 2,277 correctness + parity + MPS tests.
 | **gelu** (tanh) | 16384 × 256 | `mx.nn.gelu_approx` | **3.1×** |
 | **softmax** | 16384 × 768 | `mx.softmax` | **2.9×** |
 | **causal attention** | 1×8×2048×128 | `scaled_dot_product_attention` | **3.9×** |
+| **qk_norm_rope** (fused per-head) | 4096 × 32 × 128 | `mx.fast` rms_norm + rope | **2.5×** |
 | **fused add + rms_norm** | 4096 × 1024 | `add` + `mx.fast.rms_norm` | **1.9×** |
 | **rms_norm backward** (fused 1-pass) | 65536 × 512 | `mx.fast.rms_norm` VJP | **1.5×** |
 | **layernorm backward** (fused 1-pass) | 65536 × 512 | `mx.fast.layer_norm` VJP | **1.6×** |
@@ -91,29 +96,37 @@ for the full sweep + the honest rejects:
 The passes are honest about rejects: fused-write cascade, copy-pair compaction, and `adamw` vec4 were
 all built or prototyped, measured to not win, and reverted/documented.
 
-### New model architectures (Wave 9)
+### New model architectures (Wave 9) — ported from AlpinDale's metal-forge
 
-A gap-closing wave that ports the kernels modern open models need to actually run — each one
-naive-correct → validated against a numpy/HF oracle → cross-backend parity-tested → benched →
-optimized keep-if-win. Details in `perf/optimization_status.md`.
+Wave 9 is a gap-closing wave that ports the kernels modern open models need to actually run. The
+algorithms come from **[metal-forge](https://github.com/AlpinDale)**, a vLLM-style Metal
+inference-kernel library by **[AlpinDale](https://github.com/AlpinDale)**
+([@AlpinDale](https://x.com/AlpinDale)) — **huge thanks** for the reference implementations. Each
+kernel below is re-expressed on the ThunderMittens tile substrate (not copied), then run through the
+per-kernel loop: naive-correct → validated against a numpy/HF oracle → cross-backend parity-tested →
+benched → optimized keep-if-win. Details in `perf/optimization_status.md`.
 
-- **gpt-oss** — **quantized grouped expert GEMMs** (`moe_grouped_gemm_rect_q` / `swiglu_q`,
-  dequant-in-register + `mma_ABt`, 6 formats incl. MXFP4/NVFP4; swiglu_oai + expert-bias baked in),
-  **attention sinks + logit softcap** (over fwd / causal / window / varlen / paged), and the
-  **fused act→quant epilogues** feeding them (~1.28× the unfused swiglu→quantize chain).
-- **DeepSeek-V3 / Kimi-K2** — **grouped `noaux_tc` routing** (softmax/sigmoid/sqrt-softplus scoring,
-  two-level group top-k, ids-exact vs the HF oracle) to compose with the quantized experts + MLA.
-- **Qwen3-Next / Kimi-Linear** — **GatedDeltaNet linear attention** (`gdn_recur`, varlen + persistent
-  paged state pool + GQA) and **fused per-head QK-RMSNorm+RoPE** (2.6× the `mx.fast` composition).
-- **Mamba-1 hybrids** — **selective scan** (S6) dense / varlen / **APC** (paged state checkpointing
-  for automatic prefix caching).
-- **Quantized serving** — per-group-128 + asymmetric-int8 (azp) activation quant with an azp-corrected
-  W8A8 GEMM, and the **TurboQuant KV codec** (K asymmetric-uniform + V random-sign-FWHT/Lloyd-Max,
-  2–8 bit, K codes bit-exact vs the fp16 oracle).
-- **Long-context / sampling** — **MInference** decode block-mask builder (per-head block-sparse paged
-  attention), the full modern **sampler zoo** (top-nσ / top-A / ε- / η-cutoff / quadratic / skew /
-  XTC / no-repeat-ngram / DRY / top-k & top-p renorm), plus `tau_tail`, `packbits`/`segment_packbits`,
-  and `permute_cols` layout utilities.
+Every kernel here is credited to AlpinDale / metal-forge as the source of the algorithm:
+
+| model target | ThunderMittens kernel | ported from metal-forge | measured |
+|---|---|---|---|
+| **gpt-oss** | quantized grouped expert GEMMs (`moe_grouped_gemm_rect_q` / `swiglu_q`, dequant-in-register + `mma_ABt`, MXFP4/NVFP4/fp8/int + swiglu_oai + expert bias) | `moe/moe.metal` | ~dense-bf16 speed at prefill, **reads 4–8× fewer weight bytes**; wins at decode |
+| **gpt-oss / Gemma-2/3** | attention **sinks + logit softcap** (fwd / causal / window / varlen / paged) | `attention.metal` | flagless path regression-free |
+| **gpt-oss** | fused **act→quant epilogues** (`silu_mul_quant_fp8`/`int8`/`fp8_group`) | act-quant fusion | **~1.4×** the unfused swiglu→quantize chain |
+| **DeepSeek-V3 / Kimi-K2** | grouped **`noaux_tc` routing** (softmax/sigmoid/sqrt-softplus, two-level group top-k) | `moe/moe.metal` | ids-exact vs HF; within noise of plain top-k |
+| **Qwen3-Next / Kimi-Linear** | **GatedDeltaNet linear attention** (`gdn_recur`, varlen + paged state pool + GQA) | `gdn_linear_attention` | novel mixer (no MLX baseline) |
+| **Qwen3** | fused per-head **QK-RMSNorm + RoPE** (`qk_norm_rope`, NeoX + GPT-J) | `qk_norm_rope` | **2.5×** the `mx.fast` rms_norm+rope composition |
+| **Mamba-1 hybrids** | **selective scan** (S6) dense / varlen / **APC** paged-state checkpointing | `sequence/selective_scan.metal` | reference-faithful recurrence |
+| **W8A8 serving** | per-group-128 + asymmetric-int8 (**azp**) activation quant + azp-corrected W8A8 GEMM | `quantization` | codes bit-exact vs numpy |
+| **sub-4-bit KV** | **TurboQuant KV codec** (K asymmetric-uniform + V random-sign-FWHT / Lloyd-Max, 2–8 bit) | `quantization/turboquant.metal`, `hadamard.metal` | K codes bit-exact vs fp16 oracle |
+| **long-context** | **MInference** decode block-mask builder + per-head block-sparse paged attention | `attention.metal` | exact-int oracle |
+| **sampling** | the modern **sampler zoo** (top-nσ / top-A / ε- / η-cutoff / quadratic / skew / XTC / no-repeat-ngram / DRY / top-k & top-p renorm) | `sampling/sample_top_p.metal` | bandwidth-bound, one simdgroup/row |
+| **layout / utils** | `tau_tail`, `packbits` / `segment_packbits`, `permute_cols` | `cache/tau.metal`, `sampling/bitpack.metal`, `layout/layout.metal` | exact vs `np.packbits` / gather |
+
+The Wave-9 optimization pass then vectorized the two bf16-bound kernels that measured a win —
+`gdn_recur` (vec4 k/q loads: prefill ~7%, decode ~5%) and `act_quant` (vec4 amax+encode:
+int8 4096×2880 **~27%**) — and honestly reverted the f32 sampler-zoo vec4, which regressed at scale
+(f32 strided loads are already coalesced). See `perf/optimization_status.md`.
 
 ## Prerequisites (all paths)
 
@@ -223,9 +236,21 @@ python -m pytest */correctness/ tk_torch/tests/ tests_parity/
 Primitive-level MSL unit tests (register/shared tile ops) build and run through Xcode — see
 [1. MSL Kernel Development](#1-msl-kernel-development).
 
-## References
+## References & credits
 
-Please see [our blog post](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx) to learn more about this work. Please checkout [our paper](https://arxiv.org/abs/2410.20399) to learn more about the ThunderKittens project. 
+ThunderMittens is a [QuixiAI](https://github.com/QuixiAI) fork of
+[ThunderKittens](https://github.com/HazyResearch/ThunderKittens/) by **HazyResearch** — the original,
+upstream project. See HazyResearch's [blog post](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx)
+and [paper](https://arxiv.org/abs/2410.20399) to learn more about the ThunderKittens framework this fork
+builds on.
+
+The Wave-9 model-architecture kernels (quantized grouped expert GEMMs, attention sinks + softcap,
+DeepSeek `noaux_tc` routing, GatedDeltaNet linear attention, `qk_norm_rope`, Mamba-1 selective scan,
+azp/per-group activation quant, the TurboQuant KV codec, MInference block masks, the sampler zoo, and
+the `tau_tail` / `packbits` / `permute_cols` utilities) are ported from
+**[metal-forge](https://github.com/AlpinDale)** by **[AlpinDale](https://github.com/AlpinDale)**
+([@AlpinDale](https://x.com/AlpinDale)) — thank you for the reference implementations that made these
+kernels possible.
 
 
 
