@@ -676,6 +676,23 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_selective_scan_parity():
+    rng = np.random.default_rng(57)
+    b, d, L, G, N = 2, 32, 12, 2, 16
+    u = (0.5 * rng.standard_normal((b, d, L))).astype(np.float32)
+    delta = (0.3 * rng.standard_normal((b, d, L))).astype(np.float32)
+    A = (-np.exp(0.5 * rng.standard_normal((d, N)))).astype(np.float32)
+    B = (0.5 * rng.standard_normal((b, G, N, L))).astype(np.float32)
+    C = (0.5 * rng.standard_normal((b, G, N, L))).astype(np.float32)
+    h0 = (0.2 * rng.standard_normal((b, d, N))).astype(np.float32)
+    om, sm = tk.selective_scan(mx.array(u), mx.array(delta), mx.array(A), mx.array(B),
+                               mx.array(C), mx.array(h0))
+    t = lambda a: torch.from_numpy(a).to("mps")
+    ot, st = tk.selective_scan(t(u), t(delta), t(A), t(B), t(C), t(h0))
+    _assert_parity(om, ot, atol=1e-5)
+    _assert_parity(sm, st, atol=1e-5)
+
+
 @pytest.mark.parametrize("interleaved", [False, True])
 def test_qk_norm_rope_parity(interleaved):
     rng = np.random.default_rng(56)

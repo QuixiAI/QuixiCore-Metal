@@ -1768,6 +1768,84 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// Mamba-1 (S6) selective scan (dense + varlen). Functional: state is cloned and the clone
+// updated in place; returns (out, new_state).
+static std::tuple<at::Tensor, at::Tensor> selective_scan_mps(
+    const at::Tensor& u_in, const at::Tensor& delta_in, const at::Tensor& A_in,
+    const at::Tensor& B_in, const at::Tensor& C_in, const at::Tensor& state_in,
+    const c10::optional<at::Tensor>& D_in, const c10::optional<at::Tensor>& bias_in,
+    const c10::optional<at::Tensor>& z_in, bool delta_softplus) {
+  TORCH_CHECK(u_in.device().is_mps() && u_in.dim() == 3 && tk_is_float_dtype(u_in),
+              "selective_scan: u must be a float (batch, dim, seqlen) MPS tensor");
+  const int batch = u_in.size(0), dim = u_in.size(1), seqlen = u_in.size(2);
+  TORCH_CHECK(B_in.dim() == 4 && B_in.sizes() == C_in.sizes(),
+              "selective_scan: B/C must be (batch, n_groups, dstate, seqlen)");
+  const int n_groups = B_in.size(1), dstate = B_in.size(2);
+  TORCH_CHECK(dstate <= 256 && dim % n_groups == 0,
+              "selective_scan: dstate <= 256, dim %% n_groups == 0");
+  auto u = u_in.contiguous(), delta = delta_in.to(u_in.scalar_type()).contiguous();
+  auto A = A_in.to(at::kFloat).contiguous();
+  auto B = B_in.to(u_in.scalar_type()).contiguous(), C = C_in.to(u_in.scalar_type()).contiguous();
+  const bool has_d = D_in.has_value(), has_bias = bias_in.has_value(), has_z = z_in.has_value();
+  auto dummy_f = at::zeros({1}, u.options().dtype(at::kFloat));
+  auto dummy_io = at::zeros({1}, u.options());
+  auto D = has_d ? D_in->to(at::kFloat).contiguous() : dummy_f;
+  auto bias = has_bias ? bias_in->to(at::kFloat).contiguous() : dummy_f;
+  auto z = has_z ? z_in->to(u_in.scalar_type()).contiguous() : dummy_io;
+  auto state = state_in.to(at::kFloat).contiguous().clone();
+  auto out = at::empty_like(u);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_selective_scan_dense(e, u, delta, A, B, C, D, bias, z, out, state,
+                                    batch, dim, seqlen, dstate, n_groups,
+                                    has_d ? 1 : 0, has_bias ? 1 : 0, has_z ? 1 : 0,
+                                    delta_softplus ? 1 : 0, tk_type_name(u));
+  });
+  return {out, state};
+}
+
+static std::tuple<at::Tensor, at::Tensor> selective_scan_varlen_mps(
+    const at::Tensor& u_in, const at::Tensor& delta_in, const at::Tensor& A_in,
+    const at::Tensor& B_in, const at::Tensor& C_in, const at::Tensor& qsl_in,
+    const at::Tensor& state_in, const c10::optional<at::Tensor>& D_in,
+    const c10::optional<at::Tensor>& bias_in, const c10::optional<at::Tensor>& z_in,
+    const c10::optional<at::Tensor>& cidx_in, const c10::optional<at::Tensor>& his_in,
+    bool delta_softplus, int64_t null_block_id) {
+  TORCH_CHECK(u_in.device().is_mps() && u_in.dim() == 2 && tk_is_float_dtype(u_in),
+              "selective_scan_varlen: u must be a float (dim, total_tokens) MPS tensor");
+  const int dim = u_in.size(0), total_tokens = u_in.size(1);
+  TORCH_CHECK(B_in.dim() == 3 && B_in.sizes() == C_in.sizes(),
+              "selective_scan_varlen: B/C must be (n_groups, dstate, total_tokens)");
+  const int n_groups = B_in.size(0), dstate = B_in.size(1);
+  TORCH_CHECK(dstate <= 256 && dim % n_groups == 0,
+              "selective_scan_varlen: dstate <= 256, dim %% n_groups == 0");
+  auto u = u_in.contiguous(), delta = delta_in.to(u_in.scalar_type()).contiguous();
+  auto A = A_in.to(at::kFloat).contiguous();
+  auto B = B_in.to(u_in.scalar_type()).contiguous(), C = C_in.to(u_in.scalar_type()).contiguous();
+  auto qsl = qsl_in.to(at::kInt).contiguous();
+  const int batch = qsl.size(0) - 1;
+  const bool has_d = D_in.has_value(), has_bias = bias_in.has_value(), has_z = z_in.has_value();
+  const bool use_ci = cidx_in.has_value(), use_his = his_in.has_value();
+  auto dummy_f = at::zeros({1}, u.options().dtype(at::kFloat));
+  auto dummy_io = at::zeros({1}, u.options());
+  auto dummy_i = at::zeros({1}, u.options().dtype(at::kInt));
+  auto dummy_u8 = at::zeros({1}, u.options().dtype(at::kByte));
+  auto D = has_d ? D_in->to(at::kFloat).contiguous() : dummy_f;
+  auto bias = has_bias ? bias_in->to(at::kFloat).contiguous() : dummy_f;
+  auto z = has_z ? z_in->to(u_in.scalar_type()).contiguous() : dummy_io;
+  auto cidx = use_ci ? cidx_in->to(at::kInt).contiguous() : dummy_i;
+  auto his = use_his ? his_in->to(at::kByte).contiguous() : dummy_u8;
+  auto state = state_in.to(at::kFloat).contiguous().clone();
+  auto out = at::empty_like(u);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_selective_scan_varlen(e, u, delta, A, B, C, D, bias, z, qsl, cidx, his,
+                                     out, state, batch, dim, total_tokens, dstate, n_groups,
+                                     has_d ? 1 : 0, has_bias ? 1 : 0, has_z ? 1 : 0,
+                                     delta_softplus ? 1 : 0, use_ci ? 1 : 0, use_his ? 1 : 0,
+                                     static_cast<int>(null_block_id), tk_type_name(u));
+  });
+  return {out, state};
+}
+
 // Fused per-head QK-RMSNorm + RoPE over packed QKV; V heads copied through.
 static at::Tensor qk_norm_rope_mps(const at::Tensor& qkv_in, const at::Tensor& qw_in,
                                    const at::Tensor& kw_in, const at::Tensor& cos_in,
@@ -3236,6 +3314,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("selective_scan", &selective_scan_mps,
+        "ThunderMittens Mamba-1 selective scan (MPS)",
+        pybind11::arg("u"), pybind11::arg("delta"), pybind11::arg("A"), pybind11::arg("B"),
+        pybind11::arg("C"), pybind11::arg("state"), pybind11::arg("D") = pybind11::none(),
+        pybind11::arg("delta_bias") = pybind11::none(), pybind11::arg("z") = pybind11::none(),
+        pybind11::arg("delta_softplus") = true);
+  m.def("selective_scan_varlen", &selective_scan_varlen_mps,
+        "ThunderMittens varlen Mamba-1 selective scan (MPS)",
+        pybind11::arg("u"), pybind11::arg("delta"), pybind11::arg("A"), pybind11::arg("B"),
+        pybind11::arg("C"), pybind11::arg("query_start_loc"), pybind11::arg("state"),
+        pybind11::arg("D") = pybind11::none(), pybind11::arg("delta_bias") = pybind11::none(),
+        pybind11::arg("z") = pybind11::none(), pybind11::arg("cache_indices") = pybind11::none(),
+        pybind11::arg("has_initial_state") = pybind11::none(),
+        pybind11::arg("delta_softplus") = true, pybind11::arg("null_block_id") = -1);
   m.def("qk_norm_rope", &qk_norm_rope_mps,
         "ThunderMittens fused per-head QK-RMSNorm + RoPE on packed QKV (MPS)",
         pybind11::arg("qkv"), pybind11::arg("q_weight"), pybind11::arg("k_weight"),

@@ -52,6 +52,9 @@ inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { ret
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
 inline std::string moe_route_grouped_kernel_name(const std::string& t) { return "moe_route_grouped_" + t; }
 inline std::string qk_norm_rope_kernel_name(int D) { return "qk_norm_rope_" + std::to_string(D); }
+inline std::string selective_scan_kernel_name(const std::string& variant, const std::string& t) {
+  return "selective_scan_" + variant + "_" + t;
+}
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
 inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
@@ -426,6 +429,63 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// ----- Mamba-1 (S6) selective scan. Layouts channel-major (seqlen/total_tokens LAST);
+//        state (…, dim, dstate) fp32 is the single in/out buffer (bound as out; the MLX path
+//        clone-prepasses the pool). grid (batch, dim, 1); threads = round32(dstate) <= 256. -----
+template <class E>
+void launch_selective_scan_dense(E& e, typename E::in_t u, typename E::in_t delta,
+                                 typename E::in_t A, typename E::in_t B, typename E::in_t C,
+                                 typename E::in_t D, typename E::in_t delta_bias,
+                                 typename E::in_t z, typename E::out_t out,
+                                 typename E::out_t state, int batch, int dim, int seqlen,
+                                 int dstate, int n_groups, int has_d, int has_delta_bias,
+                                 int has_z, int delta_softplus, const std::string& type_name) {
+  e.pipeline(selective_scan_kernel_name("dense", type_name));
+  e.in(u, 0); e.in(delta, 1); e.in(A, 2); e.in(B, 3); e.in(C, 4);
+  e.in(D, 5); e.in(delta_bias, 6); e.in(z, 7);
+  e.out(out, 8); e.out(state, 9);
+  e.bytes(batch, 10); e.bytes(dim, 11); e.bytes(seqlen, 12); e.bytes(dstate, 13);
+  e.bytes(n_groups, 14); e.bytes(has_d, 15); e.bytes(has_delta_bias, 16);
+  e.bytes(has_z, 17); e.bytes(delta_softplus, 18);
+  const int threads = ((dstate + 31) / 32) * 32;
+  e.dispatch(batch, dim, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_selective_scan_varlen(E& e, typename E::in_t u, typename E::in_t delta,
+                                  typename E::in_t A, typename E::in_t B, typename E::in_t C,
+                                  typename E::in_t D, typename E::in_t delta_bias,
+                                  typename E::in_t z, typename E::in_t query_start_loc,
+                                  typename E::in_t cache_indices,
+                                  typename E::in_t has_initial_state, typename E::out_t out,
+                                  typename E::out_t state, int batch, int dim, int total_tokens,
+                                  int dstate, int n_groups, int has_d, int has_delta_bias,
+                                  int has_z, int delta_softplus, int use_cache_indices,
+                                  int use_has_initial_state, int null_block_id,
+                                  const std::string& type_name) {
+  e.pipeline(selective_scan_kernel_name("varlen", type_name));
+  e.in(u, 0); e.in(delta, 1); e.in(A, 2); e.in(B, 3); e.in(C, 4);
+  e.in(D, 5); e.in(delta_bias, 6); e.in(z, 7);
+  e.in(query_start_loc, 8); e.in(cache_indices, 9); e.in(has_initial_state, 10);
+  e.out(out, 11); e.out(state, 12);
+  e.bytes(batch, 13); e.bytes(dim, 14); e.bytes(total_tokens, 15); e.bytes(dstate, 16);
+  e.bytes(n_groups, 17); e.bytes(has_d, 18); e.bytes(has_delta_bias, 19);
+  e.bytes(has_z, 20); e.bytes(delta_softplus, 21); e.bytes(use_cache_indices, 22);
+  e.bytes(use_has_initial_state, 23); e.bytes(null_block_id, 24);
+  const int threads = ((dstate + 31) / 32) * 32;
+  e.dispatch(batch, dim, 1, threads, 1, 1);
+}
+
+// fp32 pool clone prepass (src@0 -> dst@1 ; n@2(u32)); grid-stride copy.
+// (non-template kernel => the namespaced symbol survives, per the mittens:: gotcha)
+template <class E>
+void launch_sscan_pool_clone(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {
+  e.pipeline("mittens::sscan_pool_clone");
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
 }
 
 // ----- qk_norm_rope: qkv@0 q_weight@1 k_weight@2 cos@3 sin@4 positions@5(i32) -> out@6 ;

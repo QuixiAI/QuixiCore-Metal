@@ -65,6 +65,7 @@
 #include "add_norm/add_norm.h"
 #include "rope_kv/rope_kv.h"
 #include "qk_norm_rope/qk_norm_rope.h"
+#include "selective_scan/selective_scan.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -518,6 +519,23 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def(
+      "selective_scan", &selective_scan,
+      "u"_a, "delta"_a, "A"_a, "B"_a, "C"_a, "state"_a, "D"_a = nb::none(),
+      "delta_bias"_a = nb::none(), "z"_a = nb::none(), "delta_softplus"_a = true,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Mamba-1 (S6) selective scan, dense batch (channel-major). Returns [out, new_state].)");
+
+    m.def(
+      "selective_scan_varlen", &selective_scan_varlen,
+      "u"_a, "delta"_a, "A"_a, "B"_a, "C"_a, "query_start_loc"_a, "state"_a,
+      "D"_a = nb::none(), "delta_bias"_a = nb::none(), "z"_a = nb::none(),
+      "cache_indices"_a = nb::none(), "has_initial_state"_a = nb::none(),
+      "delta_softplus"_a = true, "null_block_id"_a = -1,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Varlen S6 scan over flattened tokens with a per-request paged state pool.
+         Returns [out, new_state_pool] (untouched slots preserved).)");
 
     m.def(
       "qk_norm_rope", &qk_norm_rope,

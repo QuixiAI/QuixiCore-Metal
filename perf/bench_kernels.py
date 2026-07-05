@@ -1342,6 +1342,34 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("selective_scan")
+def selective_scan_cases(be, preset, formats):
+    """Mamba-1 S6 scan: sequential-in-time, parallel-over-state. No framework baseline
+    (a lazily-traced per-step composition is pathological); ms + GB/s over the io tensors."""
+    tk = be.tk()
+    rng = np.random.default_rng(32)
+    shapes = _pick(preset, [(2, 1024, 128, 16)],
+                   [(2, 2048, 512, 16), (2, 2048, 512, 128)],
+                   [(2, 2048, 512, 16), (2, 2048, 2048, 16), (2, 4096, 512, 128)])
+    for b, d, L, N in shapes:
+        u = (0.5 * rng.standard_normal((b, d, L))).astype(np.float32)
+        delta = (0.3 * rng.standard_normal((b, d, L))).astype(np.float32)
+        A = (-np.exp(0.5 * rng.standard_normal((d, N)))).astype(np.float32)
+        B = (0.5 * rng.standard_normal((b, 1, N, L))).astype(np.float32)
+        C = (0.5 * rng.standard_normal((b, 1, N, L))).astype(np.float32)
+        h0 = np.zeros((b, d, N), np.float32)
+        u_d, dl_d = be.array(u, "bf16"), be.array(delta, "bf16")
+        A_d = be.array(A, "f32")
+        B_d, C_d = be.array(B, "bf16"), be.array(C, "bf16")
+        h_d = be.array(h0, "f32")
+        yield Case("selective_scan", f"B{b}_d{d}_L{L}_N{N}", {"B": b, "d": d, "L": L, "N": N},
+                   "bf16",
+                   target=lambda u_d=u_d, dl_d=dl_d, A_d=A_d, B_d=B_d, C_d=C_d, h_d=h_d:
+                       tk.selective_scan(u_d, dl_d, A_d, B_d, C_d, h_d)[0],
+                   baselines={}, ref=None,
+                   bytes_moved=2.0 * (3 * b * d * L * 2 + 2 * b * N * L * 2))
+
+
 @register("qk_norm_rope")
 def qk_norm_rope_cases(be, preset, formats):
     """Fused per-head QK-RMSNorm + RoPE on packed QKV vs an mx-ops composition (per-head

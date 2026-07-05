@@ -31,6 +31,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
     os.path.join(_KERNELS, "qk_norm_rope", "qk_norm_rope.metal"),
+    os.path.join(_KERNELS, "selective_scan", "selective_scan.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -601,6 +602,25 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
+
+
+def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, z=None, state=None,
+                   delta_softplus=True):
+    """Mamba-1 (S6) selective scan, dense batch (channel-major). Returns (out, new_state). MPS."""
+    return tuple(_ext.selective_scan(u, delta, A, B, C, D=D, delta_bias=delta_bias, z=z,
+                                     state=state, delta_softplus=delta_softplus))
+
+
+def selective_scan_varlen(u, delta, A, B, C, query_start_loc, state, D=None, delta_bias=None,
+                          z=None, cache_indices=None, has_initial_state=None,
+                          delta_softplus=True, null_block_id=-1):
+    """Varlen S6 scan over flattened tokens with a per-request paged state pool. MPS."""
+    return tuple(_ext.selective_scan_varlen(u, delta, A, B, C, query_start_loc, state,
+                                            D=D, delta_bias=delta_bias, z=z,
+                                            cache_indices=cache_indices,
+                                            has_initial_state=has_initial_state,
+                                            delta_softplus=delta_softplus,
+                                            null_block_id=null_block_id))
 
 
 def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,

@@ -791,6 +791,46 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def selective_scan(u, delta, A, B, C, state, D=None, delta_bias=None, z=None,
+                   delta_softplus=True):
+    """Mamba-1 (S6) selective scan forward, dense batch. Channel-major layouts:
+    u/delta/z/out (batch, dim, seqlen); B/C (batch, n_groups, dstate, seqlen); A (dim, dstate)
+    fp32 (A < 0); D/delta_bias (dim,) fp32 optional; state (batch, dim, dstate) fp32.
+    Returns (out, new_state) — functional (the input state is not mutated). dstate <= 256.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(u):
+        return _torch().selective_scan(u, delta, A, B, C, D=D, delta_bias=delta_bias, z=z,
+                                       state=state, delta_softplus=delta_softplus)
+    out = _mlx().selective_scan(u, delta, A, B, C, D=D, delta_bias=delta_bias, z=z,
+                                state=state, delta_softplus=delta_softplus)
+    return out[0], out[1]
+
+
+def selective_scan_varlen(u, delta, A, B, C, query_start_loc, state, D=None, delta_bias=None,
+                          z=None, cache_indices=None, has_initial_state=None,
+                          delta_softplus=True, null_block_id=-1):
+    """Varlen Mamba-1 scan over a flattened token axis with a per-request paged state pool:
+    u/delta/z/out (dim, total_tokens); B/C (n_groups, dstate, total_tokens);
+    query_start_loc (B+1,) int32; state (num_slots, dim, dstate) fp32 indexed per request by
+    cache_indices (optional; identity when absent; == null_block_id skips the request);
+    has_initial_state (B,) uint8 optional (fresh prefill starts at h = 0). Returns
+    (out, new_state_pool) with untouched slots preserved. Accepts mlx.array or torch (MPS)."""
+    if _is_torch(u):
+        return _torch().selective_scan_varlen(u, delta, A, B, C, query_start_loc, state, D=D,
+                                              delta_bias=delta_bias, z=z,
+                                              cache_indices=cache_indices,
+                                              has_initial_state=has_initial_state,
+                                              delta_softplus=delta_softplus,
+                                              null_block_id=null_block_id)
+    out = _mlx().selective_scan_varlen(u, delta, A, B, C, D=D, delta_bias=delta_bias, z=z,
+                                       query_start_loc=query_start_loc,
+                                       cache_indices=cache_indices,
+                                       has_initial_state=has_initial_state, state=state,
+                                       delta_softplus=delta_softplus,
+                                       null_block_id=null_block_id)
+    return out[0], out[1]
+
+
 def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
                  num_heads_v, eps=1e-6, interleaved=False, gemma=False):
     """Fused per-head QK-RMSNorm + RoPE over a packed QKV buffer (the Qwen3 attention-prep

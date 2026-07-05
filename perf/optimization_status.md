@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen (2026-07-05)
+
+New kernels/selective_scan/: sequential-in-time / parallel-over-state (threadgroup per
+(batch, dim), one thread per state index, dstate <= 256, fp32 state, io f32/f16/bf16).
+Reference-faithful port of metal-forge/vLLM mamba semantics (softplus discretization,
+exp(delta*A), D*u skip, silu(z) gate; channel-major layouts) with tk-native bf16 instead
+of uint16 bit-twiddling. Varlen: flattened token axis + query_start_loc, per-request paged
+state pool via cache_indices (null_block_id skip) and has_initial_state; the MLX path is
+functional via an sscan_pool_clone prepass (untouched slots preserved), torch clones too.
+Unlocks Mamba-1 hybrids (Jamba, Falcon-Mamba). varlen_apc (chunked state checkpoints for
+prefix caching) is the recorded next step for this family.
+
+- Tests: 12 fp64-oracle cases (3 dtypes x 3 shapes incl. dstate=160 multi-simd reduce,
+  no-optionals, varlen-vs-dense with scattered pool slots + untouched-slot preservation,
+  null-block skip) + fp32 cross-backend parity (out and state, atol 1e-5).
+- Perf: B2/d2048/L512 0.93 ms (N=16), 5.16 ms (N=128) — sequential-scan bound, no
+  framework baseline exists (per-step composition is pathological to trace). Optimization
+  candidates recorded: vec4 B/C loads, one-simdgroup geometry for dstate<=32, Blelloch
+  time-scan (major rewrite).
+
 ## Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE (2026-07-05)
 
 New kernels/qk_norm_rope/: one warp per (token, head) over packed QKV (T, (Hq+Hk+Hv)*D) —
