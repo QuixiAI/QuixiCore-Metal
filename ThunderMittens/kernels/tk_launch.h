@@ -2219,6 +2219,49 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// ----- per-group / azp activation quantizers (quant_rt): one simdgroup per row. -----
+template <class E>
+void launch_quantize_per_group_fp8(E& e, typename E::in_t x, typename E::out_t codes,
+                                   typename E::out_t scale, int rows, int D, int G, int ue8m0,
+                                   const std::string& type_name) {
+  e.pipeline("quantize_per_group_fp8_" + type_name);
+  e.in(x, 0); e.out(codes, 1); e.out(scale, 2);
+  e.bytes(D, 3); e.bytes(G, 4); e.bytes(ue8m0, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_quantize_per_group_int8(E& e, typename E::in_t x, typename E::out_t codes,
+                                    typename E::out_t scale, int rows, int D, int G,
+                                    const std::string& type_name) {
+  e.pipeline("quantize_per_group_int8_" + type_name);
+  e.in(x, 0); e.out(codes, 1); e.out(scale, 2);
+  e.bytes(D, 3); e.bytes(G, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_quantize_per_token_int8_azp(E& e, typename E::in_t x, typename E::out_t codes,
+                                        typename E::out_t scale, typename E::out_t azp,
+                                        int rows, int D, const std::string& type_name) {
+  e.pipeline("quantize_per_token_int8_azp_" + type_name);
+  e.in(x, 0); e.out(codes, 1); e.out(scale, 2); e.out(azp, 3);
+  e.bytes(D, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// azp-corrected W8A8: D@0 Wq@1 Xq@2 w_scale@3(h) a_scale@4(f32) w_rowsum@5(i32) azp@6(i32) ;
+//        N@7 K@8 M@9 ; grid (N,1,1), 32 thr.
+template <class E>
+void launch_qgemm_w8a8_azp(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                           typename E::in_t w_scale, typename E::in_t a_scale,
+                           typename E::in_t w_rowsum, typename E::in_t azp,
+                           int N, int K, int M) {
+  e.pipeline("mittens::qgemm_w8a8_azp");
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(w_scale, 3); e.in(a_scale, 4);
+  e.in(w_rowsum, 5); e.in(azp, 6);
+  e.bytes(N, 7); e.bytes(K, 8); e.bytes(M, 9);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // ----- qgemm_w8a8 (W8A8 int8xint8 PREFILL, M>1): D@0 Wq@1(int8 N,K) Xq@2(int8 M,K) w_scale@3
 //        a_scale@4 ; N@5 K@6 M@7 ; grid (N,1,1) 32 threads. Exact int32, scaled once. -----
 template <class E>

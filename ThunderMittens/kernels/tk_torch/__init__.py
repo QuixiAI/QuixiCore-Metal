@@ -605,6 +605,26 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     return _ext.moe_route_topk(logits, int(k))
 
 
+def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
+    """Per-group dynamic fp8 e4m3. Returns (codes u8, scale (rows, D/G) f32). MPS."""
+    return tuple(_ext.quantize_per_group_fp8(x, group_size, ue8m0))
+
+
+def quantize_per_group_int8(x, group_size=128):
+    """Per-group dynamic symmetric int8. Returns (codes i8, scale). MPS."""
+    return tuple(_ext.quantize_per_group_int8(x, group_size))
+
+
+def quantize_per_token_int8_azp(x):
+    """Asymmetric per-token int8 (vLLM azp). Returns (codes, scale, azp i32). MPS."""
+    return tuple(_ext.quantize_per_token_int8_azp(x))
+
+
+def qgemm_w8a8_azp(wq, xq, w_scale, a_scale, w_rowsum, azp):
+    """azp-corrected W8A8 GEMM: y = s_w*s_a*(W@Xq^T - azp*rowsum(W)). MPS."""
+    return _ext.qgemm_w8a8_azp(wq, xq, w_scale, a_scale, w_rowsum, azp)
+
+
 def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initial=True):
     """GatedDeltaNet delta-rule linear attention (varlen packed, fp32 state pool). MPS."""
     return tuple(_ext.gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping,

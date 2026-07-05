@@ -676,6 +676,22 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_quant_group_azp_parity():
+    rng = np.random.default_rng(59)
+    x = rng.standard_normal((17, 256)).astype(np.float32)
+    cm, sm = tk.quantize_per_group_fp8(mx.array(x), group_size=128, ue8m0=True)
+    ct, st = tk.quantize_per_group_fp8(torch.from_numpy(x).to("mps"), group_size=128, ue8m0=True)
+    _assert_parity(cm, ct, atol=0)
+    _assert_parity(sm, st, atol=0)
+    cm, sm = tk.quantize_per_group_int8(mx.array(x), group_size=128)
+    ct, st = tk.quantize_per_group_int8(torch.from_numpy(x).to("mps"), group_size=128)
+    _assert_parity(cm, ct, atol=0)
+    cm, sm, am = tk.quantize_per_token_int8_azp(mx.array(x))
+    ct, st, at2 = tk.quantize_per_token_int8_azp(torch.from_numpy(x).to("mps"))
+    _assert_parity(cm, ct, atol=0)
+    _assert_parity(am, at2, atol=0)
+
+
 def test_gdn_recur_parity():
     rng = np.random.default_rng(58)
     lens, Hk, Hv, Dk, Dv, S = [5, 3], 2, 4, 64, 64, 4

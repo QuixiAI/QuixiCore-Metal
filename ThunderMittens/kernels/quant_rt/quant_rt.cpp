@@ -56,6 +56,104 @@ std::vector<array> quantize_per_token_int8(const array& x, StreamOrDevice s /* =
       {x_c});
 }
 
+std::vector<array> quantize_per_group_fp8(const array& x, int group_size, bool ue8m0,
+                                          StreamOrDevice s) {
+  qrt_check(x, "quantize_per_group_fp8");
+  const int D = x.shape(-1);
+  if (group_size <= 0 || group_size % 4 != 0 || D % group_size != 0) {
+    throw std::invalid_argument("quantize_per_group_fp8: need group_size % 4 == 0, D % group_size == 0");
+  }
+  auto scale_shape = x.shape();
+  scale_shape.back() = D / group_size;
+  return array::make_arrays(
+      {x.shape(), scale_shape},
+      {uint8, float32},
+      std::make_shared<QuantizePerGroupFp8>(to_stream(s), group_size, ue8m0),
+      {contiguous(x, false, s)});
+}
+
+std::vector<array> quantize_per_group_int8(const array& x, int group_size, StreamOrDevice s) {
+  qrt_check(x, "quantize_per_group_int8");
+  const int D = x.shape(-1);
+  if (group_size <= 0 || group_size % 4 != 0 || D % group_size != 0) {
+    throw std::invalid_argument("quantize_per_group_int8: need group_size % 4 == 0, D % group_size == 0");
+  }
+  auto scale_shape = x.shape();
+  scale_shape.back() = D / group_size;
+  return array::make_arrays(
+      {x.shape(), scale_shape},
+      {int8, float32},
+      std::make_shared<QuantizePerGroupInt8>(to_stream(s), group_size),
+      {contiguous(x, false, s)});
+}
+
+std::vector<array> quantize_per_token_int8_azp(const array& x, StreamOrDevice s) {
+  qrt_check(x, "quantize_per_token_int8_azp");
+  return array::make_arrays(
+      {x.shape(), qrt_scale_shape(x), qrt_scale_shape(x)},
+      {int8, float32, int32},
+      std::make_shared<QuantizePerTokenInt8Azp>(to_stream(s)),
+      {contiguous(x, false, s)});
+}
+
+void QuantizePerGroupFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("QuantizePerGroupFp8 has no CPU implementation.");
+}
+void QuantizePerGroupFp8::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& codes = outputs[0];
+  auto& scale = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  codes.set_data(allocator::malloc_or_wait(codes.nbytes()));
+  scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_quantize_per_group_fp8(enc, x, codes, scale, rows, D, g_, ue8m0_ ? 1 : 0,
+                                    type_to_name(x));
+}
+
+void QuantizePerGroupInt8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("QuantizePerGroupInt8 has no CPU implementation.");
+}
+void QuantizePerGroupInt8::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& codes = outputs[0];
+  auto& scale = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  codes.set_data(allocator::malloc_or_wait(codes.nbytes()));
+  scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_quantize_per_group_int8(enc, x, codes, scale, rows, D, g_, type_to_name(x));
+}
+
+void QuantizePerTokenInt8Azp::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("QuantizePerTokenInt8Azp has no CPU implementation.");
+}
+void QuantizePerTokenInt8Azp::eval_gpu(const std::vector<array>& inputs,
+                                       std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& codes = outputs[0];
+  auto& scale = outputs[1];
+  auto& azp = outputs[2];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  codes.set_data(allocator::malloc_or_wait(codes.nbytes()));
+  scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
+  azp.set_data(allocator::malloc_or_wait(azp.nbytes()));
+  const int D = x.shape(-1);
+  const int rows = static_cast<int>(x.size() / D);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_quantize_per_token_int8_azp(enc, x, codes, scale, azp, rows, D, type_to_name(x));
+}
+
 void QuantizePerTokenFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("QuantizePerTokenFp8 has no CPU implementation.");
 }
@@ -153,6 +251,9 @@ void QuantizePerTensor::eval_gpu(
     throw std::runtime_error(LABEL " has no vmap implementation.");          \
   }
 
+TK_QRT_NO_AUTODIFF(QuantizePerGroupFp8, "QuantizePerGroupFp8")
+TK_QRT_NO_AUTODIFF(QuantizePerGroupInt8, "QuantizePerGroupInt8")
+TK_QRT_NO_AUTODIFF(QuantizePerTokenInt8Azp, "QuantizePerTokenInt8Azp")
 TK_QRT_NO_AUTODIFF(QuantizePerTokenFp8, "QuantizePerTokenFp8")
 TK_QRT_NO_AUTODIFF(QuantizePerTokenInt8, "QuantizePerTokenInt8")
 TK_QRT_NO_AUTODIFF(QuantizePerTensor, "QuantizePerTensor")

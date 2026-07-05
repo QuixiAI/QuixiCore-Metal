@@ -33,6 +33,37 @@ kernel void qgemm_w8a8(
     }
 }
 
+// ---- azp-aware W8A8: asymmetric int8 activations Xq = round(x/s_a) + azp[m]. Correction:
+//   y[n,m] = s_w[n]*s_a[m] * ( sum_k W[n,k]*Xq[m,k]  -  azp[m] * sum_k W[n,k] )
+// with w_rowsum (N,) int32 host-precomputed (tk.quant.quantize_w8a8 packer). ----
+kernel void qgemm_w8a8_azp(
+    device   half*  D       [[buffer(0)]],   // (N, M) output
+    device   char*  Wq      [[buffer(1)]],   // (N, K) int8 weights, row-major
+    device   char*  Xq      [[buffer(2)]],   // (M, K) int8 activations, token-major
+    device   half*  w_scale [[buffer(3)]],   // (N,) per-channel
+    device   float* a_scale [[buffer(4)]],   // (M,) per-token (azp quantizer emits f32)
+    device   const int* w_rowsum [[buffer(5)]],  // (N,)
+    device   const int* azp      [[buffer(6)]],  // (M,)
+    const constant int &N [[buffer(7)]],
+    const constant int &K [[buffer(8)]],
+    const constant int &M [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const int n = tgid.x;
+    device const uint* wrow = (device const uint*)(Wq + (uint)n * K);
+    const float wsc = float(w_scale[n]);
+    const int rsum = w_rowsum[n];
+    for (int m = 0; m < M; m++) {
+        device const uint* xrow = (device const uint*)(Xq + (uint)m * K);
+        int acc = 0;
+        for (int u = (int)lane; u < K / 4; u += 32) acc += idot4(wrow[u], xrow[u]);
+        acc = metal::simd_sum(acc);
+        if (lane == 0) {
+            D[(uint)n * M + m] = half(float(acc - azp[m] * rsum) * wsc * a_scale[m]);
+        }
+    }
+}
+
 // ---- BitNet W2A8 prefill: ternary 2-bit weight (per-group absmean) x int8 act (per-token scale). ----
 kernel void qgemm_w2a8(
     device   half*  D       [[buffer(0)]],   // (N, M)

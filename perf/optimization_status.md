@@ -1,5 +1,17 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant (2026-07-05)
+
+quant_rt extensions: quantize_per_group_fp8/int8 (group-wise dynamic quant along the row,
+canonical G=128 — the activation side of block-quantized GEMMs; scale (rows, D/G) f32;
+ue8m0 flag rounds fp8 scales up to powers of two, MX convention) and
+quantize_per_token_int8_azp (vLLM asymmetric: scale=(max-min)/255, azp=rint(-128-min/s),
+constant-row fallback documented). Plus qgemm_w8a8_azp in qgemm_int: the zero-point
+correction epilogue acc - azp[m]*w_rowsum[n] (w_rowsum host-precomputed) — validates the
+azp layout with a real consumer. int8 codes/scales/azp BIT-EXACT vs numpy twins
+(no transcendentals); fp8 verified by power-of-two + coverage + half-ulp reconstruction
+bounds; azp GEMM int-exact vs int64 numpy. 40 correctness + parity-atol-0 green.
+
 ## Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention (2026-07-05)
 
 New kernels/gdn/: the Qwen3-Next / Kimi-Linear hybrid-mixer recurrence — per-timestep

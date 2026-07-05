@@ -203,3 +203,150 @@ instantiate_quant_tensor(bfloat16, bf16)
 instantiate_quant_rt(float32, float)
 instantiate_quant_rt(float16, half)
 instantiate_quant_rt(bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Per-GROUP dynamic quantization (group size G along the row, canonical G=128): the
+// activation-side layout for block-quantized GEMMs (DeepSeek fp8_block etc.).
+// scale layout (rows, D/G) f32 row-major. ue8m0 != 0 rounds the fp8 scale UP to a
+// power of two (exp = ceil(log2(amax/448)), the mla_kv_insert_fp8 idiom) — the MX
+// convention block-scaled consumers expect. G % 4 == 0, D % G == 0.
+// ---------------------------------------------------------------------------
+template <typename T>
+kernel void quantize_per_group_fp8(device const T *x     [[buffer(0)]],
+                                   device uchar   *codes [[buffer(1)]],
+                                   device float   *scale [[buffer(2)]],
+                                   constant int   &D     [[buffer(3)]],
+                                   constant int   &G     [[buffer(4)]],
+                                   constant int   &ue8m0 [[buffer(5)]],
+                                   uint row  [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
+    const long base = (long)row * D;
+    const int ngroups = D / G;
+    for (int g = 0; g < ngroups; ++g) {
+        const long gbase = base + (long)g * G;
+        float amax = 0.0f;
+        for (int c = (int)lane; c < G / 4; c += 32) {
+            const float4 v = float4(((device const T4*)(x + gbase))[c]);
+            amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+        }
+        amax = simd_max(amax);
+        float s = amax / 448.0f;
+        if (ue8m0 != 0 && amax > 0.0f) {
+            s = exp2(ceil(log2(max(amax, 1e-10f) / 448.0f)));
+        }
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        for (int c = (int)lane; c < G / 4; c += 32) {
+            const float4 v = float4(((device const T4*)(x + gbase))[c]) * inv;
+            ((device uchar4*)(codes + gbase))[c] =
+                uchar4(tk_e4m3_encode(v.x), tk_e4m3_encode(v.y),
+                       tk_e4m3_encode(v.z), tk_e4m3_encode(v.w));
+        }
+        if (lane == 0) {
+            scale[(long)row * ngroups + g] = s;
+        }
+    }
+}
+
+template <typename T>
+kernel void quantize_per_group_int8(device const T *x     [[buffer(0)]],
+                                    device char    *codes [[buffer(1)]],
+                                    device float   *scale [[buffer(2)]],
+                                    constant int   &D     [[buffer(3)]],
+                                    constant int   &G     [[buffer(4)]],
+                                    uint row  [[threadgroup_position_in_grid]],
+                                    uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
+    const long base = (long)row * D;
+    const int ngroups = D / G;
+    for (int g = 0; g < ngroups; ++g) {
+        const long gbase = base + (long)g * G;
+        float amax = 0.0f;
+        for (int c = (int)lane; c < G / 4; c += 32) {
+            const float4 v = float4(((device const T4*)(x + gbase))[c]);
+            amax = max(amax, max(max(fabs(v.x), fabs(v.y)), max(fabs(v.z), fabs(v.w))));
+        }
+        amax = simd_max(amax);
+        const float s = amax / 127.0f;
+        const float inv = s > 0.0f ? 1.0f / s : 0.0f;
+        for (int c = (int)lane; c < G / 4; c += 32) {
+            const float4 v = float4(((device const T4*)(x + gbase))[c]) * inv;
+            ((device char4*)(codes + gbase))[c] =
+                char4(tk_int8_encode(v.x), tk_int8_encode(v.y),
+                      tk_int8_encode(v.z), tk_int8_encode(v.w));
+        }
+        if (lane == 0) {
+            scale[(long)row * ngroups + g] = s;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ASYMMETRIC per-token int8 (zero-point) quantization — vLLM dynamic_scaled_int8_azp:
+//   scale = (max - min) / 255 ;  azp = rint(-128 - min/scale) ;
+//   q = clamp(rint(x/scale) + azp, -128, 127) ; reconstruct scale * (q - azp).
+// Constant rows (max == min) fall back to a symmetric-style scale so the value
+// round-trips (range 0 would otherwise divide by zero).
+// ---------------------------------------------------------------------------
+template <typename T>
+kernel void quantize_per_token_int8_azp(device const T *x     [[buffer(0)]],
+                                        device char    *codes [[buffer(1)]],
+                                        device float   *scale [[buffer(2)]],
+                                        device int     *azp_out [[buffer(3)]],
+                                        constant int   &D     [[buffer(4)]],
+                                        uint row  [[threadgroup_position_in_grid]],
+                                        uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)row * D;
+    float mn = 3.4028234663852886e38f, mx = -3.4028234663852886e38f;
+    for (int i = (int)lane; i < D; i += 32) {
+        const float v = float(x[base + i]);
+        mn = min(mn, v);
+        mx = max(mx, v);
+    }
+    mn = simd_min(mn);
+    mx = simd_max(mx);
+    const float range = mx - mn;
+    const float s = range > 0.0f ? range / 255.0f
+                                 : max(fabs(mn) / 127.0f, 1e-7f);
+    const float inv = 1.0f / s;
+    const int azp = int(rint(-128.0f - mn * inv));
+    for (int i = (int)lane; i < D; i += 32) {
+        const int q = int(rint(float(x[base + i]) * inv)) + azp;
+        codes[base + i] = char(clamp(q, -128, 127));
+    }
+    if (lane == 0) {
+        scale[row] = s;
+        azp_out[row] = azp;
+    }
+}
+
+#define instantiate_quant_group(type_name, T)                                       \
+  template [[host_name("quantize_per_group_fp8_" #type_name)]] [[kernel]] void      \
+  quantize_per_group_fp8<T>(device const T *x [[buffer(0)]],                        \
+                            device uchar *codes [[buffer(1)]],                      \
+                            device float *scale [[buffer(2)]],                      \
+                            constant int &D [[buffer(3)]],                          \
+                            constant int &G [[buffer(4)]],                          \
+                            constant int &ue8m0 [[buffer(5)]],                      \
+                            uint row [[threadgroup_position_in_grid]],              \
+                            uint lane [[thread_index_in_simdgroup]]);               \
+  template [[host_name("quantize_per_group_int8_" #type_name)]] [[kernel]] void     \
+  quantize_per_group_int8<T>(device const T *x [[buffer(0)]],                       \
+                             device char *codes [[buffer(1)]],                      \
+                             device float *scale [[buffer(2)]],                     \
+                             constant int &D [[buffer(3)]],                         \
+                             constant int &G [[buffer(4)]],                         \
+                             uint row [[threadgroup_position_in_grid]],             \
+                             uint lane [[thread_index_in_simdgroup]]);              \
+  template [[host_name("quantize_per_token_int8_azp_" #type_name)]] [[kernel]] void \
+  quantize_per_token_int8_azp<T>(device const T *x [[buffer(0)]],                   \
+                                 device char *codes [[buffer(1)]],                  \
+                                 device float *scale [[buffer(2)]],                 \
+                                 device int *azp_out [[buffer(3)]],                 \
+                                 constant int &D [[buffer(4)]],                     \
+                                 uint row [[threadgroup_position_in_grid]],         \
+                                 uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_quant_group(float32, float)
+instantiate_quant_group(float16, half)
+instantiate_quant_group(bfloat16, bf16)

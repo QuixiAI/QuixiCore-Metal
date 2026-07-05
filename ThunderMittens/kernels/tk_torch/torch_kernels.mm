@@ -1768,6 +1768,76 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// per-group / azp activation quantizers + azp-corrected W8A8 GEMM.
+static std::tuple<at::Tensor, at::Tensor> quantize_per_group_fp8_mps(
+    const at::Tensor& x_in, int64_t group_size, bool ue8m0) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in), "quantize_per_group_fp8: float MPS");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(group_size > 0 && group_size % 4 == 0 && D % group_size == 0,
+              "quantize_per_group_fp8: bad group_size");
+  const int rows = x.numel() / D;
+  auto codes = at::empty_like(x, x.options().dtype(at::kByte));
+  auto sshape = x.sizes().vec(); sshape.back() = D / group_size;
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_per_group_fp8(e, x, codes, scale, rows, D, (int)group_size,
+                                      ue8m0 ? 1 : 0, tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor> quantize_per_group_int8_mps(
+    const at::Tensor& x_in, int64_t group_size) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in), "quantize_per_group_int8: float MPS");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(group_size > 0 && group_size % 4 == 0 && D % group_size == 0,
+              "quantize_per_group_int8: bad group_size");
+  const int rows = x.numel() / D;
+  auto codes = at::empty_like(x, x.options().dtype(at::kChar));
+  auto sshape = x.sizes().vec(); sshape.back() = D / group_size;
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_per_group_int8(e, x, codes, scale, rows, D, (int)group_size,
+                                       tk_type_name(x));
+  });
+  return {codes, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> quantize_per_token_int8_azp_mps(
+    const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "quantize_per_token_int8_azp: float MPS");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  const int rows = x.numel() / D;
+  auto codes = at::empty_like(x, x.options().dtype(at::kChar));
+  auto sshape = x.sizes().vec(); sshape.pop_back();
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  auto azp = at::empty(sshape, x.options().dtype(at::kInt));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantize_per_token_int8_azp(e, x, codes, scale, azp, rows, D, tk_type_name(x));
+  });
+  return {codes, scale, azp};
+}
+
+static at::Tensor qgemm_w8a8_azp_mps(const at::Tensor& wq_in, const at::Tensor& xq_in,
+                                     const at::Tensor& ws_in, const at::Tensor& as_in,
+                                     const at::Tensor& rsum_in, const at::Tensor& azp_in) {
+  TORCH_CHECK(wq_in.device().is_mps() && wq_in.scalar_type() == at::kChar &&
+              xq_in.scalar_type() == at::kChar, "qgemm_w8a8_azp: wq/xq int8 MPS");
+  auto wq = wq_in.contiguous(), xq = xq_in.contiguous();
+  auto ws = ws_in.to(at::kHalf).contiguous(), as = as_in.to(at::kFloat).contiguous();
+  auto rsum = rsum_in.to(at::kInt).contiguous(), azp = azp_in.to(at::kInt).contiguous();
+  const int N = wq.size(0), K = wq.size(1), M = xq.size(0);
+  auto out = at::empty({N, M}, wq.options().dtype(at::kHalf));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qgemm_w8a8_azp(e, out, wq, xq, ws, as, rsum, azp, N, K, M);
+  });
+  return out;
+}
+
 // GatedDeltaNet delta-rule linear attention (varlen packed + persistent fp32 state pool).
 static std::tuple<at::Tensor, at::Tensor> gdn_recur_mps(
     const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in,
@@ -3340,6 +3410,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("quantize_per_group_fp8", &quantize_per_group_fp8_mps,
+        "per-group dynamic fp8 quant (MPS)", pybind11::arg("x"),
+        pybind11::arg("group_size") = 128, pybind11::arg("ue8m0") = false);
+  m.def("quantize_per_group_int8", &quantize_per_group_int8_mps,
+        "per-group dynamic int8 quant (MPS)", pybind11::arg("x"),
+        pybind11::arg("group_size") = 128);
+  m.def("quantize_per_token_int8_azp", &quantize_per_token_int8_azp_mps,
+        "asymmetric per-token int8 quant (MPS)");
+  m.def("qgemm_w8a8_azp", &qgemm_w8a8_azp_mps, "azp-corrected W8A8 GEMM (MPS)");
   m.def("gdn_recur", &gdn_recur_mps,
         "ThunderMittens GatedDeltaNet linear attention (MPS)",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("g"),

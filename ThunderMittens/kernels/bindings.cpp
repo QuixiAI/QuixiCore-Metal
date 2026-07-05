@@ -522,6 +522,31 @@ NB_MODULE(_ext, m) {
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
 
     m.def(
+      "quantize_per_group_fp8", &quantize_per_group_fp8,
+      "x"_a, "group_size"_a = 128, "ue8m0"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(per-group dynamic fp8 e4m3: returns (codes u8, scale (rows, D/G) f32).
+         ue8m0 rounds scales up to powers of two (MX convention).)");
+
+    m.def(
+      "quantize_per_group_int8", &quantize_per_group_int8,
+      "x"_a, "group_size"_a = 128,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(per-group dynamic symmetric int8: returns (codes i8, scale (rows, D/G) f32).)");
+
+    m.def(
+      "quantize_per_token_int8_azp", &quantize_per_token_int8_azp,
+      "x"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(asymmetric per-token int8 (vLLM azp): returns (codes, scale (rows,), azp (rows,) i32).)");
+
+    m.def(
+      "qgemm_w8a8_azp", &qgemm_w8a8_azp,
+      "wq"_a, "xq"_a, "w_scale"_a, "a_scale"_a, "w_rowsum"_a, "azp"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(azp-corrected W8A8 GEMM: y = s_w*s_a*(W@Xq^T - azp*rowsum(W)).)");
+
+    m.def(
       "gdn_recur", &gdn_recur,
       "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state_pool"_a, "cu_seqlens"_a, "slot_mapping"_a,
       "load_initial"_a = true,

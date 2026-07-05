@@ -791,6 +791,43 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
+    """Per-group dynamic fp8 e4m3 along the last axis (canonical group 128 — the activation
+    side of block-quantized GEMMs). Returns (codes u8, scale (rows, D/G) f32); ue8m0 rounds
+    scales up to powers of two (MX convention). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().quantize_per_group_fp8(x, group_size, ue8m0)
+    out = _mlx().quantize_per_group_fp8(x, group_size=group_size, ue8m0=ue8m0)
+    return out[0], out[1]
+
+
+def quantize_per_group_int8(x, group_size=128):
+    """Per-group dynamic symmetric int8. Returns (codes i8, scale (rows, D/G) f32).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().quantize_per_group_int8(x, group_size)
+    out = _mlx().quantize_per_group_int8(x, group_size=group_size)
+    return out[0], out[1]
+
+
+def quantize_per_token_int8_azp(x):
+    """ASYMMETRIC per-token int8 (vLLM azp): scale=(max-min)/255, azp=rint(-128-min/scale),
+    q=clamp(rint(x/scale)+azp). Reconstruct scale*(q-azp). Returns (codes, scale, azp).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().quantize_per_token_int8_azp(x)
+    out = _mlx().quantize_per_token_int8_azp(x)
+    return out[0], out[1], out[2]
+
+
+def qgemm_w8a8_azp(wq, xq, w_scale, a_scale, w_rowsum, azp):
+    """azp-corrected W8A8 GEMM: y[n,m] = s_w[n]*s_a[m]*(sum_k W*Xq - azp[m]*w_rowsum[n]).
+    w_rowsum = W.sum(axis=1) int32, host-precomputed. Accepts mlx.array or torch (MPS)."""
+    if _is_torch(wq):
+        return _torch().qgemm_w8a8_azp(wq, xq, w_scale, a_scale, w_rowsum, azp)
+    return _mlx().qgemm_w8a8_azp(wq, xq, w_scale, a_scale, w_rowsum, azp)
+
+
 def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initial=True):
     """GDN / GatedDeltaNet linear attention (the Qwen3-Next / Kimi-Linear hybrid mixer):
     per-timestep delta rule S = g*S + k*beta*(v - k.S); y = q.S, over varlen packed

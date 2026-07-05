@@ -21,6 +21,18 @@ namespace mlx::core {
 std::vector<array> quantize_per_token_fp8(const array& x, StreamOrDevice s = {});
 std::vector<array> quantize_per_token_int8(const array& x, StreamOrDevice s = {});
 
+/** Per-GROUP dynamic quant along the last axis (canonical group_size=128; the activation-side
+ *  layout for block-quantized GEMMs). Returns [codes, scale (rows, D/G) f32]. ue8m0 rounds the
+ *  fp8 scale up to a power of two (MX convention). D % group_size == 0, group_size % 4 == 0. */
+std::vector<array> quantize_per_group_fp8(const array& x, int group_size = 128,
+                                          bool ue8m0 = false, StreamOrDevice s = {});
+std::vector<array> quantize_per_group_int8(const array& x, int group_size = 128,
+                                           StreamOrDevice s = {});
+
+/** ASYMMETRIC per-token int8 (vLLM azp): scale=(max-min)/255, azp=rint(-128-min/scale),
+ *  q=clamp(rint(x/scale)+azp). Returns [codes i8, scale (rows,) f32, azp (rows,) i32]. */
+std::vector<array> quantize_per_token_int8_azp(const array& x, StreamOrDevice s = {});
+
 /**
  *  Per-tensor (global) dynamic quantization: one scale = global_absmax / QMAX (via a P3
  *  atomic-max reduction). Returns [codes, scale (scalar), scale_u (uint32 scratch)]; callers
@@ -65,6 +77,70 @@ class QuantizePerTokenFp8 : public Primitive {
       const std::vector<array>&, const std::vector<int>&) override;
   const char* name() const { return "QuantizePerTokenFp8"; }
   void print(std::ostream& os) override { os << "QuantizePerTokenFp8"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class QuantizePerGroupFp8 : public Primitive {
+ public:
+  QuantizePerGroupFp8(Stream stream, int g, bool ue8m0)
+      : Primitive(stream), g_(g), ue8m0_(ue8m0) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QuantizePerGroupFp8"; }
+  void print(std::ostream& os) override { os << "QuantizePerGroupFp8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& oo = static_cast<const QuantizePerGroupFp8&>(other);
+    return g_ == oo.g_ && ue8m0_ == oo.ue8m0_;
+  }
+
+ private:
+  int g_;
+  bool ue8m0_;
+};
+
+class QuantizePerGroupInt8 : public Primitive {
+ public:
+  QuantizePerGroupInt8(Stream stream, int g) : Primitive(stream), g_(g) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QuantizePerGroupInt8"; }
+  void print(std::ostream& os) override { os << "QuantizePerGroupInt8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return g_ == static_cast<const QuantizePerGroupInt8&>(other).g_;
+  }
+
+ private:
+  int g_;
+};
+
+class QuantizePerTokenInt8Azp : public Primitive {
+ public:
+  explicit QuantizePerTokenInt8Azp(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QuantizePerTokenInt8Azp"; }
+  void print(std::ostream& os) override { os << "QuantizePerTokenInt8Azp"; }
   bool is_equivalent(const Primitive&) const override { return true; }
 };
 
