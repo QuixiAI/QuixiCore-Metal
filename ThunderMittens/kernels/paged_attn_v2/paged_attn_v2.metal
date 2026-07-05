@@ -41,6 +41,7 @@ kernel void paged_attention_partition(
     constant int &num_partitions [[buffer(13)]],
     constant int &partition_size [[buffer(14)]],
     constant int &window [[buffer(15)]],      // >0 = sliding window
+    constant float &softcap [[buffer(16)]],   // >0 = Gemma-style logit soft-capping
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -54,6 +55,7 @@ kernel void paged_attention_partition(
     const int end = min(start + partition_size, context_len);
     // Sliding window: raise this partition's lower bound to the window start (end unchanged).
     const int t_start = (window > 0) ? max(start, context_len - window) : start;
+    const bool capped = softcap > 0.0f;
 
     const long q_base = ((long)batch * num_heads + head) * D;
     const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
@@ -81,7 +83,8 @@ kernel void paged_attention_partition(
             const int d = (int)lane + 32 * i;
             partial += qv[i] * float(key_cache[cache_base + d]);
         }
-        const float score = simd_sum(partial) * scale;
+        float score = simd_sum(partial) * scale;
+        if (capped) score = softcap * metal::tanh(score / softcap);   // natural domain here
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
         const float beta = exp(score - new_m);
@@ -127,6 +130,7 @@ kernel void paged_attention_partition_fp8(
     device const float *v_scale [[buffer(16)]],
     constant int &fmt [[buffer(17)]],       // 0 = e4m3, 1 = e5m2
     constant int &window [[buffer(18)]],    // >0 = sliding window
+    constant float &softcap [[buffer(19)]], // >0 = Gemma-style logit soft-capping
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -140,6 +144,7 @@ kernel void paged_attention_partition_fp8(
     const int start = part * partition_size;
     const int end = min(start + partition_size, context_len);
     const int t_start = (window > 0) ? max(start, context_len - window) : start;
+    const bool capped = softcap > 0.0f;
 
     const long q_base = ((long)batch * num_heads + head) * D;
     const long stat_idx = ((long)batch * num_heads + head) * num_partitions + part;
@@ -169,7 +174,8 @@ kernel void paged_attention_partition_fp8(
             const float kdec = fmt == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
             partial += qv[i] * (kdec * ks);
         }
-        const float score = simd_sum(partial) * scale;
+        float score = simd_sum(partial) * scale;
+        if (capped) score = softcap * metal::tanh(score / softcap);
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
         const float beta = exp(score - new_m);
@@ -193,6 +199,9 @@ kernel void paged_attention_partition_fp8(
     }
 }
 
+// The attention sink lands HERE, not in the partition kernels: it must enter the softmax
+// denominator exactly once per (batch, head), and only the reduce sees all partitions.
+// The sink's value row contributes nothing to the output accumulation.
 template <typename T, int D>
 kernel void paged_attention_reduce(
     device const float *tmp_out [[buffer(0)]],    // (B, H, P, D)
@@ -201,6 +210,8 @@ kernel void paged_attention_reduce(
     device T *out [[buffer(3)]],                   // (B, H, D)
     constant int &num_heads [[buffer(4)]],
     constant int &num_partitions [[buffer(5)]],
+    device const float *sinks [[buffer(6)]],       // per-head; read only when has_sink
+    constant int &has_sink [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
     constexpr int VALUES_PER_LANE = D / 32;
@@ -213,6 +224,8 @@ kernel void paged_attention_reduce(
     for (int p = 0; p < num_partitions; ++p) {
         gm = max(gm, max_logits[base + p]);
     }
+    const float sink = (has_sink != 0) ? sinks[head] : NEG_INF;
+    if (has_sink != 0) gm = max(gm, sink);
     float gden = 0.0f;
     for (int p = 0; p < num_partitions; ++p) {
         const float mp = max_logits[base + p];
@@ -221,6 +234,7 @@ kernel void paged_attention_reduce(
         }
         gden += exp_sums[base + p] * exp(mp - gm);
     }
+    if (has_sink != 0) gden += exp(sink - gm);     // exactly once, across all partitions
     const float inv = 1.0f / (gden + 1e-6f);
 
     float acc[VALUES_PER_LANE];
@@ -413,6 +427,7 @@ kernel void cascade_prefix_partition_fp8(
       constant int &num_partitions [[buffer(13)]],                            \
       constant int &partition_size [[buffer(14)]],                            \
       constant int &window [[buffer(15)]],                                    \
+      constant float &softcap [[buffer(16)]],                                 \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
   template [[host_name("paged_attention_reduce_" #type_name "_" #DVAL)]]      \
@@ -423,6 +438,8 @@ kernel void cascade_prefix_partition_fp8(
       device T *out [[buffer(3)]],                                            \
       constant int &num_heads [[buffer(4)]],                                  \
       constant int &num_partitions [[buffer(5)]],                             \
+      device const float *sinks [[buffer(6)]],                                \
+      constant int &has_sink [[buffer(7)]],                                   \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
   template [[host_name("cascade_prefix_partition_" #type_name "_" #DVAL)]]    \
@@ -464,6 +481,7 @@ kernel void cascade_prefix_partition_fp8(
       device const float *v_scale [[buffer(16)]],                             \
       constant int &fmt [[buffer(17)]],                                       \
       constant int &window [[buffer(18)]],                                    \
+      constant float &softcap [[buffer(19)]],                                 \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
   template [[host_name("cascade_prefix_partition_fp8_" #type_name "_" #DVAL)]] \
@@ -503,6 +521,8 @@ template [[host_name("paged_attention_reduce_bfloat16_512")]]
     device bf16 *out [[buffer(3)]],
     constant int &num_heads [[buffer(4)]],
     constant int &num_partitions [[buffer(5)]],
+    device const float *sinks [[buffer(6)]],
+    constant int &has_sink [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]);
 instantiate_paged_v2_fp8(float32, float, 64)

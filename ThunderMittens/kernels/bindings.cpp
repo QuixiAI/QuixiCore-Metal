@@ -361,10 +361,13 @@ NB_MODULE(_ext, m) {
       "scale"_a = 0.0f,
       "partition_size"_a = 512,
       "window"_a = 0,
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         long-context paged decode attention (partition/reduce). GQA/MQA aware.
-        window > 0 restricts to the `window` most recent keys.
+        window > 0 restricts to the `window` most recent keys. softcap > 0 = Gemma-style
+        logit capping; sinks (H,) = gpt-oss attention sinks (merged once, in the reduce).
       )");
 
   m.def(
@@ -442,10 +445,12 @@ NB_MODULE(_ext, m) {
       "partition_size"_a = 512,
       "fmt"_a = 0,
       "window"_a = 0,
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         long-context paged decode over an fp8 (uint8) cache, per-head scales; fmt 0=e4m3, 1=e5m2. GQA aware.
-        window > 0 restricts to the `window` most recent keys.
+        window > 0 restricts to the `window` most recent keys; softcap/sinks as paged_attention_v2.
       )");
 
     m.def(
@@ -1203,10 +1208,13 @@ NB_MODULE(_ext, m) {
       "seq_qlen"_a,
       "scale"_a,
       nb::kw_only(),
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         varlen / paged-prefill causal attention: ragged packed queries (head-major,
-        padded per sequence to a multiple of 8) reading K/V from the paged cache
+        padded per sequence to a multiple of 8) reading K/V from the paged cache.
+        softcap > 0 = Gemma-style logit capping; sinks (H,) = gpt-oss attention sinks.
       )");
 
   m.def(

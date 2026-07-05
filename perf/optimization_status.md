@@ -1,5 +1,21 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 2: attention softcap + sinks (2026-07-05)
+
+Gemma-2/3 logit soft-capping (runtime scalar, <=0 off) and gpt-oss attention sinks
+(per-head denominator-only logit) across attn_fwd (+q16), attn_causal, attn_window,
+attn_varlen_prefill, and paged v2 (softcap in the partitions incl. fp8; the sink merged
+EXACTLY ONCE in the shared reduce — which also makes cascade/MLA compositions sink-capable
+for free). Correctness traps pinned in-kernel comments: no log2(e) fold into Q when capped;
+cap BEFORE masks; sink seeds the running max. sinks bound as always-present placeholder
+buffers (q / tmp_out) gated by has_sink — no dummy allocations, no host_name doubling.
+
+- Tests: fp64 oracles per kernel incl. the Gemma-2 (window+softcap) and gpt-oss
+  (window+sink) layer configs; 231 attention-family correctness + 79 parity green.
+- Perf: flagless-path regression guard measured clean — attn fwd 0.454 ms (SDPA 0.504),
+  causal 0.226/0.878 ms, paged v2 0.433 ms (dense-loop base 1.78) at the quick shapes;
+  the flags cost a uniform branch + 3 bound args when off.
+
 ## Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs (2026-07-05)
 
 New kernels `moe_grouped_gemm_rect_q<FMT>` / `moe_grouped_gemm_swiglu_q<FMT>` (formats mxfp4,

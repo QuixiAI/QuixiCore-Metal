@@ -484,7 +484,7 @@ def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: floa
 
 
 def attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
-                        tile_seq, tile_local0, seq_qlen, scale):
+                        tile_seq, tile_local0, seq_qlen, scale, softcap=0.0, sinks=None):
     """Low-level varlen/paged-prefill attention (head-major q/o + host worklist). MPS.
 
     q_hm (H, total_padded, D) bf16; key_cache/value_cache (nb, bs, H_KV, D) bf16;
@@ -492,7 +492,8 @@ def attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
     seq_qlen (B,) int32. Returns o_hm (H, total_padded, D). Prefer tk.attn_varlen_prefill,
     which builds the worklist and pads/transposes for you."""
     return _ext.attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
-                                    tile_seq, tile_local0, seq_qlen, float(scale))
+                                    tile_seq, tile_local0, seq_qlen, float(scale),
+                                    softcap=float(softcap), sinks=sinks)
 
 
 def varlen_pad_q(q_packed, cu_seqlens, pad_off, total_padded):
@@ -541,12 +542,14 @@ def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index, label_smooth
 
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                        block_table: torch.Tensor, context_lens: torch.Tensor,
-                       scale: float = 0.0, partition_size: int = 512, window: int = 0):
+                       scale: float = 0.0, partition_size: int = 512, window: int = 0,
+                       softcap: float = 0.0, sinks: torch.Tensor | None = None):
     """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
     q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D); D in {64,128}.
     window > 0 restricts to the `window` most recent keys."""
     return _ext.paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
-                                   float(scale), int(partition_size), int(window))
+                                   float(scale), int(partition_size), int(window),
+                                   softcap=float(softcap), sinks=sinks)
 
 
 def cascade_attention(q: torch.Tensor, prefix_k: torch.Tensor, prefix_v: torch.Tensor,
@@ -578,7 +581,8 @@ def cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_t
 
 
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
-                           k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3", window=0):
+                           k_scale, v_scale, scale=0.0, partition_size=512, fmt="e4m3", window=0,
+                           softcap=0.0, sinks=None):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA aware. MPS.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) tensor (per-head).
@@ -588,7 +592,8 @@ def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
     H_KV = key_cache.shape[2]
     return _ext.paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
                                        _scale_vec_t(k_scale, H_KV, q), _scale_vec_t(v_scale, H_KV, q),
-                                       float(scale), int(partition_size), _fmt_code(fmt), int(window))
+                                       float(scale), int(partition_size), _fmt_code(fmt), int(window),
+                                       softcap=float(softcap), sinks=sinks)
 
 
 def moe_route_topk(logits: torch.Tensor, k: int):

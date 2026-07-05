@@ -28,6 +28,8 @@ array paged_attention_v2(
     float scale = 0.0f,
     int partition_size = 512,
     int window = 0,
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {});
 
 /**
@@ -47,6 +49,8 @@ array paged_attention_v2_fp8(
     int partition_size = 512,
     int fmt = 0,
     int window = 0,
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {});
 
 /**
@@ -162,12 +166,13 @@ class CascadePrefixPartition : public Primitive {
 class PagedAttentionV2Partition : public Primitive {
  public:
   PagedAttentionV2Partition(Stream stream, float scale, int num_partitions, int partition_size,
-                            int window = 0)
+                            int window = 0, float softcap = 0.0f)
       : Primitive(stream),
         scale_(scale),
         num_partitions_(num_partitions),
         partition_size_(partition_size),
-        window_(window) {}
+        window_(window),
+        softcap_(softcap) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -183,7 +188,8 @@ class PagedAttentionV2Partition : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttentionV2Partition&>(other);
     return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
-        partition_size_ == o.partition_size_ && window_ == o.window_;
+        partition_size_ == o.partition_size_ && window_ == o.window_ &&
+        softcap_ == o.softcap_;
   }
 
  private:
@@ -191,18 +197,21 @@ class PagedAttentionV2Partition : public Primitive {
   int num_partitions_;
   int partition_size_;
   int window_;
+  float softcap_;
 };
 
 class PagedAttentionV2PartitionFp8 : public Primitive {
  public:
   PagedAttentionV2PartitionFp8(
-      Stream stream, float scale, int num_partitions, int partition_size, int fmt, int window = 0)
+      Stream stream, float scale, int num_partitions, int partition_size, int fmt, int window = 0,
+      float softcap = 0.0f)
       : Primitive(stream),
         scale_(scale),
         num_partitions_(num_partitions),
         partition_size_(partition_size),
         fmt_(fmt),
-        window_(window) {}
+        window_(window),
+        softcap_(softcap) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -218,7 +227,8 @@ class PagedAttentionV2PartitionFp8 : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttentionV2PartitionFp8&>(other);
     return scale_ == o.scale_ && num_partitions_ == o.num_partitions_ &&
-        partition_size_ == o.partition_size_ && fmt_ == o.fmt_ && window_ == o.window_;
+        partition_size_ == o.partition_size_ && fmt_ == o.fmt_ && window_ == o.window_ &&
+        softcap_ == o.softcap_;
   }
 
  private:
@@ -227,11 +237,15 @@ class PagedAttentionV2PartitionFp8 : public Primitive {
   int partition_size_;
   int fmt_;
   int window_;
+  float softcap_;
 };
 
 class PagedAttentionV2Reduce : public Primitive {
  public:
-  explicit PagedAttentionV2Reduce(Stream stream) : Primitive(stream) {}
+  // has_sink: inputs[3] is the per-head (H,) fp32 gpt-oss attention-sink buffer (else a
+  // placeholder). The sink enters the merged softmax denominator here, exactly once.
+  explicit PagedAttentionV2Reduce(Stream stream, bool has_sink = false)
+      : Primitive(stream), has_sink_(has_sink) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -244,7 +258,12 @@ class PagedAttentionV2Reduce : public Primitive {
       const std::vector<array>&, const std::vector<int>&) override;
   const char* name() const { return "PagedAttentionV2Reduce"; }
   void print(std::ostream& os) override { os << "PagedAttentionV2Reduce"; }
-  bool is_equivalent(const Primitive&) const override { return true; }
+  bool is_equivalent(const Primitive& other) const override {
+    return has_sink_ == static_cast<const PagedAttentionV2Reduce&>(other).has_sink_;
+  }
+
+ private:
+  bool has_sink_;
 };
 
 } // namespace mlx::core

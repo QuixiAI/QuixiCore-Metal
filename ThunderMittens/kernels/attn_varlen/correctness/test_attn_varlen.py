@@ -200,3 +200,50 @@ if __name__ == "__main__":
     test_prefix(64)
     test_matches_attn_causal()
     print("ok")
+
+
+def _oracle_flags(qn, kc, vc, bt, cu, ctxs, H, H_KV, bs, scale, softcap=0.0, sinks=None):
+    """_oracle + Gemma-style softcap and gpt-oss denominator-only sinks."""
+    out = np.zeros_like(qn)
+    grp = H // H_KV
+    for b in range(len(ctxs)):
+        s, e = int(cu[b]), int(cu[b + 1])
+        qlen, ctx = e - s, ctxs[b]
+        past = ctx - qlen
+        K = np.stack([kc[bt[b, t // bs], t % bs] for t in range(ctx)], 0)
+        V = np.stack([vc[bt[b, t // bs], t % bs] for t in range(ctx)], 0)
+        for h in range(H):
+            kvh = h // grp
+            for j in range(qlen):
+                lim = past + j + 1
+                sc = (qn[s + j, h].astype(np.float64) @ K[:lim, kvh].T.astype(np.float64)) * scale
+                if softcap > 0:
+                    sc = softcap * np.tanh(sc / softcap)
+                m = sc.max()
+                if sinks is not None:
+                    m = max(m, float(sinks[h]))
+                w = np.exp(sc - m)
+                den = w.sum() + (np.exp(float(sinks[h]) - m) if sinks is not None else 0.0)
+                out[s + j, h] = (w / den) @ V[:lim, kvh]
+    return out
+
+
+@pytest.mark.parametrize("softcap,use_sink", [(20.0, False), (0.0, True), (20.0, True)])
+def test_varlen_softcap_sinks(softcap, use_sink):
+    cu, ctxs, H, H_KV, D, bs = [0, 4, 20], [40, 60], 4, 2, 64, 16
+    rng = np.random.default_rng(3)
+    scale = 1.0 / np.sqrt(D)
+    total_q = cu[-1]
+    q = (0.3 * rng.standard_normal((total_q, H, D))).astype(np.float32)
+    kc, vc, bt = _build_cache(rng, ctxs, H_KV, D, bs)
+    cl = np.array(ctxs, np.int32)
+    sinks_np = (rng.standard_normal(H) * 1.5).astype(np.float32) if use_sink else None
+    o = tk.attn_varlen_prefill(
+        mx.array(q).astype(mx.bfloat16), mx.array(kc).astype(mx.bfloat16),
+        mx.array(vc).astype(mx.bfloat16), mx.array(bt), mx.array(cl), cu, scale=float(scale),
+        softcap=softcap, sinks=None if sinks_np is None else mx.array(sinks_np))
+    mx.eval(o)
+    on = np.array(o.astype(mx.float32))
+    ref = _oracle_flags(q, kc, vc, bt, cu, ctxs, H, H_KV, bs, scale, softcap, sinks_np)
+    rel = np.abs(on - ref).max() / (np.abs(ref).max() + 1e-6)
+    assert rel < 0.03, f"relerr {rel} (cap={softcap}, sink={use_sink})"

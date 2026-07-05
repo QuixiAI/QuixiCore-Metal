@@ -1374,7 +1374,7 @@ void launch_paged_attention_partition(
     typename E::out_t tmp_out, typename E::out_t max_logits, typename E::out_t exp_sums,
     int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    int window, const std::string& type_name) {
+    int window, float softcap, const std::string& type_name) {
   e.pipeline(paged_attention_partition_kernel_name(type_name, head_size));
   e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
   e.in(block_table, 3); e.in(context_lens, 4);
@@ -1382,6 +1382,7 @@ void launch_paged_attention_partition(
   e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
   e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12);
   e.bytes(num_partitions, 13); e.bytes(partition_size, 14); e.bytes(window, 15);
+  e.bytes(softcap, 16);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 
@@ -1409,7 +1410,7 @@ void launch_paged_attention_partition_fp8(
     typename E::out_t tmp_out, typename E::out_t max_logits, typename E::out_t exp_sums,
     int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
     int block_table_stride, float scale, int num_partitions, int partition_size,
-    typename E::in_t k_scale, typename E::in_t v_scale, int fmt, int window,
+    typename E::in_t k_scale, typename E::in_t v_scale, int fmt, int window, float softcap,
     const std::string& type_name) {
   e.pipeline(paged_attention_partition_fp8_kernel_name(type_name, head_size));
   e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
@@ -1419,6 +1420,7 @@ void launch_paged_attention_partition_fp8(
   e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12);
   e.bytes(num_partitions, 13); e.bytes(partition_size, 14);
   e.in(k_scale, 15); e.in(v_scale, 16); e.bytes(fmt, 17); e.bytes(window, 18);
+  e.bytes(softcap, 19);
   e.dispatch(num_heads, batch, num_partitions, 32, 1, 1);
 }
 // fp8 cascade prefix partition (uint8 shared prefix KV + per-kv-head dequant on read).
@@ -1439,15 +1441,19 @@ void launch_cascade_prefix_partition_fp8(
 }
 
 // ----- Paged attention v2 reduce: tmp_out@0 max_logits@1 exp_sums@2 (fp32) -> out@3 ;
-//        num_heads@4 num_partitions@5 ; grid (H, B, 1), 32 threads. LSE merge over partitions. -----
+//        num_heads@4 num_partitions@5 sinks@6(f32*) has_sink@7(i32) ; grid (H, B, 1), 32 thr.
+//        LSE merge over partitions. The attention sink (gpt-oss) enters the denominator HERE,
+//        exactly once — never in the partition kernels. sinks read only when has_sink; pass
+//        tmp_out as the placeholder binding otherwise. -----
 template <class E>
 void launch_paged_attention_reduce(
     E& e, typename E::in_t tmp_out, typename E::in_t max_logits, typename E::in_t exp_sums,
     typename E::out_t out, int batch, int num_heads, int head_size, int num_partitions,
-    const std::string& type_name) {
+    typename E::in_t sinks, int has_sink, const std::string& type_name) {
   e.pipeline(paged_attention_reduce_kernel_name(type_name, head_size));
   e.in(tmp_out, 0); e.in(max_logits, 1); e.in(exp_sums, 2); e.out(out, 3);
   e.bytes(num_heads, 4); e.bytes(num_partitions, 5);
+  e.in(sinks, 6); e.bytes(has_sink, 7);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
@@ -1490,13 +1496,15 @@ void launch_attn_varlen_prefill(E& e, typename E::in_t q_hm, typename E::in_t ke
                                 typename E::in_t context_lens, typename E::in_t tile_seq,
                                 typename E::in_t tile_local0, typename E::in_t seq_qlen,
                                 typename E::out_t o_hm, int n_tiles, int total_padded, int H,
-                                int H_KV, int block_size, int bt_stride, float scale, int D) {
+                                int H_KV, int block_size, int bt_stride, float scale, int D,
+                                float softcap, typename E::in_t sinks, int has_sink) {
   e.pipeline("attn_varlen_prefill_" + std::to_string(D));
   e.in(q_hm, 0); e.in(key_cache, 1); e.in(value_cache, 2); e.in(block_table, 3);
   e.in(context_lens, 4); e.in(tile_seq, 5); e.in(tile_local0, 6); e.in(seq_qlen, 7);
   e.out(o_hm, 8);
   e.bytes(total_padded, 9); e.bytes(H, 10); e.bytes(H_KV, 11);
   e.bytes(block_size, 12); e.bytes(bt_stride, 13); e.bytes(scale, 14);
+  e.bytes(softcap, 15); e.in(sinks, 16); e.bytes(has_sink, 17);
   e.dispatch(n_tiles, H, 1, 32, 1, 1);
 }
 // Device varlen Q pad/gather (packed -> head-major) and output re-gather (head-major -> packed).

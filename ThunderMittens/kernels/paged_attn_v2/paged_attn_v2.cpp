@@ -36,6 +36,8 @@ array paged_attention_v2(
     float scale /* = 0.0f */,
     int partition_size /* = 512 */,
     int window /* = 0 */,
+    float softcap /* = 0.0f */,
+    const std::optional<array>& sinks /* = std::nullopt */,
     StreamOrDevice s /* = {} */) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_v2: q must have shape (batch, num_heads, head_size)");
@@ -83,18 +85,25 @@ array paged_attention_v2(
   const int max_ctx = block_table.shape(1) * block_size;
   const int num_partitions = std::max(1, (max_ctx + partition_size - 1) / partition_size);
 
+  const bool has_sink = sinks.has_value();
+  if (has_sink && (sinks->ndim() != 1 || sinks->shape(0) != H)) {
+    throw std::invalid_argument("paged_attention_v2: sinks must be (num_heads,)");
+  }
+
   auto parts = array::make_arrays(
       {{B, H, num_partitions, D}, {B, H, num_partitions}, {B, H, num_partitions}},
       {float32, float32, float32},
       std::make_shared<PagedAttentionV2Partition>(to_stream(s), scale, num_partitions,
-                                                  partition_size, window),
+                                                  partition_size, window, softcap),
       {q_c, key_c, value_c, table_c, lens_c});
 
+  // 4th reduce input: the sink buffer, or parts[1] as the placeholder binding when absent.
+  auto sink_arr = has_sink ? astype(*sinks, float32, s) : parts[1];
   return array(
       {B, H, D},
       dtype,
-      std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
-      {parts[0], parts[1], parts[2]});
+      std::make_shared<PagedAttentionV2Reduce>(to_stream(s), has_sink),
+      {parts[0], parts[1], parts[2], sink_arr});
 }
 
 array cascade_attention(
@@ -260,6 +269,8 @@ array paged_attention_v2_fp8(
     int partition_size /* = 512 */,
     int fmt /* = 0 */,
     int window /* = 0 */,
+    float softcap /* = 0.0f */,
+    const std::optional<array>& sinks /* = std::nullopt */,
     StreamOrDevice s /* = {} */) {
   if (q.ndim() != 3) {
     throw std::invalid_argument("paged_attention_v2_fp8: q must have shape (batch, num_heads, head_size)");
@@ -313,18 +324,24 @@ array paged_attention_v2_fp8(
   const int max_ctx = block_table.shape(1) * block_size;
   const int num_partitions = std::max(1, (max_ctx + partition_size - 1) / partition_size);
 
+  const bool has_sink = sinks.has_value();
+  if (has_sink && (sinks->ndim() != 1 || sinks->shape(0) != H)) {
+    throw std::invalid_argument("paged_attention_v2_fp8: sinks must be (num_heads,)");
+  }
+
   auto parts = array::make_arrays(
       {{B, H, num_partitions, D}, {B, H, num_partitions}, {B, H, num_partitions}},
       {float32, float32, float32},
       std::make_shared<PagedAttentionV2PartitionFp8>(
-          to_stream(s), scale, num_partitions, partition_size, fmt, window),
+          to_stream(s), scale, num_partitions, partition_size, fmt, window, softcap),
       {q_c, key_c, value_c, table_c, lens_c, ks_c, vs_c});
 
+  auto sink_arr = has_sink ? astype(*sinks, float32, s) : parts[1];
   return array(
       {B, H, D},
       q.dtype(),
-      std::make_shared<PagedAttentionV2Reduce>(to_stream(s)),
-      {parts[0], parts[1], parts[2]});
+      std::make_shared<PagedAttentionV2Reduce>(to_stream(s), has_sink),
+      {parts[0], parts[1], parts[2], sink_arr});
 }
 
 void PagedAttentionV2PartitionFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -364,7 +381,7 @@ void PagedAttentionV2PartitionFp8::eval_gpu(
       enc, q, key_cache, value_cache, block_table, context_lens,
       tmp_out, max_logits, exp_sums, B, H, num_kv_heads, D, block_size,
       block_table.shape(1), scale, num_partitions_, partition_size_,
-      k_scale, v_scale, fmt_, window_, type_to_name(q));
+      k_scale, v_scale, fmt_, window_, softcap_, type_to_name(q));
 }
 
 void PagedAttentionV2Partition::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -401,7 +418,8 @@ void PagedAttentionV2Partition::eval_gpu(
   tk::launch_paged_attention_partition(
       enc, q, key_cache, value_cache, block_table, context_lens,
       tmp_out, max_logits, exp_sums, B, H, num_kv_heads, D, block_size,
-      block_table.shape(1), scale, num_partitions_, partition_size_, window_, type_to_name(q));
+      block_table.shape(1), scale, num_partitions_, partition_size_, window_, softcap_,
+      type_to_name(q));
 }
 
 void CascadePrefixPartition::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -527,6 +545,9 @@ void PagedAttentionV2Reduce::eval_gpu(
   auto& tmp_out = inputs[0];
   auto& max_logits = inputs[1];
   auto& exp_sums = inputs[2];
+  // inputs[3] = per-head sink buffer when has_sink_; older 3-input callers (mla/cascade/fp8
+  // compositions) bind tmp_out as the placeholder — the kernel never reads it then.
+  auto& sinks = (has_sink_ && inputs.size() > 3) ? inputs[3] : inputs[0];
   auto& out = outputs[0];
 
   auto& s = stream();
@@ -541,7 +562,8 @@ void PagedAttentionV2Reduce::eval_gpu(
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_paged_attention_reduce(
-      enc, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, type_to_name(out));
+      enc, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, sinks,
+      has_sink_ ? 1 : 0, type_to_name(out));
 }
 
 #define TK_PAV2_NO_AUTODIFF(CLASS, LABEL)                                    \

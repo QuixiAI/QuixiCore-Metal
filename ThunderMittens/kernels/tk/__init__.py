@@ -148,7 +148,7 @@ def varlen_build_worklist(cu_seqlens, max_tiles):
 
 
 def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_lens,
-                        cu_seqlens_q, scale=0.0):
+                        cu_seqlens_q, scale=0.0, softcap=0.0, sinks=None):
     """Varlen / paged-prefill causal attention: ragged packed queries reading K/V from the paged
     cache, no dense (B,H,N,D) materialization. Supports a cached prefix (context_len >= q_len),
     GQA, and D in {64,128}.
@@ -184,7 +184,8 @@ def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_l
         tl = torch.from_numpy(tile_local0).to(dev)
         sq = torch.from_numpy(qlens).to(dev)
         o_hm = _torch().attn_varlen_prefill(
-            q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale))
+            q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale),
+            softcap=softcap, sinks=sinks)
         o_pad = o_hm.permute(1, 0, 2).contiguous()                 # (total_padded, H, D)
         outs = [o_pad[int(pad_off[b]):int(pad_off[b]) + int(qlens[b])] for b in range(B)]
         return torch.cat(outs, 0)
@@ -200,7 +201,8 @@ def attn_varlen_prefill(q_packed, key_cache, value_cache, block_table, context_l
     q_hm = mx.transpose(mx.concatenate(parts, axis=0), (1, 0, 2))   # (H, total_padded, D)
     ts, tl, sq = mx.array(tile_seq), mx.array(tile_local0), mx.array(qlens)
     o_hm = _mlx().attn_varlen_prefill(
-        q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale))
+        q_hm, key_cache, value_cache, block_table, context_lens, ts, tl, sq, float(scale),
+        softcap=float(softcap), sinks=sinks)
     o_pad = mx.transpose(o_hm, (1, 0, 2))                           # (total_padded, H, D)
     outs = [o_pad[int(pad_off[b]):int(pad_off[b]) + int(qlens[b])] for b in range(B)]
     return mx.concatenate(outs, axis=0)
@@ -223,7 +225,7 @@ def varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q):
 
 
 def attn_varlen_prefill_device(q_packed, key_cache, value_cache, block_table, context_lens,
-                               cu_seqlens, max_tiles, scale=0.0):
+                               cu_seqlens, max_tiles, scale=0.0, softcap=0.0, sinks=None):
     """FULLY DEVICE-RESIDENT varlen prefill: builds the tile worklist, pads/gathers Q into the
     head-major layout, runs the paged-prefill attention, and re-gathers the output back to packed —
     all on-device from a DEVICE cu_seqlens (B+1,) int, with only ONE scalar readback (total_padded,
@@ -238,10 +240,12 @@ def attn_varlen_prefill_device(q_packed, key_cache, value_cache, block_table, co
     q_hm = varlen_pad_q(q_packed, cu_seqlens, pad_off, total_padded)
     if _is_torch(q_packed):
         o_hm = _torch().attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
-                                            tile_seq, tile_local0, qlens, float(scale))
+                                            tile_seq, tile_local0, qlens, float(scale),
+                                            softcap=softcap, sinks=sinks)
     else:
         o_hm = _mlx().attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
-                                          tile_seq, tile_local0, qlens, float(scale))
+                                          tile_seq, tile_local0, qlens, float(scale),
+                                          softcap=float(softcap), sinks=sinks)
     return varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q)
 
 
@@ -690,19 +694,23 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
 
 
 def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
-                       scale=0.0, partition_size=256, window=0):
+                       scale=0.0, partition_size=256, window=0, softcap=0.0, sinks=None):
     """Long-context paged decode attention (partition/reduce). GQA/MQA aware.
 
     q/out (B,H,D); caches (num_blocks, block_size, num_kv_heads, D). Accepts
     mlx.array or torch.Tensor (MPS). partition_size must be a multiple of block_size.
-    window > 0 restricts to the `window` most recent keys.
+    window > 0 restricts to the `window` most recent keys. softcap > 0 applies Gemma-style
+    logit capping (in the partitions); sinks (H,) adds gpt-oss attention-sink logits to the
+    softmax denominator (merged exactly once, in the reduce).
     """
     if _is_torch(q):
         return _torch().paged_attention_v2(
-            q, key_cache, value_cache, block_table, context_lens, scale, partition_size, window)
+            q, key_cache, value_cache, block_table, context_lens, scale, partition_size, window,
+            softcap=softcap, sinks=sinks)
     return _mlx().paged_attention_v2(
         q, key_cache, value_cache, block_table, context_lens,
-        scale=scale, partition_size=partition_size, window=window)
+        scale=scale, partition_size=partition_size, window=window,
+        softcap=float(softcap), sinks=sinks)
 
 
 def cascade_attention(q, prefix_k, prefix_v, key_cache, value_cache, block_table, context_lens,
@@ -753,7 +761,8 @@ def cascade_attention_fp8(q, prefix_k, prefix_v, key_cache, value_cache, block_t
 
 
 def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
-                           k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3", window=0):
+                           k_scale, v_scale, scale=0.0, partition_size=256, fmt="e4m3", window=0,
+                           softcap=0.0, sinks=None):
     """Long-context paged decode over an fp8 (uint8) cache, dequantized on read. GQA/MQA aware.
 
     k_scale/v_scale: plain float (per-tensor) or a (num_kv_heads,) array (per-head).
@@ -765,10 +774,11 @@ def paged_attention_v2_fp8(q, key_cache, value_cache, block_table, context_lens,
     if _is_torch(q):
         return _torch().paged_attention_v2_fp8(
             q, key_cache, value_cache, block_table, context_lens, k_scale, v_scale,
-            scale, partition_size, fmt, window)
+            scale, partition_size, fmt, window, softcap=softcap, sinks=sinks)
     return _mlx().paged_attention_v2_fp8(
         q, key_cache, value_cache, block_table, context_lens, k_scale, v_scale,
-        scale=scale, partition_size=partition_size, fmt=_fmt_code(fmt), window=window)
+        scale=scale, partition_size=partition_size, fmt=_fmt_code(fmt), window=window,
+        softcap=float(softcap), sinks=sinks)
 
 
 def moe_route_topk(logits, k):

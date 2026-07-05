@@ -269,3 +269,61 @@ if __name__ == "__main__":
     for ps in (4, 8, 16):
         test_paged_attention_v2("float32", 3e-5, 64, 4, 2, ps)
         print("ok", ps)
+
+
+def _ref_capped_sink(q, kc, vc, bt, cl, scale, window=0, softcap=0.0, sinks=None):
+    """Full-softmax oracle with Gemma-style softcap (in-partition) and gpt-oss sink
+    (denominator-only, merged once)."""
+    B, H, D = q.shape
+    H_KV = kc.shape[2]
+    group = H // H_KV
+    bs = kc.shape[1]
+    out = np.zeros_like(q, np.float32)
+    for b in range(B):
+        ctx = int(cl[b])
+        t0 = max(0, ctx - window) if window > 0 else 0
+        for h in range(H):
+            kvh = h // group
+            sc, vs = [], []
+            for t in range(t0, ctx):
+                blk = bt[b, t // bs]
+                slot = t % bs
+                s_val = float(np.dot(q[b, h], kc[blk, slot, kvh]) * scale)
+                if softcap > 0:
+                    s_val = softcap * math.tanh(s_val / softcap)
+                sc.append(s_val)
+                vs.append(vc[blk, slot, kvh])
+            if not sc:
+                continue
+            s = np.array(sc, np.float64)
+            m = s.max()
+            if sinks is not None:
+                m = max(m, float(sinks[h]))
+            e = np.exp(s - m)
+            den = e.sum()
+            if sinks is not None:
+                den += math.exp(float(sinks[h]) - m)
+            out[b, h] = np.sum((e / den)[:, None] * np.stack(vs), axis=0)
+    return out
+
+
+@pytest.mark.parametrize("softcap,use_sink", [(20.0, False), (0.0, True), (20.0, True)])
+@pytest.mark.parametrize("partition_size", [4, 16])
+def test_paged_attention_v2_softcap_sinks(softcap, use_sink, partition_size):
+    rng = np.random.default_rng(99)
+    B, num_blocks, block_size, H, H_KV, D = 2, 8, 4, 4, 2, 64
+    q = (0.2 * rng.normal(size=(B, H, D))).astype(np.float32)
+    kc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    vc = (0.2 * rng.normal(size=(num_blocks, block_size, H_KV, D))).astype(np.float32)
+    bt = np.array([[0, 1, 2, 3], [4, 5, 6, 7]], dtype=np.int32)
+    cl = np.array([10, 16], dtype=np.int32)
+    scale = 1.0 / math.sqrt(D)
+    sinks_np = (rng.normal(size=H) * 1.5).astype(np.float32) if use_sink else None
+
+    got = paged_attention_v2(
+        mx.array(q), mx.array(kc), mx.array(vc), mx.array(bt), mx.array(cl),
+        scale=0.0, partition_size=partition_size, softcap=softcap,
+        sinks=None if sinks_np is None else mx.array(sinks_np))
+    mx.eval(got)
+    ref = _ref_capped_sink(q, kc, vc, bt, cl, scale, 0, softcap, sinks_np)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-5, rtol=2e-3)

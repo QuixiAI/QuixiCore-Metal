@@ -26,23 +26,33 @@ array attn_varlen_prefill(
     const array& tile_local0,
     const array& seq_qlen,
     float scale,
+    float softcap /* = 0.0f */,
+    const std::optional<array>& sinks /* = std::nullopt */,
     StreamOrDevice s /* = {} */) {
   assert(q_hm.dtype() == bfloat16 && key_cache.dtype() == bfloat16 &&
          value_cache.dtype() == bfloat16);
   assert(q_hm.ndim() == 3);
+  const int H = q_hm.shape(0);
   const int D = q_hm.shape(2);
   assert(D == 64 || D == 128);
+  const bool has_sink = sinks.has_value();
+  if (has_sink && (sinks->ndim() != 1 || sinks->shape(0) != H)) {
+    throw std::invalid_argument("attn_varlen_prefill: sinks must be (H,)");
+  }
   // The kernel assumes contiguous head-major q/o and contiguous index arrays; the Python wrapper
   // builds q_hm by transpose (a strided view), so force row-contiguity here.
+  auto q_c = contiguous(q_hm, false, s);
+  // 9th input: sink buffer (q as the placeholder binding when absent — never read then).
+  auto sink_arr = has_sink ? contiguous(astype(*sinks, float32, s), false, s) : q_c;
   return array(
       q_hm.shape(), bfloat16,
-      std::make_shared<AttnVarlenPrefill>(to_stream(s), scale),
-      {contiguous(q_hm, false, s), contiguous(key_cache, false, s),
+      std::make_shared<AttnVarlenPrefill>(to_stream(s), scale, softcap, has_sink),
+      {q_c, contiguous(key_cache, false, s),
        contiguous(value_cache, false, s), contiguous(astype(block_table, int32, s), false, s),
        contiguous(astype(context_lens, int32, s), false, s),
        contiguous(astype(tile_seq, int32, s), false, s),
        contiguous(astype(tile_local0, int32, s), false, s),
-       contiguous(astype(seq_qlen, int32, s), false, s)});
+       contiguous(astype(seq_qlen, int32, s), false, s), sink_arr});
 }
 
 std::vector<array> varlen_build_worklist(
@@ -166,7 +176,7 @@ void AttnVarlenPrefill::eval_cpu(const std::vector<array>&, std::vector<array>&)
 void AttnVarlenPrefill::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
-  assert(inputs.size() == 8);
+  assert(inputs.size() == 9);
   auto& q_hm = inputs[0];
   auto& key_cache = inputs[1];
   auto& value_cache = inputs[2];
@@ -175,6 +185,7 @@ void AttnVarlenPrefill::eval_gpu(
   auto& tile_seq = inputs[5];
   auto& tile_local0 = inputs[6];
   auto& seq_qlen = inputs[7];
+  auto& sinks = inputs[8];   // == q_hm (placeholder) when has_sink_ is false
   auto& out = outputs[0];
 
   auto& s = stream();
@@ -193,7 +204,8 @@ void AttnVarlenPrefill::eval_gpu(
   MLXEncoder enc(d, ce);
   tk::launch_attn_varlen_prefill(enc, q_hm, key_cache, value_cache, block_table, context_lens,
                                  tile_seq, tile_local0, seq_qlen, out, n_tiles, total_padded, H,
-                                 H_KV, block_size, bt_stride, scale_, D);
+                                 H_KV, block_size, bt_stride, scale_, D, softcap_, sinks,
+                                 has_sink_ ? 1 : 0);
 }
 
 std::vector<array> AttnVarlenPrefill::jvp(

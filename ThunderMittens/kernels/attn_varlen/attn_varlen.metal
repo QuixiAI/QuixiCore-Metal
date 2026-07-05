@@ -38,6 +38,9 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
                                 constant int      &block_size   [[buffer(12)]],
                                 constant int      &bt_stride    [[buffer(13)]],
                                 constant float    &scale        [[buffer(14)]],
+                                constant float    &softcap      [[buffer(15)]],
+                                device const float *sinks       [[buffer(16)]],
+                                constant int      &has_sink     [[buffer(17)]],
                                 uint3 blockIdx [[threadgroup_position_in_grid]],
                                 uint  tid      [[thread_index_in_threadgroup]],
                                 uint  laneId   [[thread_index_in_simdgroup]]) {
@@ -68,8 +71,13 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
     rv_att max_vec_last, max_vec, norm_vec;
 
     load(q_reg, gl_q, {0, head, gx, 0}, laneId);
-    neg_infty(max_vec); zero(norm_vec); zero(o_reg);
-    const bf16 q_mul = (bf16)(scale * 1.44269504089f);   // fold scale * log2(e) (exp2 softmax)
+    const bool capped = softcap > 0.0f;
+    const float sink_l2 = (has_sink != 0) ? sinks[head] * 1.44269504089f : 0.0f;
+    if (has_sink != 0) { zero(max_vec); add(max_vec, max_vec, sink_l2); }
+    else               { neg_infty(max_vec); }
+    zero(norm_vec); zero(o_reg);
+    // softcap active: keep raw scale (tanh is nonlinear); log2(e) applies after the cap.
+    const bf16 q_mul = (bf16)(capped ? scale : scale * 1.44269504089f);
     mul(q_reg, q_reg, q_mul);
 
     for (int kv0 = 0; kv0 < kv_limit; kv0 += TNV) {
@@ -89,6 +97,11 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
         load(k_reg, sK, laneId);                                    // shared -> col reg (K^T)
         zero(att_block);
         mma_ABt(att_block, q_reg, k_reg, att_block);
+        if (capped) {   // BEFORE the causal mask (tanh would compress -1e30 to -softcap)
+            mul(att_block, att_block, 1.0f / softcap);
+            tanh(att_block, att_block);
+            mul(att_block, att_block, softcap * 1.44269504089f);
+        }
         // Boundary tile: mask keys past each query's causal horizon. shift = past+local0-kv0;
         // shift >= 7 means the whole tile is in-horizon (no-op).
         const int shift = past + local0 - kv0;
@@ -107,6 +120,14 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
         mma_AB(o_reg, att_block, v_reg, o_reg);
         threadgroup_barrier(metal::mem_flags::mem_threadgroup);     // before sK/sV reuse
     }
+    if (has_sink != 0) {
+        rv_att sink_term;
+        copy(sink_term, max_vec, laneId);
+        mul(sink_term, sink_term, -1.0f);
+        add(sink_term, sink_term, sink_l2);
+        exp2(sink_term, sink_term);
+        add(norm_vec, norm_vec, sink_term);
+    }
     div_row(o_reg, o_reg, norm_vec);
     store(gl_o, o_reg, {0, head, gx, 0}, laneId);
 }
@@ -120,7 +141,8 @@ kernel void attn_varlen_prefill(device   bf16     *q_hm         [[buffer(0)]],  
     device bf16 *o_hm [[buffer(8)]], constant int &total_padded [[buffer(9)]],         \
     constant int &H [[buffer(10)]], constant int &H_KV [[buffer(11)]],                 \
     constant int &block_size [[buffer(12)]], constant int &bt_stride [[buffer(13)]],   \
-    constant float &scale [[buffer(14)]],                                             \
+    constant float &scale [[buffer(14)]], constant float &softcap [[buffer(15)]],      \
+    device const float *sinks [[buffer(16)]], constant int &has_sink [[buffer(17)]],   \
     uint3 blockIdx [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint laneId [[thread_index_in_simdgroup]]);
 

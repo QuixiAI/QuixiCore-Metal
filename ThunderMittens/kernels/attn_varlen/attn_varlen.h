@@ -26,6 +26,8 @@ array attn_varlen_prefill(
     const array& tile_local0,
     const array& seq_qlen,
     float scale,
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {});
 
 /**
@@ -95,7 +97,9 @@ class VarlenBuildWorklist : public Primitive {
 
 class AttnVarlenPrefill : public Primitive {
  public:
-  explicit AttnVarlenPrefill(Stream stream, float scale) : Primitive(stream), scale_(scale) {}
+  explicit AttnVarlenPrefill(Stream stream, float scale, float softcap = 0.0f,
+                             bool has_sink = false)
+      : Primitive(stream), scale_(scale), softcap_(softcap), has_sink_(has_sink) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
@@ -107,11 +111,14 @@ class AttnVarlenPrefill : public Primitive {
   const char* name() const { return "AttnVarlenPrefill"; }
   void print(std::ostream& os) override { os << "AttnVarlenPrefill"; }
   bool is_equivalent(const Primitive& other) const override {
-    return scale_ == static_cast<const AttnVarlenPrefill&>(other).scale_;
+    auto& o = static_cast<const AttnVarlenPrefill&>(other);
+    return scale_ == o.scale_ && softcap_ == o.softcap_ && has_sink_ == o.has_sink_;
   }
 
  private:
   float scale_;
+  float softcap_;
+  bool has_sink_;
 };
 
 } // namespace mlx::core

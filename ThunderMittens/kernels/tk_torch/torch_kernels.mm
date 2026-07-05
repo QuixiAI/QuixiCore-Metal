@@ -1010,8 +1010,7 @@ static at::Tensor mla_decode_mps(
     tk::launch_mla_decode_partition(e, q, cache, bt, cl, tmp_out, max_logits, exp_sums, B, N,
                                     block_size, static_cast<int>(bt.size(1)), scale_f, latent,
                                     64, P, psize);
-    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, latent, P,
-                                      "bfloat16");
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, latent, P, tmp_out, 0, "bfloat16");
   });
   return out;
 }
@@ -1048,8 +1047,7 @@ static at::Tensor mla_decode_fp8_mps(
     tk::launch_mla_decode_fp8_partition(e, q, data, sc, bt, cl, tmp_out, max_logits, exp_sums,
                                         B, N, block_size, static_cast<int>(bt.size(1)), scale_f,
                                         P, psize);
-    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P,
-                                      "bfloat16");
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P, tmp_out, 0, "bfloat16");
   });
   return out;
 }
@@ -1088,8 +1086,7 @@ static at::Tensor mla_decode_fp8_sparse_mps(
                                                static_cast<int>(data.size(1)),
                                                static_cast<int>(bt.size(1)), scale_f, max_topk,
                                                P, psize);
-    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P,
-                                      "bfloat16");
+    tk::launch_paged_attention_reduce(e, tmp_out, max_logits, exp_sums, out, B, N, 512, P, tmp_out, 0, "bfloat16");
   });
   return out;
 }
@@ -1362,7 +1359,8 @@ static std::tuple<at::Tensor, at::Tensor> rope_kv_insert_mps(
 static at::Tensor paged_attention_v2_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
-    double scale, int64_t partition_size, int64_t window) {
+    double scale, int64_t partition_size, int64_t window, double softcap,
+    const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_in.device().is_mps(), "paged_attention_v2: q must be an MPS tensor");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -1397,14 +1395,23 @@ static at::Tensor paged_attention_v2_mps(
   auto out = at::empty_like(q);
   const float scale_f = scale > 0.0 ? static_cast<float>(scale)
                                     : 1.0f / std::sqrt(static_cast<float>(D));
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = tmp_out;   // placeholder binding when absent (never read)
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H,
+                "paged_attention_v2: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_paged_attention_partition(
         e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
         B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
-        num_partitions, static_cast<int>(partition_size), static_cast<int>(window), tn);
+        num_partitions, static_cast<int>(partition_size), static_cast<int>(window),
+        static_cast<float>(softcap), tn);
     tk::launch_paged_attention_reduce(
-        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
+        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, sinks,
+        has_sink ? 1 : 0, tn);
   });
   return out;
 }
@@ -1450,15 +1457,13 @@ static at::Tensor cascade_attention_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_cascade_prefix_partition(e, q, prefix_k, prefix_v, p_tmp, p_ml, p_es, B, H, H_KV, D,
                                         prefix_len, scale_f, Pp, ps, tn);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens,
-                                         s_tmp, s_ml, s_es, B, H, H_KV, D, block_size,
-                                         static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
   });
   auto tmp = at::cat({p_tmp, s_tmp}, 2);
   auto ml = at::cat({p_ml, s_ml}, 2);
   auto es = at::cat({p_es, s_es}, 2);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, Pp + Ps, tn);
+    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, Pp + Ps, tmp, 0, tn);
   });
   return out;
 }
@@ -1503,16 +1508,14 @@ static at::Tensor cascade_attention_multi_mps(
     }
     auto s_tmp = at::empty({B, H, Ps, D}, f32), s_ml = at::empty({B, H, Ps}, f32),
          s_es = at::empty({B, H, Ps}, f32);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens,
-                                         s_tmp, s_ml, s_es, B, H, H_KV, D, block_size,
-                                         static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, block_table, context_lens, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
     tmps.push_back(s_tmp); mls.push_back(s_ml); ess.push_back(s_es);
     total_parts += Ps;
   });
   auto tmp = at::cat(tmps, 2), ml = at::cat(mls, 2), es = at::cat(ess, 2);
   auto out = at::empty_like(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, total_parts, tn);
+    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, total_parts, tmp, 0, tn);
   });
   return out;
 }
@@ -1553,14 +1556,12 @@ static at::Tensor cascade_attention_fp8_mps(
     tk::launch_cascade_prefix_partition_fp8(e, q, pk, pv, p_tmp, p_ml, p_es, B, H, H_KV, D,
                                             prefix_len, scale_f, Pp, ps, ks, vs,
                                             static_cast<int>(fmt), tn);
-    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, bt, cl, s_tmp, s_ml, s_es,
-                                         B, H, H_KV, D, block_size, static_cast<int>(bt.size(1)),
-                                         scale_f, Ps, ps, 0, tn);
+    tk::launch_paged_attention_partition(e, q, key_cache, value_cache, bt, cl, s_tmp, s_ml, s_es, B, H, H_KV, D, block_size, static_cast<int>(bt.size(1)), scale_f, Ps, ps, 0, 0.0f, tn);
   });
   auto tmp = at::cat({p_tmp, s_tmp}, 2), ml = at::cat({p_ml, s_ml}, 2), es = at::cat({p_es, s_es}, 2);
   auto out = at::empty_like(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, Pp + Ps, tn);
+    tk::launch_paged_attention_reduce(e, tmp, ml, es, out, B, H, D, Pp + Ps, tmp, 0, tn);
   });
   return out;
 }
@@ -1570,7 +1571,8 @@ static at::Tensor paged_attention_v2_fp8_mps(
     const at::Tensor& q_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
     const at::Tensor& k_scale_in, const at::Tensor& v_scale_in,
-    double scale, int64_t partition_size, int64_t fmt, int64_t window) {
+    double scale, int64_t partition_size, int64_t fmt, int64_t window, double softcap,
+    const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in), "paged_attention_v2_fp8: q must be float MPS");
   TORCH_CHECK(q_in.dim() == 3, "paged_attention_v2_fp8: q must be (B,H,D)");
   TORCH_CHECK(key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes(),
@@ -1606,15 +1608,23 @@ static at::Tensor paged_attention_v2_fp8_mps(
   auto out = at::empty_like(q);
   const float scale_f = scale > 0.0 ? static_cast<float>(scale)
                                     : 1.0f / std::sqrt(static_cast<float>(D));
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = tmp_out;   // placeholder binding when absent (never read)
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H,
+                "paged_attention_v2_fp8: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_paged_attention_partition_fp8(
         e, q, key_cache, value_cache, block_table, context_lens, tmp_out, max_logits, exp_sums,
         B, H, H_KV, D, block_size, static_cast<int>(block_table.size(1)), scale_f,
         num_partitions, static_cast<int>(partition_size), ks, vs, static_cast<int>(fmt),
-        static_cast<int>(window), tn);
+        static_cast<int>(window), static_cast<float>(softcap), tn);
     tk::launch_paged_attention_reduce(
-        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, tn);
+        e, tmp_out, max_logits, exp_sums, out, B, H, D, num_partitions, sinks,
+        has_sink ? 1 : 0, tn);
   });
   return out;
 }
@@ -2271,7 +2281,7 @@ static at::Tensor attn_varlen_prefill_mps(
     const at::Tensor& q_hm_in, const at::Tensor& key_cache_in, const at::Tensor& value_cache_in,
     const at::Tensor& block_table_in, const at::Tensor& context_lens_in,
     const at::Tensor& tile_seq_in, const at::Tensor& tile_local0_in, const at::Tensor& seq_qlen_in,
-    double scale) {
+    double scale, double softcap, const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_hm_in.device().is_mps(), "attn_varlen_prefill: q_hm must be an MPS tensor");
   TORCH_CHECK(q_hm_in.scalar_type() == at::kBFloat16 &&
               key_cache_in.scalar_type() == at::kBFloat16 &&
@@ -2290,11 +2300,19 @@ static at::Tensor attn_varlen_prefill_mps(
   const int bt_stride = block_table.size(1), n_tiles = tile_seq.size(0);
   TORCH_CHECK(D == 64 || D == 128, "attn_varlen_prefill: D must be 64 or 128");
   TORCH_CHECK(block_size % 8 == 0, "attn_varlen_prefill: block_size must be a multiple of 8");
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = q_hm;   // placeholder binding when absent (never read)
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H,
+                "attn_varlen_prefill: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   auto out = at::empty_like(q_hm);
   tk_encode([&](TorchEncoder& e) {
     tk::launch_attn_varlen_prefill(e, q_hm, key_cache, value_cache, block_table, context_lens,
                                    tile_seq, tile_local0, seq_qlen, out, n_tiles, total_padded,
-                                   H, H_KV, block_size, bt_stride, static_cast<float>(scale), D);
+                                   H, H_KV, block_size, bt_stride, static_cast<float>(scale), D,
+                                   static_cast<float>(softcap), sinks, has_sink ? 1 : 0);
   });
   return out;
 }
@@ -3136,11 +3154,20 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mla_decode_fp8", &mla_decode_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 latent decode (MPS)");
   m.def("mla_decode_fp8_sparse", &mla_decode_fp8_sparse_mps, "ThunderMittens DeepSeek-V4 sparse latent decode (MPS)");
   m.def("mla_kv_insert_fp8", &mla_kv_insert_fp8_mps, "ThunderMittens DeepSeek-V4 packed fp8 MLA KV-insert (MPS)");
-  m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)");
+  m.def("paged_attention_v2", &paged_attention_v2_mps, "ThunderMittens long-context paged attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("key_cache"), pybind11::arg("value_cache"),
+        pybind11::arg("block_table"), pybind11::arg("context_lens"), pybind11::arg("scale"),
+        pybind11::arg("partition_size"), pybind11::arg("window"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("cascade_attention", &cascade_attention_mps, "ThunderMittens cascade / shared-prefix attention (MPS)");
   m.def("cascade_attention_multi", &cascade_attention_multi_mps, "ThunderMittens N-level cascade attention (MPS)");
   m.def("cascade_attention_fp8", &cascade_attention_fp8_mps, "ThunderMittens fp8-prefix cascade attention (MPS)");
-  m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)");
+  m.def("paged_attention_v2_fp8", &paged_attention_v2_fp8_mps, "ThunderMittens long-context fp8 paged attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("key_cache"), pybind11::arg("value_cache"),
+        pybind11::arg("block_table"), pybind11::arg("context_lens"), pybind11::arg("k_scale"),
+        pybind11::arg("v_scale"), pybind11::arg("scale"), pybind11::arg("partition_size"),
+        pybind11::arg("fmt"), pybind11::arg("window"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("moe_route_topk", &moe_route_topk_mps, "ThunderMittens MoE top-k routing (MPS)");
   m.def("moe_permute", &moe_permute_mps, "ThunderMittens MoE permute (MPS)");
   m.def("moe_pad_schedule", &moe_pad_schedule_mps, "ThunderMittens MoE padded schedule (MPS)");
@@ -3178,7 +3205,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("window"),
         pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
-        "ThunderMittens varlen/paged-prefill causal attention (MPS)");
+        "ThunderMittens varlen/paged-prefill causal attention (MPS)",
+        pybind11::arg("q_hm"), pybind11::arg("key_cache"), pybind11::arg("value_cache"),
+        pybind11::arg("block_table"), pybind11::arg("context_lens"), pybind11::arg("tile_seq"),
+        pybind11::arg("tile_local0"), pybind11::arg("seq_qlen"), pybind11::arg("scale"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("varlen_pad_q", &varlen_pad_q_mps, "ThunderMittens device varlen Q pad/gather (MPS)");
   m.def("varlen_regather_o", &varlen_regather_o_mps, "ThunderMittens device varlen output re-gather (MPS)");
   m.def("varlen_build_worklist", &varlen_build_worklist_mps,
