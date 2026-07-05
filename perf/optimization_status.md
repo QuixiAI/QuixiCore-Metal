@@ -1,5 +1,30 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 11: TurboQuant KV codec (2026-07-05)
+
+New kernels/turboquant/ (arXiv 2502): tq_encode + tq_decode. K = asymmetric-uniform
+per-32-element fp16 scale+zp (2-8 bits, signed q8_0 or unsigned sub-8-bit); V = random-sign
+FWHT rotation -> per-32 fp16 RMS scale -> Lloyd-Max nearest-centroid (searchsorted against
+midpoint boundaries, 2/3/4/8 bits, sub-8-bit byte-packed). The fp16 arithmetic chain is
+transcribed VERBATIM from metal-forge so the numpy oracle reproduces K codes bit-for-bit.
+One threadgroup per (token, kv_head), HEAD_SIZE threads, one simdgroup == one 32-elem scale
+group (min/max/RMS are simd_* reductions); FWHT stages 0-4 are register shuffles, 5+ go
+through threadgroup memory. head_size in {64,128,256}. TM divergences from the reference:
+signs (tq_signs) + Lloyd-Max centroids (lloyd_max_centroids) are BUFFERS not baked tables;
+k_bits/k_signed/v_bits are runtime scalars; slot_mapping int32. Functional 5-cache-array
+return via a byte-clone prepass (untouched slots preserved). Attention integration (rotated-
+domain V accumulate + one deferred inverse FWHT per head, exploiting FWHT linearity) is
+spec'd in the reference and DEFERRED — this cache format already supports it.
+
+- Tests: K codes/scale/zp bit-exact vs the fp16 oracle (8-bit signed + 4-bit unsigned +
+  sub-8-bit byte-straddle); V codes >= 95% exact with off-by-one only at fp16-borderline
+  boundaries; round-trip SNR floors (K 8-bit > 30 dB, V 4-bit > 18 dB); decode-vs-oracle;
+  functional untouched-slot preservation (slot -1 skip). Parity: V codes + all scales
+  atol=0, K codes off-by-one (borderline fp16 rint across separately compiled metallibs).
+- No standalone bench entry (codec throughput dominated by the paged scatter it replaces;
+  the win is the sub-4-bit cache footprint — recorded, revisit with the deferred attention
+  integration).
+
 ## Wave-9 — gap port, kernel 10: MInference block-mask builder (2026-07-05)
 
 New kernels/minference/: minference_build_block_mask converts per-head vertical column

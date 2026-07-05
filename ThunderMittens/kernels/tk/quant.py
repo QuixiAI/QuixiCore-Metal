@@ -1412,3 +1412,112 @@ def dequantize_fp8_block2d(codes, scale2d):
     codes = np.ascontiguousarray(codes, np.uint8); N, kt, _ = codes.shape
     srow = np.repeat(scale2d.astype(np.float32), 128, axis=0)                  # (N,kt)
     return (srow[:, :, None] * _e4m3_decode_arr(codes)).reshape(N, kt * 128)
+
+
+# ---------------------------------------------------------------------------
+# TurboQuant KV-codec host helpers (arXiv 2502). The kernel takes the random signs and
+# Lloyd-Max centroids as BUFFERS (a TM divergence from metal-forge's baked FWHT_SIGNS_*
+# tables) so any head size / seed works. These reproduce the reference generators exactly
+# so the numpy oracle and the kernel agree bit-for-bit.
+# ---------------------------------------------------------------------------
+def tq_signs(head_size, seed=42):
+    """Deterministic +/-1 random signs (metal-forge FWHT_SIGNS_* generator: MLX
+    random.key(seed) -> 1 - 2*randint(0,2)). Falls back to a numpy PCG stream keyed by
+    the same seed when MLX is unavailable — tests key both sides off THIS array, so the
+    exact bit pattern only needs to be self-consistent."""
+    try:
+        import mlx.core as mx
+        r = mx.random.randint(0, 2, shape=(head_size,), key=mx.random.key(seed))
+        return (1 - 2 * np.array(r)).astype(np.float32)
+    except Exception:
+        rng = np.random.default_rng(seed)
+        return (1 - 2 * rng.integers(0, 2, size=head_size)).astype(np.float32)
+
+
+def lloyd_max_centroids(bits, iters=64, n_samples=1 << 16, seed=0):
+    """Lloyd-Max (k-means on the 1-D Gaussian) optimal quantizer centroids for N(0,1),
+    ascending — the V-codebook TurboQuant searchsorts against. Deterministic in `seed`."""
+    k = 1 << bits
+    rng = np.random.default_rng(seed)
+    x = rng.standard_normal(n_samples)
+    # init: empirical quantiles so the two sides converge to the same fixed point
+    c = np.quantile(x, (np.arange(k) + 0.5) / k)
+    for _ in range(iters):
+        bnd = 0.5 * (c[:-1] + c[1:])
+        idx = np.searchsorted(bnd, x)
+        newc = c.copy()
+        for j in range(k):
+            m = idx == j
+            if m.any():
+                newc[j] = x[m].mean()
+        if np.allclose(newc, c):
+            c = newc
+            break
+        c = newc
+    return np.sort(c).astype(np.float32)
+
+
+def _tq_fwht(x, signs, encode):
+    """Reference FWHT: encode = H(signs*x)/sqrt(N); decode = signs*H(x)/sqrt(N)."""
+    n = x.shape[-1]
+    y = (x * signs) if encode else x.copy()
+    h = 1
+    while h < n:
+        for i in range(0, n, h * 2):
+            a = y[..., i:i + h].copy()
+            b = y[..., i + h:i + 2 * h].copy()
+            y[..., i:i + h] = a + b
+            y[..., i + h:i + 2 * h] = a - b
+        h *= 2
+    y = y / np.sqrt(n)
+    return y if encode else (y * signs)
+
+
+def tq_encode_ref(k, v, signs, centroids, k_bits, k_signed, v_bits):
+    """fp16-faithful numpy transcription of tq_encode for a single (token, head) K/V row.
+    Returns (k_idx int, k_scale f16, k_zp f16, v_idx int, v_scale f16). 32-element groups."""
+    f16 = np.float16
+    k = np.asarray(k, np.float32); v = np.asarray(v, np.float32)
+    hs = k.shape[-1]
+    ng = hs // 32
+    k_idx = np.zeros(hs, np.int64); k_scale = np.zeros(ng, f16); k_zp = np.zeros(ng, f16)
+    for g in range(ng):
+        seg = k[g * 32:(g + 1) * 32]
+        kmin, kmax = seg.min(), seg.max()
+        if k_signed:
+            mv = (1 << (k_bits - 1)) - 1
+            sc = f16(f16(kmax - kmin) / f16(2.0 * mv))
+            ksum = f16(kmax + kmin)
+            zp = np.rint(np.float32(ksum / (f16(2.0) * sc)))
+            idx = np.rint(np.float32(seg.astype(f16) / sc) - zp).astype(np.int64)
+            idx = np.clip(idx, -mv, mv)
+        else:
+            mv = (1 << k_bits) - 1
+            sc = f16(f16(kmax - kmin) / f16(float(mv)))
+            zp = np.rint(np.float32(f16(kmin) / sc))
+            idx = np.rint(np.float32(seg.astype(f16) / sc) - zp).astype(np.int64)
+            idx = np.clip(idx, 0, mv)
+        k_idx[g * 32:(g + 1) * 32] = idx
+        k_scale[g] = sc; k_zp[g] = f16(zp)
+    v_rot = _tq_fwht(v, signs, encode=True).astype(f16)
+    v_idx = np.zeros(hs, np.int64); v_scale = np.zeros(ng, f16)
+    bnd = 0.5 * (centroids[:-1] + centroids[1:])
+    for g in range(ng):
+        seg = v_rot[g * 32:(g + 1) * 32].astype(np.float32)
+        vsc = f16(np.sqrt((seg * seg).mean()))
+        vnorm = (v_rot[g * 32:(g + 1) * 32] / vsc).astype(np.float32)
+        v_idx[g * 32:(g + 1) * 32] = np.searchsorted(bnd, vnorm)
+        v_scale[g] = vsc
+    return k_idx, k_scale, k_zp, v_idx, v_scale
+
+
+def tq_decode_ref(k_idx, k_scale, k_zp, v_idx, v_scale, signs, centroids):
+    """Inverse of tq_encode_ref: (k row, v row) floats."""
+    hs = k_idx.shape[-1]; ng = hs // 32
+    k = np.zeros(hs, np.float32); v_rot = np.zeros(hs, np.float32)
+    for g in range(ng):
+        sl = slice(g * 32, (g + 1) * 32)
+        k[sl] = (k_idx[sl].astype(np.float32) + float(k_zp[g])) * float(k_scale[g])
+        v_rot[sl] = centroids[v_idx[sl]] * float(v_scale[g])
+    v = _tq_fwht(v_rot, signs, encode=False)
+    return k, v

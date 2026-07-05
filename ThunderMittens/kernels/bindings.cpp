@@ -69,6 +69,7 @@
 #include "gdn/gdn.h"
 #include "act_quant/act_quant.h"
 #include "minference/minference.h"
+#include "turboquant/turboquant.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -528,6 +529,19 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def("tq_encode", &tq_encode,
+      "key"_a, "value"_a, "key_cache"_a, "value_cache"_a, "key_scale"_a, "value_scale"_a,
+      "key_zero"_a, "slot_mapping"_a, "v_centroids"_a, "signs"_a, "block_size"_a,
+      "k_bits"_a, "k_signed"_a, "v_bits"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(TurboQuant KV encode -> [key_cache, value_cache, key_scale, value_scale, key_zero].)");
+    m.def("tq_decode", &tq_decode,
+      "key_cache"_a, "value_cache"_a, "key_scale"_a, "value_scale"_a, "key_zero"_a, "slots"_a,
+      "v_centroids"_a, "signs"_a, "num_kv_heads"_a, "head_size"_a, "block_size"_a,
+      "k_bits"_a, "k_signed"_a, "v_bits"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(TurboQuant KV decode (gather + dequantize) -> [k_out, v_out] float32.)");
 
     m.def("minference_block_mask", &minference_block_mask,
       "vertical_indexes"_a, "slash_indexes"_a, "context_lens"_a, "max_blocks"_a,

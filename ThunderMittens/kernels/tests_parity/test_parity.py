@@ -676,6 +676,38 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_turboquant_parity():
+    from tk.quant import tq_signs, lloyd_max_centroids
+    rng = np.random.default_rng(63)
+    hs, Hkv, T, bs, nblocks = 128, 2, 4, 16, 3
+    k = rng.standard_normal((T, Hkv, hs)).astype(np.float32)
+    v = rng.standard_normal((T, Hkv, hs)).astype(np.float32)
+    slots = np.array([0, 5, 17, 33], np.int32)
+    signs = tq_signs(hs); cent = lloyd_max_centroids(4)
+    ng = hs // 32
+    kc = np.zeros((nblocks, bs, Hkv, hs), np.uint8)
+    vc = np.zeros((nblocks, bs, Hkv, (hs * 4 + 7) // 8), np.uint8)
+    zs = np.zeros((nblocks, bs, Hkv, ng), np.float16)
+    args_mlx = [mx.array(a) for a in (k, v, kc, vc, zs, zs, zs, slots, cent, signs)]
+    om = tk.tq_encode(*args_mlx, bs, 8, True, 4)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    args_t = [t(a) for a in (k, v, kc, vc, zs, zs, zs, slots, cent, signs)]
+    ot = tk.tq_encode(*args_t, bs, 8, True, 4)
+    # scales/zp bit-exact; K codes off-by-one on borderline fp16 rint values (separately
+    # compiled metallibs round the half division differently — same as act_quant parity)
+    _assert_parity(om[0], ot[0], atol=1)   # key codes
+    for a, b in zip(om[1:], ot[1:]):
+        _assert_parity(a, b, atol=0)       # value codes + all scales/zp
+    # decode parity
+    dm = tk.tq_decode(om[0], om[1], om[2], om[3], om[4], mx.array(slots), mx.array(cent),
+                      mx.array(signs), Hkv, hs, bs, 8, True, 4)
+    dt = tk.tq_decode(ot[0], ot[1], ot[2], ot[3], ot[4], t(slots), t(cent), t(signs),
+                      Hkv, hs, bs, 8, True, 4)
+    # k_out inherits the K-code off-by-one (one scale step ~ 0.02); v_out bit-exact-ish
+    _assert_parity(dm[0], dt[0], atol=3e-2)
+    _assert_parity(dm[1], dt[1], atol=1e-4)
+
+
 def test_minference_block_mask_parity():
     rng = np.random.default_rng(62)
     B, H, nnz = 2, 4, 16

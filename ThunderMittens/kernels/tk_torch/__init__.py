@@ -35,6 +35,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "gdn", "gdn.metal"),
     os.path.join(_KERNELS, "act_quant", "act_quant.metal"),
     os.path.join(_KERNELS, "minference", "minference.metal"),
+    os.path.join(_KERNELS, "turboquant", "turboquant.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -607,6 +608,23 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
 
+
+
+def tq_encode(key, value, key_cache, value_cache, key_scale, value_scale, key_zero,
+              slot_mapping, v_centroids, signs, block_size, k_bits, k_signed, v_bits):
+    """TurboQuant KV encode. Returns [key_cache, value_cache, key_scale, value_scale,
+    key_zero] (functional). MPS."""
+    return list(_ext.tq_encode(key, value, key_cache, value_cache, key_scale, value_scale,
+                               key_zero, slot_mapping, v_centroids, signs, int(block_size),
+                               int(k_bits), bool(k_signed), int(v_bits)))
+
+
+def tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero, slots, v_centroids,
+              signs, num_kv_heads, head_size, block_size, k_bits, k_signed, v_bits):
+    """TurboQuant KV decode (gather + dequantize). Returns [k_out, v_out] float32. MPS."""
+    return list(_ext.tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero,
+                               slots, v_centroids, signs, int(num_kv_heads), int(head_size),
+                               int(block_size), int(k_bits), bool(k_signed), int(v_bits)))
 
 
 def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,

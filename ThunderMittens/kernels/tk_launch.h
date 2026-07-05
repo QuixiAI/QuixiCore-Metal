@@ -2231,7 +2231,49 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
-// ----- minference_build_block_mask: vert@0 slash@1 (B,H,nnz i32 -1pad) lens@2 -> mask@3
+// ----- TurboQuant KV codec (turboquant.metal). encode grid (tokens, Hkv), HS threads;
+//        decode grid (n, Hkv), HS threads. tq_clone_bytes: 1D over bytes (16/thread). -----
+template <class E>
+void launch_tq_clone_bytes(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {
+  e.pipeline("mittens::tq_clone_bytes");
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  const uint32_t nthreads = (n + 15) / 16;
+  e.dispatch((int)((nthreads + 255) / 256), 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_tq_encode(E& e, typename E::in_t key, typename E::in_t value,
+                      typename E::out_t key_cache, typename E::out_t value_cache,
+                      typename E::out_t key_scale, typename E::out_t value_scale,
+                      typename E::out_t key_zero, typename E::in_t slot_mapping,
+                      typename E::in_t v_centroids, typename E::in_t signs,
+                      int num_tokens, int num_kv_heads, int head_size, int block_size,
+                      int k_bits, int k_signed, int v_bits, const std::string& type_name) {
+  e.pipeline("tq_encode_" + type_name + "_hs" + std::to_string(head_size));
+  e.in(key, 0); e.in(value, 1); e.out(key_cache, 2); e.out(value_cache, 3);
+  e.out(key_scale, 4); e.out(value_scale, 5); e.out(key_zero, 6);
+  e.in(slot_mapping, 7); e.in(v_centroids, 8); e.in(signs, 9);
+  e.bytes(num_kv_heads, 10); e.bytes(block_size, 11);
+  e.bytes(k_bits, 12); e.bytes(k_signed, 13); e.bytes(v_bits, 14);
+  e.dispatch(num_tokens, num_kv_heads, 1, head_size, 1, 1);
+}
+template <class E>
+void launch_tq_decode(E& e, typename E::in_t key_cache, typename E::in_t value_cache,
+                      typename E::in_t key_scale, typename E::in_t value_scale,
+                      typename E::in_t key_zero, typename E::in_t slots,
+                      typename E::in_t v_centroids, typename E::in_t signs,
+                      typename E::out_t k_out, typename E::out_t v_out,
+                      int n, int num_kv_heads, int head_size, int block_size,
+                      int k_bits, int k_signed, int v_bits, const std::string& type_name) {
+  e.pipeline("tq_decode_" + type_name + "_hs" + std::to_string(head_size));
+  e.in(key_cache, 0); e.in(value_cache, 1); e.in(key_scale, 2); e.in(value_scale, 3);
+  e.in(key_zero, 4); e.in(slots, 5); e.in(v_centroids, 6); e.in(signs, 7);
+  e.out(k_out, 8); e.out(v_out, 9);
+  e.bytes(num_kv_heads, 10); e.bytes(block_size, 11);
+  e.bytes(k_bits, 12); e.bytes(k_signed, 13); e.bytes(v_bits, 14);
+  e.dispatch(n, num_kv_heads, 1, head_size, 1, 1);
+}
+
+// ----- minference_build_block_mask:// ----- minference_build_block_mask: vert@0 slash@1 (B,H,nnz i32 -1pad) lens@2 -> mask@3
 //        (B,H,max_blocks i32); scalars H@4 nnz_v@5 nnz_s@6 vtopk@7 stopk@8 bs@9 mb@10
 //        last_n@11 ; grid (H, B, 1), 32 thr. -----
 template <class E>

@@ -154,6 +154,7 @@
 				kernels/gdn/gdn.cpp,
 				kernels/act_quant/act_quant.cpp,
 				kernels/minference/minference.cpp,
+				kernels/turboquant/turboquant.cpp,
 				kernels/mla/mla.cpp,
 				kernels/paged_attn_v2/paged_attn_v2.cpp,
 				kernels/hadamard/hadamard.cpp,

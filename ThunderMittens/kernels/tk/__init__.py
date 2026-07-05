@@ -792,6 +792,36 @@ def moe_route_topk(logits, k):
 
 
 
+def tq_encode(key, value, key_cache, value_cache, key_scale, value_scale, key_zero,
+              slot_mapping, v_centroids, signs, block_size, k_bits, k_signed, v_bits):
+    """TurboQuant KV-cache encode: K asymmetric-uniform (per-32 fp16 scale+zp, 2-8 bits);
+    V random-sign FWHT rotation -> per-32 fp16 RMS scale -> Lloyd-Max nearest-centroid
+    (2/3/4/8 bits). key/value (tokens, num_kv_heads, head_size in {64,128,256}); caches
+    paged (num_blocks, block_size, num_kv_heads, packed/scale-groups); v_centroids
+    (2^v_bits,) and signs (head_size,) from tk.quant.lloyd_max_centroids / tq_signs.
+    Returns the 5 updated cache arrays (functional). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(key):
+        return _torch().tq_encode(key, value, key_cache, value_cache, key_scale, value_scale,
+                                  key_zero, slot_mapping, v_centroids, signs, block_size,
+                                  k_bits, k_signed, v_bits)
+    return list(_mlx().tq_encode(key, value, key_cache, value_cache, key_scale, value_scale,
+                                 key_zero, slot_mapping, v_centroids, signs, int(block_size),
+                                 int(k_bits), bool(k_signed), int(v_bits)))
+
+
+def tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero, slots, v_centroids,
+              signs, num_kv_heads, head_size, block_size, k_bits, k_signed, v_bits):
+    """Inverse of tq_encode: gather a slot list and dequantize (V inverse-FWHT'd) to
+    [k_out, v_out] float32 (n, num_kv_heads, head_size). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(key_cache):
+        return _torch().tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero,
+                                  slots, v_centroids, signs, num_kv_heads, head_size,
+                                  block_size, k_bits, k_signed, v_bits)
+    return list(_mlx().tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero,
+                                 slots, v_centroids, signs, int(num_kv_heads), int(head_size),
+                                 int(block_size), int(k_bits), bool(k_signed), int(v_bits)))
+
+
 def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,
                           block_size, vertical_topk=1 << 30, slash_topk=1 << 30,
                           last_n_blocks=1):

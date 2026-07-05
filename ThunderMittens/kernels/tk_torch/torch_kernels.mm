@@ -1888,6 +1888,56 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// TurboQuant KV codec (encode + decode).
+static std::vector<at::Tensor> tq_encode_mps(
+    const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& kc_in,
+    const at::Tensor& vc_in, const at::Tensor& ks_in, const at::Tensor& vs_in,
+    const at::Tensor& kz_in, const at::Tensor& slots_in, const at::Tensor& cent_in,
+    const at::Tensor& signs_in, int64_t block_size, int64_t k_bits, bool k_signed,
+    int64_t v_bits) {
+  TORCH_CHECK(key_in.device().is_mps() && key_in.dim() == 3 && tk_is_float_dtype(key_in),
+              "tq_encode: key must be a float (tokens, num_kv_heads, head_size) MPS tensor");
+  const int num_tokens = key_in.size(0), num_kv_heads = key_in.size(1), hs = key_in.size(2);
+  TORCH_CHECK(hs == 64 || hs == 128 || hs == 256, "tq_encode: head_size must be 64/128/256");
+  auto key = key_in.contiguous(), value = value_in.to(key_in.scalar_type()).contiguous();
+  auto kc = kc_in.to(at::kByte).contiguous().clone();
+  auto vc = vc_in.to(at::kByte).contiguous().clone();
+  auto ks = ks_in.to(at::kHalf).contiguous().clone();
+  auto vs = vs_in.to(at::kHalf).contiguous().clone();
+  auto kz = kz_in.to(at::kHalf).contiguous().clone();
+  auto slots = slots_in.to(at::kInt).contiguous();
+  auto cent = cent_in.to(at::kFloat).contiguous(), signs = signs_in.to(at::kFloat).contiguous();
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_tq_encode(e, key, value, kc, vc, ks, vs, kz, slots, cent, signs, num_tokens,
+                         num_kv_heads, hs, (int)block_size, (int)k_bits, k_signed ? 1 : 0,
+                         (int)v_bits, tk_type_name(key));
+  });
+  return {kc, vc, ks, vs, kz};
+}
+
+static std::vector<at::Tensor> tq_decode_mps(
+    const at::Tensor& kc_in, const at::Tensor& vc_in, const at::Tensor& ks_in,
+    const at::Tensor& vs_in, const at::Tensor& kz_in, const at::Tensor& slots_in,
+    const at::Tensor& cent_in, const at::Tensor& signs_in, int64_t num_kv_heads,
+    int64_t head_size, int64_t block_size, int64_t k_bits, bool k_signed, int64_t v_bits) {
+  TORCH_CHECK(kc_in.device().is_mps(), "tq_decode: caches must be MPS tensors");
+  const int n = slots_in.size(0);
+  auto kc = kc_in.to(at::kByte).contiguous(), vc = vc_in.to(at::kByte).contiguous();
+  auto ks = ks_in.to(at::kHalf).contiguous(), vs = vs_in.to(at::kHalf).contiguous();
+  auto kz = kz_in.to(at::kHalf).contiguous();
+  auto slots = slots_in.to(at::kInt).contiguous();
+  auto cent = cent_in.to(at::kFloat).contiguous(), signs = signs_in.to(at::kFloat).contiguous();
+  auto opts = at::TensorOptions().dtype(at::kFloat).device(kc.device());
+  auto k_out = at::empty({n, num_kv_heads, head_size}, opts);
+  auto v_out = at::empty({n, num_kv_heads, head_size}, opts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_tq_decode(e, kc, vc, ks, vs, kz, slots, cent, signs, k_out, v_out, n,
+                         (int)num_kv_heads, (int)head_size, (int)block_size, (int)k_bits,
+                         k_signed ? 1 : 0, (int)v_bits, "float32");
+  });
+  return {k_out, v_out};
+}
+
 // MInference decode block-mask builder.
 static at::Tensor minference_block_mask_mps(
     const at::Tensor& vert_in, const at::Tensor& slash_in, const at::Tensor& lens_in,
@@ -3656,6 +3706,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("tq_encode", &tq_encode_mps, "TurboQuant KV encode (MPS)");
+  m.def("tq_decode", &tq_decode_mps, "TurboQuant KV decode (MPS)");
   m.def("minference_block_mask", &minference_block_mask_mps,
         "MInference decode block-mask builder (MPS)", pybind11::arg("vertical_indexes"),
         pybind11::arg("slash_indexes"), pybind11::arg("context_lens"),
