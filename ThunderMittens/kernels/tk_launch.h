@@ -182,15 +182,19 @@ void launch_matmul_custom(E& e, typename E::out_t o, typename E::in_t a, typenam
 // ----- attn_fwd: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----
 template <class E>
 void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
-                     typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+                     typename E::out_t o, unsigned N, unsigned H, int B, int D,
+                     float softcap, typename E::in_t sinks, int has_sink) {
   // 16-row Q tile for D=128 when N allows: halves the passes over K/V (the 8-row tile fell
   // to 7.4 TFLOP/s at (2,16,4096,128) from K/V re-read pressure; q16 measured 1.3-1.6x).
   // D=64 was TRIED and reverted: its K/V stream is half the bytes and the doubled register
   // footprint made q16 ~1.4x slower there.
+  // softcap <= 0 disables logit soft-capping. sinks is a per-head fp32 buffer read only when
+  // has_sink != 0; callers without sinks pass q as the placeholder binding (never read).
   const bool q16 = (D == 128) && (N % 16 == 0);
   e.pipeline(q16 ? attn_fwd_kernel_name(D) + "_q16" : attn_fwd_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
+  e.bytes(softcap, 6); e.in(sinks, 7); e.bytes(has_sink, 8);
   e.dispatch(static_cast<int>(N) / (q16 ? 16 : 8), static_cast<int>(H), B, 32, 1, 1);
 }
 
@@ -1447,25 +1451,32 @@ void launch_paged_attention_reduce(
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
-// ----- attn_causal: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----
-// Same as attn_fwd but with causal masking (lower-triangular).
+// ----- attn_causal: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) softcap@6(f32) sinks@7(f32*)
+//        has_sink@8(i32) ; grid (N/8, H, B) group (32,1,1) -----
+// Same as attn_fwd but with causal masking (lower-triangular). softcap <= 0 off; sinks read
+// only when has_sink (pass q as the placeholder binding otherwise).
 template <class E>
 void launch_attn_causal(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
-                        typename E::out_t o, unsigned N, unsigned H, int B, int D) {
+                        typename E::out_t o, unsigned N, unsigned H, int B, int D,
+                        float softcap, typename E::in_t sinks, int has_sink) {
   e.pipeline(attn_causal_kernel_name(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5);
+  e.bytes(softcap, 6); e.in(sinks, 7); e.bytes(has_sink, 8);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
-// ----- attn_window: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) window@6(i32) ;
-//        grid (N/8, H, B) group (32,1,1). Sliding-window causal (W most recent keys incl self). -----
+// ----- attn_window: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) window@6(i32) softcap@7(f32)
+//        sinks@8(f32*) has_sink@9(i32) ; grid (N/8, H, B) group (32,1,1).
+//        Sliding-window causal (W most recent keys incl self). -----
 template <class E>
 void launch_attn_window(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
-                        typename E::out_t o, unsigned N, unsigned H, int B, int D, int window) {
+                        typename E::out_t o, unsigned N, unsigned H, int B, int D, int window,
+                        float softcap, typename E::in_t sinks, int has_sink) {
   e.pipeline("attn_window_" + std::to_string(D));
   e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
   e.bytes(N, 4); e.bytes(H, 5); e.bytes(window, 6);
+  e.bytes(softcap, 7); e.in(sinks, 8); e.bytes(has_sink, 9);
   e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 

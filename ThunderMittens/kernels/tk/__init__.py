@@ -106,11 +106,13 @@ def matmul_custom(x, y):
     return out[:N, :M]
 
 
-def attn_fwd(q, k, v):
-    """Non-causal attention forward. Accepts mlx.array or torch.Tensor (MPS)."""
+def attn_fwd(q, k, v, softcap=0.0, sinks=None):
+    """Non-causal attention forward. softcap > 0 applies Gemma-style logit soft-capping
+    (softcap*tanh(s/softcap)); sinks (H,) adds gpt-oss-style per-head attention-sink logits
+    to the softmax denominator. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
-        return _torch().attn_fwd(q, k, v)
-    return _mlx().attn_fwd(q, k, v)
+        return _torch().attn_fwd(q, k, v, softcap=softcap, sinks=sinks)
+    return _mlx().attn_fwd(q, k, v, softcap=float(softcap), sinks=sinks)
 
 
 def _varlen_worklist(cu_seqlens_q):
@@ -1499,21 +1501,25 @@ def quantize_per_token_int8(x):
     return _mlx().quantize_per_token_int8(x)
 
 
-def attn_causal(q, k, v):
-    """Causal attention forward. Accepts mlx.array or torch.Tensor (MPS)."""
+def attn_causal(q, k, v, softcap=0.0, sinks=None):
+    """Causal attention forward. softcap > 0 applies Gemma-style logit soft-capping;
+    sinks (H,) adds gpt-oss-style attention-sink logits to the softmax denominator.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
-        return _torch().attn_causal(q, k, v)
-    return _mlx().attn_causal(q, k, v)
+        return _torch().attn_causal(q, k, v, softcap=softcap, sinks=sinks)
+    return _mlx().attn_causal(q, k, v, softcap=float(softcap), sinks=sinks)
 
 
-def attn_window(q, k, v, window):
+def attn_window(q, k, v, window, softcap=0.0, sinks=None):
     """Sliding-window causal attention (Mistral/Gemma-style local attention): a query at
     position i attends keys [max(0, i-window+1), i] — the `window` most recent tokens
     including self. window <= 0 disables the window (== attn_causal). q,k,v (B,H,N,D) bf16,
-    D in {64,128}, N%8==0. Accepts mlx.array or torch.Tensor (MPS)."""
+    D in {64,128}, N%8==0. softcap > 0 = Gemma-2 logit capping; sinks (H,) = gpt-oss
+    attention sinks (the window+sink combination is the gpt-oss layer config).
+    Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
-        return _torch().attn_window(q, k, v, window)
-    return _mlx().attn_window(q, k, v, window)
+        return _torch().attn_window(q, k, v, window, softcap=softcap, sinks=sinks)
+    return _mlx().attn_window(q, k, v, window, softcap=float(softcap), sinks=sinks)
 
 
 def flux_gelu(x, w, bias):

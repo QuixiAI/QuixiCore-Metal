@@ -9,6 +9,10 @@ namespace mittens {
 //     strictly-upper-triangular scores to -inf before the softmax).
 constant constexpr const int TNc = 8;
 
+// softcap / sinks: same semantics + implementation as attn_fwd (see the comment there).
+// Ordering matters vs masking: the softcap tanh applies to RAW scores BEFORE make_causal /
+// make_windowed — capping after would compress the -1e30 mask to a finite -softcap and
+// un-mask future positions.
 template <int D>
 kernel void attn_causal(device   bf16     *q [[buffer(0)]],
                         device   bf16     *k [[buffer(1)]],
@@ -16,6 +20,9 @@ kernel void attn_causal(device   bf16     *q [[buffer(0)]],
                         device   bf16     *o [[buffer(3)]],
                         constant unsigned &N [[buffer(4)]],
                         constant unsigned &H [[buffer(5)]],
+                        constant float    &softcap [[buffer(6)]],
+                        device const float *sinks  [[buffer(7)]],
+                        constant int      &has_sink [[buffer(8)]],
                         uint3 blockIdx [[threadgroup_position_in_grid]],
                         uint laneId [[thread_index_in_simdgroup]]) {
     static_assert(D == 64 || D == 128, "D must be 64 or 128");
@@ -45,10 +52,18 @@ kernel void attn_causal(device   bf16     *q [[buffer(0)]],
     rv_att norm_vec;
 
     load(q_reg, gl_q, {block, head, q_seq, 0}, laneId);
-    neg_infty(max_vec);
+    const bool capped = softcap > 0.0f;
+    constexpr const float scale_c = (D == 128) ? 0.08838834764f : 0.125f;
+    const float sink_l2 = (has_sink != 0) ? sinks[head] * 1.44269504089f : 0.0f;
+    if (has_sink != 0) {
+        zero(max_vec);
+        add(max_vec, max_vec, sink_l2);
+    } else {
+        neg_infty(max_vec);
+    }
     zero(norm_vec);
     zero(o_reg);
-    constexpr const bf16 q_mul = ((D == 128) ? 0.08838834764bf : 0.125bf) * 1.44269504089bf;
+    const bf16 q_mul = bf16(capped ? scale_c : scale_c * 1.44269504089f);
     mul(q_reg, q_reg, q_mul);
 
     // Causal: only attend to key blocks at or before the query block.
@@ -57,6 +72,11 @@ kernel void attn_causal(device   bf16     *q [[buffer(0)]],
         load(k_reg, gl_k, {block, head, kv_idx, 0}, laneId);
         zero(att_block);
         mma_ABt(att_block, q_reg, k_reg, att_block);
+        if (capped) {                          // BEFORE the mask (see header comment)
+            mul(att_block, att_block, 1.0f / softcap);
+            tanh(att_block, att_block);
+            mul(att_block, att_block, softcap * 1.44269504089f);
+        }
         if (kv_idx == q_seq) {
             // strictly-upper-triangular scores -> -inf (mask future positions)
             float neg_big = -1e30f;   // thread-space (make_causal takes thread const&)
@@ -74,6 +94,14 @@ kernel void attn_causal(device   bf16     *q [[buffer(0)]],
         load(v_reg, gl_v, {block, head, kv_idx, 0}, laneId);
         mma_AB(o_reg, att_block, v_reg, o_reg);
     }
+    if (has_sink != 0) {
+        rv_att sink_term;
+        copy(sink_term, max_vec, laneId);
+        mul(sink_term, sink_term, -1.0f);
+        add(sink_term, sink_term, sink_l2);
+        exp2(sink_term, sink_term);
+        add(norm_vec, norm_vec, sink_term);
+    }
     div_row(o_reg, o_reg, norm_vec);
     store(gl_o, o_reg, {block, head, q_seq, 0}, laneId);
 }
@@ -86,6 +114,9 @@ kernel void attn_causal(device   bf16     *q [[buffer(0)]],
     device   bf16     *o [[buffer(3)]], \
     constant unsigned &N [[buffer(4)]], \
     constant unsigned &H [[buffer(5)]], \
+    constant float    &softcap [[buffer(6)]], \
+    device const float *sinks  [[buffer(7)]], \
+    constant int      &has_sink [[buffer(8)]], \
     uint3 blockIdx [[threadgroup_position_in_grid]], \
     uint laneId [[thread_index_in_simdgroup]]); \
 
@@ -108,6 +139,9 @@ kernel void attn_window(device   bf16     *q [[buffer(0)]],
                         constant unsigned &N [[buffer(4)]],
                         constant unsigned &H [[buffer(5)]],
                         constant int      &window [[buffer(6)]],
+                        constant float    &softcap [[buffer(7)]],
+                        device const float *sinks  [[buffer(8)]],
+                        constant int      &has_sink [[buffer(9)]],
                         uint3 blockIdx [[threadgroup_position_in_grid]],
                         uint laneId [[thread_index_in_simdgroup]]) {
     static_assert(D == 64 || D == 128, "D must be 64 or 128");
@@ -136,10 +170,18 @@ kernel void attn_window(device   bf16     *q [[buffer(0)]],
     rv_att norm_vec;
 
     load(q_reg, gl_q, {block, head, q_seq, 0}, laneId);
-    neg_infty(max_vec);
+    const bool capped = softcap > 0.0f;
+    constexpr const float scale_w = (D == 128) ? 0.08838834764f : 0.125f;
+    const float sink_l2 = (has_sink != 0) ? sinks[head] * 1.44269504089f : 0.0f;
+    if (has_sink != 0) {
+        zero(max_vec);
+        add(max_vec, max_vec, sink_l2);
+    } else {
+        neg_infty(max_vec);
+    }
     zero(norm_vec);
     zero(o_reg);
-    constexpr const bf16 q_mul = ((D == 128) ? 0.08838834764bf : 0.125bf) * 1.44269504089bf;
+    const bf16 q_mul = bf16(capped ? scale_w : scale_w * 1.44269504089f);
     mul(q_reg, q_reg, q_mul);
 
     // oldest key any row of this q tile can reach is q_seq*8 - window + 1 (row 0's bound)
@@ -148,6 +190,11 @@ kernel void attn_window(device   bf16     *q [[buffer(0)]],
         load(k_reg, gl_k, {block, head, kv_idx, 0}, laneId);
         zero(att_block);
         mma_ABt(att_block, q_reg, k_reg, att_block);
+        if (capped) {                          // BEFORE the masks (see attn_causal comment)
+            mul(att_block, att_block, 1.0f / softcap);
+            tanh(att_block, att_block);
+            mul(att_block, att_block, softcap * 1.44269504089f);
+        }
         if (kv_idx == q_seq) {
             float neg_big = -1e30f;
             make_causal(att_block, att_block, laneId, neg_big);
@@ -171,6 +218,14 @@ kernel void attn_window(device   bf16     *q [[buffer(0)]],
         load(v_reg, gl_v, {block, head, kv_idx, 0}, laneId);
         mma_AB(o_reg, att_block, v_reg, o_reg);
     }
+    if (has_sink != 0) {
+        rv_att sink_term;
+        copy(sink_term, max_vec, laneId);
+        mul(sink_term, sink_term, -1.0f);
+        add(sink_term, sink_term, sink_l2);
+        exp2(sink_term, sink_term);
+        add(norm_vec, norm_vec, sink_term);
+    }
     div_row(o_reg, o_reg, norm_vec);
     store(gl_o, o_reg, {block, head, q_seq, 0}, laneId);
 }
@@ -184,6 +239,9 @@ kernel void attn_window(device   bf16     *q [[buffer(0)]],
     constant unsigned &N [[buffer(4)]], \
     constant unsigned &H [[buffer(5)]], \
     constant int      &window [[buffer(6)]], \
+    constant float    &softcap [[buffer(7)]], \
+    device const float *sinks  [[buffer(8)]], \
+    constant int      &has_sink [[buffer(9)]], \
     uint3 blockIdx [[threadgroup_position_in_grid]], \
     uint laneId [[thread_index_in_simdgroup]]); \
 

@@ -218,7 +218,8 @@ static at::Tensor matmul_custom_mps(const at::Tensor& x_in, const at::Tensor& y_
 }
 
 static at::Tensor attn_fwd_mps(const at::Tensor& q_in, const at::Tensor& k_in,
-                               const at::Tensor& v_in) {
+                               const at::Tensor& v_in, double softcap,
+                               const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_in.device().is_mps(), "attn_fwd: q must be an MPS tensor");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_fwd: q must be bfloat16");
   auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
@@ -228,8 +229,17 @@ static at::Tensor attn_fwd_mps(const at::Tensor& q_in, const at::Tensor& k_in,
   const int D = q.size(3);
   TORCH_CHECK(D == 64 || D == 128, "attn_fwd: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "attn_fwd: N must be a multiple of 8");
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = q;   // placeholder binding when absent (kernel never reads it)
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H, "attn_fwd: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   auto out = at::empty_like(q);
-  tk_encode([&](TorchEncoder& e) { tk::launch_attn_fwd(e, q, k, v, out, N, H, B, D); });
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_fwd(e, q, k, v, out, N, H, B, D, static_cast<float>(softcap), sinks,
+                        has_sink ? 1 : 0);
+  });
   return out;
 }
 
@@ -2206,7 +2216,8 @@ static std::tuple<at::Tensor, at::Tensor> quantize_per_token_int8_mps(const at::
 }
 
 static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
-                                 const at::Tensor& v_in) {
+                                  const at::Tensor& v_in, double softcap,
+                                  const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_in.device().is_mps(), "attn_causal: q must be an MPS tensor");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_causal: q must be bfloat16");
   auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
@@ -2216,13 +2227,23 @@ static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in
   const int D = q.size(3);
   TORCH_CHECK(D == 64 || D == 128, "attn_causal: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "attn_causal: N must be a multiple of 8");
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = q;
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H, "attn_causal: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   auto out = at::empty_like(q);
-  tk_encode([&](TorchEncoder& e) { tk::launch_attn_causal(e, q, k, v, out, N, H, B, D); });
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_causal(e, q, k, v, out, N, H, B, D, static_cast<float>(softcap), sinks,
+                           has_sink ? 1 : 0);
+  });
   return out;
 }
 
 static at::Tensor attn_window_mps(const at::Tensor& q_in, const at::Tensor& k_in,
-                                  const at::Tensor& v_in, int64_t window) {
+                                  const at::Tensor& v_in, int64_t window, double softcap,
+                                  const c10::optional<at::Tensor>& sinks_in) {
   TORCH_CHECK(q_in.device().is_mps(), "attn_window: q must be an MPS tensor");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_window: q must be bfloat16");
   auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
@@ -2232,9 +2253,16 @@ static at::Tensor attn_window_mps(const at::Tensor& q_in, const at::Tensor& k_in
   const int D = q.size(3);
   TORCH_CHECK(D == 64 || D == 128, "attn_window: D must be 64 or 128");
   TORCH_CHECK(N % 8 == 0, "attn_window: N must be a multiple of 8");
+  const bool has_sink = sinks_in.has_value();
+  at::Tensor sinks = q;
+  if (has_sink) {
+    TORCH_CHECK(sinks_in->dim() == 1 && sinks_in->size(0) == H, "attn_window: sinks must be (H,)");
+    sinks = sinks_in->to(at::kFloat).contiguous();
+  }
   auto out = at::empty_like(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_attn_window(e, q, k, v, out, N, H, B, D, static_cast<int>(window));
+    tk::launch_attn_window(e, q, k, v, out, N, H, B, D, static_cast<int>(window),
+                           static_cast<float>(softcap), sinks, has_sink ? 1 : 0);
   });
   return out;
 }
@@ -3055,7 +3083,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "ThunderMittens fused LayerNorm backward -> [dX, dweight, dbias] (MPS)");
   m.def("add_rt", &add_rt_mps, "ThunderMittens add_rt elementwise add (MPS)");
   m.def("matmul_custom", &matmul_custom_mps, "ThunderMittens matmul_custom GEMM (MPS)");
-  m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)");
+  m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
   m.def("rms_norm_bwd_dx", &rms_norm_bwd_dx_mps, "ThunderMittens RMSNorm backward dX (MPS)");
   m.def("rms_norm_bwd_fused", &rms_norm_bwd_fused_mps,
@@ -3141,8 +3171,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("quantize_per_tensor_int8", &quantize_per_tensor_int8_mps, "ThunderMittens per-tensor int8 quant (MPS)");
   m.def("quantize_per_token_fp8", &quantize_per_token_fp8_mps, "ThunderMittens per-row fp8 quant (MPS)");
   m.def("quantize_per_token_int8", &quantize_per_token_int8_mps, "ThunderMittens per-row int8 quant (MPS)");
-  m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)");
-  m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)");
+  m.def("attn_causal", &attn_causal_mps, "ThunderMittens causal attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
+  m.def("attn_window", &attn_window_mps, "ThunderMittens sliding-window causal attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("window"),
+        pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("attn_varlen_prefill", &attn_varlen_prefill_mps,
         "ThunderMittens varlen/paged-prefill causal attention (MPS)");
   m.def("varlen_pad_q", &varlen_pad_q_mps, "ThunderMittens device varlen Q pad/gather (MPS)");

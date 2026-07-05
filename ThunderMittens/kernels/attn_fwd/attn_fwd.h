@@ -18,10 +18,15 @@ namespace mlx::core {
  *  Follow numpy style broadcasting between x and y
  *  Inputs are upcasted to floats if needed
  **/
+/** Dense attention forward (B,H,N,D bf16). softcap <= 0 disables Gemma-style logit
+ *  soft-capping. sinks: optional per-head fp32 (H,) attention-sink logits (gpt-oss) —
+ *  added to the softmax denominator only. */
 array attn_fwd(
     const array& q, // Input array q
     const array& k, // Input array k
     const array& v, // Input array q
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {} // Stream on which to schedule the operation
 );
 
@@ -31,8 +36,8 @@ array attn_fwd(
 
 class AttnFwd : public Primitive {
  public:
-  explicit AttnFwd(Stream stream)
-    : Primitive(stream) {};
+  explicit AttnFwd(Stream stream, float softcap = 0.0f, bool has_sink = false)
+    : Primitive(stream), softcap_(softcap), has_sink_(has_sink) {};
 
   /**
    * A primitive must know how to evaluate itself on the CPU/GPU
@@ -81,6 +86,10 @@ class AttnFwd : public Primitive {
 
   /** Fall back implementation for evaluation on CPU */
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
+
+ private:
+  float softcap_;
+  bool has_sink_;
 };
 
 } // namespace mlx::core

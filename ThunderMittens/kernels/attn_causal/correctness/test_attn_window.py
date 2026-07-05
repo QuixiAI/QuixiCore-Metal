@@ -73,3 +73,61 @@ if __name__ == "__main__":
             test_attn_window(shp, w)
         test_attn_window_full_equals_causal(shp)
         print("ok", shp)
+
+
+def _ref_masked_attn(q, k, v, scale, window=0, softcap=0.0, sinks=None):
+    """fp64 numpy oracle: causal (+optional sliding window) with optional Gemma-2 softcap
+    and gpt-oss denominator-only sinks."""
+    import numpy as np
+    qf = np.array(q.astype(mx.float32), dtype=np.float64)
+    kf = np.array(k.astype(mx.float32), dtype=np.float64)
+    vf = np.array(v.astype(mx.float32), dtype=np.float64)
+    B, H, N, D = qf.shape
+    s = np.einsum("bhnd,bhmd->bhnm", qf, kf) * scale
+    if softcap > 0:
+        s = softcap * np.tanh(s / softcap)
+    i = np.arange(N)[:, None]
+    j = np.arange(N)[None, :]
+    mask = j > i
+    if window > 0:
+        mask |= j < (i - window + 1)
+    s = np.where(mask[None, None], -np.inf, s)
+    if sinks is not None:
+        m = np.maximum(s.max(-1), sinks[None, :, None])
+    else:
+        m = s.max(-1)
+    e = np.exp(s - m[..., None])
+    den = e.sum(-1)
+    if sinks is not None:
+        den = den + np.exp(sinks[None, :, None] - m)
+    p = e / den[..., None]
+    return np.einsum("bhnm,bhmd->bhnd", p, vf)
+
+
+@pytest.mark.parametrize("shape", [(1, 2, 256, 64), (2, 2, 128, 128)])
+@pytest.mark.parametrize("window,softcap,use_sink", [
+    (0, 30.0, False),    # Gemma-2 global layer: causal + softcap (via attn_causal)
+    (64, 50.0, False),   # Gemma-2 local layer: window + softcap
+    (64, 0.0, True),     # gpt-oss local layer: window + sink
+    (0, 0.0, True),      # gpt-oss global layer: causal + sink
+    (64, 30.0, True),    # everything at once
+])
+def test_attn_softcap_sinks(shape, window, softcap, use_sink):
+    import numpy as np
+    from tk import attn_causal
+    B, H, N, D = shape
+    rng = np.random.default_rng(7)
+    q = mx.array(rng.standard_normal((B, H, N, D)).astype("float32")).astype(mx.bfloat16)
+    k = mx.array(rng.standard_normal((B, H, N, D)).astype("float32")).astype(mx.bfloat16)
+    v = mx.array(rng.standard_normal((B, H, N, D)).astype("float32")).astype(mx.bfloat16)
+    sinks_np = (rng.standard_normal(H) * 2.0).astype("float32") if use_sink else None
+    sinks = mx.array(sinks_np) if use_sink else None
+
+    if window > 0:
+        got = attn_window(q, k, v, window, softcap=softcap, sinks=sinks)
+    else:
+        got = attn_causal(q, k, v, softcap=softcap, sinks=sinks)
+    mx.eval(got)
+    ref = _ref_masked_attn(q, k, v, 1.0 / math.sqrt(D), window, softcap, sinks_np)
+    diff = np.abs(np.array(got.astype(mx.float32), dtype=np.float64) - ref).max()
+    assert diff < 4e-2, f"max diff {diff} (w={window}, cap={softcap}, sink={use_sink})"

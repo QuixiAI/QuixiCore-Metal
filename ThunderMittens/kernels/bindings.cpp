@@ -55,6 +55,7 @@
 #include <nanobind/stl/variant.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
+#include <nanobind/stl/optional.h>
 
 #include "add_rt/add_rt.h"
 #include "attn_fwd/attn_fwd.h"
@@ -125,9 +126,13 @@ NB_MODULE(_ext, m) {
       "k"_a,
       "v"_a,
       nb::kw_only(),
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
-        attn fwd
+        Dense attention forward (B,H,N,D bf16). softcap > 0 applies Gemma-style logit
+        soft-capping (softcap*tanh(s/softcap)); sinks is an optional per-head (H,) fp32
+        attention-sink logit added to the softmax denominator (gpt-oss).
       )");
 
     m.def(
@@ -1161,9 +1166,12 @@ NB_MODULE(_ext, m) {
       "k"_a,
       "v"_a,
       nb::kw_only(),
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
-        causal (lower-triangular) attention forward
+        causal (lower-triangular) attention forward. softcap > 0 = Gemma-style logit
+        capping; sinks (H,) = gpt-oss attention-sink logits (denominator only).
       )");
 
     m.def(
@@ -1174,6 +1182,8 @@ NB_MODULE(_ext, m) {
       "v"_a,
       "window"_a,
       nb::kw_only(),
+      "softcap"_a = 0.0f,
+      "sinks"_a = nb::none(),
       "stream"_a = nb::none(),
       R"(
         sliding-window causal attention forward: query i attends keys

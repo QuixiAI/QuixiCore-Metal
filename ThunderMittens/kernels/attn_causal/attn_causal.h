@@ -19,6 +19,8 @@ array attn_causal(
     const array& q,
     const array& k,
     const array& v,
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {}
 );
 
@@ -32,6 +34,8 @@ array attn_window(
     const array& k,
     const array& v,
     int window,
+    float softcap = 0.0f,
+    const std::optional<array>& sinks = std::nullopt,
     StreamOrDevice s = {}
 );
 
@@ -41,7 +45,8 @@ array attn_window(
 
 class AttnWindow : public Primitive {
  public:
-  explicit AttnWindow(Stream stream, int window) : Primitive(stream), window_(window) {};
+  explicit AttnWindow(Stream stream, int window, float softcap = 0.0f, bool has_sink = false)
+      : Primitive(stream), window_(window), softcap_(softcap), has_sink_(has_sink) {};
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -54,16 +59,20 @@ class AttnWindow : public Primitive {
   const char* name() const { return "AttnWindow"; }
   void print(std::ostream& os) override { os << "AttnWindow[" << window_ << "]"; }
   bool is_equivalent(const Primitive& other) const override {
-    return window_ == static_cast<const AttnWindow&>(other).window_;
+    auto& o = static_cast<const AttnWindow&>(other);
+    return window_ == o.window_ && softcap_ == o.softcap_ && has_sink_ == o.has_sink_;
   }
 
  private:
   int window_;
+  float softcap_;
+  bool has_sink_;
 };
 
 class AttnCausal : public Primitive {
  public:
-  explicit AttnCausal(Stream stream) : Primitive(stream) {};
+  explicit AttnCausal(Stream stream, float softcap = 0.0f, bool has_sink = false)
+      : Primitive(stream), softcap_(softcap), has_sink_(has_sink) {};
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override;
@@ -94,6 +103,10 @@ class AttnCausal : public Primitive {
   bool is_equivalent(const Primitive& other) const override;
 
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
+
+ private:
+  float softcap_;
+  bool has_sink_;
 };
 
 } // namespace mlx::core

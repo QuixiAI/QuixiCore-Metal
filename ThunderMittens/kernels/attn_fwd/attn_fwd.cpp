@@ -37,35 +37,33 @@ array attn_fwd(
     const array& q, // Input array q
     const array& k, // Input array k
     const array& v, // Input array q
+    float softcap /* = 0.0f */,
+    const std::optional<array>& sinks /* = std::nullopt */,
     StreamOrDevice s /* = {} */ // Stream on which to schedule the operation
 ) {
     assert(q.dtype() == bfloat16 && k.dtype() == bfloat16 && k.dtype() == bfloat16);
     assert(q.shape() == k.shape() && k.shape() == v.shape());
 
-    const int B = q.shape(0);
     const int H = q.shape(1);
-    const int N = q.shape(2);
     const int D = q.shape(3);
-    
-    
     assert(D == 64 || D == 128);
 
-  // Promote dtypes between x and y as needed
-
-  // Upcast to float32 for non-floating point inputs x and y
   auto out_dtype = bfloat16;
-
-  // Broadcast the shapes of x and y (on the same stream s)
   auto out_shape = q.shape();
 
-  // Construct the array as the output of the Axpby primitive
-  // with the broadcasted and upcasted arrays as inputs
+  const bool has_sink = sinks.has_value();
+  if (has_sink && (sinks->ndim() != 1 || sinks->shape(0) != H)) {
+    throw std::invalid_argument("attn_fwd: sinks must be (H,)");
+  }
+  // 4th input is the per-head sink buffer; q doubles as the placeholder binding when absent
+  // (the kernel only dereferences it when has_sink).
+  auto sink_arr = has_sink ? astype(*sinks, float32, s) : q;
   return array(
       /* const std::vector<int>& shape = */ out_shape,
       /* Dtype dtype = */ out_dtype,
       /* std::unique_ptr<Primitive> primitive = */
-      std::make_shared<AttnFwd>(to_stream(s)),
-      /* const std::vector<array>& inputs = */ {q, k, v});
+      std::make_shared<AttnFwd>(to_stream(s), softcap, has_sink),
+      /* const std::vector<array>& inputs = */ {q, k, v, sink_arr});
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -129,10 +127,11 @@ void AttnFwd::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
   // Prepare inputs
-  assert(inputs.size() == 3);
+  assert(inputs.size() == 4);
   auto& q = inputs[0];
   auto& k = inputs[1];
   auto& v = inputs[2];
+  auto& sinks = inputs[3];   // == q (placeholder) when has_sink_ is false
   auto& out = outputs[0];
     
   // Each primitive carries the stream it should execute on
@@ -167,7 +166,8 @@ void AttnFwd::eval_gpu(
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_attn_fwd(enc, q, k, v, out, static_cast<unsigned>(N),
-                      static_cast<unsigned>(H), B, D);
+                      static_cast<unsigned>(H), B, D, softcap_, sinks,
+                      has_sink_ ? 1 : 0);
 }
 
 // #else // Metal is not available
@@ -238,7 +238,7 @@ std::pair<std::vector<array>, std::vector<int>> AttnFwd::vmap(
 /** Equivalence check **/
 bool AttnFwd::is_equivalent(const Primitive& other) const {
   const AttnFwd& r_other = static_cast<const AttnFwd&>(other);
-  return true;
+  return softcap_ == r_other.softcap_ && has_sink_ == r_other.has_sink_;
 }
 
 } // namespace mlx::core

@@ -126,9 +126,11 @@ def matmul_custom(x: torch.Tensor, y: torch.Tensor):
     return out[:N, :M].contiguous()
 
 
-def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    """Non-causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
-    return _ext.attn_fwd(q, k, v)
+def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float = 0.0,
+             sinks: torch.Tensor | None = None):
+    """Non-causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
+    softcap > 0 = Gemma-style logit capping; sinks (H,) = gpt-oss attention sinks."""
+    return _ext.attn_fwd(q, k, v, float(softcap), sinks)
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
@@ -474,9 +476,11 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                                     float(scale), _fmt_code(fmt), int(window))
 
 
-def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-    """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
-    return _ext.attn_causal(q, k, v)
+def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float = 0.0,
+                sinks: torch.Tensor | None = None):
+    """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
+    softcap > 0 = Gemma-style logit capping; sinks (H,) = gpt-oss attention sinks."""
+    return _ext.attn_causal(q, k, v, softcap=float(softcap), sinks=sinks)
 
 
 def attn_varlen_prefill(q_hm, key_cache, value_cache, block_table, context_lens,
@@ -501,10 +505,12 @@ def varlen_regather_o(o_hm, cu_seqlens, pad_off, total_q):
     return _ext.varlen_regather_o(o_hm, cu_seqlens, pad_off, int(total_q))
 
 
-def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int):
+def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int,
+                softcap: float = 0.0, sinks: torch.Tensor | None = None):
     """Sliding-window causal attention: query i attends keys [max(0, i-window+1), i].
-    window <= 0 disables the window. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0."""
-    return _ext.attn_window(q, k, v, window)
+    window <= 0 disables the window. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
+    softcap > 0 = Gemma-style logit capping; sinks (H,) = gpt-oss attention sinks."""
+    return _ext.attn_window(q, k, v, window, softcap=float(softcap), sinks=sinks)
 
 
 def lm_head_sample(h, W, bias, mode, k, temperature, seed):
