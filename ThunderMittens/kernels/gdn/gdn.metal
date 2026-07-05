@@ -64,13 +64,16 @@ kernel void gdn_recur(device const T *q            [[buffer(0)]],
     device const T *beta_ = beta + (long)seq_start * Hv;
     device T *y_ = y + (long)seq_start * Hv * Dv + hv_idx * Dv;
 
+    using TN = metal::vec<T, N_PER_T>;   // lane owns N_PER_T CONTIGUOUS Dk elems -> vec load
     for (int t = 0; t < seq_len; ++t) {
         const float g_val = float(g_[hv_idx]);
+        const TN kvec = ((device const TN*)(k_ + dk0))[0];   // k read once, reused below
+        const TN qvec = ((device const TN*)(q_ + dk0))[0];
         float kv_mem = 0.0f;
         #pragma clang loop unroll(full)
         for (int i = 0; i < N_PER_T; ++i) {
             state[i] *= g_val;
-            kv_mem += state[i] * float(k_[dk0 + i]);
+            kv_mem += state[i] * float(kvec[i]);
         }
         kv_mem = metal::simd_sum(kv_mem);
 
@@ -79,8 +82,8 @@ kernel void gdn_recur(device const T *q            [[buffer(0)]],
         float out = 0.0f;
         #pragma clang loop unroll(full)
         for (int i = 0; i < N_PER_T; ++i) {
-            state[i] += float(k_[dk0 + i]) * delta;
-            out += state[i] * float(q_[dk0 + i]);
+            state[i] += float(kvec[i]) * delta;
+            out += state[i] * float(qvec[i]);
         }
         out = metal::simd_sum(out);
         if (lane == 0) {

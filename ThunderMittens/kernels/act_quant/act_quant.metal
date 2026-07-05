@@ -30,18 +30,32 @@ kernel void silu_mul_quant_fp8(device const T *x     [[buffer(0)]],
                                constant float &limit [[buffer(7)]],
                                uint row  [[threadgroup_position_in_grid]],
                                uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
     const long base = (long)row * D;
+    const int nchunks = (D % 4 == 0) ? D / 4 : 0;     // vec4 path when D is 4-aligned
     float amax = 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
-        amax = max(amax, fabs(actq_eval(mode, float(x[base + i]), float(gate[base + i]),
-                                        alpha, limit)));
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const T4*)(x + base))[c]);
+        const float4 gv = float4(((device const T4*)(gate + base))[c]);
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) amax = max(amax, fabs(actq_eval(mode, xv[j], gv[j], alpha, limit)));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
+        amax = max(amax, fabs(actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit)));
     }
     amax = simd_max(amax);
     const float s = amax / 448.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
-        const float r = actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit);
-        codes[base + i] = tk_e4m3_encode(r * inv);
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const T4*)(x + base))[c]);
+        const float4 gv = float4(((device const T4*)(gate + base))[c]);
+        uchar4 out;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) out[j] = tk_e4m3_encode(actq_eval(mode, xv[j], gv[j], alpha, limit) * inv);
+        ((device uchar4*)(codes + base))[c] = out;
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
+        codes[base + i] = tk_e4m3_encode(actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit) * inv);
     }
     if (lane == 0) {
         scale[row] = s;
@@ -59,18 +73,32 @@ kernel void silu_mul_quant_int8(device const T *x     [[buffer(0)]],
                                 constant float &limit [[buffer(7)]],
                                 uint row  [[threadgroup_position_in_grid]],
                                 uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
     const long base = (long)row * D;
+    const int nchunks = (D % 4 == 0) ? D / 4 : 0;
     float amax = 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
-        amax = max(amax, fabs(actq_eval(mode, float(x[base + i]), float(gate[base + i]),
-                                        alpha, limit)));
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const T4*)(x + base))[c]);
+        const float4 gv = float4(((device const T4*)(gate + base))[c]);
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) amax = max(amax, fabs(actq_eval(mode, xv[j], gv[j], alpha, limit)));
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
+        amax = max(amax, fabs(actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit)));
     }
     amax = simd_max(amax);
     const float s = amax / 127.0f;
     const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-    for (int i = (int)lane; i < D; i += 32) {
-        const float r = actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit);
-        codes[base + i] = tk_int8_encode(r * inv);
+    for (int c = (int)lane; c < nchunks; c += 32) {
+        const float4 xv = float4(((device const T4*)(x + base))[c]);
+        const float4 gv = float4(((device const T4*)(gate + base))[c]);
+        char4 out;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) out[j] = tk_int8_encode(actq_eval(mode, xv[j], gv[j], alpha, limit) * inv);
+        ((device char4*)(codes + base))[c] = out;
+    }
+    for (int i = nchunks * 4 + (int)lane; i < D; i += 32) {
+        codes[base + i] = tk_int8_encode(actq_eval(mode, float(x[base + i]), float(gate[base + i]), alpha, limit) * inv);
     }
     if (lane == 0) {
         scale[row] = s;
@@ -90,14 +118,18 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
                                      constant float &limit [[buffer(9)]],
                                      uint row  [[threadgroup_position_in_grid]],
                                      uint lane [[thread_index_in_simdgroup]]) {
+    using T4 = vec<T, 4>;
     const long base = (long)row * D;
     const int ngroups = D / G;
+    const int gchunks = G / 4;                       // G % 4 == 0 (host-enforced)
     for (int g = 0; g < ngroups; ++g) {
         const long gbase = base + (long)g * G;
         float amax = 0.0f;
-        for (int i = (int)lane; i < G; i += 32) {
-            amax = max(amax, fabs(actq_eval(mode, float(x[gbase + i]), float(gate[gbase + i]),
-                                            alpha, limit)));
+        for (int c = (int)lane; c < gchunks; c += 32) {
+            const float4 xv = float4(((device const T4*)(x + gbase))[c]);
+            const float4 gv = float4(((device const T4*)(gate + gbase))[c]);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; ++j) amax = max(amax, fabs(actq_eval(mode, xv[j], gv[j], alpha, limit)));
         }
         amax = simd_max(amax);
         float s = amax / 448.0f;
@@ -105,10 +137,13 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
             s = exp2(ceil(log2(max(amax, 1e-10f) / 448.0f)));
         }
         const float inv = s > 0.0f ? 1.0f / s : 0.0f;
-        for (int i = (int)lane; i < G; i += 32) {
-            const float r = actq_eval(mode, float(x[gbase + i]), float(gate[gbase + i]),
-                                      alpha, limit);
-            codes[gbase + i] = tk_e4m3_encode(r * inv);
+        for (int c = (int)lane; c < gchunks; c += 32) {
+            const float4 xv = float4(((device const T4*)(x + gbase))[c]);
+            const float4 gv = float4(((device const T4*)(gate + gbase))[c]);
+            uchar4 out;
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < 4; ++j) out[j] = tk_e4m3_encode(actq_eval(mode, xv[j], gv[j], alpha, limit) * inv);
+            ((device uchar4*)(codes + gbase))[c] = out;
         }
         if (lane == 0) {
             scale[(long)row * ngroups + g] = s;

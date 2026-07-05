@@ -1,5 +1,39 @@
 # ThunderMittens — performance status
 
+## Wave-9 — optimization pass over the gap-port kernels (2026-07-05)
+
+Measure-first sweep over the 12 new kernel families. The clean finding: the **bf16-I/O**
+kernels win from manual vec4 (scalar bf16 loads waste bandwidth — the same lesson as
+gelu_bwd/dropout in Wave-8), while the **f32** kernels do NOT (their scalar strided loads are
+already coalesced and compiler-vectorized, so manual vec4 only adds overhead at scale).
+
+WINS (kept):
+- **gdn_recur** vec4 k/q loads (lanes already own contiguous Dk slices; k now read once/step
+  instead of twice) — prefill 2x2048 1.56 -> 1.50 ms (~7%), decode R64 0.45 -> 0.43 ms (~5%).
+- **act_quant** silu_mul_quant_{fp8,int8,fp8_group} vec4 (quant_rt float4-chunk pattern on
+  both the amax and encode passes) — int8 T4096xD2880 0.30 -> 0.22 ms (~27%), T512 0.038 ->
+  0.027 ms (~30%). Confirms scalar bf16 load, not the silu exp, was the ceiling.
+
+REJECTS (measured, reverted):
+- **quadratic_transform** (and by extension the f32 sampler zoo) vec4: WON at T256 (0.31 ->
+  0.16) but REGRESSED at T1024 (0.70 -> 0.80, repeatable 3x) — the throughput-bound regime
+  that matters more. f32 strided loads are already optimal; reverted. Applies to the whole
+  logit-transform family (all f32) -> left scalar.
+
+LEFT AS-IS (assessed, at/near floor):
+- **selective_scan** N128 5.09 ms — sequential Mamba scan with a per-timestep threadgroup
+  reduce barrier; B/C are strided by total_tokens (not vec4-able) and the recurrence is
+  serial. Only the chunked/Blelloch rewrite (recorded, high-risk) would move it — not an
+  opt-pass change.
+- **moe_grouped_gemm_swiglu_q** swiglu_oai 512-row 1.93 ms vs 1.27 dense (1.52x) — already
+  5-variant-tuned in the port; the two-pass reduce fits the 28 KB threadgroup budget and the
+  gap is dequant + epilogue. Closing it needs the documented deep candidates (K-step 64, fold
+  moe_gather into the A load) that risk correctness for a kernel already reading ~8x fewer
+  bytes than dense. Deferred with spec.
+- **turboquant** (fp16 chain kept verbatim for bit-exactness), **qk_norm_rope** (2.6x already,
+  substrate rv_fl vector loads), **quant_rt** (already float4), tiny utilities
+  (tau_tail/permute_cols/packbits/minference/moe_route, bandwidth/latency-bound) — no change.
+
 ## Wave-9 — follow-up: selective_scan varlen_apc (2026-07-05)
 
 Completes D1.1 (selective scan): the varlen + automatic-prefix-caching (APC) variant.
