@@ -2231,7 +2231,50 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
-// ----- TurboQuant KV codec (turboquant.metal). encode grid (tokens, Hkv), HS threads;
+// ----- marginal utilities (marginal.metal). tau_tail flat 1D grid; packbits 1 thr/byte;
+//        segment_packbits 1 thr/output-byte; permute_cols 2D (cols, rows). -----
+template <class E>
+void launch_marginal_copy(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {
+  e.pipeline("mittens::tq_clone_bytes");   // shared 16-byte/thread byte clone
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  const uint32_t nthreads = (n + 15) / 16;
+  e.dispatch((int)((nthreads + 255) / 256), 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_tau_tail(E& e, typename E::out_t qkv, typename E::in_t tok_qv_lin,
+                     typename E::in_t tau_pos_table, typename E::in_t positions, int elements,
+                     int n_heads, int head_dim, int q_dim, const std::string& type_name) {
+  e.pipeline("tau_tail_" + type_name);
+  e.out(qkv, 0); e.in(tok_qv_lin, 1); e.in(tau_pos_table, 2); e.in(positions, 3);
+  e.bytes(elements, 4); e.bytes(n_heads, 5); e.bytes(head_dim, 6); e.bytes(q_dim, 7);
+  e.dispatch((elements + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_packbits(E& e, typename E::in_t input, typename E::out_t output, int num_elements,
+                     int bit_order_big) {
+  e.pipeline("mittens::packbits_uint8");
+  e.in(input, 0); e.out(output, 1); e.bytes(num_elements, 2); e.bytes(bit_order_big, 3);
+  const int nbytes = (num_elements + 7) / 8;
+  e.dispatch((nbytes + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_segment_packbits(E& e, typename E::in_t input, typename E::in_t input_indptr,
+                             typename E::in_t output_indptr, typename E::out_t output,
+                             int num_segments, int total_output_bytes, int bit_order_big) {
+  e.pipeline("mittens::segment_packbits_uint8");
+  e.in(input, 0); e.in(input_indptr, 1); e.in(output_indptr, 2); e.out(output, 3);
+  e.bytes(num_segments, 4); e.bytes(total_output_bytes, 5); e.bytes(bit_order_big, 6);
+  e.dispatch((total_output_bytes + 255) / 256, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_permute_cols(E& e, typename E::in_t input, typename E::in_t perm,
+                         typename E::out_t output, int rows, int cols) {
+  e.pipeline("mittens::permute_cols_16bit");
+  e.in(input, 0); e.in(perm, 1); e.out(output, 2); e.bytes(rows, 3); e.bytes(cols, 4);
+  e.dispatch((cols + 15) / 16, (rows + 15) / 16, 1, 16, 16, 1);
+}
+
+// ----- TurboQuant KV codec (turboquant.metal).// ----- TurboQuant KV codec (turboquant.metal). encode grid (tokens, Hkv), HS threads;
 //        decode grid (n, Hkv), HS threads. tq_clone_bytes: 1D over bytes (16/thread). -----
 template <class E>
 void launch_tq_clone_bytes(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {

@@ -70,6 +70,7 @@
 #include "act_quant/act_quant.h"
 #include "minference/minference.h"
 #include "turboquant/turboquant.h"
+#include "marginal/marginal.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -529,6 +530,22 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def("tau_tail", &tau_tail,
+      "qkv"_a, "tok_qv_lin"_a, "tau_pos_table"_a, "positions"_a, "n_heads"_a, "head_dim"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(scale Q and V slices of a packed (T, 3*q_dim) QKV by tanh(gate)+tau_pos.)");
+    m.def("packbits", &packbits,
+      "x"_a, "bit_order_big"_a = true, nb::kw_only(), "stream"_a = nb::none(),
+      R"(pack bool/uint8 into bits (np.packbits); big or little bit order.)");
+    m.def("segment_packbits", &segment_packbits,
+      "x"_a, "input_indptr"_a, "output_indptr"_a, "total_output_bytes"_a,
+      "bit_order_big"_a = true,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(ragged per-row packbits (output_indptr = host cumsum of ceil(len/8)).)");
+    m.def("permute_cols", &permute_cols,
+      "x"_a, "perm"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(16-bit column gather x[:, perm] (dtype-agnostic on 2-byte elements).)");
 
     m.def("tq_encode", &tq_encode,
       "key"_a, "value"_a, "key_cache"_a, "value_cache"_a, "key_scale"_a, "value_scale"_a,

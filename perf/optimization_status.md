@@ -1,5 +1,27 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 12: marginal layout/bit utilities (2026-07-05)
+
+New kernels/marginal/ (one dir, four ops via a small kind-dispatched primitive):
+- tau_tail: scale the Q and V slices of a packed (T, 3*q_dim) QKV by tanh(tok_qv_lin)+
+  tau_pos_table[pos, head] (K slice passes through); functional via the shared byte-clone
+  prepass. Flat-grid elementwise v1 (any head_dim); the float2 _d64 variant is a bench-gated
+  follow-up. int32 positions (TM convention; ref int64).
+- packbits / segment_packbits: bool/uint8 -> bits, big/little order (np.packbits). Segment
+  variant binary-searches output_indptr (host cumsum of ceil(len/8)); total_output_bytes is
+  a caller-provided int (MLX's lazy graph can't read output_indptr[-1] at build time).
+- permute_cols: dtype-agnostic 16-bit column gather x[:, perm] (Marlin act-order reperm).
+
+- Tests: packbits/segment_packbits exact vs np.packbits (both bit orders, ragged rows);
+  permute_cols exact vs x[:, perm] (uint16 + bf16); tau_tail vs numpy transcription with
+  K-slice-untouched check; 6 green + parity atol=0 (ints/codes) / 1e-5 (tau_tail).
+- Trivial bandwidth-bound ops; no bench entries.
+
+DESIGNATED CUT (per plan): moe_lora_align — vLLM's LoRA-alignment metadata format has no
+ThunderMittens consumer (moe_grouped_gemm* take the existing route/permute/pad output), so
+porting it would ship dead code. Recorded here as the plan's explicit scope-tightening cut,
+not an oversight; revisit if/when a multi-LoRA MoE serving path lands.
+
 ## Wave-9 — gap port, kernel 11: TurboQuant KV codec (2026-07-05)
 
 New kernels/turboquant/ (arXiv 2502): tq_encode + tq_decode. K = asymmetric-uniform

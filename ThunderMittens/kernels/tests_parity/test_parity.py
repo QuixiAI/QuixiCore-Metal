@@ -676,6 +676,27 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_marginal_parity():
+    rng = np.random.default_rng(64)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    x = (rng.random(100) > 0.5).astype(np.uint8)
+    _assert_parity(tk.packbits(mx.array(x)), tk.packbits(t(x)), atol=0)
+    w = rng.integers(0, 60000, (5, 64)).astype(np.uint16)
+    perm = rng.permutation(64).astype(np.int32)
+    pm = tk.permute_cols(mx.array(w.view(np.int16)), mx.array(perm))
+    pt = tk.permute_cols(t(w.view(np.int16)), t(perm))
+    _assert_parity(pm, pt, atol=0)
+    T, nh, hd = 4, 4, 32
+    qd = nh * hd
+    qkv = rng.standard_normal((T, 3 * qd)).astype(np.float32)
+    gate = rng.standard_normal((T, 2 * nh)).astype(np.float32)
+    tau = rng.standard_normal((30, nh)).astype(np.float32)
+    pos = rng.integers(0, 30, T).astype(np.int32)
+    tm = tk.tau_tail(mx.array(qkv), mx.array(gate), mx.array(tau), mx.array(pos), nh, hd)
+    tt = tk.tau_tail(t(qkv), t(gate), t(tau), t(pos), nh, hd)
+    _assert_parity(tm, tt, atol=1e-5)
+
+
 def test_turboquant_parity():
     from tk.quant import tq_signs, lloyd_max_centroids
     rng = np.random.default_rng(63)

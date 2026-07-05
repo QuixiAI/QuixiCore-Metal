@@ -1888,6 +1888,62 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// marginal utilities: tau_tail, packbits, segment_packbits, permute_cols.
+static at::Tensor tau_tail_mps(const at::Tensor& qkv_in, const at::Tensor& gate_in,
+                               const at::Tensor& tau_in, const at::Tensor& pos_in,
+                               int64_t n_heads, int64_t head_dim) {
+  TORCH_CHECK(qkv_in.device().is_mps() && qkv_in.dim() == 2 && tk_is_float_dtype(qkv_in),
+              "tau_tail: qkv must be a float (T, 3*q_dim) MPS tensor");
+  const int T = qkv_in.size(0), q_dim = qkv_in.size(1) / 3;
+  TORCH_CHECK(n_heads * head_dim == q_dim, "tau_tail: n_heads*head_dim must equal q_dim");
+  auto out = qkv_in.contiguous().clone();
+  auto gate = gate_in.to(qkv_in.scalar_type()).contiguous();
+  auto tau = tau_in.to(qkv_in.scalar_type()).contiguous();
+  auto pos = pos_in.to(at::kInt).contiguous();
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_tau_tail(e, out, gate, tau, pos, T * (int)n_heads * (int)head_dim,
+                        (int)n_heads, (int)head_dim, q_dim, tk_type_name(qkv_in));
+  });
+  return out;
+}
+static at::Tensor packbits_mps(const at::Tensor& x_in, bool bit_order_big) {
+  TORCH_CHECK(x_in.device().is_mps(), "packbits: x must be an MPS tensor");
+  auto x = x_in.to(at::kByte).contiguous().view({-1});
+  const int n = x.numel();
+  auto out = at::empty({(n + 7) / 8}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_packbits(e, x, out, n, bit_order_big ? 1 : 0);
+  });
+  return out;
+}
+static at::Tensor segment_packbits_mps(const at::Tensor& x_in, const at::Tensor& in_ind,
+                                       const at::Tensor& out_ind, int64_t total_output_bytes,
+                                       bool bit_order_big) {
+  TORCH_CHECK(x_in.device().is_mps(), "segment_packbits: x must be an MPS tensor");
+  auto x = x_in.to(at::kByte).contiguous().view({-1});
+  auto ii = in_ind.to(at::kInt).contiguous(), oi = out_ind.to(at::kInt).contiguous();
+  const int num_segments = ii.numel() - 1;
+  auto out = at::empty({total_output_bytes}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_segment_packbits(e, x, ii, oi, out, num_segments, (int)total_output_bytes,
+                                bit_order_big ? 1 : 0);
+  });
+  return out;
+}
+static at::Tensor permute_cols_mps(const at::Tensor& x_in, const at::Tensor& perm_in) {
+  TORCH_CHECK(x_in.device().is_mps() && x_in.dim() == 2 && x_in.element_size() == 2,
+              "permute_cols: x must be a 2-D 16-bit MPS tensor");
+  auto x = x_in.contiguous();
+  auto perm = perm_in.to(at::kInt).contiguous();
+  const int rows = x.size(0), cols = x.size(1);
+  auto out = at::empty_like(x);
+  auto xv = x.view(at::kShort), ov = out.view(at::kShort);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_permute_cols(e, xv, perm, ov, rows, cols);
+  });
+  return out;
+}
+
 // TurboQuant KV codec (encode + decode).
 static std::vector<at::Tensor> tq_encode_mps(
     const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& kc_in,
@@ -3706,6 +3762,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("tau_tail", &tau_tail_mps, "tau_tail QKV tail scaling (MPS)");
+  m.def("packbits", &packbits_mps, "packbits (MPS)", pybind11::arg("x"),
+        pybind11::arg("bit_order_big") = true);
+  m.def("segment_packbits", &segment_packbits_mps, "segment_packbits (MPS)",
+        pybind11::arg("x"), pybind11::arg("input_indptr"), pybind11::arg("output_indptr"),
+        pybind11::arg("total_output_bytes"), pybind11::arg("bit_order_big") = true);
+  m.def("permute_cols", &permute_cols_mps, "permute_cols 16-bit column gather (MPS)");
   m.def("tq_encode", &tq_encode_mps, "TurboQuant KV encode (MPS)");
   m.def("tq_decode", &tq_decode_mps, "TurboQuant KV decode (MPS)");
   m.def("minference_block_mask", &minference_block_mask_mps,

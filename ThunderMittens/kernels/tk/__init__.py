@@ -792,6 +792,47 @@ def moe_route_topk(logits, k):
 
 
 
+def tau_tail(qkv, tok_qv_lin, tau_pos_table, positions, n_heads, head_dim):
+    """tau_tail tail scaling: multiply the Q and V slices of a packed (T, 3*q_dim) QKV by
+    tanh(tok_qv_lin[:, head]) + tau_pos_table[positions, head] (Q uses the first n_heads gate
+    columns, V the next n_heads); the K slice passes through. tok_qv_lin (T, 2*n_heads),
+    tau_pos_table (max_pos, n_heads), positions (T,) int. Returns a new QKV (functional).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(qkv):
+        return _torch().tau_tail(qkv, tok_qv_lin, tau_pos_table, positions, n_heads, head_dim)
+    return _mlx().tau_tail(qkv, tok_qv_lin, tau_pos_table, positions, int(n_heads),
+                           int(head_dim))
+
+
+def packbits(x, bit_order_big=True):
+    """Pack a bool/uint8 array (row-major flattened) into bits, np.packbits semantics
+    (bit_order_big=True matches numpy's default). Returns uint8 (ceil(N/8),).
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().packbits(x, bit_order_big)
+    return _mlx().packbits(x, bool(bit_order_big))
+
+
+def segment_packbits(x, input_indptr, output_indptr, total_output_bytes, bit_order_big=True):
+    """Ragged per-row packbits: pack each segment [input_indptr[i], input_indptr[i+1]) of the
+    flat uint8 input into output_indptr[i] onward. output_indptr = host cumsum of
+    ceil(seg_len/8); total_output_bytes = output_indptr[-1]. Accepts mlx/torch (MPS)."""
+    if _is_torch(x):
+        return _torch().segment_packbits(x, input_indptr, output_indptr, total_output_bytes,
+                                         bit_order_big)
+    return _mlx().segment_packbits(x, input_indptr, output_indptr, int(total_output_bytes),
+                                   bool(bit_order_big))
+
+
+def permute_cols(x, perm):
+    """Column gather output[:, c] = x[:, perm[c]] on a 16-bit dtype (f16/bf16/int16/uint16 —
+    Marlin's act-order weight repermutation). x (rows, cols), perm (cols,) int.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().permute_cols(x, perm)
+    return _mlx().permute_cols(x, perm)
+
+
 def tq_encode(key, value, key_cache, value_cache, key_scale, value_scale, key_zero,
               slot_mapping, v_centroids, signs, block_size, k_bits, k_signed, v_bits):
     """TurboQuant KV-cache encode: K asymmetric-uniform (per-32 fp16 scale+zp, 2-8 bits);

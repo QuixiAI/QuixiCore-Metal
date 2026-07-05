@@ -36,6 +36,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "act_quant", "act_quant.metal"),
     os.path.join(_KERNELS, "minference", "minference.metal"),
     os.path.join(_KERNELS, "turboquant", "turboquant.metal"),
+    os.path.join(_KERNELS, "marginal", "marginal.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -608,6 +609,28 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
 
+
+
+def tau_tail(qkv, tok_qv_lin, tau_pos_table, positions, n_heads, head_dim):
+    """tau_tail: scale Q and V slices of a packed (T, 3*q_dim) QKV. Returns new qkv. MPS."""
+    return _ext.tau_tail(qkv, tok_qv_lin, tau_pos_table, positions, int(n_heads),
+                         int(head_dim))
+
+
+def packbits(x, bit_order_big=True):
+    """Pack bool/uint8 into bits (np.packbits). Returns uint8 (ceil(N/8),). MPS."""
+    return _ext.packbits(x, bool(bit_order_big))
+
+
+def segment_packbits(x, input_indptr, output_indptr, total_output_bytes, bit_order_big=True):
+    """Ragged per-row packbits (output_indptr = host cumsum of ceil(len/8)). MPS."""
+    return _ext.segment_packbits(x, input_indptr, output_indptr, int(total_output_bytes),
+                                 bool(bit_order_big))
+
+
+def permute_cols(x, perm):
+    """16-bit column gather x[:, perm] (dtype-agnostic on 2-byte elements). MPS."""
+    return _ext.permute_cols(x, perm)
 
 
 def tq_encode(key, value, key_cache, value_cache, key_scale, value_scale, key_zero,
