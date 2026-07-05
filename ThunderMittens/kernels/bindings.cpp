@@ -685,6 +685,18 @@ NB_MODULE(_ext, m) {
          Returns [out, new_state_pool] (untouched slots preserved).)");
 
     m.def(
+      "selective_scan_varlen_apc", &selective_scan_varlen_apc,
+      "u"_a, "delta"_a, "A"_a, "B"_a, "C"_a, "query_start_loc"_a, "cache_indices"_a,
+      "has_initial_state"_a, "state"_a, "block_idx_first_scheduled_token"_a,
+      "block_idx_last_scheduled_token"_a, "initial_state_idx"_a, "cu_chunk_seqlen"_a,
+      "last_chunk_indices"_a, "block_size"_a, "cache_indices_stride"_a, "use_chunk_metadata"_a,
+      "D"_a = nb::none(), "delta_bias"_a = nb::none(), "z"_a = nb::none(),
+      "delta_softplus"_a = true, "null_block_id"_a = -1,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Varlen S6 scan with automatic-prefix-caching paged state checkpointing.
+         Returns [out, new_state_pool].)");
+
+    m.def(
       "qk_norm_rope", &qk_norm_rope,
       "qkv"_a, "q_weight"_a, "k_weight"_a, "cos"_a, "sin"_a, "positions"_a,
       "num_heads_q"_a, "num_heads_k"_a, "num_heads_v"_a,

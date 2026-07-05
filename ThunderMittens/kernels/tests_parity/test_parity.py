@@ -808,6 +808,32 @@ def test_quant_group_azp_parity():
     _assert_parity(am, at2, atol=0)
 
 
+def test_selective_scan_apc_parity():
+    rng = np.random.default_rng(65)
+    dim, dstate, n_groups = 8, 16, 1
+    lens = [10]
+    total = sum(lens)
+    qsl = np.array([0, total], np.int32)
+    bs, stride, nslots = 8, 3, 6
+    u = (0.3 * rng.standard_normal((dim, total))).astype(np.float32)
+    delta = (0.2 * rng.standard_normal((dim, total))).astype(np.float32)
+    A = (-0.5 - rng.random((dim, dstate))).astype(np.float32)
+    B = (0.3 * rng.standard_normal((n_groups, dstate, total))).astype(np.float32)
+    C = (0.3 * rng.standard_normal((n_groups, dstate, total))).astype(np.float32)
+    state = (0.2 * rng.standard_normal((nslots, dim, dstate))).astype(np.float32)
+    ci = np.array([0, 1, 2], np.int32)
+    his = np.array([1], np.uint8)
+    z0 = np.zeros(1, np.int32)
+    args = [A, B, C, qsl, ci, his, state, np.zeros(1, np.int32), np.array([1], np.int32),
+            np.zeros(1, np.int32), z0, z0]
+    om = tk.selective_scan_varlen_apc(mx.array(u), mx.array(delta), *[mx.array(a) for a in args],
+                                      bs, stride, False)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    ot = tk.selective_scan_varlen_apc(t(u), t(delta), *[t(a) for a in args], bs, stride, False)
+    _assert_parity(om[0], ot[0], atol=1e-4)
+    _assert_parity(om[1], ot[1], atol=1e-4)
+
+
 def test_gdn_recur_parity():
     rng = np.random.default_rng(58)
     lens, Hk, Hv, Dk, Dv, S = [5, 3], 2, 4, 64, 64, 4

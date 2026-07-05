@@ -2294,6 +2294,47 @@ static std::tuple<at::Tensor, at::Tensor> selective_scan_varlen_mps(
   return {out, state};
 }
 
+static std::tuple<at::Tensor, at::Tensor> selective_scan_varlen_apc_mps(
+    const at::Tensor& u_in, const at::Tensor& delta_in, const at::Tensor& A_in,
+    const at::Tensor& B_in, const at::Tensor& C_in, const at::Tensor& qsl_in,
+    const at::Tensor& cidx_in, const at::Tensor& his_in, const at::Tensor& state_in,
+    const at::Tensor& bif_in, const at::Tensor& bil_in, const at::Tensor& isi_in,
+    const at::Tensor& ccs_in, const at::Tensor& lci_in, int64_t block_size,
+    int64_t cache_indices_stride, bool use_chunk_metadata,
+    const c10::optional<at::Tensor>& D_in, const c10::optional<at::Tensor>& bias_in,
+    const c10::optional<at::Tensor>& z_in, bool delta_softplus, int64_t null_block_id) {
+  TORCH_CHECK(u_in.device().is_mps() && u_in.dim() == 2 && tk_is_float_dtype(u_in),
+              "selective_scan_varlen_apc: u must be a float (dim, total_tokens) MPS tensor");
+  const int dim = u_in.size(0), total_tokens = u_in.size(1);
+  const int n_groups = B_in.size(0), dstate = B_in.size(1);
+  auto u = u_in.contiguous(), delta = delta_in.to(u_in.scalar_type()).contiguous();
+  auto A = A_in.to(at::kFloat).contiguous();
+  auto B = B_in.to(u_in.scalar_type()).contiguous(), C = C_in.to(u_in.scalar_type()).contiguous();
+  auto qsl = qsl_in.to(at::kInt).contiguous();
+  const int batch = qsl.size(0) - 1;
+  const bool has_d = D_in.has_value(), has_bias = bias_in.has_value(), has_z = z_in.has_value();
+  auto dummy_f = at::zeros({1}, u.options().dtype(at::kFloat));
+  auto dummy_io = at::zeros({1}, u.options());
+  auto D = has_d ? D_in->to(at::kFloat).contiguous() : dummy_f;
+  auto bias = has_bias ? bias_in->to(at::kFloat).contiguous() : dummy_f;
+  auto z = has_z ? z_in->to(u_in.scalar_type()).contiguous() : dummy_io;
+  auto cidx = cidx_in.to(at::kInt).contiguous(), his = his_in.to(at::kByte).contiguous();
+  auto bif = bif_in.to(at::kInt).contiguous(), bil = bil_in.to(at::kInt).contiguous();
+  auto isi = isi_in.to(at::kInt).contiguous(), ccs = ccs_in.to(at::kInt).contiguous();
+  auto lci = lci_in.to(at::kInt).contiguous();
+  auto state = state_in.to(at::kFloat).contiguous().clone();
+  auto out = at::empty_like(u);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_selective_scan_varlen_apc(
+        e, u, delta, A, B, C, D, bias, z, qsl, cidx, his, out, state, bif, bil, isi, ccs, lci,
+        batch, dim, total_tokens, dstate, n_groups, has_d ? 1 : 0, has_bias ? 1 : 0,
+        has_z ? 1 : 0, delta_softplus ? 1 : 0, static_cast<int>(null_block_id),
+        (int)block_size, (int)cache_indices_stride, use_chunk_metadata ? 1 : 0,
+        tk_type_name(u));
+  });
+  return {out, state};
+}
+
 // Fused per-head QK-RMSNorm + RoPE over packed QKV; V heads copied through.
 static at::Tensor qk_norm_rope_mps(const at::Tensor& qkv_in, const at::Tensor& qw_in,
                                    const at::Tensor& kw_in, const at::Tensor& cos_in,
@@ -3823,6 +3864,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("C"), pybind11::arg("state"), pybind11::arg("D") = pybind11::none(),
         pybind11::arg("delta_bias") = pybind11::none(), pybind11::arg("z") = pybind11::none(),
         pybind11::arg("delta_softplus") = true);
+  m.def("selective_scan_varlen_apc", &selective_scan_varlen_apc_mps,
+        "ThunderMittens varlen S6 scan with APC paged state (MPS)",
+        pybind11::arg("u"), pybind11::arg("delta"), pybind11::arg("A"), pybind11::arg("B"),
+        pybind11::arg("C"), pybind11::arg("query_start_loc"), pybind11::arg("cache_indices"),
+        pybind11::arg("has_initial_state"), pybind11::arg("state"),
+        pybind11::arg("block_idx_first_scheduled_token"),
+        pybind11::arg("block_idx_last_scheduled_token"), pybind11::arg("initial_state_idx"),
+        pybind11::arg("cu_chunk_seqlen"), pybind11::arg("last_chunk_indices"),
+        pybind11::arg("block_size"), pybind11::arg("cache_indices_stride"),
+        pybind11::arg("use_chunk_metadata"), pybind11::arg("D") = c10::nullopt,
+        pybind11::arg("delta_bias") = c10::nullopt, pybind11::arg("z") = c10::nullopt,
+        pybind11::arg("delta_softplus") = true, pybind11::arg("null_block_id") = -1);
   m.def("selective_scan_varlen", &selective_scan_varlen_mps,
         "ThunderMittens varlen Mamba-1 selective scan (MPS)",
         pybind11::arg("u"), pybind11::arg("delta"), pybind11::arg("A"), pybind11::arg("B"),

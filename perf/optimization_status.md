@@ -1,5 +1,24 @@
 # ThunderMittens — performance status
 
+## Wave-9 — follow-up: selective_scan varlen_apc (2026-07-05)
+
+Completes D1.1 (selective scan): the varlen + automatic-prefix-caching (APC) variant.
+Same S6 recurrence as varlen but the running state is checkpointed into PAGED state blocks
+at chunk boundaries (last chunk -> block_idx_last_scheduled_token) and the initial state is
+read from a possibly-cached prefix block (initial_state_idx). Buffer table transcribed 1:1
+from metal-forge's selective_scan_fwd_varlen_apc_state_float32_typed (block_idx_first/last
+scheduled token, initial_state_idx, cu_chunk_seqlen, last_chunk_indices, block_size,
+cache_indices_stride, use_chunk_metadata). New SelectiveScanApc primitive (dedicated, not
+overloaded onto SelectiveScan) with the functional pool-clone prepass; use_chunk_metadata=0
+falls back to fixed block_size chunking. Gated behind its own test per the plan (highest-risk
+chunk metadata).
+
+- Tests: 4 fp64-oracle cases (uniform-chunk f32/bf16, prefix-cache-initial-state from a
+  non-zero block, multi-chunk intermediate checkpoints, untouched-slot preservation) +
+  fp32 parity; 16 selective_scan tests green total. The chunk-metadata (cu_chunk_seqlen)
+  path is implemented and exercised via use_chunk_metadata=False fallback in these tests;
+  the full logical-chunk scheduler metadata is a vLLM-runtime input (recorded).
+
 ## Wave-9 — gap port, kernel 12: marginal layout/bit utilities (2026-07-05)
 
 New kernels/marginal/ (one dir, four ops via a small kind-dispatched primitive):

@@ -779,6 +779,21 @@ def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, z=None, state=Non
                                      state=state, delta_softplus=delta_softplus))
 
 
+def selective_scan_varlen_apc(u, delta, A, B, C, query_start_loc, cache_indices,
+                              has_initial_state, state, block_idx_first_scheduled_token,
+                              block_idx_last_scheduled_token, initial_state_idx,
+                              cu_chunk_seqlen, last_chunk_indices, block_size,
+                              cache_indices_stride, use_chunk_metadata, D=None,
+                              delta_bias=None, z=None, delta_softplus=True, null_block_id=-1):
+    """Varlen S6 scan with automatic prefix caching (paged state checkpointing). MPS."""
+    return tuple(_ext.selective_scan_varlen_apc(
+        u, delta, A, B, C, query_start_loc, cache_indices, has_initial_state, state,
+        block_idx_first_scheduled_token, block_idx_last_scheduled_token, initial_state_idx,
+        cu_chunk_seqlen, last_chunk_indices, int(block_size), int(cache_indices_stride),
+        bool(use_chunk_metadata), D=D, delta_bias=delta_bias, z=z,
+        delta_softplus=delta_softplus, null_block_id=null_block_id))
+
+
 def selective_scan_varlen(u, delta, A, B, C, query_start_loc, state, D=None, delta_bias=None,
                           z=None, cache_indices=None, has_initial_state=None,
                           delta_softplus=True, null_block_id=-1):

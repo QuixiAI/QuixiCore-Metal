@@ -1124,6 +1124,36 @@ def selective_scan_varlen(u, delta, A, B, C, query_start_loc, state, D=None, del
     return out[0], out[1]
 
 
+def selective_scan_varlen_apc(u, delta, A, B, C, query_start_loc, cache_indices,
+                              has_initial_state, state, block_idx_first_scheduled_token,
+                              block_idx_last_scheduled_token, initial_state_idx,
+                              cu_chunk_seqlen, last_chunk_indices, block_size,
+                              cache_indices_stride, use_chunk_metadata, D=None,
+                              delta_bias=None, z=None, delta_softplus=True, null_block_id=-1):
+    """Varlen Mamba-1 scan with automatic prefix caching (the vLLM mamba paged-scan path):
+    same S6 recurrence as selective_scan_varlen, but the running state is checkpointed into
+    the paged state pool at chunk boundaries and the initial state is read from a
+    (possibly cached) prefix block indexed by initial_state_idx. cache_indices is
+    (B, cache_indices_stride) int32 mapping (request, block) -> pool slot; the chunk-metadata
+    arrays (block_idx_first/last_scheduled_token (B,), cu_chunk_seqlen, last_chunk_indices)
+    describe the logical chunk boundaries — pass use_chunk_metadata=False to chunk uniformly
+    by block_size. Returns (out, new_state_pool). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(u):
+        return _torch().selective_scan_varlen_apc(
+            u, delta, A, B, C, query_start_loc, cache_indices, has_initial_state, state,
+            block_idx_first_scheduled_token, block_idx_last_scheduled_token, initial_state_idx,
+            cu_chunk_seqlen, last_chunk_indices, block_size, cache_indices_stride,
+            use_chunk_metadata, D=D, delta_bias=delta_bias, z=z, delta_softplus=delta_softplus,
+            null_block_id=null_block_id)
+    out = _mlx().selective_scan_varlen_apc(
+        u, delta, A, B, C, query_start_loc, cache_indices, has_initial_state, state,
+        block_idx_first_scheduled_token, block_idx_last_scheduled_token, initial_state_idx,
+        cu_chunk_seqlen, last_chunk_indices, int(block_size), int(cache_indices_stride),
+        bool(use_chunk_metadata), D=D, delta_bias=delta_bias, z=z,
+        delta_softplus=delta_softplus, null_block_id=null_block_id)
+    return out[0], out[1]
+
+
 def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
                  num_heads_v, eps=1e-6, interleaved=False, gemma=False):
     """Fused per-head QK-RMSNorm + RoPE over a packed QKV buffer (the Qwen3 attention-prep

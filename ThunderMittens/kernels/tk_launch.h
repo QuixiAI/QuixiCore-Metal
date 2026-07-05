@@ -498,6 +498,34 @@ void launch_selective_scan_varlen(E& e, typename E::in_t u, typename E::in_t del
   e.dispatch(batch, dim, 1, threads, 1, 1);
 }
 
+// varlen + APC: paged state checkpointing at chunk boundaries + prefix-cache initial state.
+template <class E>
+void launch_selective_scan_varlen_apc(
+    E& e, typename E::in_t u, typename E::in_t delta, typename E::in_t A, typename E::in_t B,
+    typename E::in_t C, typename E::in_t D, typename E::in_t delta_bias, typename E::in_t z,
+    typename E::in_t query_start_loc, typename E::in_t cache_indices,
+    typename E::in_t has_initial_state, typename E::out_t out, typename E::out_t state,
+    typename E::in_t block_idx_first, typename E::in_t block_idx_last,
+    typename E::in_t initial_state_idx, typename E::in_t cu_chunk_seqlen,
+    typename E::in_t last_chunk_indices, int batch, int dim, int total_tokens, int dstate,
+    int n_groups, int has_d, int has_delta_bias, int has_z, int delta_softplus,
+    int null_block_id, int block_size, int cache_indices_stride, int use_chunk_metadata,
+    const std::string& type_name) {
+  e.pipeline(selective_scan_kernel_name("varlen_apc", type_name));
+  e.in(u, 0); e.in(delta, 1); e.in(A, 2); e.in(B, 3); e.in(C, 4);
+  e.in(D, 5); e.in(delta_bias, 6); e.in(z, 7);
+  e.in(query_start_loc, 8); e.in(cache_indices, 9); e.in(has_initial_state, 10);
+  e.out(out, 11); e.out(state, 12);
+  e.in(block_idx_first, 13); e.in(block_idx_last, 14); e.in(initial_state_idx, 15);
+  e.in(cu_chunk_seqlen, 16); e.in(last_chunk_indices, 17);
+  e.bytes(batch, 18); e.bytes(dim, 19); e.bytes(total_tokens, 20); e.bytes(dstate, 21);
+  e.bytes(n_groups, 22); e.bytes(has_d, 23); e.bytes(has_delta_bias, 24);
+  e.bytes(has_z, 25); e.bytes(delta_softplus, 26); e.bytes(null_block_id, 27);
+  e.bytes(block_size, 28); e.bytes(cache_indices_stride, 29); e.bytes(use_chunk_metadata, 30);
+  const int threads = ((dstate + 31) / 32) * 32;
+  e.dispatch(batch, dim, 1, threads, 1, 1);
+}
+
 // fp32 pool clone prepass (src@0 -> dst@1 ; n@2(u32)); grid-stride copy.
 // (non-template kernel => the namespaced symbol survives, per the mittens:: gotcha)
 template <class E>
