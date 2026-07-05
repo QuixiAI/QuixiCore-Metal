@@ -2121,6 +2121,26 @@ def rms_norm_add_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(3 * N * D * 2))
 
 
+@register("norm_quant_block")
+def norm_quant_block_cases(be, preset, formats):
+    """Fused rms_norm(x+residual) -> per-128-block int8 vs the unfused chain
+    (rms_norm_add -> quantize_per_group). The win is eliminating the (N,D) bf16 round-trip."""
+    tk = be.tk()
+    rng = np.random.default_rng(240)
+    for N, D in _pick(preset, [(4096, 1024)], [(16384, 1024), (65536, 768)],
+                      [(65536, 1024), (131072, 1024)]):
+        x_d = be.array(rng.standard_normal((N, D)).astype(np.float32), "bf16")
+        r_d = be.array(rng.standard_normal((N, D)).astype(np.float32), "bf16")
+        w_d = be.array(rng.standard_normal((D,)).astype(np.float32), "bf16")
+        base = {"norm_then_group_quant":
+                (lambda x_d=x_d, r_d=r_d, w_d=w_d:
+                 tk.quantize_per_group_int8(tk.rms_norm_add(x_d, r_d, w_d)[0], group_size=128)[0])}
+        yield Case("norm_quant_block", f"N{N}_D{D}", {"N": N, "D": D}, "bf16",
+                   target=lambda x_d=x_d, r_d=r_d, w_d=w_d:
+                       tk.rms_norm_add_per_block(x_d, r_d, w_d, int8=True)[0],
+                   baselines=base, ref=None, bytes_moved=float(3 * N * D * 2))
+
+
 @register("embedding_backward")
 def embedding_backward_cases(be, preset, formats):
     tk = be.tk()

@@ -726,6 +726,22 @@ def rms_norm_add_int8(x, residual, weight, eps=1e-5):
     return tuple(_ext.rms_norm_add_int8_dyn(x, residual, weight, float(eps)))
 
 
+def layernorm_add_int8(x, residual, weight, bias, eps=1e-5):
+    """Fused add + layernorm + dynamic per-row int8. Returns (codes i8, x+residual, scale). MPS."""
+    return tuple(_ext.layernorm_add_int8_dyn(x, residual, weight, bias, float(eps)))
+
+
+def rms_norm_add_per_block(x, residual, weight, eps=1e-5, int8=False, ue8m0=False):
+    """Fused add + rms_norm + per-128-block quant. Returns (codes, x+residual, scale (rows,D/128)). MPS."""
+    return tuple(_ext.rms_norm_add_per_block(x, residual, weight, float(eps), bool(int8), bool(ue8m0)))
+
+
+def layernorm_add_per_block(x, residual, weight, bias, eps=1e-5, int8=False, ue8m0=False):
+    """Fused add + layernorm + per-128-block quant. Returns (codes, x+residual, scale). MPS."""
+    return tuple(_ext.layernorm_add_per_block(x, residual, weight, bias, float(eps), bool(int8),
+                                              bool(ue8m0)))
+
+
 _ACTQ_MODES = {"swiglu": 0, "swiglu_oai": 1}
 
 

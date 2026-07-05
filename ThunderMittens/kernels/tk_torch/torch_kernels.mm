@@ -451,6 +451,59 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> layernorm_add_fp8_dyn_mps(
   return {codes, res_out, scale};
 }
 
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> layernorm_add_int8_dyn_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, const at::Tensor& b_in,
+    double eps) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_add_int8_dyn(e, x, r, w, b, codes, res_out, scale, M, D, static_cast<float>(eps));
+  });
+  return {codes, res_out, scale};
+}
+
+// per-block (per-128-group) dynamic norm-quant. int8=true -> char codes, else uchar (fp8).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> rms_norm_add_per_block_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, double eps,
+    bool int8, bool ue8m0) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  TORCH_CHECK(D % 128 == 0, "rms_norm_add_per_block: D must be a multiple of 128");
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(int8 ? at::kChar : at::kByte));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end());
+  sshape.back() = D / 128;
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_add_per_block(e, x, r, w, codes, res_out, scale, M, D,
+                                      static_cast<float>(eps), int8, ue8m0 ? 1 : 0);
+  });
+  return {codes, res_out, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> layernorm_add_per_block_mps(
+    const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in, const at::Tensor& b_in,
+    double eps, bool int8, bool ue8m0) {
+  int D; uint32_t M; anfp8_check(x_in, r_in, D, M);
+  TORCH_CHECK(D % 128 == 0, "layernorm_add_per_block: D must be a multiple of 128");
+  auto x = x_in.contiguous(), r = r_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
+  auto codes = at::empty(x.sizes(), x.options().dtype(int8 ? at::kChar : at::kByte));
+  auto res_out = at::empty_like(x);
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end());
+  sshape.back() = D / 128;
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_layernorm_add_per_block(e, x, r, w, b, codes, res_out, scale, M, D,
+                                       static_cast<float>(eps), int8, ue8m0 ? 1 : 0);
+  });
+  return {codes, res_out, scale};
+}
+
 static at::Tensor softmax_mps(const at::Tensor& x_in) {
   TORCH_CHECK(x_in.device().is_mps(), "softmax: x must be an MPS tensor");
   TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "softmax: x must be bfloat16");
@@ -3831,6 +3884,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("dry_penalty", &dry_penalty_mps, "DRY repetition penalty (MPS)");
   m.def("rms_norm_add_int8_dyn", &rms_norm_add_int8_dyn_mps,
         "fused add + rms_norm + dynamic per-row int8 (MPS)");
+  m.def("layernorm_add_int8_dyn", &layernorm_add_int8_dyn_mps,
+        "fused add + layernorm + dynamic per-row int8 (MPS)");
+  m.def("rms_norm_add_per_block", &rms_norm_add_per_block_mps,
+        "fused add + rms_norm + per-128-block quant (MPS)", pybind11::arg("x"),
+        pybind11::arg("residual"), pybind11::arg("weight"), pybind11::arg("eps"),
+        pybind11::arg("int8"), pybind11::arg("ue8m0") = false);
+  m.def("layernorm_add_per_block", &layernorm_add_per_block_mps,
+        "fused add + layernorm + per-128-block quant (MPS)", pybind11::arg("x"),
+        pybind11::arg("residual"), pybind11::arg("weight"), pybind11::arg("bias"),
+        pybind11::arg("eps"), pybind11::arg("int8"), pybind11::arg("ue8m0") = false);
   m.def("silu_mul_quant_fp8", &silu_mul_quant_fp8_mps,
         "fused gated-activation -> per-token fp8 (MPS)", pybind11::arg("x"),
         pybind11::arg("gate"), pybind11::arg("mode") = 0, pybind11::arg("alpha") = 1.702,

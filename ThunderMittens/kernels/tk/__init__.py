@@ -995,6 +995,40 @@ def rms_norm_add_int8(x, residual, weight, eps=1e-5):
     return out[0], out[1], out[2]
 
 
+def layernorm_add_int8(x, residual, weight, bias, eps=1e-5):
+    """Fused residual-add + LayerNorm + dynamic per-row int8 (int8 sibling of layernorm_add_fp8
+    dynamic). Returns (codes i8, x+residual, scale (rows,)). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(x):
+        return _torch().layernorm_add_int8(x, residual, weight, bias, eps)
+    out = _mlx().layernorm_add_int8_dyn(x, residual, weight, bias, float(eps))
+    return out[0], out[1], out[2]
+
+
+def rms_norm_add_per_block(x, residual, weight, eps=1e-5, int8=False, ue8m0=False):
+    """Fused residual-add + RMSNorm + per-128-block dynamic quant — emits (rows, D/128) group
+    scales directly, so the codes feed the block-quant expert GEMMs (moe_grouped_gemm_*_q) with
+    no separate quantize pass. int8=False -> fp8 e4m3 (ue8m0 rounds group scales to powers of
+    two); int8=True -> symmetric int8. Returns (codes, x+residual, scale (rows, D/128)). D%128==0.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().rms_norm_add_per_block(x, residual, weight, eps, int8, ue8m0)
+    out = (_mlx().rms_norm_add_per_block_int8(x, residual, weight, float(eps)) if int8
+           else _mlx().rms_norm_add_per_block_fp8(x, residual, weight, float(eps), ue8m0=ue8m0))
+    return out[0], out[1], out[2]
+
+
+def layernorm_add_per_block(x, residual, weight, bias, eps=1e-5, int8=False, ue8m0=False):
+    """Fused residual-add + LayerNorm + per-128-block dynamic quant (the LayerNorm sibling of
+    rms_norm_add_per_block). Returns (codes, x+residual, scale (rows, D/128)). D%128==0.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().layernorm_add_per_block(x, residual, weight, bias, eps, int8, ue8m0)
+    out = (_mlx().layernorm_add_per_block_int8(x, residual, weight, bias, float(eps)) if int8
+           else _mlx().layernorm_add_per_block_fp8(x, residual, weight, bias, float(eps),
+                                                   ue8m0=ue8m0))
+    return out[0], out[1], out[2]
+
+
 def silu_mul_quant_fp8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
     """Fused gated activation -> dynamic per-token fp8 e4m3: act = silu(x)*gate ("swiglu") or
     the gpt-oss clamped variant ("swiglu_oai", alpha/limit); codes = e4m3(act/scale) with

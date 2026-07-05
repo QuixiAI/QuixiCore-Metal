@@ -151,6 +151,13 @@ static std::vector<int> anfp8_scale_shape(const array& x) {
   return sh;
 }
 
+// per-block scale shape: (..., D/128) — one scale per 128-wide group per row.
+static std::vector<int> anfp8_block_scale_shape(const array& x) {
+  std::vector<int> sh(x.shape().begin(), x.shape().end());
+  sh.back() = x.shape(-1) / 128;
+  return sh;
+}
+
 std::vector<array> rms_norm_add_fp8(
     const array& x, const array& residual, const array& weight, float eps, float scale,
     StreamOrDevice s) {
@@ -219,6 +226,79 @@ std::vector<array> layernorm_add_fp8_dyn(
       {x, residual, weight, bias});
 }
 
+std::vector<array> layernorm_add_int8_dyn(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "layernorm_add_int8_dyn");
+  if (weight.shape(0) != D || bias.shape(0) != D) {
+    throw std::invalid_argument("layernorm_add_int8_dyn: weight/bias must be (D,)");
+  }
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_scale_shape(x)}, {int8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), true, true, eps, 0.0f, true),
+      {x, residual, weight, bias});
+}
+
+static void check_block_D(int D, const char* name) {
+  if (D % 128 != 0) {
+    throw std::invalid_argument(std::string(name) + ": D must be a multiple of 128");
+  }
+}
+
+std::vector<array> rms_norm_add_per_block_fp8(
+    const array& x, const array& residual, const array& weight, float eps, bool ue8m0,
+    StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "rms_norm_add_per_block_fp8");
+  check_block_D(D, "rms_norm_add_per_block_fp8");
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_block_scale_shape(x)}, {uint8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), false, true, eps, 0.0f, false, 128, ue8m0),
+      {x, residual, weight});
+}
+
+std::vector<array> rms_norm_add_per_block_int8(
+    const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "rms_norm_add_per_block_int8");
+  check_block_D(D, "rms_norm_add_per_block_int8");
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_block_scale_shape(x)}, {int8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), false, true, eps, 0.0f, true, 128, false),
+      {x, residual, weight});
+}
+
+std::vector<array> layernorm_add_per_block_fp8(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    bool ue8m0, StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "layernorm_add_per_block_fp8");
+  check_block_D(D, "layernorm_add_per_block_fp8");
+  if (weight.shape(0) != D || bias.shape(0) != D) {
+    throw std::invalid_argument("layernorm_add_per_block_fp8: weight/bias must be (D,)");
+  }
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_block_scale_shape(x)}, {uint8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), true, true, eps, 0.0f, false, 128, ue8m0),
+      {x, residual, weight, bias});
+}
+
+std::vector<array> layernorm_add_per_block_int8(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    StreamOrDevice s) {
+  const int D = x.shape(-1);
+  check_norm_shapes(x, residual, D, "layernorm_add_per_block_int8");
+  check_block_D(D, "layernorm_add_per_block_int8");
+  if (weight.shape(0) != D || bias.shape(0) != D) {
+    throw std::invalid_argument("layernorm_add_per_block_int8: weight/bias must be (D,)");
+  }
+  return array::make_arrays(
+      {x.shape(), x.shape(), anfp8_block_scale_shape(x)}, {int8, bfloat16, float32},
+      std::make_shared<AddNormFp8>(to_stream(s), true, true, eps, 0.0f, true, 128, false),
+      {x, residual, weight, bias});
+}
+
 void AddNormFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("AddNormFp8 has no CPU implementation.");
 }
@@ -241,12 +321,32 @@ void AddNormFp8::eval_gpu(
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
 
+  if (group_size_ > 0) {
+    // per-block (per-128-group) dynamic quant; scale is (rows, D/128)
+    auto& scale = outputs[2];
+    scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
+    const int ue8 = ue8m0_ ? 1 : 0;
+    if (layernorm_) {
+      auto& bias = inputs[3];
+      tk::launch_layernorm_add_per_block(enc, x, residual, weight, bias, codes, res_out, scale,
+                                         M, D, eps_, int8_, ue8);
+    } else {
+      tk::launch_rms_norm_add_per_block(enc, x, residual, weight, codes, res_out, scale, M, D,
+                                        eps_, int8_, ue8);
+    }
+    return;
+  }
+
   if (layernorm_) {
     auto& bias = inputs[3];
     if (dynamic_) {
       auto& scale = outputs[2];
       scale.set_data(allocator::malloc_or_wait(scale.nbytes()));
-      tk::launch_layernorm_add_fp8_dyn(enc, x, residual, weight, bias, codes, res_out, scale, M, D, eps_);
+      if (int8_) {
+        tk::launch_layernorm_add_int8_dyn(enc, x, residual, weight, bias, codes, res_out, scale, M, D, eps_);
+      } else {
+        tk::launch_layernorm_add_fp8_dyn(enc, x, residual, weight, bias, codes, res_out, scale, M, D, eps_);
+      }
     } else {
       tk::launch_layernorm_add_fp8(enc, x, residual, weight, bias, codes, res_out, M, D, eps_, inv_scale_);
     }

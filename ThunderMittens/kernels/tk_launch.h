@@ -45,6 +45,13 @@ inline std::string rms_norm_add_fp8_dyn_kernel_name(int D) { return "rms_norm_ad
 inline std::string rms_norm_add_int8_dyn_kernel_name(int D) { return "rms_norm_add_int8_dyn_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_kernel_name(int D) { return "layernorm_add_fp8_" + std::to_string(D); }
 inline std::string layernorm_add_fp8_dyn_kernel_name(int D) { return "layernorm_add_fp8_dyn_" + std::to_string(D); }
+inline std::string layernorm_add_int8_dyn_kernel_name(int D) { return "layernorm_add_int8_dyn_" + std::to_string(D); }
+inline std::string rms_norm_add_per_block_kernel_name(int D, bool i8) {
+  return std::string("rms_norm_add_per_block_") + (i8 ? "int8_" : "fp8_") + std::to_string(D);
+}
+inline std::string layernorm_add_per_block_kernel_name(int D, bool i8) {
+  return std::string("layernorm_add_per_block_") + (i8 ? "int8_" : "fp8_") + std::to_string(D);
+}
 inline std::string argmax_kernel_name(const std::string& t) { return "argmax_" + t; }
 inline std::string moe_route_topk_kernel_name(const std::string& t) { return "moe_route_topk_" + t; }
 inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_finalize_" + t; }
@@ -942,6 +949,37 @@ void launch_rms_norm_add_int8_dyn(E& e, typename E::in_t x, typename E::in_t r, 
   e.pipeline(rms_norm_add_int8_dyn_kernel_name(D));
   e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4); e.out(scale, 5);
   e.bytes(M, 6); e.bytes(eps, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+// per-block (per-128-group) dynamic norm-quant: codes@3 res_out@4 scale@5(rows,D/128) ; ue8m0@8.
+template <class E>
+void launch_rms_norm_add_per_block(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                   typename E::out_t codes, typename E::out_t res_out,
+                                   typename E::out_t scale, uint32_t M, int D, float eps, bool int8,
+                                   int ue8m0) {
+  e.pipeline(rms_norm_add_per_block_kernel_name(D, int8));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.out(codes, 3); e.out(res_out, 4); e.out(scale, 5);
+  e.bytes(M, 6); e.bytes(eps, 7); e.bytes(ue8m0, 8);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_layernorm_add_int8_dyn(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                   typename E::in_t b, typename E::out_t codes,
+                                   typename E::out_t res_out, typename E::out_t scale, uint32_t M,
+                                   int D, float eps) {
+  e.pipeline(layernorm_add_int8_dyn_kernel_name(D));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(codes, 4); e.out(res_out, 5); e.out(scale, 6);
+  e.bytes(M, 7); e.bytes(eps, 8);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_layernorm_add_per_block(E& e, typename E::in_t x, typename E::in_t r, typename E::in_t w,
+                                    typename E::in_t b, typename E::out_t codes,
+                                    typename E::out_t res_out, typename E::out_t scale, uint32_t M,
+                                    int D, float eps, bool int8, int ue8m0) {
+  e.pipeline(layernorm_add_per_block_kernel_name(D, int8));
+  e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(codes, 4); e.out(res_out, 5); e.out(scale, 6);
+  e.bytes(M, 7); e.bytes(eps, 8); e.bytes(ue8m0, 9);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 template <class E>

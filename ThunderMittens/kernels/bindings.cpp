@@ -286,6 +286,31 @@ NB_MODULE(_ext, m) {
       "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(fused residual-add + layernorm + dynamic per-row fp8. Returns (codes, x+residual, scale).)");
+    m.def(
+      "layernorm_add_int8_dyn", &layernorm_add_int8_dyn,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + layernorm + dynamic per-row int8. Returns (codes, x+residual, scale).)");
+    m.def(
+      "rms_norm_add_per_block_fp8", &rms_norm_add_per_block_fp8,
+      "x"_a, "residual"_a, "weight"_a, "eps"_a, "ue8m0"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + rms_norm + per-128-block fp8. Returns (codes, x+residual, scale (rows,D/128)).)");
+    m.def(
+      "rms_norm_add_per_block_int8", &rms_norm_add_per_block_int8,
+      "x"_a, "residual"_a, "weight"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + rms_norm + per-128-block int8. Returns (codes, x+residual, scale (rows,D/128)).)");
+    m.def(
+      "layernorm_add_per_block_fp8", &layernorm_add_per_block_fp8,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a, "ue8m0"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + layernorm + per-128-block fp8. Returns (codes, x+residual, scale (rows,D/128)).)");
+    m.def(
+      "layernorm_add_per_block_int8", &layernorm_add_per_block_int8,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a, "eps"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused residual-add + layernorm + per-128-block int8. Returns (codes, x+residual, scale (rows,D/128)).)");
 
     m.def(
       "rope_kv_insert",

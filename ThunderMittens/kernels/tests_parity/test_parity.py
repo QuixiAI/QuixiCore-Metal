@@ -1424,6 +1424,29 @@ def test_rms_norm_add_fp8_parity(shape):
     _assert_parity(sm, st, atol=1e-4)
 
 
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 512)])
+def test_norm_quant_wave10_parity(shape):
+    D = shape[-1]
+    rng = np.random.default_rng(11)
+    x = rng.standard_normal(shape).astype(np.float32)
+    r = rng.standard_normal(shape).astype(np.float32)
+    w = rng.standard_normal((D,)).astype(np.float32)
+    b = (0.1 * rng.standard_normal((D,))).astype(np.float32)
+    ml = lambda a: _mk(a, "mlx")
+    to = lambda a: _mk(a, "torch")
+    # per-block int8 / fp8 (rms) and layernorm int8 dyn. Codes off-by-one across the two
+    # separately-compiled metallibs (fp32 rsqrt rounding); scales last-ulp.
+    for kw in [{"int8": True}, {"int8": False}, {"int8": False, "ue8m0": True}]:
+        cm, am, sm = tk.rms_norm_add_per_block(ml(x), ml(r), ml(w), **kw)
+        ct, at, st = tk.rms_norm_add_per_block(to(x), to(r), to(w), **kw)
+        _assert_parity(cm, ct, atol=1)
+        _assert_parity(sm, st, atol=1e-4)
+    cm, am, sm = tk.layernorm_add_int8(ml(x), ml(r), ml(w), ml(b))
+    ct, at, st = tk.layernorm_add_int8(to(x), to(r), to(w), to(b))
+    _assert_parity(cm, ct, atol=1)
+    _assert_parity(sm, st, atol=1e-4)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_layernorm_add_parity(shape):
     D = shape[-1]

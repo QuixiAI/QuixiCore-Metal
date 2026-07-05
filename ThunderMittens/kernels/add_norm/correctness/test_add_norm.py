@@ -176,3 +176,110 @@ def test_rms_norm_add_backward(D):
     assert np.allclose(np.array(dx), dh, atol=2e-3)
     assert np.allclose(np.array(dresidual), dh, atol=2e-3)       # dx IS dresidual
     assert np.allclose(np.array(dweight), dw_ref, atol=2e-3)
+
+
+# ---------------------------------------------------------------------------
+# Wave-10: fused norm -> per-block quant + LayerNorm int8. The normed value is
+# exp-free, so given the kernel's bf16-rounded (x+residual) the int8 codes are
+# BIT-EXACT vs a numpy twin; fp8 uses a half-ulp reconstruction bound. Per-block
+# emits (rows, D/128) group scales.
+# ---------------------------------------------------------------------------
+import tk as _tk
+from tk.quant import _e4m3_decode_arr as _dec
+
+_BLK_SHAPES = [(2, 64, 512), (1, 256, 768), (8, 256), (4, 128, 1024)]
+
+
+# The kernel normalizes the fp32 register sum (not the bf16-rounded res_out); res_out is the
+# bf16-rounded sum. Weight/bias arrive as bf16. Twin computes both in fp32.
+def _normed_rms(x, r, w, eps=1e-5):
+    s = (mx.array(x).astype(mx.bfloat16).astype(mx.float32)
+         + mx.array(r).astype(mx.bfloat16).astype(mx.float32))
+    added = np.array(s.astype(mx.bfloat16).astype(mx.float32))
+    ms = (s * s).mean(-1, keepdims=True)
+    y = s * mx.rsqrt(ms + eps) * mx.array(w).astype(mx.bfloat16).astype(mx.float32)
+    return np.array(y), added
+
+
+def _normed_ln(x, r, w, b, eps=1e-5):
+    s = (mx.array(x).astype(mx.bfloat16).astype(mx.float32)
+         + mx.array(r).astype(mx.bfloat16).astype(mx.float32))
+    added = np.array(s.astype(mx.bfloat16).astype(mx.float32))
+    mean = s.mean(-1, keepdims=True)
+    var = ((s - mean) ** 2).mean(-1, keepdims=True)
+    y = ((s - mean) * mx.rsqrt(var + eps) * mx.array(w).astype(mx.bfloat16).astype(mx.float32)
+         + mx.array(b).astype(mx.bfloat16).astype(mx.float32))
+    return np.array(y), added
+
+
+@pytest.mark.parametrize("shape", [(2, 64, 512), (8, 256), (4, 128, 1024)])
+def test_layernorm_add_int8_dyn(shape):
+    D = shape[-1]
+    mx.random.seed(3)
+    x = mx.random.normal(shape).astype(mx.bfloat16)
+    r = mx.random.normal(shape).astype(mx.bfloat16)
+    w = mx.random.normal((D,)).astype(mx.bfloat16)
+    b = (0.1 * mx.random.normal((D,))).astype(mx.bfloat16)
+    codes, added, scale = _tk.layernorm_add_int8(x, r, w, b)
+    mx.eval(codes, added, scale)
+    y, added_ref = _normed_ln(x, r, w, b)
+    yf = y.reshape(-1, D)
+    s = np.abs(yf).max(-1) / 127.0
+    inv = np.where(s > 0, 1.0 / s, 0.0)
+    ref = np.clip(np.rint(yf * inv[:, None]), -128, 127).astype(np.int8)
+    got = np.array(codes).reshape(-1, D).astype(np.int32)
+    # off-by-one where the fp32 rsqrt/weight chain flips a borderline int8 rounding
+    assert np.abs(got - ref.astype(np.int32)).max() <= 1 and (got == ref).mean() > 0.97
+    np.testing.assert_allclose(np.array(scale).reshape(-1), s, rtol=2e-2)
+    np.testing.assert_array_equal(np.array(added.astype(mx.float32)), added_ref.astype(np.float32))
+
+
+@pytest.mark.parametrize("shape", _BLK_SHAPES)
+@pytest.mark.parametrize("norm", ["rms", "ln"])
+def test_per_block_int8(shape, norm):
+    D = shape[-1]
+    G = 128
+    mx.random.seed(4)
+    x = mx.random.normal(shape).astype(mx.bfloat16)
+    r = mx.random.normal(shape).astype(mx.bfloat16)
+    w = mx.random.normal((D,)).astype(mx.bfloat16)
+    b = (0.1 * mx.random.normal((D,))).astype(mx.bfloat16)
+    if norm == "rms":
+        codes, added, scale = _tk.rms_norm_add_per_block(x, r, w, int8=True)
+        y, _ = _normed_rms(x, r, w)
+    else:
+        codes, added, scale = _tk.layernorm_add_per_block(x, r, w, b, int8=True)
+        y, _ = _normed_ln(x, r, w, b)
+    mx.eval(codes, added, scale)
+    rows = int(np.prod(shape[:-1]))
+    yb = y.reshape(rows, D // G, G)
+    s = np.abs(yb).max(-1) / 127.0                       # (rows, D/G)
+    inv = np.where(s > 0, 1.0 / s, 0.0)
+    ref = np.clip(np.rint(yb * inv[..., None]), -128, 127).astype(np.int8).reshape(rows, D)
+    assert np.array(scale).reshape(rows, D // G).shape == (rows, D // G)
+    got = np.array(codes).reshape(rows, D).astype(np.int32)
+    assert np.abs(got - ref.astype(np.int32)).max() <= 1 and (got == ref).mean() > 0.97
+    np.testing.assert_allclose(np.array(scale).reshape(rows, D // G), s, rtol=2e-2)
+
+
+@pytest.mark.parametrize("shape", _BLK_SHAPES)
+@pytest.mark.parametrize("ue8m0", [False, True])
+def test_per_block_fp8(shape, ue8m0):
+    D = shape[-1]
+    G = 128
+    mx.random.seed(5)
+    x = mx.random.normal(shape).astype(mx.bfloat16)
+    r = mx.random.normal(shape).astype(mx.bfloat16)
+    w = mx.random.normal((D,)).astype(mx.bfloat16)
+    codes, added, scale = _tk.rms_norm_add_per_block(x, r, w, int8=False, ue8m0=ue8m0)
+    mx.eval(codes, added, scale)
+    y, _ = _normed_rms(x, r, w)
+    rows = int(np.prod(shape[:-1]))
+    yb = y.reshape(rows, D // G, G)
+    sn = np.array(scale).reshape(rows, D // G)
+    assert (sn * 448.0 >= np.abs(yb).max(-1) - 1e-2).all()          # covers block amax
+    if ue8m0:
+        exp = np.log2(np.where(sn > 0, sn, 1.0))
+        np.testing.assert_array_equal(exp, np.round(exp))           # power-of-two scales
+    recon = sn[..., None] * _dec(np.array(codes).reshape(rows, D // G, G))
+    assert (np.abs(recon - yb) <= np.abs(yb) * 2.0 ** -4 + sn[..., None] * 2.0 ** -6 + 5e-2).all()

@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion (2026-07-05)
+
+Completed the fused-add-norm quant matrix in kernels/add_norm/ (metal-forge
+normalization/layer_norm_quant.metal): layernorm_add_int8_dyn (the one-off int8 LayerNorm gap)
+plus per-128-block fp8/int8 for BOTH rms_add and layernorm_add. The per-block variant emits
+(rows, D/128) group scales directly, so its codes feed the block-quant expert GEMMs
+(moe_grouped_gemm_*_q) with no separate quantize_per_group pass. Novel piece: the per-128-block
+amax in the rv_fl<D> register layout — with G=128 (compile-time, canonical) each lane's w-th
+element lives in block w/4 independent of lane, so per-block absmax is a simd_max over WPB=4
+consecutive w (register-resident, no threadgroup scratch, unlike the reference's group_max[256]).
+Extended the AddNormFp8 primitive with group_size_/ue8m0_; fp8 gets the ue8m0 power-of-two option.
+
+- Tests: int8 codes off-by-one vs a numpy twin (fp32 rsqrt/weight chain flips borderline codes;
+  res_out bit-exact); fp8 half-ulp reconstruction + power-of-two/coverage; 41 add_norm green +
+  parity (codes atol=1 across the two metallibs, scales 1e-4).
+- Perf: the fusion IS the optimization (register-resident single-simdgroup). Fused per-block int8
+  = 1.6x the unfused rms_norm_add -> quantize_per_group chain (16384x1024: 0.287 vs 0.456 ms;
+  65536x768: 0.839 vs 1.396 ms) — eliminates the (N,D) bf16 round-trip. No further opt needed.
+- Deferred (documented): standalone non-add norm-quant, scale_ub clamp, block sizes != 128.
+
 ## Wave-9 — optimization pass over the gap-port kernels (2026-07-05)
 
 Measure-first sweep over the 12 new kernel families. The clean finding: the **bf16-I/O**

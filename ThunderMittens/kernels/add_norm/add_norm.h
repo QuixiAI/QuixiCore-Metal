@@ -61,6 +61,25 @@ std::vector<array> layernorm_add_fp8(
 std::vector<array> layernorm_add_fp8_dyn(
     const array& x, const array& residual, const array& weight, const array& bias, float eps,
     StreamOrDevice s = {});
+/** int8 sibling of layernorm_add_fp8_dyn. Returns (codes int8, x+residual, scale (rows,) f32). */
+std::vector<array> layernorm_add_int8_dyn(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    StreamOrDevice s = {});
+
+/** Per-block (per-128-group) dynamic norm-quant: the block-quant GEMM activation layout fused
+ *  into the residual-add norm. Returns [codes, x+residual, scale (rows, D/128) f32]. fp8 gets an
+ *  optional ue8m0 power-of-two scale. D % 128 == 0. */
+std::vector<array> rms_norm_add_per_block_fp8(
+    const array& x, const array& residual, const array& weight, float eps, bool ue8m0 = false,
+    StreamOrDevice s = {});
+std::vector<array> rms_norm_add_per_block_int8(
+    const array& x, const array& residual, const array& weight, float eps, StreamOrDevice s = {});
+std::vector<array> layernorm_add_per_block_fp8(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    bool ue8m0 = false, StreamOrDevice s = {});
+std::vector<array> layernorm_add_per_block_int8(
+    const array& x, const array& residual, const array& weight, const array& bias, float eps,
+    StreamOrDevice s = {});
 
 ///////////////////////////////////////////////////////////////////////////////
 // Primitives
@@ -68,10 +87,11 @@ std::vector<array> layernorm_add_fp8_dyn(
 
 class AddNormFp8 : public Primitive {
  public:
+  // group_size 0 = per-row dynamic; >0 = per-block (canonical 128). ue8m0 applies to fp8 per-block.
   AddNormFp8(Stream stream, bool layernorm, bool dynamic, float eps, float inv_scale,
-             bool int8q = false)
+             bool int8q = false, int group_size = 0, bool ue8m0 = false)
     : Primitive(stream), layernorm_(layernorm), dynamic_(dynamic), eps_(eps),
-      inv_scale_(inv_scale), int8_(int8q) {};
+      inv_scale_(inv_scale), int8_(int8q), group_size_(group_size), ue8m0_(ue8m0) {};
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(
@@ -86,13 +106,16 @@ class AddNormFp8 : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const AddNormFp8&>(other);
     return layernorm_ == o.layernorm_ && dynamic_ == o.dynamic_ && eps_ == o.eps_ &&
-        inv_scale_ == o.inv_scale_ && int8_ == o.int8_;
+        inv_scale_ == o.inv_scale_ && int8_ == o.int8_ && group_size_ == o.group_size_ &&
+        ue8m0_ == o.ue8m0_;
   }
 
  private:
   bool layernorm_, dynamic_;
   float eps_, inv_scale_;
   bool int8_;
+  int group_size_ = 0;
+  bool ue8m0_ = false;
 };
 
 class RMSNormAdd : public Primitive {
