@@ -106,6 +106,49 @@ std::vector<array> kv_cache_gather(
       {key_c, value_c, block_c, lens_c});
 }
 
+std::vector<array> kv_cache_gather_fp8(
+    const array& key_cache, const array& value_cache, const array& block_table,
+    const array& cu_seq_lens, const array& k_scale, const array& v_scale, int num_tokens,
+    int fmt, StreamOrDevice s) {
+  if (key_cache.ndim() != 4 || value_cache.shape() != key_cache.shape()) {
+    throw std::invalid_argument(
+        "kv_cache_gather_fp8: caches must be (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (block_table.ndim() != 2 || cu_seq_lens.ndim() != 1 ||
+      cu_seq_lens.shape(0) != block_table.shape(0) + 1) {
+    throw std::invalid_argument("kv_cache_gather_fp8: block_table (seqs, max_blocks), cu_seq_lens (seqs+1,)");
+  }
+  const int H = key_cache.shape(2);
+  const int D = key_cache.shape(3);
+  std::vector<int> out_shape = {num_tokens, H, D};
+  return array::make_arrays(
+      {out_shape, out_shape},
+      {bfloat16, bfloat16},
+      std::make_shared<KvCacheGatherFp8>(to_stream(s), num_tokens, fmt),
+      {contiguous(astype(key_cache, uint8, s), false, s),
+       contiguous(astype(value_cache, uint8, s), false, s),
+       contiguous(astype(block_table, int32, s), false, s),
+       contiguous(astype(cu_seq_lens, int32, s), false, s),
+       contiguous(astype(k_scale, float32, s), false, s),
+       contiguous(astype(v_scale, float32, s), false, s)});
+}
+
+std::vector<array> kv_cache_scale_update(
+    const array& key, const array& value, const array& old_key_scale,
+    const array& old_value_scale, StreamOrDevice s) {
+  if (key.shape() != value.shape()) {
+    throw std::invalid_argument("kv_cache_scale_update: key and value must have the same shape");
+  }
+  const auto dtype = promoted_float_dtype(key, value, "kv_cache_scale_update");
+  return array::make_arrays(
+      {{1}, {1}},
+      {float32, float32},
+      std::make_shared<KvCacheScaleUpdate>(to_stream(s)),
+      {contiguous_cast(key, dtype, s), contiguous_cast(value, dtype, s),
+       contiguous(astype(old_key_scale, float32, s), false, s),
+       contiguous(astype(old_value_scale, float32, s), false, s)});
+}
+
 std::vector<array> kv_cache_copy_blocks(
     const array& key_cache,
     const array& value_cache,
@@ -578,6 +621,38 @@ void KvCacheGather::eval_gpu(
       type_to_name(key_cache));
 }
 
+void KvCacheGatherFp8::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  outputs[0].set_data(allocator::malloc_or_wait(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc_or_wait(outputs[1].nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  auto& key_cache = inputs[0];
+  tk::launch_kv_cache_gather_fp8(
+      enc, key_cache, inputs[1], outputs[0], outputs[1], inputs[2], inputs[3], inputs[4],
+      inputs[5], num_tokens_, inputs[3].shape(0) - 1, key_cache.shape(1), inputs[2].shape(1),
+      key_cache.shape(2), key_cache.shape(3), fmt_, "bfloat16");
+}
+void KvCacheGatherFp8::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheGatherFp8 has no CPU implementation.");
+}
+
+void KvCacheScaleUpdate::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  outputs[0].set_data(allocator::malloc_or_wait(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc_or_wait(outputs[1].nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_kv_cache_scale_update(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1],
+      static_cast<uint64_t>(inputs[0].size()), type_to_name(inputs[0]));
+}
+void KvCacheScaleUpdate::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheScaleUpdate has no CPU implementation.");
+}
+
 void KvCacheCopyBlocks::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("KvCacheCopyBlocks has no CPU implementation.");
 }
@@ -905,6 +980,8 @@ TK_KV_NO_AUTODIFF(KvCacheScatter, "KvCacheScatter")
 TK_KV_NO_AUTODIFF(KvCacheScatterFp8, "KvCacheScatterFp8")
 TK_KV_NO_AUTODIFF(PagedAttentionFp8, "PagedAttentionFp8")
 TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
+TK_KV_NO_AUTODIFF(KvCacheGatherFp8, "KvCacheGatherFp8")
+TK_KV_NO_AUTODIFF(KvCacheScaleUpdate, "KvCacheScaleUpdate")
 TK_KV_NO_AUTODIFF(KvCacheCopyBlocks, "KvCacheCopyBlocks")
 TK_KV_NO_AUTODIFF(BeamBuildCopyPairs, "BeamBuildCopyPairs")
 TK_KV_NO_AUTODIFF(BeamRemapBlockTable, "BeamRemapBlockTable")

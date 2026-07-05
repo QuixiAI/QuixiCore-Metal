@@ -1274,6 +1274,30 @@ def fftconv_cases(be, preset, formats):
 
 
 # --------------------------------------------------------------------------- serving kernels
+@register("kv_gather_fp8")
+def kv_gather_fp8_cases(be, preset, formats):
+    """fp8 KV gather + upconvert (reads 1-byte codes) vs bf16 gather (reads 2-byte). The read
+    path for a paged fp8 prefix cache; the win is halving the cache read bandwidth."""
+    tk = be.tk()
+    rng = np.random.default_rng(241)
+    for nb, bs, H, D in _pick(preset, [(64, 16, 8, 128)], [(256, 16, 8, 128)],
+                              [(512, 16, 8, 128), (1024, 16, 8, 128)]):
+        total = nb * bs
+        K = (0.3 * rng.standard_normal((total, H, D))).astype(np.float32)
+        V = (0.3 * rng.standard_normal((total, H, D))).astype(np.float32)
+        ks = float(np.abs(K).max() / 448.0)
+        vs = float(np.abs(V).max() / 448.0)
+        kc, vc = tk.kv_cache_scatter_fp8(be.array(K, "bf16"), be.array(V, "bf16"),
+                                         be.int_array(np.arange(total, dtype=np.int64)), nb, bs, ks, vs)
+        bt = be.int_array(np.arange(nb, dtype=np.int32).reshape(1, nb))
+        cu = be.int_array(np.array([0, total], np.int32))
+        ksa, vsa = be.array(np.full((H,), ks, np.float32), "f32"), be.array(np.full((H,), vs, np.float32), "f32")
+        yield Case("kv_gather_fp8", f"nb{nb}_H{H}_D{D}", {"nb": nb, "H": H, "D": D}, "fp8",
+                   target=lambda kc=kc, vc=vc, bt=bt, cu=cu, ksa=ksa, vsa=vsa, t=total:
+                       tk.kv_cache_gather_fp8(kc, vc, bt, cu, ksa, vsa, t)[0],
+                   baselines={}, ref=None, bytes_moved=float(2 * total * H * D * 1))
+
+
 @register("paged_attn")
 def paged_attn_cases(be, preset, formats):
     tk = be.tk()

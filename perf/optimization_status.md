@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-10 K2: fp8 KV gather+upconvert + incremental scale update (2026-07-05)
+
+Extended kernels/kv_cache/ (metal-forge cache/gather_kv_cache.metal + kv_scale_update.metal,
+credit AlpinDale) to close the fp8 KV loop. kv_cache_gather_fp8<OUT_T>: the READ path for a
+paged fp8 prefix cache — reads e4m3/e5m2 code bytes and dequantizes to bf16 via
+code * scale[kv_head] (per-kv_head scales, round-trips exactly with kv_cache_scatter_fp8),
+same worklist as kv_cache_gather (one TG/token, cu_seq_lens binary search, block<0 zero-fill),
+fmt runtime scalar. kv_cache_scale_update: incremental per-tensor running-max (new = max(old,
+absmax/240)) — the streaming-decode analogue of the one-shot kv_cache_scales; single 256-thread
+threadgroup, no atomics needed for the scalar (grid-stride reduction seeds from the old value).
+
+- Tests: scatter_fp8 -> gather_fp8 round-trip (== decode(code)*scale exactly, within fp8
+  relative precision of the original K, e4m3 + e5m2); scale_update vs numpy running-max
+  (only-raises verified); 154 kv_cache green + parity (bf16 rows 2e-2, scales 1e-5).
+- Perf: bandwidth-bound read path, reads 1-byte codes vs the bf16 gather's 2-byte (halved
+  cache read bandwidth); nb256 gather 0.104 ms. Same near-optimal one-TG/token coalesced
+  structure as kv_cache_gather — no further opt.
+- Deferred (documented): per-tensor (vs per-kv_head) fp8 gather variant; the MLA-cache
+  upconvert-gather (cp_gather_upconvert_fp8_mla — different 656-byte cache layout).
+
 ## Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion (2026-07-05)
 
 Completed the fused-add-norm quant matrix in kernels/add_norm/ (metal-forge

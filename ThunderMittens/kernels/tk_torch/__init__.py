@@ -343,6 +343,18 @@ def kv_cache_gather(key_cache: torch.Tensor, value_cache: torch.Tensor,
     return _ext.kv_cache_gather(key_cache, value_cache, block_table, cu_seq_lens, int(num_tokens))
 
 
+def kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scale, v_scale,
+                        num_tokens, fmt=0):
+    """fp8 KV gather + upconvert to bf16 (per-kv_head scales). Returns (key_out, value_out). MPS."""
+    return _ext.kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scale,
+                                    v_scale, int(num_tokens), int(fmt))
+
+
+def kv_cache_scale_update(key, value, old_key_scale, old_value_scale):
+    """Incremental per-tensor KV scale running-max update. Returns (new_key_scale, new_value_scale). MPS."""
+    return _ext.kv_cache_scale_update(key, value, old_key_scale, old_value_scale)
+
+
 def kv_cache_copy_blocks(key_cache: torch.Tensor, value_cache: torch.Tensor,
                          block_mapping: torch.Tensor):
     """Copy paged KV cache blocks according to (src, dst) pairs. MPS tensors."""

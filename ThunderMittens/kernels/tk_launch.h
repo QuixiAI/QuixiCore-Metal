@@ -1350,6 +1350,37 @@ void launch_kv_cache_gather(
   e.dispatch(num_tokens, 1, 1, 256, 1, 1);
 }
 
+// ----- fp8 KV gather + upconvert: uchar caches@0,1 -> bf16 out@2,3 ; block_table@4 cu_seq_lens@5
+//        k_scale@6 v_scale@7 (per-kv_head) ; scalars num_tokens@8..head_size@13 fmt@14. -----
+template <class E>
+void launch_kv_cache_gather_fp8(
+    E& e, typename E::in_t key_cache, typename E::in_t value_cache, typename E::out_t key_out,
+    typename E::out_t value_out, typename E::in_t block_table, typename E::in_t cu_seq_lens,
+    typename E::in_t k_scale, typename E::in_t v_scale, int num_tokens, int num_seqs,
+    int block_size, int block_table_stride, int num_heads, int head_size, int fmt,
+    const std::string& out_type_name) {
+  e.pipeline("kv_cache_gather_fp8_" + out_type_name);
+  e.in(key_cache, 0); e.in(value_cache, 1); e.out(key_out, 2); e.out(value_out, 3);
+  e.in(block_table, 4); e.in(cu_seq_lens, 5); e.in(k_scale, 6); e.in(v_scale, 7);
+  e.bytes(num_tokens, 8); e.bytes(num_seqs, 9); e.bytes(block_size, 10);
+  e.bytes(block_table_stride, 11); e.bytes(num_heads, 12); e.bytes(head_size, 13);
+  e.bytes(fmt, 14);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+// ----- incremental KV scale update (running max): key@0 value@1 old_k@2 old_v@3 -> new_k@4
+//        new_v@5 ; n@6. Single 256-thread threadgroup. -----
+template <class E>
+void launch_kv_cache_scale_update(
+    E& e, typename E::in_t key, typename E::in_t value, typename E::in_t old_key_scale,
+    typename E::in_t old_value_scale, typename E::out_t new_key_scale,
+    typename E::out_t new_value_scale, uint64_t n, const std::string& type_name) {
+  e.pipeline("kv_cache_scale_update_" + type_name);
+  e.in(key, 0); e.in(value, 1); e.in(old_key_scale, 2); e.in(old_value_scale, 3);
+  e.out(new_key_scale, 4); e.out(new_value_scale, 5); e.bytes(n, 6);
+  e.dispatch(1, 1, 1, 256, 1, 1);
+}
+
 // ----- KV cache clone: key_cache@0 value_cache@1 -> key_out@2 value_out@3 ; n@4. -----
 template <class E>
 void launch_kv_cache_clone(

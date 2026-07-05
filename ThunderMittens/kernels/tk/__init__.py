@@ -599,6 +599,30 @@ def kv_cache_scales(key, value):
     return _mlx().kv_cache_scales(key, value)
 
 
+def kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scale, v_scale,
+                        num_tokens, fmt=0):
+    """fp8 KV gather + upconvert — the read path for a paged fp8 prefix cache. Reads e4m3
+    (fmt=0) or e5m2 (fmt=1) codes and dequantizes to bf16 via code * scale[kv_head]; the
+    per-kv_head scales round-trip with tk.kv_cache_scatter_fp8. Caches are uint8
+    (num_blocks, block_size, num_kv_heads, head_size); k_scale/v_scale are (num_kv_heads,).
+    Returns (key_out, value_out) bf16 (num_tokens, num_kv_heads, head_size). Accepts
+    mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(key_cache):
+        return _torch().kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens,
+                                            k_scale, v_scale, num_tokens, fmt)
+    return _mlx().kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens,
+                                      k_scale, v_scale, int(num_tokens), int(fmt))
+
+
+def kv_cache_scale_update(key, value, old_key_scale, old_value_scale):
+    """Incremental per-tensor KV scale update (running max): new = max(old, absmax/240) — the
+    streaming-decode analogue of kv_cache_scales. Returns (new_key_scale, new_value_scale)
+    (1,) f32. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(key):
+        return _torch().kv_cache_scale_update(key, value, old_key_scale, old_value_scale)
+    return _mlx().kv_cache_scale_update(key, value, old_key_scale, old_value_scale)
+
+
 def paged_attention(q, key_cache, value_cache, block_table, context_lens, scale=0.0, window=0):
     """Decode paged attention. q/out (B,H,D), caches (num_blocks, block_size, H, D).
     window > 0 restricts to the `window` most recent keys (Mistral sliding window)."""

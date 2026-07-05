@@ -605,6 +605,99 @@ kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// fp8 KV gather + upconvert: the read path for a paged fp8 prefix cache. Reads
+// e4m3/e5m2 code bytes from the paged cache and dequantizes to OUT_T (bf16) via
+// tk_e4m3/e5m2_decode(code) * scale[kv_head] — per-kv_head scales so it round-trips
+// exactly with kv_cache_scatter_fp8. Same worklist as kv_cache_gather (one TG per
+// token, cu_seq_lens binary search, block<0 zero-fill). fmt 0=e4m3, 1=e5m2.
+// ---------------------------------------------------------------------------
+template <typename OUT_T>
+kernel void kv_cache_gather_fp8(device const uchar *key_cache [[buffer(0)]],
+                                device const uchar *value_cache [[buffer(1)]],
+                                device OUT_T *key_out [[buffer(2)]],
+                                device OUT_T *value_out [[buffer(3)]],
+                                device const int *block_table [[buffer(4)]],
+                                device const int *cu_seq_lens [[buffer(5)]],
+                                device const float *k_scale [[buffer(6)]],
+                                device const float *v_scale [[buffer(7)]],
+                                constant int &num_tokens [[buffer(8)]],
+                                constant int &num_seqs [[buffer(9)]],
+                                constant int &block_size [[buffer(10)]],
+                                constant int &block_table_stride [[buffer(11)]],
+                                constant int &num_heads [[buffer(12)]],
+                                constant int &head_size [[buffer(13)]],
+                                constant int &fmt [[buffer(14)]],
+                                uint token [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tptg [[threads_per_threadgroup]]) {
+    if ((int)token >= num_tokens) { return; }
+    int lo = 0, hi = num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (cu_seq_lens[mid] <= (int)token) lo = mid; else hi = mid - 1;
+    }
+    const int batch = lo;
+    const int local_token = (int)token - cu_seq_lens[batch];
+    const int table_col = local_token / block_size;
+    const int slot = local_token % block_size;
+    const int block = block_table[batch * block_table_stride + table_col];
+    const int row_elems = num_heads * head_size;
+    const long out_base = (long)token * row_elems;
+    if (block < 0) {
+        for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+            key_out[out_base + i] = OUT_T(0);
+            value_out[out_base + i] = OUT_T(0);
+        }
+        return;
+    }
+    const long cache_base = (((long)block * block_size + slot) * num_heads) * head_size;
+    for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+        const int kv_head = i / head_size;
+        const uchar kc = key_cache[cache_base + i];
+        const uchar vc = value_cache[cache_base + i];
+        const float kd = fmt == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
+        const float vd = fmt == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
+        key_out[out_base + i] = OUT_T(kd * k_scale[kv_head]);
+        value_out[out_base + i] = OUT_T(vd * v_scale[kv_head]);
+    }
+}
+
+// Incremental per-tensor KV scale update (running max). Seeds from the existing scale and
+// only raises it: new = max(old, absmax(k or v)/240). Single 256-thread threadgroup
+// (grid-stride), same reduction as kv_cache_scales — no atomics needed for the scalar.
+template <typename T>
+kernel void kv_cache_scale_update(device const T *key [[buffer(0)]],
+                                  device const T *value [[buffer(1)]],
+                                  device const float *old_key_scale [[buffer(2)]],
+                                  device const float *old_value_scale [[buffer(3)]],
+                                  device float *new_key_scale [[buffer(4)]],
+                                  device float *new_value_scale [[buffer(5)]],
+                                  constant ulong &n [[buffer(6)]],
+                                  uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float shared_key[256];
+    threadgroup float shared_value[256];
+    float key_max = 0.0f, value_max = 0.0f;
+    for (ulong i = tid; i < n; i += 256) {
+        key_max = max(key_max, abs(float(key[i])));
+        value_max = max(value_max, abs(float(value[i])));
+    }
+    shared_key[tid] = key_max;
+    shared_value[tid] = value_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            shared_key[tid] = max(shared_key[tid], shared_key[tid + stride]);
+            shared_value[tid] = max(shared_value[tid], shared_value[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) {
+        new_key_scale[0] = max(old_key_scale[0], shared_key[0] / 240.0f);
+        new_value_scale[0] = max(old_value_scale[0], shared_value[0] / 240.0f);
+    }
+}
+
 #define instantiate_kv_cache_scatter_fp8(type_name, T)                        \
   template [[host_name("kv_cache_scatter_fp8_" #type_name)]] [[kernel]] void  \
   kv_cache_scatter_fp8<T>(device const T *key [[buffer(0)]],                  \
@@ -620,7 +713,35 @@ kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
                           constant int &fmt [[buffer(10)]],                   \
                           uint token [[threadgroup_position_in_grid]],        \
                           uint tid [[thread_position_in_threadgroup]],        \
-                          uint tptg [[threads_per_threadgroup]]);
+                          uint tptg [[threads_per_threadgroup]]);             \
+  template [[host_name("kv_cache_gather_fp8_" #type_name)]] [[kernel]] void   \
+  kv_cache_gather_fp8<T>(device const uchar *key_cache [[buffer(0)]],         \
+                         device const uchar *value_cache [[buffer(1)]],       \
+                         device T *key_out [[buffer(2)]],                     \
+                         device T *value_out [[buffer(3)]],                   \
+                         device const int *block_table [[buffer(4)]],         \
+                         device const int *cu_seq_lens [[buffer(5)]],         \
+                         device const float *k_scale [[buffer(6)]],           \
+                         device const float *v_scale [[buffer(7)]],           \
+                         constant int &num_tokens [[buffer(8)]],              \
+                         constant int &num_seqs [[buffer(9)]],                \
+                         constant int &block_size [[buffer(10)]],             \
+                         constant int &block_table_stride [[buffer(11)]],     \
+                         constant int &num_heads [[buffer(12)]],              \
+                         constant int &head_size [[buffer(13)]],              \
+                         constant int &fmt [[buffer(14)]],                    \
+                         uint token [[threadgroup_position_in_grid]],         \
+                         uint tid [[thread_position_in_threadgroup]],         \
+                         uint tptg [[threads_per_threadgroup]]);              \
+  template [[host_name("kv_cache_scale_update_" #type_name)]] [[kernel]] void \
+  kv_cache_scale_update<T>(device const T *key [[buffer(0)]],                 \
+                           device const T *value [[buffer(1)]],               \
+                           device const float *old_key_scale [[buffer(2)]],   \
+                           device const float *old_value_scale [[buffer(3)]], \
+                           device float *new_key_scale [[buffer(4)]],         \
+                           device float *new_value_scale [[buffer(5)]],       \
+                           constant ulong &n [[buffer(6)]],                   \
+                           uint tid [[thread_position_in_threadgroup]]);
 
 #define instantiate_paged_attention_fp8(type_name, T, DVAL)                   \
   template [[host_name("paged_attention_fp8_" #type_name "_" #DVAL)]]         \

@@ -931,6 +931,44 @@ static std::tuple<at::Tensor, at::Tensor> kv_cache_scales_mps(
   return {key_scale, value_scale};
 }
 
+static std::tuple<at::Tensor, at::Tensor> kv_cache_gather_fp8_mps(
+    const at::Tensor& kc_in, const at::Tensor& vc_in, const at::Tensor& bt_in,
+    const at::Tensor& cu_in, const at::Tensor& ks_in, const at::Tensor& vs_in,
+    int64_t num_tokens, int64_t fmt) {
+  TORCH_CHECK(kc_in.device().is_mps() && kc_in.dim() == 4 && vc_in.sizes() == kc_in.sizes(),
+              "kv_cache_gather_fp8: caches must be (num_blocks, block_size, num_kv_heads, head_size)");
+  auto kc = kc_in.to(at::kByte).contiguous(), vc = vc_in.to(at::kByte).contiguous();
+  auto bt = bt_in.to(at::kInt).contiguous(), cu = cu_in.to(at::kInt).contiguous();
+  auto ks = ks_in.to(at::kFloat).contiguous(), vs = vs_in.to(at::kFloat).contiguous();
+  const int H = kc.size(2), D = kc.size(3);
+  auto opts = at::TensorOptions().dtype(at::kBFloat16).device(kc.device());
+  auto key_out = at::empty({num_tokens, H, D}, opts);
+  auto value_out = at::empty({num_tokens, H, D}, opts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_gather_fp8(e, kc, vc, key_out, value_out, bt, cu, ks, vs,
+                                   (int)num_tokens, (int)(cu.size(0) - 1), (int)kc.size(1),
+                                   (int)bt.size(1), H, D, (int)fmt, "bfloat16");
+  });
+  return {key_out, value_out};
+}
+
+static std::tuple<at::Tensor, at::Tensor> kv_cache_scale_update_mps(
+    const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& oks_in,
+    const at::Tensor& ovs_in) {
+  TORCH_CHECK(key_in.device().is_mps() && key_in.sizes() == value_in.sizes() &&
+                  tk_is_float_dtype(key_in),
+              "kv_cache_scale_update: key/value must be same-shape float MPS tensors");
+  auto key = key_in.contiguous(), value = value_in.contiguous();
+  auto oks = oks_in.to(at::kFloat).contiguous(), ovs = ovs_in.to(at::kFloat).contiguous();
+  auto nks = at::empty({1}, key.options().dtype(at::kFloat));
+  auto nvs = at::empty({1}, key.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_scale_update(e, key, value, oks, ovs, nks, nvs,
+                                     (uint64_t)key.numel(), tk_type_name(key));
+  });
+  return {nks, nvs};
+}
+
 // fp8 KV cache: scatter K/V into a uint8 (e4m3) paged cache with per-tensor scales.
 static std::tuple<at::Tensor, at::Tensor> kv_cache_scatter_fp8_mps(
     const at::Tensor& key_in, const at::Tensor& value_in, const at::Tensor& slot_in,
@@ -3819,6 +3857,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("beam_build_copy_pairs", &beam_build_copy_pairs_mps, "ThunderMittens beam KV reorder copy-pair builder (MPS)");
   m.def("beam_remap_block_table", &beam_remap_block_table_mps, "ThunderMittens zero-copy beam block-table remap (MPS)");
   m.def("kv_cache_scales", &kv_cache_scales_mps, "ThunderMittens KV cache fp8 scales (MPS)");
+  m.def("kv_cache_gather_fp8", &kv_cache_gather_fp8_mps, "fp8 KV gather + upconvert (MPS)",
+        pybind11::arg("key_cache"), pybind11::arg("value_cache"), pybind11::arg("block_table"),
+        pybind11::arg("cu_seq_lens"), pybind11::arg("k_scale"), pybind11::arg("v_scale"),
+        pybind11::arg("num_tokens"), pybind11::arg("fmt") = 0);
+  m.def("kv_cache_scale_update", &kv_cache_scale_update_mps,
+        "incremental KV scale running-max update (MPS)");
   m.def("paged_attention", &paged_attention_mps, "ThunderMittens paged decode attention (MPS)");
   m.def("paged_attention_alibi", &paged_attention_alibi_mps, "ThunderMittens paged decode with ALiBi (MPS)");
   m.def("paged_attention_block_sparse", &paged_attention_block_sparse_mps, "ThunderMittens block-sparse paged decode (MPS)");

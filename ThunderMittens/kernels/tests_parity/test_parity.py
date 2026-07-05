@@ -1447,6 +1447,40 @@ def test_norm_quant_wave10_parity(shape):
     _assert_parity(sm, st, atol=1e-4)
 
 
+def test_kv_gather_fp8_scale_update_parity():
+    rng = np.random.default_rng(12)
+    num_blocks, block_size, H_KV, D = 4, 16, 2, 64
+    total = num_blocks * block_size
+    K = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    ks = float(np.abs(K).max() / 448.0)
+    vs = float(np.abs(V).max() / 448.0)
+    slot = np.arange(total, dtype=np.int64)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
+    cu = np.array([0, total], np.int32)
+    ksa = np.full((H_KV,), ks, np.float32)
+    vsa = np.full((H_KV,), vs, np.float32)
+    ml = lambda a: _mk(a, "mlx")
+    to = lambda a: _mk(a, "torch")
+    kcm, vcm = tk.kv_cache_scatter_fp8(ml(K).astype(mx.bfloat16), ml(V).astype(mx.bfloat16),
+                                       mx.array(slot), num_blocks, block_size, ks, vs)
+    kct, vct = tk.kv_cache_scatter_fp8(to(K).to(torch.bfloat16), to(V).to(torch.bfloat16),
+                                       torch.from_numpy(slot).to("mps"), num_blocks, block_size, ks, vs)
+    kom, vom = tk.kv_cache_gather_fp8(kcm, vcm, mx.array(bt), mx.array(cu), mx.array(ksa),
+                                      mx.array(vsa), total)
+    kot, vot = tk.kv_cache_gather_fp8(kct, vct, torch.from_numpy(bt).to("mps"),
+                                      torch.from_numpy(cu).to("mps"), torch.from_numpy(ksa).to("mps"),
+                                      torch.from_numpy(vsa).to("mps"), total)
+    _assert_parity(kom, kot, atol=2e-2)
+    _assert_parity(vom, vot, atol=2e-2)
+    ok = np.array([0.1], np.float32); ov = np.array([0.1], np.float32)
+    nkm, nvm = tk.kv_cache_scale_update(ml(K), ml(V), mx.array(ok), mx.array(ov))
+    nkt, nvt = tk.kv_cache_scale_update(to(K), to(V), torch.from_numpy(ok).to("mps"),
+                                        torch.from_numpy(ov).to("mps"))
+    _assert_parity(nkm, nkt, atol=1e-5)
+    _assert_parity(nvm, nvt, atol=1e-5)
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (8, 256)])
 def test_layernorm_add_parity(shape):
     D = shape[-1]

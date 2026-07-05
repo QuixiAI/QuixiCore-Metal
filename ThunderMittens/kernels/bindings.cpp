@@ -1218,6 +1218,20 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "kv_cache_gather_fp8", &kv_cache_gather_fp8,
+      "key_cache"_a, "value_cache"_a, "block_table"_a, "cu_seq_lens"_a, "k_scale"_a,
+      "v_scale"_a, "num_tokens"_a, "fmt"_a = 0,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fp8 KV gather + upconvert: dequantize e4m3/e5m2 codes to bf16 via per-kv_head scales.
+         Returns [key_out, value_out] bf16.)");
+
+    m.def(
+      "kv_cache_scale_update", &kv_cache_scale_update,
+      "key"_a, "value"_a, "old_key_scale"_a, "old_value_scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(incremental per-tensor KV scale running-max: new = max(old, absmax/240).)");
+
+    m.def(
       "kv_cache_copy_blocks",
       &kv_cache_copy_blocks,
       "key_cache"_a,

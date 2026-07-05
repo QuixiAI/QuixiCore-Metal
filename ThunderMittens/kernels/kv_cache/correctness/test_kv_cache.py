@@ -694,3 +694,63 @@ def test_beam_remap_block_table(BM):
             b_read = kc_bf[new_bt[row, c]]          # original cache via remapped table
             a_read = kc2[bt[row, c]]                # reordered cache via original table
             np.testing.assert_allclose(a_read, b_read, atol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Wave-10: fp8 KV gather + upconvert (the read path) and incremental scale update.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("fmt,decode", [(0, _e4m3_decode_arr), (1, _e5m2_decode_arr)])
+@pytest.mark.parametrize("H_KV,D", [(2, 64), (4, 128)])
+def test_kv_cache_gather_fp8_roundtrip(fmt, decode, H_KV, D):
+    from tk import kv_cache_gather_fp8
+    rng = np.random.default_rng(300 + fmt + H_KV + D)
+    num_blocks, block_size = 4, 16
+    total = num_blocks * block_size
+    K = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    QMAX = 448.0 if fmt == 0 else 57344.0
+    ks = float(np.abs(K).max() / QMAX)
+    vs = float(np.abs(V).max() / QMAX)
+    # scatter into the paged fp8 cache (per-tensor scalar), token t -> slot t
+    kc, vc = kv_cache_scatter_fp8(
+        mx.array(K).astype(mx.bfloat16), mx.array(V).astype(mx.bfloat16),
+        mx.array(np.arange(total, dtype=np.int64)), num_blocks, block_size, ks, vs, fmt=fmt)
+    mx.eval(kc, vc)
+    # gather back: one sequence covering all tokens, identity block table, per-kv_head scales
+    block_table = np.arange(num_blocks, dtype=np.int32).reshape(1, num_blocks)
+    cu = np.array([0, total], np.int32)
+    ks_arr = np.full((H_KV,), ks, np.float32)
+    vs_arr = np.full((H_KV,), vs, np.float32)
+    ko, vo = kv_cache_gather_fp8(kc, vc, mx.array(block_table), mx.array(cu),
+                                 mx.array(ks_arr), mx.array(vs_arr), total, fmt=fmt)
+    mx.eval(ko, vo)
+    # gather output == bf16(decode(code) * scale) — the exact value the cache holds
+    k_ref = (decode(np.array(kc)) * ks).reshape(total, H_KV, D)
+    v_ref = (decode(np.array(vc)) * vs).reshape(total, H_KV, D)
+    np.testing.assert_allclose(np.array(ko.astype(mx.float32)), k_ref, atol=2e-2, rtol=2e-2)
+    np.testing.assert_allclose(np.array(vo.astype(mx.float32)), v_ref, atol=2e-2, rtol=2e-2)
+    # and within fp8 relative precision of the original K (e4m3 3-mantissa ~2^-3,
+    # e5m2 2-mantissa ~2^-2 relative)
+    rel = 2.0 ** -2 if fmt == 1 else 2.0 ** -3
+    assert (np.abs(np.array(ko.astype(mx.float32)) - K) <= np.abs(K) * rel + ks + 1e-3).all()
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_kv_cache_scale_update(dtype):
+    from tk import kv_cache_scale_update
+    md = {"float32": mx.float32, "bfloat16": mx.bfloat16}[dtype]
+    rng = np.random.default_rng(301)
+    k = (0.5 * rng.normal(size=(37, 4, 64))).astype(np.float32)
+    v = (0.5 * rng.normal(size=(37, 4, 64))).astype(np.float32)
+    old_k = np.array([0.1], np.float32)      # below new -> should raise
+    old_v = np.array([10.0], np.float32)     # above new -> should hold
+    nk, nv = kv_cache_scale_update(mx.array(k).astype(md), mx.array(v).astype(md),
+                                   mx.array(old_k), mx.array(old_v))
+    mx.eval(nk, nv)
+    kb = np.array(mx.array(k).astype(md).astype(mx.float32))
+    vb = np.array(mx.array(v).astype(md).astype(mx.float32))
+    ref_k = max(float(old_k[0]), np.abs(kb).max() / 240.0)
+    ref_v = max(float(old_v[0]), np.abs(vb).max() / 240.0)
+    np.testing.assert_allclose(np.array(nk), [ref_k], rtol=1e-4)
+    np.testing.assert_allclose(np.array(nv), [ref_v], rtol=1e-4)
+    assert float(np.array(nv)[0]) == pytest.approx(10.0)   # old held (only raises)

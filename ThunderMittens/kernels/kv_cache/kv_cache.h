@@ -25,6 +25,20 @@ std::vector<array> kv_cache_gather(
     int num_tokens,
     StreamOrDevice s = {});
 
+/** fp8 KV gather + upconvert: read e4m3/e5m2 codes from a paged cache and dequantize to bf16
+ *  via code * scale[kv_head] (per-kv_head scales, round-trips with kv_cache_scatter_fp8).
+ *  fmt 0=e4m3, 1=e5m2. Returns [key_out, value_out] bf16 (num_tokens, num_kv_heads, head_size). */
+std::vector<array> kv_cache_gather_fp8(
+    const array& key_cache, const array& value_cache, const array& block_table,
+    const array& cu_seq_lens, const array& k_scale, const array& v_scale, int num_tokens,
+    int fmt, StreamOrDevice s = {});
+
+/** Incremental per-tensor KV scale update (running max): new = max(old, absmax(k or v)/240).
+ *  Returns [new_key_scale, new_value_scale] (1,) f32. */
+std::vector<array> kv_cache_scale_update(
+    const array& key, const array& value, const array& old_key_scale,
+    const array& old_value_scale, StreamOrDevice s = {});
+
 std::vector<array> kv_cache_copy_blocks(
     const array& key_cache,
     const array& value_cache,
@@ -321,6 +335,48 @@ class KvCacheScatterFp8 : public Primitive {
  private:
   int block_size_;
   int fmt_;
+};
+
+class KvCacheGatherFp8 : public Primitive {
+ public:
+  KvCacheGatherFp8(Stream stream, int num_tokens, int fmt)
+      : Primitive(stream), num_tokens_(num_tokens), fmt_(fmt) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "KvCacheGatherFp8"; }
+  void print(std::ostream& os) override { os << "KvCacheGatherFp8"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const KvCacheGatherFp8&>(other);
+    return num_tokens_ == o.num_tokens_ && fmt_ == o.fmt_;
+  }
+
+ private:
+  int num_tokens_;
+  int fmt_;
+};
+
+class KvCacheScaleUpdate : public Primitive {
+ public:
+  explicit KvCacheScaleUpdate(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "KvCacheScaleUpdate"; }
+  void print(std::ostream& os) override { os << "KvCacheScaleUpdate"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
 };
 
 class PagedAttentionFp8 : public Primitive {
