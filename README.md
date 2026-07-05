@@ -14,8 +14,8 @@ ThunderMittens is an Apple Metal Shading Language (MSL) port for the [ThunderKit
 Hand-tuned tile kernels that **beat Apple's own optimized primitives** — and, where the algorithm
 allows, change the complexity class entirely. All numbers are measured median per-call latency on an
 **Apple M4 Max** (40-core GPU, ~546 GB/s), MLX backend, `speedup = baseline_ms / tk_ms`, reproducible
-via `perf/bench_kernels.py`. ~40 kernel families ship on **two backends** (MLX + PyTorch/MPS) from one
-metallib, cross-checked by 2,133 correctness + parity + MPS tests.
+via `perf/bench_kernels.py`. ~50 kernel families ship on **two backends** (MLX + PyTorch/MPS) from one
+metallib, cross-checked by 2,277 correctness + parity + MPS tests.
 
 ### Faster than the framework's own tuned kernels
 
@@ -90,6 +90,30 @@ for the full sweep + the honest rejects:
 
 The passes are honest about rejects: fused-write cascade, copy-pair compaction, and `adamw` vec4 were
 all built or prototyped, measured to not win, and reverted/documented.
+
+### New model architectures (Wave 9)
+
+A gap-closing wave that ports the kernels modern open models need to actually run — each one
+naive-correct → validated against a numpy/HF oracle → cross-backend parity-tested → benched →
+optimized keep-if-win. Details in `perf/optimization_status.md`.
+
+- **gpt-oss** — **quantized grouped expert GEMMs** (`moe_grouped_gemm_rect_q` / `swiglu_q`,
+  dequant-in-register + `mma_ABt`, 6 formats incl. MXFP4/NVFP4; swiglu_oai + expert-bias baked in),
+  **attention sinks + logit softcap** (over fwd / causal / window / varlen / paged), and the
+  **fused act→quant epilogues** feeding them (~1.28× the unfused swiglu→quantize chain).
+- **DeepSeek-V3 / Kimi-K2** — **grouped `noaux_tc` routing** (softmax/sigmoid/sqrt-softplus scoring,
+  two-level group top-k, ids-exact vs the HF oracle) to compose with the quantized experts + MLA.
+- **Qwen3-Next / Kimi-Linear** — **GatedDeltaNet linear attention** (`gdn_recur`, varlen + persistent
+  paged state pool + GQA) and **fused per-head QK-RMSNorm+RoPE** (2.6× the `mx.fast` composition).
+- **Mamba-1 hybrids** — **selective scan** (S6) dense / varlen / **APC** (paged state checkpointing
+  for automatic prefix caching).
+- **Quantized serving** — per-group-128 + asymmetric-int8 (azp) activation quant with an azp-corrected
+  W8A8 GEMM, and the **TurboQuant KV codec** (K asymmetric-uniform + V random-sign-FWHT/Lloyd-Max,
+  2–8 bit, K codes bit-exact vs the fp16 oracle).
+- **Long-context / sampling** — **MInference** decode block-mask builder (per-head block-sparse paged
+  attention), the full modern **sampler zoo** (top-nσ / top-A / ε- / η-cutoff / quadratic / skew /
+  XTC / no-repeat-ngram / DRY / top-k & top-p renorm), plus `tau_tail`, `packbits`/`segment_packbits`,
+  and `permute_cols` layout utilities.
 
 ## Prerequisites (all paths)
 
