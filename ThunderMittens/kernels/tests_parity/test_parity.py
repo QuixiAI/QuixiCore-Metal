@@ -635,6 +635,47 @@ def test_moe_grouped_gemm_swiglu_parity(H, inter):
     _assert_parity(om, ot, atol=6e-2)
 
 
+@pytest.mark.parametrize("fmt", ["mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
+def test_moe_grouped_gemm_rect_q_parity(fmt):
+    # same packed expert stack + same bf16 activations through both backends' metallibs
+    from tk.quant import quantize_expert_stack
+    rng = np.random.default_rng(53)
+    E, K_dim, N_out = 4, 256, 64
+    total, eot = _moe_padded_eot([40, 5, 70, 20])
+    A = (0.1 * rng.standard_normal((total, K_dim))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((E, K_dim, N_out))).astype(np.float32)
+    bias = (0.1 * rng.standard_normal((E, N_out))).astype(np.float32)
+    Wq = quantize_expert_stack(W, fmt)
+    om = tk.moe_grouped_gemm_rect_q(
+        mx.array(A).astype(mx.bfloat16), mx.array(Wq), mx.array(eot), format=fmt,
+        bias=mx.array(bias).astype(mx.bfloat16))
+    ot = tk.moe_grouped_gemm_rect_q(
+        torch.from_numpy(A).to(torch.bfloat16).to("mps"), torch.from_numpy(Wq).to("mps"),
+        torch.from_numpy(eot).to("mps"), format=fmt,
+        bias=torch.from_numpy(bias).to(torch.bfloat16).to("mps"))
+    _assert_parity(om, ot, atol=6e-2)
+
+
+@pytest.mark.parametrize("act", ["swiglu", "swiglu_oai"])
+def test_moe_grouped_gemm_swiglu_q_parity(act):
+    from tk.quant import quantize_expert_stack
+    rng = np.random.default_rng(54)
+    E, H, inter = 4, 256, 64
+    total, eot = _moe_padded_eot([40, 5, 70, 20])
+    A = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
+    W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
+    bias = (0.1 * rng.standard_normal((E, 2 * inter))).astype(np.float32)
+    W1q = quantize_expert_stack(W1, "mxfp4")
+    om = tk.moe_grouped_gemm_swiglu_q(
+        mx.array(A).astype(mx.bfloat16), mx.array(W1q), mx.array(eot), format="mxfp4",
+        bias=mx.array(bias).astype(mx.bfloat16), act=act)
+    ot = tk.moe_grouped_gemm_swiglu_q(
+        torch.from_numpy(A).to(torch.bfloat16).to("mps"), torch.from_numpy(W1q).to("mps"),
+        torch.from_numpy(eot).to("mps"), format="mxfp4",
+        bias=torch.from_numpy(bias).to(torch.bfloat16).to("mps"), act=act)
+    _assert_parity(om, ot, atol=6e-2)
+
+
 @pytest.mark.parametrize("E,K", [(8, 2), (64, 4)])
 def test_moe_route_topk_parity(E, K):
     rng = np.random.default_rng(0)

@@ -1,5 +1,53 @@
 # ThunderMittens — performance status
 
+## Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs (2026-07-05)
+
+New kernels `moe_grouped_gemm_rect_q<FMT>` / `moe_grouped_gemm_swiglu_q<FMT>` (formats mxfp4,
+kU4, fp8_e4m3, q8_0, nvfp4, q4_K; swiglu has act_mode 0/1 = swiglu / gpt-oss swiglu_oai with
+pre-activation expert bias). Experts packed (N_out, K) so quant groups run along the
+contraction axis; contraction is `mma_ABt` fed by a new col-layout register fill
+(`dequant_into_register_col`, mirrors the col-layout `load` lane map — the two thread
+elements are vertically adjacent). Bench: `@register("moe_q")`, baseline = dense bf16
+grouped GEMM on the same schedule.
+
+### Variant matrix (mlx quick, 2880×2880 gpt-oss tile, M4 Max; 512-row prefill numbers —
+### the 32-row decode cases were session-noise-limited, ratios ~parity with dense)
+
+| variant | rect mxfp4 | rect q8_0 | swiglu_oai mxfp4 |
+|---|---|---|---|
+| dense bf16 baseline | 0.625 | 0.624 | 1.259 |
+| v1 naive frag fill, 1 warp | 0.716 | 0.731 | 2.333 |
+| dequant-to-shared, 1 warp | 0.767 | 0.729 | 2.138 |
+| 4-warp split-K, frag fill | 0.692 | 0.689 | 2.553 |
+| 4-warp split-K, per-warp shared tiles | 0.918 | 0.670 | 2.947 |
+| **4-warp split-K + cols4 span fill (KEPT)** | **0.674** | **0.658** | **1.863** |
+
+### Kept
+- **4-warp intra-threadgroup split-K** (each warp owns every 4th K-step, private fp32
+  accumulator, one staged reduce by warp 0) — fixes the 32-thread-per-tile occupancy starvation
+  of the naive port.
+- **`tk_dequant_cols4_s8<FMT>` span decoder** (dequant.metal): decodes the col-fill's 4
+  stride-8 columns with ONE scale unpack (specialized q8_0/fp8_e4m3/mxfp8/mxfp4/kU4; the mxfp4
+  case reads just 2 bytes + 1 exp2 for 4 weights). The e8m0 formats were paying an `exp2` per
+  ELEMENT in the naive fill — that, not bandwidth, was the bottleneck (mxfp4 regressed under
+  plain split-K while q8_0 improved; the span decoder fixed exactly the mxfp4 side).
+
+### Rejected (measured)
+- Dequant-to-shared at 1 warp: barrier cost eats the span-decode win for the single-tile rect
+  kernel (0.767 vs 0.716); only helped the 2-tile swiglu.
+- Per-warp shared tiles under split-K: 20-28 KB threadgroup memory tanks occupancy
+  (rect mxfp4 0.918 — worst variant).
+
+### Status / follow-ups
+- rect_q within 5-8% of the dense bf16 kernel's wall clock while reading 4-8.5× fewer weight
+  bytes — the capacity win (gpt-oss-120B-class MoEs fitting at all) ships; swiglu_q still
+  1.48× dense (two dequant fills/step), candidates: K-step 64, 2-warp split with per-warp
+  gate/up split, vectorized A loads. Decode-shape bench needs an E=32 sweep (the E=4 decode
+  tile fits in SLC, masking the bandwidth advantage) — revisit when the routing kernel lands.
+- Correctness: 18 MLX tests (6 formats × bias, swiglu×act modes, q8_0-exact-vs-dense,
+  end-to-end quant moe_mlp) + 8 cross-backend parity cases, all green; full qgemm suite
+  re-run green after the dequant.metal change (219 + 66 tests).
+
 ## Wave-8 — optimization pass over the Wave-6/7 kernels (2026-07-03)
 
 A measure-first pass over every new kernel. First registered the last unmeasured families in

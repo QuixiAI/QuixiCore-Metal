@@ -816,20 +816,30 @@ def moe_gather(x, gather_idx):
     return _mlx().moe_gather(x, gather_idx)
 
 
-def moe_mlp(x, router_logits, W1, W2, k):
+def moe_mlp(x, router_logits, W1, W2, k, quant_format=None, w1_bias=None, w2_bias=None,
+            act="swiglu", alpha=1.702, limit=7.0):
     """End-to-end MoE MLP: route → permute → pad-schedule → gather → SwiGLU GEMM →
     down-proj GEMM → weighted combine. All-GPU, no host sync.
 
-    x (T, H); router_logits (T, E); W1 (E, H, 2*I) laid out [gate | up]; W2 (E, I, H);
-    k experts per token. Returns (T, H) in x's dtype. H%16, I%32 required.
-    Accepts mlx.array or torch.Tensor (MPS).
+    Dense path (quant_format=None): W1 (E, H, 2*I) laid out [gate | up]; W2 (E, I, H).
+    Quantized path: W1/W2 are packed uint8 expert stacks from tk.quant.quantize_expert_stack
+    — W1 (E, 2*I, row_bytes over K=H), W2 (E, H, row_bytes over K=I) — with optional
+    pre-activation w1_bias (E, 2*I) and down-proj w2_bias (E, H); act "swiglu" or
+    "swiglu_oai" (gpt-oss). x (T, H); router_logits (T, E); k experts per token.
+    Returns (T, H) in x's dtype. Accepts mlx.array or torch.Tensor (MPS).
     """
     topk_ids, topk_weights = moe_route_topk(router_logits, k)
     sorted_row_idx, offsets, _inv_idx = moe_permute(topk_ids, W1.shape[0])
     expert_of_tile, gather_idx, inv_pad, _off_pad = moe_pad_schedule(sorted_row_idx, offsets, k)
     permuted = moe_gather(x, gather_idx)
-    inter = moe_grouped_gemm_swiglu(permuted, W1, expert_of_tile)
-    expert_out = moe_grouped_gemm_rect(inter, W2, expert_of_tile)
+    if quant_format is None:
+        inter = moe_grouped_gemm_swiglu(permuted, W1, expert_of_tile)
+        expert_out = moe_grouped_gemm_rect(inter, W2, expert_of_tile)
+    else:
+        inter = moe_grouped_gemm_swiglu_q(permuted, W1, expert_of_tile, format=quant_format,
+                                          bias=w1_bias, act=act, alpha=alpha, limit=limit)
+        expert_out = moe_grouped_gemm_rect_q(inter, W2, expert_of_tile, format=quant_format,
+                                             bias=w2_bias)
     return moe_finalize(expert_out, inv_pad, topk_weights, k)
 
 
@@ -858,6 +868,44 @@ def moe_grouped_gemm_swiglu(A, W1, expert_of_tile):
     if _is_torch(A):
         return _torch().moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
     return _mlx().moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
+
+
+def moe_grouped_gemm_rect_q(A, Wq, expert_of_tile, format="mxfp4", bias=None):
+    """Quantized grouped expert GEMM: out(rows, N_out) = A @ dequant(Wq[e])^T [+ bias[e]].
+
+    A (rows, K_dim) bfloat16; Wq (E, N_out, row_bytes) uint8 packed by
+    tk.quant.quantize_expert_stack (quant groups along K_dim); bias optional (E, N_out).
+    format in {mxfp4, kU4, fp8_e4m3, q8_0, nvfp4, q4_K}. rows%32, K_dim%32 (and %block_k),
+    N_out%32. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(A):
+        return _torch().moe_grouped_gemm_rect_q(A, Wq, expert_of_tile, format=format, bias=bias)
+    import mlx.core as mx
+    has_bias = bias is not None
+    if bias is None:
+        bias = mx.zeros((1,), dtype=mx.bfloat16)
+    return _mlx().moe_grouped_gemm_rect_q(A, Wq, expert_of_tile, bias, has_bias,
+                                          A.shape[1], Wq.shape[1], format)
+
+
+def moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, format="mxfp4", bias=None,
+                              act="swiglu", alpha=1.702, limit=7.0):
+    """Quantized fused SwiGLU GEMM1: out(rows, inter) from a packed [gate | up] expert stack.
+
+    A (rows, H) bfloat16; W1q (E, 2*inter, row_bytes) uint8 (quantize_expert_stack of the
+    dense (E, H, 2*inter) W1); bias optional (E, 2*inter), added pre-activation.
+    act "swiglu" (silu(gate)*up) or "swiglu_oai" (gpt-oss: clamp by `limit`,
+    gate*sigmoid(alpha*gate)*(1+up)). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(A):
+        return _torch().moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, format=format,
+                                                  bias=bias, act=act, alpha=alpha, limit=limit)
+    import mlx.core as mx
+    act_mode = {"swiglu": 0, "swiglu_oai": 1}[act]
+    has_bias = bias is not None
+    if bias is None:
+        bias = mx.zeros((1,), dtype=mx.bfloat16)
+    return _mlx().moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, bias, has_bias,
+                                            W1q.shape[1] // 2, act_mode, float(alpha),
+                                            float(limit), format)
 
 
 def moe_finalize(expert_out, inv_idx, topk_weights, k):

@@ -1352,6 +1352,48 @@ def dequantize_kv(packed, format="q8_0"):
     return dW.reshape(B, H, N, -1)
 
 
+# ---- MoE expert-stack packing for the quantized grouped GEMMs (moe_grouped_gemm_*_q). ----
+# Each expert is TRANSPOSED to (N_out, K) before packing so quant groups run along the
+# contraction axis K (matching every upstream weight-quant format), then packed row-wise with
+# the standard QUANT_FORMATS packer. The kernels contract out = A @ dequant(Wq[e])^T via a
+# col-layout register fill + mma_ABt. Formats limited to the instantiated kernel variants.
+MOE_Q_FORMATS = ("mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K")
+_MOE_Q_BLOCK_K = {"mxfp4": 32, "kU4": 128, "fp8_e4m3": 32, "q8_0": 32, "nvfp4": 16, "q4_K": 256}
+
+
+def quantize_expert_stack(W, format="mxfp4"):
+    """Pack a dense expert stack W (E, K, N) -> uint8 (E, N, row_bytes) for the _q grouped GEMMs.
+
+    Works for both MoE weights: W1 (E, H, 2*inter) -> (E, 2*inter, row_bytes over K=H) and
+    W2 (E, inter, H) -> (E, H, row_bytes over K=inter). row_bytes = K/block_k * block_bytes.
+    Requires K % block_k == 0 (mxfp4/fp8_e4m3/q8_0: 32, nvfp4: 16, kU4: 128, q4_K: 256).
+    """
+    if format not in MOE_Q_FORMATS:
+        raise ValueError(f"quantize_expert_stack: format must be one of {MOE_Q_FORMATS}")
+    W = np.ascontiguousarray(W, np.float32)
+    E, K, N = W.shape
+    if K % _MOE_Q_BLOCK_K[format] != 0:
+        raise ValueError(f"quantize_expert_stack: K={K} not a multiple of "
+                         f"block_k={_MOE_Q_BLOCK_K[format]} for {format}")
+    quantize, _ = QUANT_FORMATS[format]
+    first = quantize(np.ascontiguousarray(W[0].T))             # (N, K/block_k, block_bytes)
+    out = np.empty((E,) + first.shape, np.uint8)
+    out[0] = first
+    for e in range(1, E):
+        out[e] = quantize(np.ascontiguousarray(W[e].T))
+    return out.reshape(E, N, -1)
+
+
+def dequantize_expert_stack(Wq, K, format="mxfp4"):
+    """Inverse of quantize_expert_stack: uint8 (E, N, row_bytes) -> dense float32 (E, K, N)."""
+    E, N, row_bytes = Wq.shape
+    nb = K // _MOE_Q_BLOCK_K[format]
+    _, dequantize = QUANT_FORMATS[format]
+    packed = np.ascontiguousarray(Wq).reshape(E * N, nb, row_bytes // nb)
+    dW = dequantize(packed).reshape(E, N, K)                   # (E, N, K), values along K
+    return np.ascontiguousarray(dW.transpose(0, 2, 1))
+
+
 # ---- fp8_block2d : storage-optimal fp8_block — codes-only (N, K/128, 128) + a separate
 # (N/128, K/128) fp16 tile scale (no per-row scale replication). value = scale_tile * e4m3(code). ----
 def quantize_fp8_block2d(W):

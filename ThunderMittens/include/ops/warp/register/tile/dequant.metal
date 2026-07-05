@@ -897,4 +897,119 @@ METAL_FUNC void dequant_into_register(thread RT& dst, device const uchar* Wq, in
     }
 }
 
+// Decode the 4 columns {c, c+8, c+16, c+24} of ONE quant block with a single scale unpack.
+// This is the column pattern of the col-layout fragment fill below (one lane's 4 width-subtile
+// slots at a fixed row): when FMT::block_k >= 32 all four land in the same block, because the
+// K tile base is 32-aligned and c <= 6. Specializations amortize the per-block scale decode
+// (fatal for the e8m0 formats, whose scale is an exp2) 4x over the naive per-element path.
+template<typename FMT>
+struct tk_dequant_cols4_s8 {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        w[0] = FMT::dequant(base, c);
+        w[1] = FMT::dequant(base, c + 8);
+        w[2] = FMT::dequant(base, c + 16);
+        w[3] = FMT::dequant(base, c + 24);
+    }
+};
+template<> struct tk_dequant_cols4_s8<q8_0> {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        const half d = ((device const half*)base)[0];
+        device const char* qs = (device const char*)(base + 2);
+        w[0] = d * half(qs[c]);      w[1] = d * half(qs[c + 8]);
+        w[2] = d * half(qs[c + 16]); w[3] = d * half(qs[c + 24]);
+    }
+};
+template<> struct tk_dequant_cols4_s8<fp8_e4m3> {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        const half d = ((device const half*)base)[0];
+        device const uchar* qs = base + 2;
+        w[0] = d * tk_e4m3_decode(qs[c]);      w[1] = d * tk_e4m3_decode(qs[c + 8]);
+        w[2] = d * tk_e4m3_decode(qs[c + 16]); w[3] = d * tk_e4m3_decode(qs[c + 24]);
+    }
+};
+template<> struct tk_dequant_cols4_s8<mxfp8> {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        const half d = metal::exp2(half((int)base[0] - 127));   // one exp2 for all 4
+        device const uchar* qs = base + 1;
+        w[0] = d * tk_e4m3_decode(qs[c]);      w[1] = d * tk_e4m3_decode(qs[c + 8]);
+        w[2] = d * tk_e4m3_decode(qs[c + 16]); w[3] = d * tk_e4m3_decode(qs[c + 24]);
+    }
+};
+template<> struct tk_dequant_cols4_s8<mxfp4> {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        // c <= 6, so cols {c, c+8} are low nibbles and {c+16, c+24} the high nibbles of the
+        // SAME two bytes qs[c], qs[c+8] — two byte loads + one exp2 cover all four weights.
+        const half d = metal::exp2(half((int)base[0] - 127));
+        const uchar b0 = (base + 1)[c], b1 = (base + 1)[c + 8];
+        w[0] = d * tk_e2m1_decode(b0 & 0x0F); w[1] = d * tk_e2m1_decode(b1 & 0x0F);
+        w[2] = d * tk_e2m1_decode(b0 >> 4);   w[3] = d * tk_e2m1_decode(b1 >> 4);
+    }
+};
+template<> struct tk_dequant_cols4_s8<kU4> {
+    static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
+        // group 128: a 32-aligned window of width <= 30 never crosses the lo/hi nibble split
+        // at col 64, so all four columns share one shift.
+        const half scale = ((device const half*)base)[0];
+        const half zp    = ((device const half*)base)[1];
+        device const uchar* qs = base + 4;
+        const int cm = (c < 64) ? c : c - 64;
+        const int sh = (c < 64) ? 0 : 4;
+        w[0] = scale * (half((qs[cm]      >> sh) & 0x0F) - zp);
+        w[1] = scale * (half((qs[cm + 8]  >> sh) & 0x0F) - zp);
+        w[2] = scale * (half((qs[cm + 16] >> sh) & 0x0F) - zp);
+        w[3] = scale * (half((qs[cm + 24] >> sh) & 0x0F) - zp);
+    }
+};
+
+// Col-layout companion to dequant_into_register, for feeding mma_ABt's B operand
+// (rt<T, M, K, col>) straight from a row-major (N, K)-packed weight — the quantized
+// A @ W^T path (grouped expert GEMMs). Mirrors the col-layout load in
+// global_to_register.metal exactly: the x/y lane derivations swap, and a lane's two
+// thread elements are VERTICALLY adjacent — logical (row, col) and (row+1, col) —
+// i.e. two different packed rows sharing one quant-block column. `by` indexes the
+// logical-row (N) tile block, `kb` the K tile block, as in the row variant.
+// For block_k >= 32 the width loop collapses to one tk_dequant_cols4_s8 span per
+// (subtile-row, element): the 4 width-subtile columns {sx, sx+8, sx+16, sx+24} of a
+// 32-aligned K tile share a quant block, so the scale is unpacked once per span.
+template<typename FMT, typename RT>
+METAL_FUNC void dequant_into_register_col(thread RT& dst, device const uchar* Wq, int N, int K,
+                                          int by, int kb, uint laneid) {
+    const int qid    = (int)laneid / 4;
+    const int simd_x = (qid & 4) + ((int)laneid / 2) % 4;
+    const int simd_y = (qid & 2) * 2 + ((int)laneid % 2) * 2;
+    const int bpr = K / FMT::block_k;
+    if (FMT::block_k >= 32 && RT::width == 4) {   // constexpr-foldable fast path
+        const int gc0  = kb * RT::cols + simd_x;
+        const int blk  = gc0 / FMT::block_k;
+        const int cib0 = gc0 % FMT::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < RT::height; i++) {
+            #pragma clang loop unroll(full)
+            for (int el = 0; el < 2; el++) {
+                const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y + el;
+                device const uchar* base = Wq + (uint)(grow * bpr + blk) * FMT::block_bytes;
+                half w[4];
+                tk_dequant_cols4_s8<FMT>::run(base, cib0, w);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < RT::width; j++)
+                    dst.tiles[i][j].data.thread_elements()[el] = (typename RT::dtype)(float)w[j];
+            }
+        }
+        return;
+    }
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < RT::height; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < RT::width; j++) {
+            const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y;
+            const int gc   = kb * RT::cols + j * mittens::TILE_DIM + simd_x;
+            const int blk = gc / FMT::block_k, cib = gc % FMT::block_k;
+            device const uchar* b0 = Wq + (uint)(grow * bpr + blk) * FMT::block_bytes;
+            device const uchar* b1 = Wq + (uint)((grow + 1) * bpr + blk) * FMT::block_bytes;
+            dst.tiles[i][j].data.thread_elements()[0] = (typename RT::dtype)(float)FMT::dequant(b0, cib);
+            dst.tiles[i][j].data.thread_elements()[1] = (typename RT::dtype)(float)FMT::dequant(b1, cib);
+        }
+    }
+}
+
 } // namespace mittens

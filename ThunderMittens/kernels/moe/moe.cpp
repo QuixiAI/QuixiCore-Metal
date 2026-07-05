@@ -393,6 +393,137 @@ array moe_grouped_gemm_swiglu(
                {a, w, eot});
 }
 
+// --------------------- quantized grouped GEMMs ---------------------
+
+namespace {
+// Instantiated [[host_name]] format variants and their quant-group sizes (contraction axis).
+// Must stay in sync with instantiate_moe_gemm_q in moe.metal and the structs in dequant.metal.
+int tk_moe_q_block_k(const std::string& f) {
+  if (f == "mxfp4" || f == "fp8_e4m3" || f == "q8_0") return 32;
+  if (f == "nvfp4") return 16;
+  if (f == "kU4") return 128;
+  if (f == "q4_K") return 256;
+  return -1;
+}
+} // namespace
+
+array moe_grouped_gemm_rect_q(
+    const array& A, const array& Wq, const array& expert_of_tile, const array& bias,
+    bool has_bias, int K_dim, int N_out, const std::string& format, StreamOrDevice s) {
+  const int block_k = tk_moe_q_block_k(format);
+  if (block_k < 0) {
+    throw std::invalid_argument("moe_grouped_gemm_rect_q: unsupported format " + format);
+  }
+  if (A.ndim() != 2 || Wq.ndim() != 3) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_rect_q: A must be (total_rows,K_dim), Wq (E,N_out,row_bytes)");
+  }
+  const int total_rows = A.shape(0);
+  if (A.shape(1) != K_dim || Wq.shape(1) != N_out) {
+    throw std::invalid_argument("moe_grouped_gemm_rect_q: K_dim/N_out mismatch with A/Wq shapes");
+  }
+  if (total_rows % 32 != 0 || K_dim % 32 != 0 || K_dim % block_k != 0 || N_out % 32 != 0) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_rect_q: total_rows%32, K_dim%32, K_dim%block_k, N_out%32 required");
+  }
+  if (A.dtype() != bfloat16 || Wq.dtype() != uint8) {
+    throw std::invalid_argument("moe_grouped_gemm_rect_q: A must be bfloat16, Wq uint8");
+  }
+  if (expert_of_tile.ndim() != 1 || expert_of_tile.shape(0) != total_rows / 32) {
+    throw std::invalid_argument("moe_grouped_gemm_rect_q: expert_of_tile must be (total_rows/32,)");
+  }
+  if (has_bias && (bias.ndim() != 2 || bias.shape(0) != Wq.shape(0) || bias.shape(1) != N_out)) {
+    throw std::invalid_argument("moe_grouped_gemm_rect_q: bias must be (E, N_out)");
+  }
+  auto a = contiguous(A, false, s);
+  auto wq = contiguous(Wq, false, s);
+  auto eot = contiguous(astype(expert_of_tile, int32, s), false, s);
+  auto b = contiguous(astype(bias, bfloat16, s), false, s);
+  return array({total_rows, N_out}, bfloat16,
+               std::make_shared<MoeGroupedGemmRectQ>(to_stream(s), format, has_bias, K_dim, N_out),
+               {a, wq, eot, b});
+}
+
+array moe_grouped_gemm_swiglu_q(
+    const array& A, const array& W1q, const array& expert_of_tile, const array& bias,
+    bool has_bias, int inter, int act_mode, float alpha, float limit,
+    const std::string& format, StreamOrDevice s) {
+  const int block_k = tk_moe_q_block_k(format);
+  if (block_k < 0) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: unsupported format " + format);
+  }
+  if (A.ndim() != 2 || W1q.ndim() != 3) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_swiglu_q: A must be (total_rows,H), W1q (E,2*inter,row_bytes)");
+  }
+  const int total_rows = A.shape(0), H = A.shape(1);
+  if (W1q.shape(1) != 2 * inter) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: W1q must be (E, 2*inter, row_bytes)");
+  }
+  if (total_rows % 32 != 0 || H % 32 != 0 || H % block_k != 0 || inter % 32 != 0) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_swiglu_q: total_rows%32, H%32, H%block_k, inter%32 required");
+  }
+  if (A.dtype() != bfloat16 || W1q.dtype() != uint8) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: A must be bfloat16, W1q uint8");
+  }
+  if (expert_of_tile.ndim() != 1 || expert_of_tile.shape(0) != total_rows / 32) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: expert_of_tile must be (total_rows/32,)");
+  }
+  if (has_bias &&
+      (bias.ndim() != 2 || bias.shape(0) != W1q.shape(0) || bias.shape(1) != 2 * inter)) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: bias must be (E, 2*inter)");
+  }
+  if (act_mode != 0 && act_mode != 1) {
+    throw std::invalid_argument("moe_grouped_gemm_swiglu_q: act_mode must be 0 or 1");
+  }
+  auto a = contiguous(A, false, s);
+  auto wq = contiguous(W1q, false, s);
+  auto eot = contiguous(astype(expert_of_tile, int32, s), false, s);
+  auto b = contiguous(astype(bias, bfloat16, s), false, s);
+  return array({total_rows, inter}, bfloat16,
+               std::make_shared<MoeGroupedGemmSwigluQ>(
+                   to_stream(s), format, has_bias, inter, act_mode, alpha, limit),
+               {a, wq, eot, b});
+}
+
+void MoeGroupedGemmRectQ::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGroupedGemmRectQ has no CPU implementation.");
+}
+void MoeGroupedGemmRectQ::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& a = inputs[0];
+  auto& wq = inputs[1];
+  auto& eot = inputs[2];
+  auto& bias = inputs[3];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_grouped_gemm_rect_q(enc, out, a, wq, eot, bias, a.shape(0), K_dim_, N_out_,
+                                     has_bias_ ? 1 : 0, format_);
+}
+
+void MoeGroupedGemmSwigluQ::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGroupedGemmSwigluQ has no CPU implementation.");
+}
+void MoeGroupedGemmSwigluQ::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& a = inputs[0];
+  auto& wq = inputs[1];
+  auto& eot = inputs[2];
+  auto& bias = inputs[3];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_grouped_gemm_swiglu_q(enc, out, a, wq, eot, bias, a.shape(0), a.shape(1),
+                                       inter_, has_bias_ ? 1 : 0, act_mode_, alpha_, limit_,
+                                       format_);
+}
+
 void MoeGroupedGemmRect::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("MoeGroupedGemmRect has no CPU implementation.");
 }
@@ -448,5 +579,7 @@ TK_MOE_NO_AUTODIFF(MoeFinalize, "MoeFinalize")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemm, "MoeGroupedGemm")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmRect, "MoeGroupedGemmRect")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwiglu, "MoeGroupedGemmSwiglu")
+TK_MOE_NO_AUTODIFF(MoeGroupedGemmRectQ, "MoeGroupedGemmRectQ")
+TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwigluQ, "MoeGroupedGemmSwigluQ")
 
 } // namespace mlx::core

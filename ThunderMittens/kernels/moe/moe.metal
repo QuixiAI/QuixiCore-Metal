@@ -445,6 +445,233 @@ instantiate_moe_grouped_gemm_rect(bfloat16, bf16)
 instantiate_moe_grouped_gemm_swiglu(float32, float)
 instantiate_moe_grouped_gemm_swiglu(bfloat16, bf16)
 
+// ---------------------------------------------------------------------------
+// Quantized grouped expert GEMMs. Same segmented single-expert-per-tile structure as the dense
+// kernels above, but W is weight-only-quantized and dequantized straight into the simdgroup
+// fragment (dequant_into_register_col — no threadgroup round-trip, no barrier). Every quant
+// format groups along the contraction axis, so experts are packed row-major over (N_out, K_dim)
+// — the TRANSPOSE of the dense kernels' (K_dim, N_out) — and the contraction is mma_ABt
+// (out = A @ Wq^T). Per-expert packed block: N_out * (K_dim/block_k) * block_bytes bytes,
+// so the per-expert base offset needs long arithmetic (multi-GB expert stacks).
+// Optional per-output-column bias sits in the fp32 epilogue (gpt-oss has expert biases);
+// pass a 1-element dummy and has_bias=0 when absent. Requires K_dim % 32 == 0 and
+// K_dim % FMT::block_k == 0. A/out are bf16 (the moe pipeline's working dtype).
+// ---------------------------------------------------------------------------
+template <typename FMT>
+kernel void moe_grouped_gemm_rect_q(device bf16 *out                 [[buffer(0)]],
+                                    device bf16 *A                   [[buffer(1)]],
+                                    device const uchar *Wq           [[buffer(2)]],
+                                    device const int *expert_of_tile [[buffer(3)]],
+                                    device const bf16 *bias          [[buffer(4)]],
+                                    constant int &total_rows         [[buffer(5)]],
+                                    constant int &K_dim              [[buffer(6)]],
+                                    constant int &N_out              [[buffer(7)]],
+                                    constant int &has_bias           [[buffer(8)]],
+                                    uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                    uint  warp           [[simdgroup_index_in_threadgroup]],
+                                    uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;    // row-tile (32 permuted rows)
+    const int OX = (int)threadgroup_id.x;    // output column-tile (in N_out)
+    const int e = expert_of_tile[OY];
+    if (e < 0) { return; }   // padding tile beyond the real schedule (never read downstream)
+
+    using global_layout = gl<bf16, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, K_dim);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, N_out);
+    const int blocks_per_row = K_dim / FMT::block_k;
+    device const uchar *Wq_e =
+        Wq + (long)e * (long)N_out * (long)blocks_per_row * FMT::block_bytes;
+
+    // 4-warp intra-threadgroup split-K over per-warp shared dequant tiles. Measured rationale
+    // (2880^2 gpt-oss tile, M4 Max): the packed path is dequant-ALU-bound, not bandwidth-bound.
+    // One warp/tile can't feed the dequant pipe (frag 0.073 ms vs dense 0.062 ms at decode), and
+    // a register fill pays the block-scale decode per ELEMENT — fatal for the e8m0 formats whose
+    // scale is an exp2 (mxfp4 regressed to 0.109 ms under register-fill split-K while q8_0
+    // improved). tk_dequant8 spans amortize the scale decode 8x, each warp owns a private sW
+    // tile (no cross-warp sync in the K loop, simdgroup barriers only), and warps split K 4-way
+    // into private fp32 accumulators reduced once at the end.
+    constexpr const int BN = 32, BK = 32, BM = 32, N_WARPS = 4;
+    threadgroup st<float, BN, BM> sAcc[N_WARPS - 1];   // 12 KB: split-K partials
+    rt<bf16, BN, BK> a_reg;
+    rt<bf16, BM, BK, ducks::rt_layout::col> w_reg;   // logical (N_out-tile x K), mma_ABt operand
+    rt<float, BN, BM> d_reg;
+    zero(d_reg);
+    for (int kb = (int)warp; kb < K_dim / BK; kb += N_WARPS) {
+        load(a_reg, gl_a, {0, 0, OY, kb}, simd_lane_id);
+        dequant_into_register_col<FMT>(w_reg, Wq_e, N_out, K_dim, OX, kb, simd_lane_id);
+        mma_ABt(d_reg, a_reg, w_reg, d_reg);
+    }
+    if (warp > 0) store(sAcc[warp - 1], d_reg, simd_lane_id);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (warp != 0) { return; }
+    rt<float, BN, BM> part;
+    #pragma clang loop unroll(full)
+    for (int w = 0; w < N_WARPS - 1; w++) {
+        load(part, sAcc[w], simd_lane_id);
+        add(d_reg, d_reg, part);
+    }
+    if (has_bias != 0) {
+        // per-output-column bias broadcast down the rows: each lane patches its own two
+        // horizontally-adjacent fp32 accumulator elements (cols sx, sx+1 of each 8x8 subtile)
+        const int qid = (int)simd_lane_id / 4;
+        const int sx  = (qid & 2) * 2 + ((int)simd_lane_id % 2) * 2;
+        device const bf16 *bias_e = bias + (long)e * N_out + OX * BM;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < d_reg.height; i++) {
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < d_reg.width; j++) {
+                const int c = j * TILE_DIM + sx;
+                d_reg.tiles[i][j].data.thread_elements()[0] += (float)bias_e[c];
+                d_reg.tiles[i][j].data.thread_elements()[1] += (float)bias_e[c + 1];
+            }
+        }
+    }
+    store(gl_d, d_reg, {0, 0, OY, OX}, simd_lane_id);
+}
+
+// Fused quantized SwiGLU GEMM1: gate/up both come from one packed W1q laid out
+// [gate(inter) | up(inter)] along the packed-row (N) axis, i.e. (2*inter, H) packed rows.
+// act_mode 0: silu(gate) * up. act_mode 1: gpt-oss swiglu_oai — gate = min(gate, limit),
+// up = clamp(up, -limit, limit), out = gate * sigmoid(alpha * gate) * (1 + up).
+// Bias (E, 2*inter) is added pre-activation (has_bias gate). Epilogue is elementwise over
+// the fp32 accumulator fragments (uniform branches; lane owns cols sx, sx+1 per subtile).
+template <typename FMT>
+kernel void moe_grouped_gemm_swiglu_q(device bf16 *out                 [[buffer(0)]],
+                                      device bf16 *A                   [[buffer(1)]],
+                                      device const uchar *W1q          [[buffer(2)]],
+                                      device const int *expert_of_tile [[buffer(3)]],
+                                      device const bf16 *bias          [[buffer(4)]],
+                                      constant int &total_rows         [[buffer(5)]],
+                                      constant int &H                  [[buffer(6)]],
+                                      constant int &inter              [[buffer(7)]],
+                                      constant int &has_bias           [[buffer(8)]],
+                                      constant int &act_mode           [[buffer(9)]],
+                                      constant float &alpha            [[buffer(10)]],
+                                      constant float &limit            [[buffer(11)]],
+                                      uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                      uint  warp           [[simdgroup_index_in_threadgroup]],
+                                      uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;
+    const int OX = (int)threadgroup_id.x;    // output column-tile in inter
+    const int e = expert_of_tile[OY];
+    if (e < 0) { return; }
+
+    using global_layout = gl<bf16, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, H);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, inter);
+    const int blocks_per_row = H / FMT::block_k;
+    device const uchar *Wq_e =
+        W1q + (long)e * (long)(2 * inter) * (long)blocks_per_row * FMT::block_bytes;
+
+    // Same 4-warp split-K + per-warp shared-dequant geometry as the rect kernel above, with
+    // two W tiles (gate/up) per warp. Threadgroup budget forces a TWO-PASS reduce sharing one
+    // fp32 staging set: 8 sW tiles (16 KB) + 3 fp32 partial tiles (12 KB) = 28 KB < 32 KB.
+    constexpr const int BN = 32, BK = 32, BM = 32, N_WARPS = 4;
+    const int up_tile = inter / BM + OX;     // up-half packed-row tile
+    threadgroup st<float, BN, BM> sAcc[N_WARPS - 1];
+    rt<bf16, BN, BK> a_reg;
+    rt<bf16, BM, BK, ducks::rt_layout::col> wg_reg, wu_reg;
+    rt<float, BN, BM> gate, up;
+    zero(gate);
+    zero(up);
+    for (int kb = (int)warp; kb < H / BK; kb += N_WARPS) {
+        load(a_reg, gl_a, {0, 0, OY, kb}, simd_lane_id);
+        dequant_into_register_col<FMT>(wg_reg, Wq_e, 2 * inter, H, OX, kb, simd_lane_id);
+        dequant_into_register_col<FMT>(wu_reg, Wq_e, 2 * inter, H, up_tile, kb, simd_lane_id);
+        mma_ABt(gate, a_reg, wg_reg, gate);
+        mma_ABt(up, a_reg, wu_reg, up);
+    }
+    // pass 1: reduce gate partials into warp 0
+    if (warp > 0) store(sAcc[warp - 1], gate, simd_lane_id);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (warp == 0) {
+        rt<float, BN, BM> part;
+        #pragma clang loop unroll(full)
+        for (int w = 0; w < N_WARPS - 1; w++) {
+            load(part, sAcc[w], simd_lane_id);
+            add(gate, gate, part);
+        }
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);   // warp 0 done reading gate partials
+    // pass 2: reduce up partials, reusing the same staging tiles
+    if (warp > 0) store(sAcc[warp - 1], up, simd_lane_id);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (warp != 0) { return; }
+    {
+        rt<float, BN, BM> part;
+        #pragma clang loop unroll(full)
+        for (int w = 0; w < N_WARPS - 1; w++) {
+            load(part, sAcc[w], simd_lane_id);
+            add(up, up, part);
+        }
+    }
+    const int qid = (int)simd_lane_id / 4;
+    const int sx  = (qid & 2) * 2 + ((int)simd_lane_id % 2) * 2;
+    device const bf16 *bg = bias + (long)e * (2 * inter) + OX * BM;
+    device const bf16 *bu = bias + (long)e * (2 * inter) + inter + OX * BM;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < gate.height; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < gate.width; j++) {
+            #pragma clang loop unroll(full)
+            for (int el = 0; el < 2; el++) {
+                const int c = j * TILE_DIM + sx + el;
+                float g = gate.tiles[i][j].data.thread_elements()[el];
+                float u = up.tiles[i][j].data.thread_elements()[el];
+                if (has_bias != 0) { g += (float)bg[c]; u += (float)bu[c]; }
+                float r;
+                if (act_mode == 1) {
+                    g = metal::min(g, limit);
+                    u = metal::clamp(u, -limit, limit);
+                    r = (g / (1.0f + metal::exp(-g * alpha))) * (1.0f + u);
+                } else {
+                    r = (g / (1.0f + metal::exp(-g))) * u;
+                }
+                gate.tiles[i][j].data.thread_elements()[el] = r;
+            }
+        }
+    }
+    store(gl_d, gate, {0, 0, OY, OX}, simd_lane_id);
+}
+
+#define instantiate_moe_gemm_q(fmt_name, FMT)                                       \
+  template [[host_name("moe_grouped_gemm_rect_q_" #fmt_name)]] [[kernel]] void       \
+  moe_grouped_gemm_rect_q<FMT>(device bf16 *out [[buffer(0)]],                       \
+                               device bf16 *A [[buffer(1)]],                         \
+                               device const uchar *Wq [[buffer(2)]],                 \
+                               device const int *expert_of_tile [[buffer(3)]],       \
+                               device const bf16 *bias [[buffer(4)]],                \
+                               constant int &total_rows [[buffer(5)]],               \
+                               constant int &K_dim [[buffer(6)]],                    \
+                               constant int &N_out [[buffer(7)]],                    \
+                               constant int &has_bias [[buffer(8)]],                 \
+                               uint3 threadgroup_id [[threadgroup_position_in_grid]],\
+                               uint warp [[simdgroup_index_in_threadgroup]],         \
+                               uint simd_lane_id [[thread_index_in_simdgroup]]);      \
+  template [[host_name("moe_grouped_gemm_swiglu_q_" #fmt_name)]] [[kernel]] void     \
+  moe_grouped_gemm_swiglu_q<FMT>(device bf16 *out [[buffer(0)]],                     \
+                                 device bf16 *A [[buffer(1)]],                       \
+                                 device const uchar *W1q [[buffer(2)]],              \
+                                 device const int *expert_of_tile [[buffer(3)]],     \
+                                 device const bf16 *bias [[buffer(4)]],              \
+                                 constant int &total_rows [[buffer(5)]],             \
+                                 constant int &H [[buffer(6)]],                      \
+                                 constant int &inter [[buffer(7)]],                  \
+                                 constant int &has_bias [[buffer(8)]],               \
+                                 constant int &act_mode [[buffer(9)]],               \
+                                 constant float &alpha [[buffer(10)]],               \
+                                 constant float &limit [[buffer(11)]],               \
+                                 uint3 threadgroup_id [[threadgroup_position_in_grid]],\
+                                 uint warp [[simdgroup_index_in_threadgroup]],       \
+                                 uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+instantiate_moe_gemm_q(mxfp4, mxfp4)
+instantiate_moe_gemm_q(kU4, kU4)
+instantiate_moe_gemm_q(fp8_e4m3, fp8_e4m3)
+instantiate_moe_gemm_q(q8_0, q8_0)
+instantiate_moe_gemm_q(nvfp4, nvfp4)
+instantiate_moe_gemm_q(q4_K, q4_K)
+
 #define instantiate_moe_finalize(type_name, T)                                 \
   template [[host_name("moe_finalize_" #type_name)]] [[kernel]] void           \
   moe_finalize<T>(device const T *expert_out [[buffer(0)]],                    \

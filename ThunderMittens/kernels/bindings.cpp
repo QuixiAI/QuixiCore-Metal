@@ -509,6 +509,20 @@ NB_MODULE(_ext, m) {
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
 
     m.def(
+      "moe_grouped_gemm_rect_q", &moe_grouped_gemm_rect_q,
+      "A"_a, "Wq"_a, "expert_of_tile"_a, "bias"_a, "has_bias"_a, "K_dim"_a, "N_out"_a,
+      "format"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(quantized grouped expert GEMM: out(rows,N_out) = A @ dequant(Wq[e])^T [+ bias[e]].
+         Wq (E, N_out, row_bytes) uint8, quant groups along K (quantize_expert_stack layout).)");
+
+    m.def(
+      "moe_grouped_gemm_swiglu_q", &moe_grouped_gemm_swiglu_q,
+      "A"_a, "W1q"_a, "expert_of_tile"_a, "bias"_a, "has_bias"_a, "inter"_a,
+      "act_mode"_a, "alpha"_a, "limit"_a, "format"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(quantized fused SwiGLU GEMM1 from a packed [gate|up] expert stack (E, 2*inter, row_bytes).
+         act_mode 0 = silu(gate)*up; 1 = swiglu_oai (clamped, alpha-sigmoid, (1+up)) for gpt-oss.)");
+
+    m.def(
       "moe_finalize",
       &moe_finalize,
       "expert_out"_a,

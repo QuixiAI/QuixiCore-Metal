@@ -624,6 +624,30 @@ def moe_grouped_gemm_swiglu(A, W1, expert_of_tile):
     return _ext.moe_grouped_gemm_swiglu(A, W1, expert_of_tile)
 
 
+_MOE_Q_ACT_MODES = {"swiglu": 0, "swiglu_oai": 1}
+
+
+def moe_grouped_gemm_rect_q(A, Wq, expert_of_tile, format="mxfp4", bias=None):
+    """Quantized grouped expert GEMM: out(rows,N_out) = A @ dequant(Wq[e])^T [+ bias[e]].
+    A bf16 (rows,K); Wq (E,N_out,row_bytes) uint8 (tk.quant.quantize_expert_stack). MPS."""
+    has_bias = bias is not None
+    if bias is None:
+        bias = torch.zeros(1, dtype=torch.bfloat16, device=A.device)
+    return _ext.moe_grouped_gemm_rect_q(A, Wq, expert_of_tile, bias, has_bias, format)
+
+
+def moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, format="mxfp4", bias=None,
+                              act="swiglu", alpha=1.702, limit=7.0):
+    """Quantized fused SwiGLU GEMM1 from a packed [gate|up] stack (E,2*inter,row_bytes) uint8.
+    act "swiglu" or "swiglu_oai" (gpt-oss: clamped, alpha-sigmoid, (1+up)). MPS."""
+    has_bias = bias is not None
+    if bias is None:
+        bias = torch.zeros(1, dtype=torch.bfloat16, device=A.device)
+    return _ext.moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, bias, has_bias,
+                                          _MOE_Q_ACT_MODES[act], float(alpha), float(limit),
+                                          format)
+
+
 def moe_finalize(expert_out: torch.Tensor, inv_idx: torch.Tensor, topk_weights: torch.Tensor, k: int):
     """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim). MPS."""
     return _ext.moe_finalize(expert_out, inv_idx, topk_weights, int(k))

@@ -1342,6 +1342,74 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("moe_q")
+def moe_q_cases(be, preset, formats):
+    """Quantized grouped expert GEMMs vs the dense bf16 grouped GEMM. Decode-shape MoE is
+    expert-weight-bandwidth-bound, so the packed/dense byte ratio bounds the speedup;
+    weight-GB/s (packed bytes decoded per second) is the headline metric. E=4 keeps host
+    packing tractable — per-tile kernel work is independent of E."""
+    tk = be.tk()
+    from tk.quant import quantize_expert_stack
+    rng = np.random.default_rng(29)
+    fmts = formats or _pick(preset, ["mxfp4"], ["mxfp4", "q8_0"],
+                            ["mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
+    # (E, K_dim, N_out, rows): gpt-oss-ish (2880x2880) decode/prefill + a Qwen3-MoE-ish rect.
+    shapes = _pick(preset, [(4, 1024, 1024, 32)],
+                   [(4, 2880, 2880, 32), (4, 2880, 2880, 512)],
+                   [(4, 2880, 2880, 32), (4, 2880, 2880, 512), (4, 2880, 2880, 4096),
+                    (4, 2048, 768, 512)])
+    for E, K_dim, N_out, rows in shapes:
+        tiles = rows // 32
+        eot = (np.arange(tiles, dtype=np.int32) * E // max(tiles, 1)).astype(np.int32)
+        A = (0.1 * rng.standard_normal((rows, K_dim))).astype(np.float32)
+        Wd = (0.1 * rng.standard_normal((E, K_dim, N_out))).astype(np.float32)
+        A_d, eot_d = be.array(A, "bf16"), be.int_array(eot)
+        W_dense = be.array(Wd, "bf16")
+        dense = (lambda A_d=A_d, W=W_dense, eot_d=eot_d:
+                 tk.moe_grouped_gemm_rect(A_d, W, eot_d))
+        for fmt in fmts:
+            bk, bb = BLOCK_INFO[fmt]
+            if K_dim % bk or K_dim % 32:
+                continue
+            Wq = quantize_expert_stack(Wd, fmt)
+            Wq_d = be.raw_array(Wq)
+            yield Case("moe_q", f"rect_{fmt}_K{K_dim}_N{N_out}_rows{rows}",
+                       {"E": E, "K": K_dim, "N": N_out, "rows": rows}, "bf16", fmt=fmt,
+                       target=lambda A_d=A_d, Wq_d=Wq_d, eot_d=eot_d, f=fmt:
+                           tk.moe_grouped_gemm_rect_q(A_d, Wq_d, eot_d, format=f),
+                       baselines={"dense_bf16_rect": dense}, ref=None,
+                       weight_bytes=tiles * N_out * (K_dim // bk) * bb,
+                       flops=2.0 * rows * K_dim * N_out)
+        del Wd, W_dense
+
+    # Fused quantized SwiGLU GEMM1, gpt-oss config (swiglu_oai + expert bias), mxfp4.
+    sw_shapes = _pick(preset, [(4, 1024, 512, 32)], [(4, 2880, 2880, 32), (4, 2880, 2880, 512)],
+                      [(4, 2880, 2880, 32), (4, 2880, 2880, 512), (4, 2880, 2880, 4096)])
+    for E, Hd, inter, rows in sw_shapes:
+        tiles = rows // 32
+        eot = (np.arange(tiles, dtype=np.int32) * E // max(tiles, 1)).astype(np.int32)
+        A = (0.1 * rng.standard_normal((rows, Hd))).astype(np.float32)
+        W1 = (0.1 * rng.standard_normal((E, Hd, 2 * inter))).astype(np.float32)
+        bias = (0.1 * rng.standard_normal((E, 2 * inter))).astype(np.float32)
+        W1q = quantize_expert_stack(W1, "mxfp4")
+        A_d, eot_d = be.array(A, "bf16"), be.int_array(eot)
+        W1_dense, W1q_d, b_d = be.array(W1, "bf16"), be.raw_array(W1q), be.array(bias, "bf16")
+        bk, bb = BLOCK_INFO["mxfp4"]
+        yield Case("moe_q", f"swiglu_oai_mxfp4_H{Hd}_I{inter}_rows{rows}",
+                   {"E": E, "H": Hd, "inter": inter, "rows": rows}, "bf16", fmt="mxfp4",
+                   target=lambda A_d=A_d, W1q_d=W1q_d, eot_d=eot_d, b_d=b_d:
+                       tk.moe_grouped_gemm_swiglu_q(A_d, W1q_d, eot_d, format="mxfp4",
+                                                    bias=b_d, act="swiglu_oai",
+                                                    alpha=1.702, limit=7.0),
+                   baselines={"dense_bf16_swiglu":
+                              lambda A_d=A_d, W=W1_dense, eot_d=eot_d:
+                                  tk.moe_grouped_gemm_swiglu(A_d, W, eot_d)},
+                   ref=None,
+                   weight_bytes=tiles * 2 * inter * (Hd // bk) * bb,
+                   flops=2.0 * rows * Hd * 2 * inter)
+        del W1, W1_dense
+
+
 @register("moe")
 def moe_cases(be, preset, formats):
     tk = be.tk()

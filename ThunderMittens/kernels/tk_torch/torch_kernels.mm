@@ -1748,6 +1748,65 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// Quantized grouped expert GEMMs: Wq is the packed (E, N_out, row_bytes) uint8 expert stack
+// (quant groups along K — tk.quant.quantize_expert_stack layout), contracted as A @ Wq^T.
+// bias: pass a 1-element dummy with has_bias=false when absent. bf16 activations only.
+static at::Tensor moe_grouped_gemm_rect_q_mps(const at::Tensor& A_in, const at::Tensor& Wq_in,
+                                              const at::Tensor& eot_in, const at::Tensor& bias_in,
+                                              bool has_bias, const std::string& format) {
+  TORCH_CHECK(A_in.device().is_mps() && A_in.scalar_type() == at::kBFloat16,
+              "moe_grouped_gemm_rect_q: A must be a bfloat16 MPS tensor");
+  TORCH_CHECK(A_in.dim() == 2 && Wq_in.dim() == 3 && Wq_in.scalar_type() == at::kByte,
+              "moe_grouped_gemm_rect_q: A (rows,K), Wq (E,N_out,row_bytes) uint8");
+  const int total_rows = A_in.size(0), K_dim = A_in.size(1), N_out = Wq_in.size(1);
+  TORCH_CHECK(total_rows % 32 == 0 && K_dim % 32 == 0 && N_out % 32 == 0,
+              "moe_grouped_gemm_rect_q: rows%32, K%32, N%32");
+  if (has_bias) {
+    TORCH_CHECK(bias_in.dim() == 2 && bias_in.size(0) == Wq_in.size(0) &&
+                bias_in.size(1) == N_out, "moe_grouped_gemm_rect_q: bias must be (E, N_out)");
+  }
+  auto A = A_in.contiguous(), Wq = Wq_in.contiguous();
+  auto eot = eot_in.to(at::kInt).contiguous();
+  auto bias = bias_in.to(at::kBFloat16).contiguous();
+  auto out = at::empty({total_rows, N_out}, A.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_grouped_gemm_rect_q(e, out, A, Wq, eot, bias, total_rows, K_dim, N_out,
+                                       has_bias ? 1 : 0, format);
+  });
+  return out;
+}
+
+static at::Tensor moe_grouped_gemm_swiglu_q_mps(const at::Tensor& A_in, const at::Tensor& W1q_in,
+                                                const at::Tensor& eot_in, const at::Tensor& bias_in,
+                                                bool has_bias, int64_t act_mode, double alpha,
+                                                double limit, const std::string& format) {
+  TORCH_CHECK(A_in.device().is_mps() && A_in.scalar_type() == at::kBFloat16,
+              "moe_grouped_gemm_swiglu_q: A must be a bfloat16 MPS tensor");
+  TORCH_CHECK(A_in.dim() == 2 && W1q_in.dim() == 3 && W1q_in.scalar_type() == at::kByte,
+              "moe_grouped_gemm_swiglu_q: A (rows,H), W1q (E,2*inter,row_bytes) uint8");
+  const int total_rows = A_in.size(0), H = A_in.size(1);
+  TORCH_CHECK(W1q_in.size(1) % 2 == 0, "moe_grouped_gemm_swiglu_q: W1q dim 1 must be 2*inter");
+  const int inter = W1q_in.size(1) / 2;
+  TORCH_CHECK(total_rows % 32 == 0 && H % 32 == 0 && inter % 32 == 0,
+              "moe_grouped_gemm_swiglu_q: rows%32, H%32, inter%32");
+  if (has_bias) {
+    TORCH_CHECK(bias_in.dim() == 2 && bias_in.size(0) == W1q_in.size(0) &&
+                bias_in.size(1) == 2 * inter,
+                "moe_grouped_gemm_swiglu_q: bias must be (E, 2*inter)");
+  }
+  auto A = A_in.contiguous(), W1q = W1q_in.contiguous();
+  auto eot = eot_in.to(at::kInt).contiguous();
+  auto bias = bias_in.to(at::kBFloat16).contiguous();
+  auto out = at::empty({total_rows, inter}, A.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_moe_grouped_gemm_swiglu_q(e, out, A, W1q, eot, bias, total_rows, H, inter,
+                                         has_bias ? 1 : 0, static_cast<int>(act_mode),
+                                         static_cast<float>(alpha), static_cast<float>(limit),
+                                         format);
+  });
+  return out;
+}
+
 // MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
 static at::Tensor moe_finalize_mps(const at::Tensor& expert_out_in, const at::Tensor& inv_in,
                                    const at::Tensor& w_in, int64_t k) {
@@ -3059,6 +3118,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("moe_grouped_gemm_rect_q", &moe_grouped_gemm_rect_q_mps, "ThunderMittens quantized grouped expert GEMM (MPS)");
+  m.def("moe_grouped_gemm_swiglu_q", &moe_grouped_gemm_swiglu_q_mps, "ThunderMittens quantized fused SwiGLU expert GEMM1 (MPS)");
   m.def("moe_finalize", &moe_finalize_mps, "ThunderMittens MoE finalize reduce (MPS)");
   m.def("argmax_sample", &argmax_sample_mps, "ThunderMittens greedy argmax sampling (MPS)");
   m.def("sample_categorical", &sample_categorical_mps, "ThunderMittens Gumbel-max sampling (MPS)");

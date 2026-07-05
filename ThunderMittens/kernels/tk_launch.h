@@ -50,6 +50,8 @@ inline std::string moe_finalize_kernel_name(const std::string& t) { return "moe_
 inline std::string moe_grouped_gemm_kernel_name(const std::string& t) { return "moe_grouped_gemm_" + t; }
 inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { return "moe_grouped_gemm_rect_" + t; }
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
+inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
+inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
 inline std::string top_k_sample_kernel_name(const std::string& t) { return "top_k_sample_" + t; }
 inline std::string top_p_sample_kernel_name(const std::string& t) { return "top_p_sample_" + t; }
@@ -418,6 +420,40 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// ----- Quantized grouped expert GEMMs (weight-only quant, bf16 activations). Wq is the packed
+// expert stack (E, N_out, K_dim/block_k, block_bytes) — (N, K) orientation, TRANSPOSED vs the
+// dense kernels, contracted as A @ Wq^T. bias is (E, N_out) bf16 (rect) / (E, 2*inter) (swiglu);
+// pass a 1-element dummy with has_bias=0 when absent. fmt selects the [[host_name]] variant
+// (mxfp4 / kU4 / fp8_e4m3 / q8_0 / nvfp4 / q4_K). -----
+// rect_q: out@0 A@1 Wq@2(u8) expert_of_tile@3(i32) bias@4 ; rows@5 K_dim@6 N_out@7 has_bias@8 ;
+//         grid (N_out/32, rows/32, 1), 32 thr.
+template <class Enc>
+void launch_moe_grouped_gemm_rect_q(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
+                                    typename Enc::in_t Wq, typename Enc::in_t expert_of_tile,
+                                    typename Enc::in_t bias, int total_rows, int K_dim, int N_out,
+                                    int has_bias, const std::string& fmt) {
+  e.pipeline(moe_grouped_gemm_rect_q_kernel_name(fmt));
+  e.out(out, 0); e.in(A, 1); e.in(Wq, 2); e.in(expert_of_tile, 3); e.in(bias, 4);
+  e.bytes(total_rows, 5); e.bytes(K_dim, 6); e.bytes(N_out, 7); e.bytes(has_bias, 8);
+  e.dispatch(N_out / 32, total_rows / 32, 1, 128, 1, 1);   // 4-warp split-K per tile
+}
+
+// swiglu_q: out@0 A@1 W1q@2(u8, [gate|up] along N) expert_of_tile@3(i32) bias@4 ; rows@5 H@6
+//           inter@7 has_bias@8 act_mode@9 (0 swiglu, 1 swiglu_oai) alpha@10(f32) limit@11(f32) ;
+//           grid (inter/32, rows/32, 1), 32 thr.
+template <class Enc>
+void launch_moe_grouped_gemm_swiglu_q(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
+                                      typename Enc::in_t W1q, typename Enc::in_t expert_of_tile,
+                                      typename Enc::in_t bias, int total_rows, int H, int inter,
+                                      int has_bias, int act_mode, float alpha, float limit,
+                                      const std::string& fmt) {
+  e.pipeline(moe_grouped_gemm_swiglu_q_kernel_name(fmt));
+  e.out(out, 0); e.in(A, 1); e.in(W1q, 2); e.in(expert_of_tile, 3); e.in(bias, 4);
+  e.bytes(total_rows, 5); e.bytes(H, 6); e.bytes(inter, 7); e.bytes(has_bias, 8);
+  e.bytes(act_mode, 9); e.bytes(alpha, 10); e.bytes(limit, 11);
+  e.dispatch(inter / 32, total_rows / 32, 1, 128, 1, 1);   // 4-warp split-K per tile
 }
 
 // ----- moe_finalize: expert_out@0 inv_idx@1(i32) topk_weights@2(f32) -> out@3 ; K@4 Hdim@5 ;

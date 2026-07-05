@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <string>
 #include <vector>
 
 #include "mlx/ops.h"
@@ -68,6 +69,25 @@ array moe_grouped_gemm_rect(
  *  A (total_rows, H); W1 (E, H, 2*inter) laid out [gate | up]. H % 16 == 0, inter % 32 == 0. **/
 array moe_grouped_gemm_swiglu(
     const array& A, const array& W1, const array& expert_of_tile, StreamOrDevice s = {});
+
+/** Quantized rectangular grouped GEMM: out (total_rows, N_out) = A @ dequant(Wq[e])^T.
+ *  A (total_rows, K_dim) bfloat16. Wq (E, N_out, row_bytes) uint8 — experts packed row-major
+ *  over (N_out, K_dim) with quant groups along K_dim (tk.quant.quantize_expert_stack layout;
+ *  row_bytes = K_dim/block_k * block_bytes). bias (E, N_out) bfloat16 added per output column
+ *  when has_bias (pass a 1-element dummy otherwise). total_rows % 32 == 0, K_dim % 32 == 0
+ *  (and % block_k), N_out % 32 == 0. format in {mxfp4,kU4,fp8_e4m3,q8_0,nvfp4,q4_K}. **/
+array moe_grouped_gemm_rect_q(
+    const array& A, const array& Wq, const array& expert_of_tile, const array& bias,
+    bool has_bias, int K_dim, int N_out, const std::string& format, StreamOrDevice s = {});
+
+/** Quantized fused SwiGLU GEMM1: out (total_rows, inter). W1q (E, 2*inter, row_bytes) uint8,
+ *  packed rows [gate(inter) | up(inter)] over K = H. act_mode 0: silu(gate)*up;
+ *  act_mode 1: gpt-oss swiglu_oai — min/clamp by `limit`, gate*sigmoid(alpha*gate)*(1+up).
+ *  bias (E, 2*inter) bfloat16 pre-activation when has_bias. **/
+array moe_grouped_gemm_swiglu_q(
+    const array& A, const array& W1q, const array& expert_of_tile, const array& bias,
+    bool has_bias, int inter, int act_mode, float alpha, float limit,
+    const std::string& format, StreamOrDevice s = {});
 
 class MoeRouteTopk : public Primitive {
  public:
@@ -204,6 +224,67 @@ class MoeGroupedGemmSwiglu : public Primitive {
   const char* name() const { return "MoeGroupedGemmSwiglu"; }
   void print(std::ostream& os) override { os << "MoeGroupedGemmSwiglu"; }
   bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class MoeGroupedGemmRectQ : public Primitive {
+ public:
+  MoeGroupedGemmRectQ(Stream stream, std::string format, bool has_bias, int K_dim, int N_out)
+      : Primitive(stream), format_(std::move(format)), has_bias_(has_bias),
+        K_dim_(K_dim), N_out_(N_out) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmRectQ"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmRectQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MoeGroupedGemmRectQ&>(other);
+    return format_ == o.format_ && has_bias_ == o.has_bias_ &&
+           K_dim_ == o.K_dim_ && N_out_ == o.N_out_;
+  }
+
+ private:
+  std::string format_;
+  bool has_bias_;
+  int K_dim_;
+  int N_out_;
+};
+
+class MoeGroupedGemmSwigluQ : public Primitive {
+ public:
+  MoeGroupedGemmSwigluQ(Stream stream, std::string format, bool has_bias, int inter,
+                        int act_mode, float alpha, float limit)
+      : Primitive(stream), format_(std::move(format)), has_bias_(has_bias), inter_(inter),
+        act_mode_(act_mode), alpha_(alpha), limit_(limit) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmSwigluQ"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmSwigluQ"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const MoeGroupedGemmSwigluQ&>(other);
+    return format_ == o.format_ && has_bias_ == o.has_bias_ && inter_ == o.inter_ &&
+           act_mode_ == o.act_mode_ && alpha_ == o.alpha_ && limit_ == o.limit_;
+  }
+
+ private:
+  std::string format_;
+  bool has_bias_;
+  int inter_;
+  int act_mode_;
+  float alpha_;
+  float limit_;
 };
 
 class MoeFinalize : public Primitive {
