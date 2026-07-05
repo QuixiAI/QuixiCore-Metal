@@ -39,6 +39,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.cpp
     ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/qk_norm_rope/qk_norm_rope.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mla/mla.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.cpp
@@ -103,6 +104,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/softmax/softmax.metal
         ${CMAKE_CURRENT_LIST_DIR}/rotary/rotary.metal
         ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.metal
+        ${CMAKE_CURRENT_LIST_DIR}/qk_norm_rope/qk_norm_rope.metal
         ${CMAKE_CURRENT_LIST_DIR}/mla/mla.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.metal

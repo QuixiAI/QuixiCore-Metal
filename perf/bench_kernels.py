@@ -1342,6 +1342,54 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("qk_norm_rope")
+def qk_norm_rope_cases(be, preset, formats):
+    """Fused per-head QK-RMSNorm + RoPE on packed QKV vs an mx-ops composition (per-head
+    fast.rms_norm + fast.rope over reshaped heads + V concat). Qwen3-8B / gpt-oss shapes."""
+    tk = be.tk()
+    rng = np.random.default_rng(31)
+    shapes = _pick(preset, [(512, 8, 2, 2, 128)],
+                   [(512, 32, 8, 8, 128), (4096, 32, 8, 8, 128)],
+                   [(512, 32, 8, 8, 128), (4096, 32, 8, 8, 128), (4096, 64, 8, 8, 64)])
+    for T, hq, hk, hv, D in shapes:
+        HT = hq + hk + hv
+        qkv = (0.3 * rng.standard_normal((T, HT * D))).astype(np.float32)
+        qw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+        kw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+        half = D // 2
+        inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+        ang = np.outer(np.arange(8192), inv)
+        cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+        pos = rng.integers(0, 8192, T).astype(np.int32)
+        qkv_d = be.array(qkv, "bf16")
+        qw_d, kw_d = be.array(qw, "bf16"), be.array(kw, "bf16")
+        c_d, s_d = be.array(cos, "bf16"), be.array(sin, "bf16")
+        p_d = be.int_array(pos)
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+
+            def composed(qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, p_d=p_d, T=T, hq=hq, hk=hk,
+                         hv=hv, D=D):
+                x = qkv_d.reshape(T, hq + hk + hv, D)
+                q = mx.fast.rms_norm(x[:, :hq], qw_d, 1e-6)
+                k = mx.fast.rms_norm(x[:, hq:hq + hk], kw_d, 1e-6)
+                # positions vary per token; fast.rope wants an offset — approximate the cost
+                q = mx.fast.rope(q.transpose(1, 0, 2), D, traditional=False, base=10000.0,
+                                 scale=1.0, offset=0).transpose(1, 0, 2)
+                k = mx.fast.rope(k.transpose(1, 0, 2), D, traditional=False, base=10000.0,
+                                 scale=1.0, offset=0).transpose(1, 0, 2)
+                return mx.concatenate([q, k, x[:, hq + hk:]], axis=1).reshape(T, -1)
+            baselines["mx_composed"] = composed
+        yield Case("qk_norm_rope", f"T{T}_hq{hq}hk{hk}hv{hv}_D{D}",
+                   {"T": T, "hq": hq, "D": D}, "bf16",
+                   target=lambda qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d,
+                          p_d=p_d, hq=hq, hk=hk, hv=hv:
+                       tk.qk_norm_rope(qkv_d, qw_d, kw_d, c_d, s_d, p_d, hq, hk, hv),
+                   baselines=baselines, ref=None,
+                   bytes_moved=2.0 * T * (hq + hk + hv) * D * 2)
+
+
 @register("moe_route")
 def moe_route_cases(be, preset, formats):
     """DeepSeek grouped routing vs the plain top-k router (same T,E,K): the grouped kernel

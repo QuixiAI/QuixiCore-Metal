@@ -791,6 +791,24 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+                 num_heads_v, eps=1e-6, interleaved=False, gemma=False):
+    """Fused per-head QK-RMSNorm + RoPE over a packed QKV buffer (the Qwen3 attention-prep
+    pattern): every Q/K head is RMSNormed over its head_dim (q_weight/k_weight (D,)) then
+    rotated at positions[token]; V heads are copied through. qkv (T, (Hq+Hk+Hv)*D) bf16;
+    cos/sin (max_pos, D/2). interleaved: False = NeoX split-half, True = GPT-J pairs;
+    gemma weights by (1+w). Full rotary only; D in {64,128,256}. Returns the new qkv.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(qkv):
+        return _torch().qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions,
+                                     num_heads_q, num_heads_k, num_heads_v,
+                                     eps=eps, interleaved=interleaved, gemma=gemma)
+    return _mlx().qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions,
+                               num_heads_q, num_heads_k, num_heads_v,
+                               eps=float(eps), interleaved=bool(interleaved),
+                               gemma=bool(gemma))
+
+
 def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,
                       routed_scaling_factor=1.0, scoring="sigmoid"):
     """DeepSeek-style grouped (node-limited) MoE routing (HF noaux_tc semantics).

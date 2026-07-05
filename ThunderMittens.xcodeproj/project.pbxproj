@@ -149,6 +149,7 @@
 				kernels/attn_bwd/attn_bwd.cpp,
 				kernels/rms_norm/rms_norm.cpp,
 				kernels/rope_kv/rope_kv.cpp,
+				kernels/qk_norm_rope/qk_norm_rope.cpp,
 				kernels/mla/mla.cpp,
 				kernels/paged_attn_v2/paged_attn_v2.cpp,
 				kernels/hadamard/hadamard.cpp,

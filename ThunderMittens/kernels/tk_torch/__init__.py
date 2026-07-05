@@ -30,6 +30,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "softmax", "softmax.metal"),
     os.path.join(_KERNELS, "rotary", "rotary.metal"),
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
+    os.path.join(_KERNELS, "qk_norm_rope", "qk_norm_rope.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -600,6 +601,15 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
+
+
+def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+                 num_heads_v, eps=1e-6, interleaved=False, gemma=False):
+    """Fused per-head QK-RMSNorm + RoPE over packed QKV (T, (Hq+Hk+Hv)*D) bf16; V heads
+    copied through. interleaved: False = NeoX split-half, True = GPT-J pairs. MPS."""
+    return _ext.qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions,
+                             int(num_heads_q), int(num_heads_k), int(num_heads_v),
+                             float(eps), bool(interleaved), bool(gemma))
 
 
 def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,

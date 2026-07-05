@@ -676,6 +676,30 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+@pytest.mark.parametrize("interleaved", [False, True])
+def test_qk_norm_rope_parity(interleaved):
+    rng = np.random.default_rng(56)
+    D, hq, hk, hv, T = 128, 8, 2, 2, 16
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    kw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    half = D // 2
+    inv = 1.0 / (10000.0 ** (np.arange(half) / half))
+    ang = np.outer(np.arange(256), inv)
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    pos = rng.integers(0, 256, T).astype(np.int32)
+    om = tk.qk_norm_rope(mx.array(qkv).astype(mx.bfloat16),
+                         mx.array(qw).astype(mx.bfloat16), mx.array(kw).astype(mx.bfloat16),
+                         mx.array(cos).astype(mx.bfloat16), mx.array(sin).astype(mx.bfloat16),
+                         mx.array(pos), hq, hk, hv, interleaved=interleaved)
+    tt = lambda a, dt: torch.from_numpy(a).to(dt).to("mps")
+    ot = tk.qk_norm_rope(tt(qkv, torch.bfloat16), tt(qw, torch.bfloat16),
+                         tt(kw, torch.bfloat16), tt(cos, torch.bfloat16),
+                         tt(sin, torch.bfloat16), torch.from_numpy(pos).to("mps"),
+                         hq, hk, hv, interleaved=interleaved)
+    _assert_parity(om, ot, atol=1e-2)
+
+
 @pytest.mark.parametrize("E,n_group,topk_group,K", [(256, 8, 4, 8), (64, 4, 2, 4)])
 def test_moe_route_grouped_parity(E, n_group, topk_group, K):
     rng = np.random.default_rng(55)

@@ -51,6 +51,7 @@ inline std::string moe_grouped_gemm_kernel_name(const std::string& t) { return "
 inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { return "moe_grouped_gemm_rect_" + t; }
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
 inline std::string moe_route_grouped_kernel_name(const std::string& t) { return "moe_route_grouped_" + t; }
+inline std::string qk_norm_rope_kernel_name(int D) { return "qk_norm_rope_" + std::to_string(D); }
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
 inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
@@ -425,6 +426,22 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// ----- qk_norm_rope: qkv@0 q_weight@1 k_weight@2 cos@3 sin@4 positions@5(i32) -> out@6 ;
+//        Hq@7 Hk@8 Hv@9 eps@10(f32) interleave@11 gemma@12 ; grid (Hq+Hk+Hv, T, 1), 32 thr.
+//        Fused per-head QK-RMSNorm + RoPE on packed QKV; V heads copied through. -----
+template <class E>
+void launch_qk_norm_rope(E& e, typename E::in_t qkv, typename E::in_t q_weight,
+                         typename E::in_t k_weight, typename E::in_t cosb, typename E::in_t sinb,
+                         typename E::in_t positions, typename E::out_t out, int T, int Hq, int Hk,
+                         int Hv, int D, float eps, int interleave, int gemma) {
+  e.pipeline(qk_norm_rope_kernel_name(D));
+  e.in(qkv, 0); e.in(q_weight, 1); e.in(k_weight, 2); e.in(cosb, 3); e.in(sinb, 4);
+  e.in(positions, 5); e.out(out, 6);
+  e.bytes(Hq, 7); e.bytes(Hk, 8); e.bytes(Hv, 9); e.bytes(eps, 10);
+  e.bytes(interleave, 11); e.bytes(gemma, 12);
+  e.dispatch(Hq + Hk + Hv, T, 1, 32, 1, 1);
 }
 
 // ----- moe_route_grouped (DeepSeek noaux_tc): logits@0 bias@1(f32,(E,)) -> topk_ids@2(i32)

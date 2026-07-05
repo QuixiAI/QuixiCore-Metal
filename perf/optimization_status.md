@@ -1,5 +1,19 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE (2026-07-05)
+
+New kernels/qk_norm_rope/: one warp per (token, head) over packed QKV (T, (Hq+Hk+Hv)*D) —
+per-head RMSNorm (gemma (1+w) flag) + RoPE (NeoX split-half via the rope_kv rv_fl<D/2>
+half-vector idiom; GPT-J interleaved via the mla contiguous-lane idiom, pairs lane-local),
+V heads vec-copied through. Functional out-of-place, one dispatch (the Qwen3/gpt-oss
+attention-prep pattern). D in {64,128,256}, full rotary.
+
+- Tests: 9 fp64-oracle cases (both rope styles x gemma, V-region bit-identity,
+  composition cross-check) + cross-backend parity (atol 1e-2 bf16).
+- Perf: Qwen3-8B shape (T=4096, 32/8/8, D=128) 0.388 ms vs 1.005 ms for the
+  mx.fast.rms_norm + fast.rope + concat composition — 2.6x (target was >= 1.5x).
+  T=512: 0.055 vs 0.111 ms. No optimization pass needed at v1.
+
 ## Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing (2026-07-05)
 
 moe_route_grouped: HF DeepSeek-V3 "noaux_tc" semantics — sigmoid / softmax / sqrt-softplus
