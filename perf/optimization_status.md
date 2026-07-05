@@ -1,5 +1,23 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 10: MInference block-mask builder (2026-07-05)
+
+New kernels/minference/: minference_build_block_mask converts per-head vertical column
+indexes + slash diagonal offsets ((B, H, nnz) i32, -1 pad) into the per-head KV block mask
+(B, H, max_blocks) that paged_attention_block_sparse now consumes directly — the consumer
+gained a mask_heads scalar (buffer 16; 1 = legacy per-batch (B, max_blocks) unchanged,
+H = per-head) so MInference's per-head selectivity is preserved instead of unioned away.
+vertical_topk/slash_topk caps give the _mergehead budget without a second kernel;
+last_n_blocks keeps the local window. The reference's serial two-pointer CSR merge is
+deliberately skipped (deferred until a prefill block-sparse consumer exists) — for decode
+the block mask IS the consumer format.
+
+- Tests: exact int equality vs the numpy marking rule (+topk-cap case), end-to-end per-head
+  mask -> block-sparse attention vs dense numpy restricted to kept blocks, legacy 2-D mask
+  regression, full kv_cache suite (152 green), torch paged subset (24), parity atol=0.
+- Trivial-cost builder (one 32-lane simdgroup per (head, batch)); no bench entry — the win
+  is the KV blocks the consumer skips.
+
 ## Wave-9 — gap port, kernel 9: the sampler zoo (2026-07-05)
 
 New kernels/sampling/sampling_transforms.metal (+ transforms.cpp/.h): 11 transforms on the

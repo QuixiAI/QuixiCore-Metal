@@ -676,6 +676,19 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_minference_block_mask_parity():
+    rng = np.random.default_rng(62)
+    B, H, nnz = 2, 4, 16
+    lens = np.array([300, 77], np.int32)
+    vert = rng.integers(-1, 320, (B, H, nnz)).astype(np.int32)
+    slash = rng.integers(-1, 320, (B, H, nnz)).astype(np.int32)
+    t = lambda a: torch.from_numpy(a).to("mps")
+    gm = tk.minference_block_mask(mx.array(vert), mx.array(slash), mx.array(lens), 24, 16,
+                                  last_n_blocks=2)
+    gt = tk.minference_block_mask(t(vert), t(slash), t(lens), 24, 16, last_n_blocks=2)
+    _assert_parity(gm, gt, atol=0)
+
+
 def test_sampler_transforms_parity():
     rng = np.random.default_rng(61)
     # margin-safe grid logits: no token within float-epsilon of a threshold

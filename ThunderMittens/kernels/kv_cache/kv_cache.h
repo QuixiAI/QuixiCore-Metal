@@ -352,9 +352,9 @@ class PagedAttentionFp8 : public Primitive {
 class PagedAttention : public Primitive {
  public:
   PagedAttention(Stream stream, float scale, bool use_alibi = false, bool use_mask = false,
-                 int window = 0)
+                 int window = 0, int mask_heads = 1)
       : Primitive(stream), scale_(scale), use_alibi_(use_alibi), use_mask_(use_mask),
-        window_(window) {}
+        window_(window) , mask_heads_(mask_heads) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
@@ -376,7 +376,7 @@ class PagedAttention : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const PagedAttention&>(other);
     return scale_ == o.scale_ && use_alibi_ == o.use_alibi_ && use_mask_ == o.use_mask_ &&
-           window_ == o.window_;
+           window_ == o.window_ && mask_heads_ == o.mask_heads_;
   }
 
  private:
@@ -384,6 +384,7 @@ class PagedAttention : public Primitive {
   bool use_alibi_;
   bool use_mask_;
   int window_;
+  int mask_heads_;
 };
 
 class PagedAttentionStaged : public Primitive {

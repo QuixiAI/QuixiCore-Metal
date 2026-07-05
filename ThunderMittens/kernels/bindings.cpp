@@ -68,6 +68,7 @@
 #include "selective_scan/selective_scan.h"
 #include "gdn/gdn.h"
 #include "act_quant/act_quant.h"
+#include "minference/minference.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -527,6 +528,14 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def("minference_block_mask", &minference_block_mask,
+      "vertical_indexes"_a, "slash_indexes"_a, "context_lens"_a, "max_blocks"_a,
+      "block_size"_a, "vertical_topk"_a = 1 << 30, "slash_topk"_a = 1 << 30,
+      "last_n_blocks"_a = 1,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(MInference decode block-mask builder: per-head vertical cols + slash offsets ->
+         (batch, num_heads, max_blocks) int32 mask for paged_attention_block_sparse.)");
 
     m.def("quadratic_transform", &quadratic_transform,
       "logits"_a, "factor"_a, "curve"_a = 1.0f, "temperature"_a = 1.0f,

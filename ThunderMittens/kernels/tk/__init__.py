@@ -792,6 +792,24 @@ def moe_route_topk(logits, k):
 
 
 
+def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,
+                          block_size, vertical_topk=1 << 30, slash_topk=1 << 30,
+                          last_n_blocks=1):
+    """MInference decode block-mask builder: per-head vertical column indexes + slash
+    diagonal offsets ((B, H, nnz) int32, -1 pad) -> per-head KV block mask
+    (B, H, max_blocks) int32 0/1 consumed directly by tk.paged_attention_block_sparse
+    (which accepts 2-D per-batch or 3-D per-head masks). vertical/slash_topk cap how many
+    index entries are used; last_n_blocks recent blocks are always attended.
+    Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(vertical_indexes):
+        return _torch().minference_block_mask(vertical_indexes, slash_indexes, context_lens,
+                                              max_blocks, block_size, vertical_topk,
+                                              slash_topk, last_n_blocks)
+    return _mlx().minference_block_mask(vertical_indexes, slash_indexes, context_lens,
+                                        int(max_blocks), int(block_size), int(vertical_topk),
+                                        int(slash_topk), int(last_n_blocks))
+
+
 def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
     """Quadratic / smoothing sampling transform: diff = l - max; diff -= diff^2(s*diff - k)
     with k = factor(3-curve)/2, s = factor(curve-1)/2; factor 0 = identity. Writes tempered

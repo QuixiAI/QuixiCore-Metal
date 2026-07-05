@@ -339,8 +339,18 @@ array paged_attention_block_sparse(
   if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0)) {
     throw std::invalid_argument("paged_attention_block_sparse: block_table must have shape (batch, max_blocks)");
   }
-  if (block_mask.shape() != block_table.shape()) {
-    throw std::invalid_argument("paged_attention_block_sparse: block_mask must match block_table shape (batch, max_blocks)");
+  int mask_heads = 1;
+  if (block_mask.ndim() == 3) {
+    // per-query-head mask (MInference vertical+slash selectivity)
+    if (block_mask.shape(0) != q.shape(0) || block_mask.shape(1) != q.shape(1) ||
+        block_mask.shape(2) != block_table.shape(1)) {
+      throw std::invalid_argument(
+          "paged_attention_block_sparse: 3-D block_mask must be (batch, num_heads, max_blocks)");
+    }
+    mask_heads = q.shape(1);
+  } else if (block_mask.shape() != block_table.shape()) {
+    throw std::invalid_argument(
+        "paged_attention_block_sparse: block_mask must be (batch, max_blocks) or (batch, num_heads, max_blocks)");
   }
   const int D = q.shape(2);
   if (!(D == 64 || D == 128)) {
@@ -362,7 +372,7 @@ array paged_attention_block_sparse(
       q.shape(),
       dtype,
       std::make_shared<PagedAttention>(to_stream(s), scale, /*use_alibi=*/false, /*use_mask=*/true,
-                                       window),
+                                       window, mask_heads),
       {q_c, key_c, value_c, table_c, lens_c, no_alibi, mask_c});
 }
 
@@ -690,6 +700,7 @@ void PagedAttention::eval_gpu(
       block_mask,
       use_mask_ ? 1 : 0,
       window_,
+      mask_heads_,
       type_to_name(q));
 }
 

@@ -1395,6 +1395,7 @@ void launch_paged_attention(
     typename E::in_t block_mask,
     int use_mask,
     int window,
+    int mask_heads,
     const std::string& type_name) {
   e.pipeline(paged_attention_kernel_name(type_name, head_size));
   e.in(q, 0);
@@ -1413,6 +1414,7 @@ void launch_paged_attention(
   e.in(block_mask, 13);
   e.bytes(use_mask, 14);
   e.bytes(window, 15);
+  e.bytes(mask_heads, 16);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
@@ -2227,6 +2229,22 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
   e.bytes(N, 4); e.bytes(K, 5);
   e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// ----- minference_build_block_mask: vert@0 slash@1 (B,H,nnz i32 -1pad) lens@2 -> mask@3
+//        (B,H,max_blocks i32); scalars H@4 nnz_v@5 nnz_s@6 vtopk@7 stopk@8 bs@9 mb@10
+//        last_n@11 ; grid (H, B, 1), 32 thr. -----
+template <class E>
+void launch_minference_block_mask(E& e, typename E::in_t vert, typename E::in_t slash,
+                                  typename E::in_t lens, typename E::out_t mask, int B, int H,
+                                  int nnz_v, int nnz_s, int vertical_topk, int slash_topk,
+                                  int block_size, int max_blocks, int last_n_blocks) {
+  e.pipeline("mittens::minference_build_block_mask");
+  e.in(vert, 0); e.in(slash, 1); e.in(lens, 2); e.out(mask, 3);
+  e.bytes(H, 4); e.bytes(nnz_v, 5); e.bytes(nnz_s, 6);
+  e.bytes(vertical_topk, 7); e.bytes(slash_topk, 8);
+  e.bytes(block_size, 9); e.bytes(max_blocks, 10); e.bytes(last_n_blocks, 11);
+  e.dispatch(H, B, 1, 32, 1, 1);
 }
 
 // ----- sampler-zoo transforms (sampling_transforms.metal): one simdgroup per row;

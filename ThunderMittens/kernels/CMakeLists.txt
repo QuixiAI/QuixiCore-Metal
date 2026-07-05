@@ -43,6 +43,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/selective_scan/selective_scan.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gdn/gdn.cpp
     ${CMAKE_CURRENT_LIST_DIR}/act_quant/act_quant.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/minference/minference.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mla/mla.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.cpp
@@ -112,6 +113,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/selective_scan/selective_scan.metal
         ${CMAKE_CURRENT_LIST_DIR}/gdn/gdn.metal
         ${CMAKE_CURRENT_LIST_DIR}/act_quant/act_quant.metal
+        ${CMAKE_CURRENT_LIST_DIR}/minference/minference.metal
         ${CMAKE_CURRENT_LIST_DIR}/mla/mla.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.metal

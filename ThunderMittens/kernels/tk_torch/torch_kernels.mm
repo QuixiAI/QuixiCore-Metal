@@ -1231,10 +1231,24 @@ static at::Tensor paged_attention_mps(
                                     : 1.0f / std::sqrt(static_cast<float>(D));
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
-                               out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
-                               static_cast<int>(block_table.size(1)), scale_f, no_alibi, 0,
-                               no_mask, 0, static_cast<int>(window), tn);
+    tk::launch_paged_attention(e, q,
+        key_cache,
+        value_cache,
+        block_table,
+        context_lens,
+        out,
+        B,
+        H,
+        H_KV,
+        D,
+        static_cast<int>(key_cache.size(1)),
+        static_cast<int>(block_table.size(1)),
+        scale_f,
+        no_alibi,
+        0,
+        no_mask,
+        0,
+        static_cast<int>(window), 1, tn);
   });
   return out;
 }
@@ -1254,9 +1268,14 @@ static at::Tensor paged_attention_block_sparse_mps(
               "paged_attention_block_sparse: num_q_heads must be a positive multiple of num_kv_heads");
   TORCH_CHECK(block_table_in.scalar_type() == at::kInt && context_lens_in.scalar_type() == at::kInt,
               "paged_attention_block_sparse: block_table and context_lens must be int32");
-  TORCH_CHECK(block_mask_in.sizes() == block_table_in.sizes(),
-              "paged_attention_block_sparse: block_mask must match block_table shape (B, max_blocks)");
+  TORCH_CHECK((block_mask_in.dim() == 2 && block_mask_in.sizes() == block_table_in.sizes()) ||
+                  (block_mask_in.dim() == 3 && block_mask_in.size(0) == q_in.size(0) &&
+                   block_mask_in.size(1) == q_in.size(1) &&
+                   block_mask_in.size(2) == block_table_in.size(1)),
+              "paged_attention_block_sparse: block_mask must be (B, max_blocks) or "
+              "(B, num_heads, max_blocks)");
   const int B = q_in.size(0), H = q_in.size(1), D = q_in.size(2);
+  const int mask_heads = block_mask_in.dim() == 3 ? H : 1;
   const int H_KV = key_cache_in.size(2);
   TORCH_CHECK(D == 64 || D == 128, "paged_attention_block_sparse: head_size must be 64 or 128");
 
@@ -1272,10 +1291,24 @@ static at::Tensor paged_attention_block_sparse_mps(
                                     : 1.0f / std::sqrt(static_cast<float>(D));
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
-                               out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
-                               static_cast<int>(block_table.size(1)), scale_f, no_alibi, 0,
-                               mask, 1, static_cast<int>(window), tn);
+    tk::launch_paged_attention(e, q,
+        key_cache,
+        value_cache,
+        block_table,
+        context_lens,
+        out,
+        B,
+        H,
+        H_KV,
+        D,
+        static_cast<int>(key_cache.size(1)),
+        static_cast<int>(block_table.size(1)),
+        scale_f,
+        no_alibi,
+        0,
+        mask,
+        1,
+        static_cast<int>(window), mask_heads, tn);
   });
   return out;
 }
@@ -1313,10 +1346,24 @@ static at::Tensor paged_attention_alibi_mps(
                                     : 1.0f / std::sqrt(static_cast<float>(D));
   const std::string tn = tk_type_name(q);
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_paged_attention(e, q, key_cache, value_cache, block_table, context_lens,
-                               out, B, H, H_KV, D, static_cast<int>(key_cache.size(1)),
-                               static_cast<int>(block_table.size(1)), scale_f, slopes, 1,
-                               no_mask, 0, static_cast<int>(window), tn);
+    tk::launch_paged_attention(e, q,
+        key_cache,
+        value_cache,
+        block_table,
+        context_lens,
+        out,
+        B,
+        H,
+        H_KV,
+        D,
+        static_cast<int>(key_cache.size(1)),
+        static_cast<int>(block_table.size(1)),
+        scale_f,
+        slopes,
+        1,
+        no_mask,
+        0,
+        static_cast<int>(window), 1, tn);
   });
   return out;
 }
@@ -1839,6 +1886,26 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
     tk::launch_moe_grouped_gemm_swiglu(e, out, A, W1, eot, total_rows, H, inter, tk_type_name(A));
   });
   return out;
+}
+
+// MInference decode block-mask builder.
+static at::Tensor minference_block_mask_mps(
+    const at::Tensor& vert_in, const at::Tensor& slash_in, const at::Tensor& lens_in,
+    int64_t max_blocks, int64_t block_size, int64_t vertical_topk, int64_t slash_topk,
+    int64_t last_n_blocks) {
+  TORCH_CHECK(vert_in.device().is_mps() && vert_in.dim() == 3 && slash_in.dim() == 3 &&
+                  vert_in.size(0) == slash_in.size(0) && vert_in.size(1) == slash_in.size(1),
+              "minference_block_mask: vertical/slash must be (B, H, nnz) MPS tensors");
+  auto vert = vert_in.to(at::kInt).contiguous(), slash = slash_in.to(at::kInt).contiguous();
+  auto lens = lens_in.to(at::kInt).contiguous();
+  const int B = vert.size(0), H = vert.size(1);
+  auto mask = at::empty({B, H, max_blocks}, vert.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_minference_block_mask(e, vert, slash, lens, mask, B, H, (int)vert.size(2),
+                                     (int)slash.size(2), (int)vertical_topk, (int)slash_topk,
+                                     (int)block_size, (int)max_blocks, (int)last_n_blocks);
+  });
+  return mask;
 }
 
 // sampler-zoo logit/prob transforms (one simdgroup per row; see sampling_transforms.metal).
@@ -3589,6 +3656,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("minference_block_mask", &minference_block_mask_mps,
+        "MInference decode block-mask builder (MPS)", pybind11::arg("vertical_indexes"),
+        pybind11::arg("slash_indexes"), pybind11::arg("context_lens"),
+        pybind11::arg("max_blocks"), pybind11::arg("block_size"),
+        pybind11::arg("vertical_topk") = 1 << 30, pybind11::arg("slash_topk") = 1 << 30,
+        pybind11::arg("last_n_blocks") = 1);
   m.def("quadratic_transform", &quadratic_transform_mps, "quadratic logit transform (MPS)");
   m.def("top_nsigma_mask", &top_nsigma_mask_mps, "top-nsigma mask (MPS)");
   m.def("top_a_mask", &top_a_mask_mps, "top-A mask (MPS)");

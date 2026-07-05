@@ -34,6 +34,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "selective_scan", "selective_scan.metal"),
     os.path.join(_KERNELS, "gdn", "gdn.metal"),
     os.path.join(_KERNELS, "act_quant", "act_quant.metal"),
+    os.path.join(_KERNELS, "minference", "minference.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -606,6 +607,15 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
 
+
+
+def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,
+                          block_size, vertical_topk=1 << 30, slash_topk=1 << 30,
+                          last_n_blocks=1):
+    """MInference decode block-mask builder -> (B, H, max_blocks) int32. MPS."""
+    return _ext.minference_block_mask(vertical_indexes, slash_indexes, context_lens,
+                                      int(max_blocks), int(block_size), int(vertical_topk),
+                                      int(slash_topk), int(last_n_blocks))
 
 
 def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
