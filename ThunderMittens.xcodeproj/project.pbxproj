@@ -156,6 +156,7 @@
 				kernels/minference/minference.cpp,
 				kernels/turboquant/turboquant.cpp,
 				kernels/marginal/marginal.cpp,
+				kernels/indexer/indexer.cpp,
 				kernels/mla/mla.cpp,
 				kernels/paged_attn_v2/paged_attn_v2.cpp,
 				kernels/hadamard/hadamard.cpp,

@@ -71,6 +71,7 @@
 #include "minference/minference.h"
 #include "turboquant/turboquant.h"
 #include "marginal/marginal.h"
+#include "indexer/indexer.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -555,6 +556,15 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def("indexer_k_quant_and_cache", &indexer_k_quant_and_cache,
+      "k"_a, "slot_mapping"_a, "code_cache"_a, "scale_cache"_a, "quant_block_size"_a = 128,
+      "ue8m0"_a = false, nb::kw_only(), "stream"_a = nb::none(),
+      R"(DeepSeek-V3.2 indexer K quant -> [code_cache u8, scale_cache f32] (functional).)");
+    m.def("indexer_k_gather", &indexer_k_gather,
+      "code_cache"_a, "scale_cache"_a, "slots"_a, "head_dim"_a, "quant_block_size"_a = 128,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(gather + dequantize the indexer cache to bf16 K for a slot list.)");
 
     m.def("tau_tail", &tau_tail,
       "qkv"_a, "tok_qv_lin"_a, "tau_pos_table"_a, "positions"_a, "n_heads"_a, "head_dim"_a,

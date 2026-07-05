@@ -37,6 +37,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "minference", "minference.metal"),
     os.path.join(_KERNELS, "turboquant", "turboquant.metal"),
     os.path.join(_KERNELS, "marginal", "marginal.metal"),
+    os.path.join(_KERNELS, "indexer", "indexer.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -660,6 +661,19 @@ def tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero, slots, v
     return list(_ext.tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero,
                                slots, v_centroids, signs, int(num_kv_heads), int(head_size),
                                int(block_size), int(k_bits), bool(k_signed), int(v_bits)))
+
+
+def indexer_k_quant_and_cache(k, slot_mapping, code_cache, scale_cache, quant_block_size=128,
+                             ue8m0=False):
+    """DeepSeek-V3.2 indexer K quant. Returns [code_cache u8, scale_cache f32] (functional). MPS."""
+    return list(_ext.indexer_k_quant_and_cache(k, slot_mapping, code_cache, scale_cache,
+                                               int(quant_block_size), bool(ue8m0)))
+
+
+def indexer_k_gather(code_cache, scale_cache, slots, head_dim, quant_block_size=128):
+    """Gather + dequantize the indexer cache to bf16 K for a slot list. MPS."""
+    return _ext.indexer_k_gather(code_cache, scale_cache, slots, int(head_dim),
+                                 int(quant_block_size))
 
 
 def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,

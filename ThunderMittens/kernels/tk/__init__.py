@@ -887,6 +887,32 @@ def tq_decode(key_cache, value_cache, key_scale, value_scale, key_zero, slots, v
                                  int(block_size), int(k_bits), bool(k_signed), int(v_bits)))
 
 
+def indexer_k_quant_and_cache(k, slot_mapping, code_cache, scale_cache, quant_block_size=128,
+                             ue8m0=False):
+    """DeepSeek-V3.2 (DSA/NSA) indexer K quant-and-cache: quantize the indexer K per
+    quant_block_size (canonical 128) into an e4m3 code cache (num_slots, head_dim) + fp32 scale
+    cache (num_slots, head_dim/qbs) that the sparse-attention top-k selector reads cheaply.
+    k (tokens, head_dim); slot_mapping (tokens,) int (<0 skips); ue8m0 rounds scales to powers
+    of two. Functional — returns (code_cache, scale_cache), untouched slots preserved. Accepts
+    mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(k):
+        return _torch().indexer_k_quant_and_cache(k, slot_mapping, code_cache, scale_cache,
+                                                  quant_block_size, ue8m0)
+    out = _mlx().indexer_k_quant_and_cache(k, slot_mapping, code_cache, scale_cache,
+                                           int(quant_block_size), bool(ue8m0))
+    return out[0], out[1]
+
+
+def indexer_k_gather(code_cache, scale_cache, slots, head_dim, quant_block_size=128):
+    """Gather + dequantize the indexer cache back to bf16 K for a slot list: k_out[row] =
+    decode(code_cache[slot]) * scale_cache[slot, qblock]. Returns bf16 (n, head_dim). Accepts
+    mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(code_cache):
+        return _torch().indexer_k_gather(code_cache, scale_cache, slots, head_dim, quant_block_size)
+    return _mlx().indexer_k_gather(code_cache, scale_cache, slots, int(head_dim),
+                                   int(quant_block_size))
+
+
 def minference_block_mask(vertical_indexes, slash_indexes, context_lens, max_blocks,
                           block_size, vertical_topk=1 << 30, slash_topk=1 << 30,
                           last_n_blocks=1):

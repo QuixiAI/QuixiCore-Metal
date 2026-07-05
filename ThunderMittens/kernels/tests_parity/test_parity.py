@@ -1447,6 +1447,34 @@ def test_norm_quant_wave10_parity(shape):
     _assert_parity(sm, st, atol=1e-4)
 
 
+def test_indexer_parity():
+    rng = np.random.default_rng(13)
+    T, num_slots, head_dim, qbs = 16, 20, 128, 128
+    nq = head_dim // qbs
+    k = (0.3 * rng.standard_normal((T, head_dim))).astype(np.float32)
+    sm = np.arange(T, dtype=np.int32)
+    c0 = np.zeros((num_slots, head_dim), np.uint8)
+    s0 = np.zeros((num_slots, nq), np.float32)
+    ml = lambda a: _mk(a, "mlx")
+    to = lambda a: _mk(a, "torch")
+    for ue8 in [False, True]:
+        cm, scm = tk.indexer_k_quant_and_cache(ml(k), mx.array(sm), mx.array(c0), mx.array(s0),
+                                               ue8m0=ue8)
+        ct, sct = tk.indexer_k_quant_and_cache(to(k), torch.from_numpy(sm).to("mps"),
+                                               torch.from_numpy(c0).to("mps"),
+                                               torch.from_numpy(s0).to("mps"), ue8m0=ue8)
+        _assert_parity(cm, ct, atol=1)      # e4m3 codes off-by-one across the two metallibs
+        _assert_parity(scm, sct, atol=1e-4)
+    slots = np.arange(T, dtype=np.int32)
+    cm, scm = tk.indexer_k_quant_and_cache(ml(k), mx.array(sm), mx.array(c0), mx.array(s0))
+    ct, sct = tk.indexer_k_quant_and_cache(to(k), torch.from_numpy(sm).to("mps"),
+                                           torch.from_numpy(c0).to("mps"),
+                                           torch.from_numpy(s0).to("mps"))
+    km = tk.indexer_k_gather(cm, scm, mx.array(slots), head_dim)
+    kt = tk.indexer_k_gather(ct, sct, torch.from_numpy(slots).to("mps"), head_dim)
+    _assert_parity(km, kt, atol=6e-2)   # inherits the codes' off-by-one (one fp8 step)
+
+
 def test_kv_gather_fp8_scale_update_parity():
     rng = np.random.default_rng(12)
     num_blocks, block_size, H_KV, D = 4, 16, 2, 64

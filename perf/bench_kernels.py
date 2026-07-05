@@ -1274,6 +1274,26 @@ def fftconv_cases(be, preset, formats):
 
 
 # --------------------------------------------------------------------------- serving kernels
+@register("indexer_quant")
+def indexer_quant_cases(be, preset, formats):
+    """DeepSeek-V3.2 indexer K quant-and-cache (bandwidth-bound: reads bf16 K, writes u8 codes)."""
+    tk = be.tk()
+    rng = np.random.default_rng(242)
+    for T, hd in _pick(preset, [(4096, 128)], [(16384, 128), (16384, 256)],
+                       [(65536, 128), (65536, 256)]):
+        k = (0.3 * rng.standard_normal((T, hd))).astype(np.float32)
+        nq = (hd + 127) // 128
+        code0 = np.zeros((T, hd), np.uint8)
+        scale0 = np.zeros((T, nq), np.float32)
+        k_d = be.array(k, "bf16")
+        c_d, s_d = be.raw_array(code0), be.array(scale0, "f32")
+        sm = be.int_array(np.arange(T, dtype=np.int32))
+        yield Case("indexer_quant", f"T{T}_hd{hd}", {"T": T, "hd": hd}, "bf16",
+                   target=lambda k_d=k_d, sm=sm, c_d=c_d, s_d=s_d:
+                       tk.indexer_k_quant_and_cache(k_d, sm, c_d, s_d)[0],
+                   baselines={}, ref=None, bytes_moved=float(T * hd * 2 + T * hd))
+
+
 @register("kv_gather_fp8")
 def kv_gather_fp8_cases(be, preset, formats):
     """fp8 KV gather + upconvert (reads 1-byte codes) vs bf16 gather (reads 2-byte). The read

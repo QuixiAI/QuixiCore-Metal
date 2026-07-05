@@ -46,6 +46,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/minference/minference.cpp
     ${CMAKE_CURRENT_LIST_DIR}/turboquant/turboquant.cpp
     ${CMAKE_CURRENT_LIST_DIR}/marginal/marginal.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/indexer/indexer.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mla/mla.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.cpp
@@ -118,6 +119,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/minference/minference.metal
         ${CMAKE_CURRENT_LIST_DIR}/turboquant/turboquant.metal
         ${CMAKE_CURRENT_LIST_DIR}/marginal/marginal.metal
+        ${CMAKE_CURRENT_LIST_DIR}/indexer/indexer.metal
         ${CMAKE_CURRENT_LIST_DIR}/mla/mla.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.metal

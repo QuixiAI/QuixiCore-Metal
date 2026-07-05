@@ -2085,6 +2085,42 @@ static std::vector<at::Tensor> tq_decode_mps(
   return {k_out, v_out};
 }
 
+// DeepSeek-V3.2 indexer K quant-and-cache (+ gather).
+static std::vector<at::Tensor> indexer_k_quant_and_cache_mps(
+    const at::Tensor& k_in, const at::Tensor& slot_in, const at::Tensor& code_in,
+    const at::Tensor& scale_in, int64_t quant_block_size, bool ue8m0) {
+  TORCH_CHECK(k_in.device().is_mps() && k_in.dim() == 2 && tk_is_float_dtype(k_in),
+              "indexer_k_quant_and_cache: k must be a float (tokens, head_dim) MPS tensor");
+  const int num_tokens = k_in.size(0), head_dim = k_in.size(1);
+  const int nq = (head_dim + (int)quant_block_size - 1) / (int)quant_block_size;
+  auto k = k_in.contiguous();
+  auto slot = slot_in.to(at::kInt).contiguous();
+  auto code = code_in.to(at::kByte).contiguous().clone();
+  auto scale = scale_in.to(at::kFloat).contiguous().clone();
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_indexer_k_quant_and_cache(e, k, slot, code, scale, num_tokens, head_dim, nq,
+                                         (int)quant_block_size, ue8m0 ? 1 : 0, tk_type_name(k));
+  });
+  return {code, scale};
+}
+
+static at::Tensor indexer_k_gather_mps(const at::Tensor& code_in, const at::Tensor& scale_in,
+                                       const at::Tensor& slots_in, int64_t head_dim,
+                                       int64_t quant_block_size) {
+  TORCH_CHECK(code_in.device().is_mps(), "indexer_k_gather: cache must be MPS");
+  const int n = slots_in.size(0);
+  const int nq = (head_dim + (int)quant_block_size - 1) / (int)quant_block_size;
+  auto code = code_in.to(at::kByte).contiguous(), scale = scale_in.to(at::kFloat).contiguous();
+  auto slots = slots_in.to(at::kInt).contiguous();
+  auto opts = at::TensorOptions().dtype(at::kBFloat16).device(code.device());
+  auto k_out = at::empty({n, head_dim}, opts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_indexer_k_gather(e, code, scale, slots, k_out, n, (int)head_dim, nq,
+                                (int)quant_block_size, "bfloat16");
+  });
+  return k_out;
+}
+
 // MInference decode block-mask builder.
 static at::Tensor minference_block_mask_mps(
     const at::Tensor& vert_in, const at::Tensor& slash_in, const at::Tensor& lens_in,
@@ -3909,6 +3945,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("permute_cols", &permute_cols_mps, "permute_cols 16-bit column gather (MPS)");
   m.def("tq_encode", &tq_encode_mps, "TurboQuant KV encode (MPS)");
   m.def("tq_decode", &tq_decode_mps, "TurboQuant KV decode (MPS)");
+  m.def("indexer_k_quant_and_cache", &indexer_k_quant_and_cache_mps,
+        "DeepSeek-V3.2 indexer K quant-and-cache (MPS)", pybind11::arg("k"),
+        pybind11::arg("slot_mapping"), pybind11::arg("code_cache"), pybind11::arg("scale_cache"),
+        pybind11::arg("quant_block_size") = 128, pybind11::arg("ue8m0") = false);
+  m.def("indexer_k_gather", &indexer_k_gather_mps, "indexer cache gather + dequant (MPS)",
+        pybind11::arg("code_cache"), pybind11::arg("scale_cache"), pybind11::arg("slots"),
+        pybind11::arg("head_dim"), pybind11::arg("quant_block_size") = 128);
   m.def("minference_block_mask", &minference_block_mask_mps,
         "MInference decode block-mask builder (MPS)", pybind11::arg("vertical_indexes"),
         pybind11::arg("slash_indexes"), pybind11::arg("context_lens"),

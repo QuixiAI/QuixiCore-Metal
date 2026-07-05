@@ -2373,6 +2373,35 @@ void launch_permute_cols(E& e, typename E::in_t input, typename E::in_t perm,
 
 // ----- TurboQuant KV codec (turboquant.metal).// ----- TurboQuant KV codec (turboquant.metal). encode grid (tokens, Hkv), HS threads;
 //        decode grid (n, Hkv), HS threads. tq_clone_bytes: 1D over bytes (16/thread). -----
+// ----- DeepSeek-V3.2 indexer (indexer.metal). quant grid (tokens, nq); gather grid (n, nq);
+//        both 32 threads. indexer_clone_bytes: 1D over bytes (16/thread). -----
+template <class E>
+void launch_indexer_clone_bytes(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {
+  e.pipeline("mittens::indexer_clone_bytes");
+  e.in(src, 0); e.out(dst, 1); e.bytes(n, 2);
+  const uint32_t nthreads = (n + 15) / 16;
+  e.dispatch((int)((nthreads + 255) / 256), 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_indexer_k_quant_and_cache(E& e, typename E::in_t k, typename E::in_t slot_mapping,
+                                      typename E::out_t code_cache, typename E::out_t scale_cache,
+                                      int num_tokens, int head_dim, int nq, int quant_block_size,
+                                      int use_ue8m0, const std::string& type_name) {
+  e.pipeline("indexer_k_quant_and_cache_" + type_name);
+  e.in(k, 0); e.in(slot_mapping, 1); e.out(code_cache, 2); e.out(scale_cache, 3);
+  e.bytes(head_dim, 4); e.bytes(quant_block_size, 5); e.bytes(use_ue8m0, 6);
+  e.dispatch(num_tokens, nq, 1, 32, 1, 1);
+}
+template <class E>
+void launch_indexer_k_gather(E& e, typename E::in_t code_cache, typename E::in_t scale_cache,
+                             typename E::in_t slots, typename E::out_t k_out, int n, int head_dim,
+                             int nq, int quant_block_size, const std::string& type_name) {
+  e.pipeline("indexer_k_gather_" + type_name);
+  e.in(code_cache, 0); e.in(scale_cache, 1); e.in(slots, 2); e.out(k_out, 3);
+  e.bytes(head_dim, 4); e.bytes(quant_block_size, 5);
+  e.dispatch(n, nq, 1, 32, 1, 1);
+}
+
 template <class E>
 void launch_tq_clone_bytes(E& e, typename E::in_t src, typename E::out_t dst, uint32_t n) {
   e.pipeline("mittens::tq_clone_bytes");

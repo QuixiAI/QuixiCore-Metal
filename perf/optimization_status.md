@@ -1,5 +1,25 @@
 # ThunderMittens — performance status
 
+## Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache (2026-07-05)
+
+New kernels/indexer/ (metal-forge indexer_k_quant_and_cache; credit AlpinDale). Quantizes the
+DSA/NSA indexer K per quant_block_size (canonical 128) into a low-precision e4m3 cache the
+sparse-attention top-k selector reads cheaply — pairs with the MInference block masks to give
+TM a real sparse-attention SELECTION path, not just a mask consumer. TM-native layout: SEPARATE
+code cache (uchar, num_slots x head_dim) + fp32 scale cache (num_slots x head_dim/qbs) indexed
+directly by slot_mapping (like the TurboQuant codec), not the reference's interleaved paged
+single-buffer. One simdgroup per (token, qblock), simd_max absmax (no threadgroup scratch);
+use_ue8m0 rounds the fp32 scale to a power of two. indexer_k_gather dequantizes back to bf16 for
+a slot list. Functional (clone-then-insert; untouched slots preserved).
+
+- Tests: fp32 scales bit-exact vs numpy (plain) / power-of-two + coverage (ue8m0); e4m3 codes
+  reconstruction-bounded (round-to-nearest-even ties differ from a numpy argmin — the repo's
+  fp8 contract); round-trip + slot<0 skip + untouched-slot preservation; 19 green + parity
+  (codes off-by-one across the two metallibs, scales 1e-4).
+- Perf: bandwidth-bound (reads bf16 K, writes u8 codes), 16384x128 0.062 ms; near-optimal
+  one-simdgroup/qblock. No further opt.
+- Deferred (documented): fused DSA sparse decode over the indexer cache (the consumer).
+
 ## Wave-10 K2: fp8 KV gather+upconvert + incremental scale update (2026-07-05)
 
 Extended kernels/kv_cache/ (metal-forge cache/gather_kv_cache.metal + kv_scale_update.metal,
