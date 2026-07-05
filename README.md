@@ -1,17 +1,27 @@
-# ThunderMittens
+# QuixiCore Metal
 
-ThunderMittens is [QuixiAI](https://github.com/QuixiAI)'s Apple Metal Shading Language (MSL) fork of
-[ThunderKittens](https://github.com/HazyResearch/ThunderKittens/) — the tile-based GPU-kernel framework
-from HazyResearch. This fork brings the substrate to Apple Silicon and extends it with a large set of
-serving, training, and model-architecture kernels running on **two backends** (MLX + PyTorch/MPS) from
-one metallib.
+QuixiCore Metal is the Apple Metal implementation of the QuixiCore kernel library.
+
+It is a standalone native implementation for Apple Silicon, with integrations for MLX and PyTorch MPS. It shares no implementation code with the other QuixiCore backends.
+
+It implements the contract defined by [QuixiAI/QuixiCore](https://github.com/QuixiAI/QuixiCore): the same operation names, quant formats, correctness expectations, benchmark methodology, and public library identity as the other QuixiCore backends.
+
+**Native implementations. Shared contract. No shared code.**
 
 <div align="center" >
-    <img src="assets/mittens.jpeg" height=350 alt="ThunderKittens logo" style="margin-bottom:px"/> 
+    <img src="assets/mittens.jpeg" height=350 alt="QuixiCore Metal logo" style="margin-bottom:px"/> 
 </div>
 
 <br>
 <br>
+
+## Origin And Focus
+
+This repository was renamed from ThunderMittens, [QuixiAI](https://github.com/QuixiAI)'s Apple Metal Shading Language (MSL) fork of
+[ThunderKittens](https://github.com/HazyResearch/ThunderKittens/) — the tile-based GPU-kernel framework
+from HazyResearch. This backend brings the substrate to Apple Silicon and extends it with a large set of
+serving, training, and model-architecture kernels running on **two integrations** (MLX + PyTorch/MPS) from
+one metallib.
 
 ## Performance highlights
 
@@ -154,7 +164,7 @@ For writing Metal Shading Language (MSL) kernels:
 
 ### 2. MLX Kernel Integration with Python
 
-For using ThunderKittens kernels within MLX in Python:
+For using QuixiCore Metal kernels within MLX in Python:
 
 #### Prerequisites
 - Python 3.8+
@@ -185,7 +195,7 @@ For using ThunderKittens kernels within MLX in Python:
 
 ### 3. PyTorch (Apple MPS) Integration with Python
 
-For using ThunderKittens kernels from PyTorch on the `mps` device. This path is **independent of
+For using QuixiCore Metal kernels from PyTorch on the `mps` device. This path is **independent of
 MLX** — it needs only PyTorch and the Metal toolchain (no CMake/nanobind, no MLX build). The same
 `.metal` kernels are compiled into a standalone metallib with `xcrun metal` and dispatched onto
 PyTorch's MPS stream.
@@ -238,10 +248,10 @@ Primitive-level MSL unit tests (register/shared tile ops) build and run through 
 
 ## References & credits
 
-ThunderMittens is a [QuixiAI](https://github.com/QuixiAI) fork of
+QuixiCore Metal was originally ThunderMittens, a [QuixiAI](https://github.com/QuixiAI) fork of
 [ThunderKittens](https://github.com/HazyResearch/ThunderKittens/) by **HazyResearch** — the original,
 upstream project. See HazyResearch's [blog post](https://hazyresearch.stanford.edu/blog/2024-11-28-tk-mlx)
-and [paper](https://arxiv.org/abs/2410.20399) to learn more about the ThunderKittens framework this fork
+and [paper](https://arxiv.org/abs/2410.20399) to learn more about the ThunderKittens framework this backend
 builds on.
 
 The Wave-9 model-architecture kernels (quantized grouped expert GEMMs, attention sinks + softcap,
@@ -251,6 +261,4 @@ the `tau_tail` / `packbits` / `permute_cols` utilities) are ported from
 **[metal-forge](https://github.com/AlpinDale)** by **[AlpinDale](https://github.com/AlpinDale)**
 ([@AlpinDale](https://x.com/AlpinDale)) — thank you for the reference implementations that made these
 kernels possible.
-
-
 
