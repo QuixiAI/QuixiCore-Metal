@@ -791,6 +791,22 @@ def moe_route_topk(logits, k):
     return _mlx().moe_route_topk(logits, k)
 
 
+def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initial=True):
+    """GDN / GatedDeltaNet linear attention (the Qwen3-Next / Kimi-Linear hybrid mixer):
+    per-timestep delta rule S = g*S + k*beta*(v - k.S); y = q.S, over varlen packed
+    sequences. q/k (total_tokens, Hk, Dk in {64,128}); v (total_tokens, Hv, Dv);
+    g/beta (total_tokens, Hv) with g the decay MULTIPLIER (not log); cu_seqlens (R+1,);
+    state_pool (num_slots, Hv, Dv, Dk) fp32 indexed by slot_mapping (R,). load_initial:
+    continue from the pool (decode) vs fresh S=0 (prefill). Returns (y, new_state_pool) —
+    functional, untouched slots preserved. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(q):
+        return _torch().gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping,
+                                  load_initial=load_initial)
+    out = _mlx().gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping,
+                           load_initial)
+    return out[0], out[1]
+
+
 def selective_scan(u, delta, A, B, C, state, D=None, delta_bias=None, z=None,
                    delta_softplus=True):
     """Mamba-1 (S6) selective scan forward, dense batch. Channel-major layouts:

@@ -55,6 +55,9 @@ inline std::string qk_norm_rope_kernel_name(int D) { return "qk_norm_rope_" + st
 inline std::string selective_scan_kernel_name(const std::string& variant, const std::string& t) {
   return "selective_scan_" + variant + "_" + t;
 }
+inline std::string gdn_recur_kernel_name(const std::string& t, int Dk) {
+  return "gdn_recur_" + t + "_d" + std::to_string(Dk);
+}
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
 inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
 inline std::string sample_categorical_kernel_name(const std::string& t) { return "sample_categorical_" + t; }
@@ -429,6 +432,22 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.out(out, 0); e.in(A, 1); e.in(W1, 2); e.in(expert_of_tile, 3);
   e.bytes(total_rows, 4); e.bytes(H, 5); e.bytes(inter, 6);
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+// ----- gdn_recur (GatedDeltaNet): q@0 k@1 v@2 g@3 beta@4 state_pool@5(f32) cu_seqlens@6(i32)
+//        slot_mapping@7(i32) -> y@8 ; R@9 Hk@10 Hv@11 Dv@12 load_initial@13 ;
+//        grid (Dv, 1, R*Hv), 32 thr (lanes partition Dk; Dk in {64,128} via kernel name). -----
+template <class E>
+void launch_gdn_recur(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                      typename E::in_t g, typename E::in_t beta, typename E::out_t state_pool,
+                      typename E::in_t cu_seqlens, typename E::in_t slot_mapping,
+                      typename E::out_t y, int R, int Hk, int Hv, int Dv, int Dk,
+                      int load_initial, const std::string& type_name) {
+  e.pipeline(gdn_recur_kernel_name(type_name, Dk));
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(g, 3); e.in(beta, 4);
+  e.out(state_pool, 5); e.in(cu_seqlens, 6); e.in(slot_mapping, 7); e.out(y, 8);
+  e.bytes(R, 9); e.bytes(Hk, 10); e.bytes(Hv, 11); e.bytes(Dv, 12); e.bytes(load_initial, 13);
+  e.dispatch(Dv, 1, R * Hv, 32, 1, 1);
 }
 
 // ----- Mamba-1 (S6) selective scan. Layouts channel-major (seqlen/total_tokens LAST);

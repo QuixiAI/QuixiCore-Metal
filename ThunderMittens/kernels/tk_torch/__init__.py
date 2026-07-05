@@ -32,6 +32,7 @@ _METAL_SOURCES = [
     os.path.join(_KERNELS, "rope_kv", "rope_kv.metal"),
     os.path.join(_KERNELS, "qk_norm_rope", "qk_norm_rope.metal"),
     os.path.join(_KERNELS, "selective_scan", "selective_scan.metal"),
+    os.path.join(_KERNELS, "gdn", "gdn.metal"),
     os.path.join(_KERNELS, "mla", "mla.metal"),
     os.path.join(_KERNELS, "gelu", "gelu.metal"),
     os.path.join(_KERNELS, "dropout", "dropout.metal"),
@@ -602,6 +603,12 @@ def moe_route_topk(logits: torch.Tensor, k: int):
     """MoE routing: top-k experts + renormalized softmax weights. Returns (ids int32, weights f32).
     logits (num_tokens, num_experts) float; k <= min(16, num_experts). MPS."""
     return _ext.moe_route_topk(logits, int(k))
+
+
+def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initial=True):
+    """GatedDeltaNet delta-rule linear attention (varlen packed, fp32 state pool). MPS."""
+    return tuple(_ext.gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping,
+                                load_initial))
 
 
 def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, z=None, state=None,

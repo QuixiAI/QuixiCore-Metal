@@ -676,6 +676,26 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     _assert_parity(om, ot, atol=6e-2)
 
 
+def test_gdn_recur_parity():
+    rng = np.random.default_rng(58)
+    lens, Hk, Hv, Dk, Dv, S = [5, 3], 2, 4, 64, 64, 4
+    T = sum(lens)
+    cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    q = (0.3 * rng.standard_normal((T, Hk, Dk))).astype(np.float32)
+    k = (0.3 * rng.standard_normal((T, Hk, Dk))).astype(np.float32)
+    v = (0.3 * rng.standard_normal((T, Hv, Dv))).astype(np.float32)
+    g = rng.uniform(0.9, 1.0, (T, Hv)).astype(np.float32)
+    beta = rng.uniform(0.2, 0.8, (T, Hv)).astype(np.float32)
+    pool = (0.2 * rng.standard_normal((S, Hv, Dv, Dk))).astype(np.float32)
+    slots = np.array([2, 0], np.int32)
+    ym, pm = tk.gdn_recur(mx.array(q), mx.array(k), mx.array(v), mx.array(g), mx.array(beta),
+                          mx.array(pool), mx.array(cu), mx.array(slots))
+    t = lambda a: torch.from_numpy(a).to("mps")
+    yt, pt = tk.gdn_recur(t(q), t(k), t(v), t(g), t(beta), t(pool), t(cu), t(slots))
+    _assert_parity(ym, yt, atol=1e-5)
+    _assert_parity(pm, pt, atol=1e-5)
+
+
 def test_selective_scan_parity():
     rng = np.random.default_rng(57)
     b, d, L, G, N = 2, 32, 12, 2, 16

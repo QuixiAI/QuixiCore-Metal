@@ -41,6 +41,7 @@ target_sources(mlx_ext
     ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.cpp
     ${CMAKE_CURRENT_LIST_DIR}/qk_norm_rope/qk_norm_rope.cpp
     ${CMAKE_CURRENT_LIST_DIR}/selective_scan/selective_scan.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/gdn/gdn.cpp
     ${CMAKE_CURRENT_LIST_DIR}/mla/mla.cpp
     ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.cpp
     ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.cpp
@@ -107,6 +108,7 @@ if(MLX_BUILD_METAL)
         ${CMAKE_CURRENT_LIST_DIR}/rope_kv/rope_kv.metal
         ${CMAKE_CURRENT_LIST_DIR}/qk_norm_rope/qk_norm_rope.metal
         ${CMAKE_CURRENT_LIST_DIR}/selective_scan/selective_scan.metal
+        ${CMAKE_CURRENT_LIST_DIR}/gdn/gdn.metal
         ${CMAKE_CURRENT_LIST_DIR}/mla/mla.metal
         ${CMAKE_CURRENT_LIST_DIR}/gelu/gelu.metal
         ${CMAKE_CURRENT_LIST_DIR}/dropout/dropout.metal

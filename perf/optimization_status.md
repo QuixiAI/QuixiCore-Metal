@@ -1,5 +1,22 @@
 # ThunderMittens — performance status
 
+## Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention (2026-07-05)
+
+New kernels/gdn/: the Qwen3-Next / Kimi-Linear hybrid-mixer recurrence — per-timestep
+delta rule S = g*S + k*beta*(v - k.S), y = q.S — one simdgroup per (request, hv, dv),
+32 lanes partitioning Dk (Dk in {64,128} compile-time), fp32 state promoted from the
+reference's io dtype. Varlen packed sequences (cu_seqlens) + persistent per-request
+fp32 state pool via slot_mapping (race-free in-place row updates; functional via the
+sscan_pool_clone prepass on both backends). GQA hk = hv/(Hv/Hk); load_initial switches
+decode-continuation vs fresh-prefill.
+
+- Tests: 8 fp64-oracle cases (3 dtypes x GQA shapes, decode step R=16, fresh-prefill
+  ignores pool, untouched-slot preservation) + fp32 cross-backend parity (y and pool).
+- Perf: prefill 2x2048 tokens (Hv=8, Dk=Dv=128) 1.55 ms; decode R=64 single-step
+  0.42 ms (launch-overhead-dominated at tiny work). Recorded bench-gated follow-ups:
+  vec4 k/q loads, ssd_decode-style row-owned geometry at Dk=64, and the chunked-WY
+  parallel prefill (high-risk/high-value, only against this measured baseline).
+
 ## Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen (2026-07-05)
 
 New kernels/selective_scan/: sequential-in-time / parallel-over-state (threadgroup per

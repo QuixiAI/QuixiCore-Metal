@@ -66,6 +66,7 @@
 #include "rope_kv/rope_kv.h"
 #include "qk_norm_rope/qk_norm_rope.h"
 #include "selective_scan/selective_scan.h"
+#include "gdn/gdn.h"
 #include "mla/mla.h"
 #include "paged_attn_v2/paged_attn_v2.h"
 #include "quant_rt/quant_rt.h"
@@ -519,6 +520,14 @@ NB_MODULE(_ext, m) {
       "moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu,
       "A"_a, "W1"_a, "expert_of_tile"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused SiLU-GLU GEMM1: out(rows,inter) = silu(A@W1_gate)*(A@W1_up); W1[e] is (H,2*inter).)");
+
+    m.def(
+      "gdn_recur", &gdn_recur,
+      "q"_a, "k"_a, "v"_a, "g"_a, "beta"_a, "state_pool"_a, "cu_seqlens"_a, "slot_mapping"_a,
+      "load_initial"_a = true,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(GatedDeltaNet delta-rule linear attention over varlen packed sequences with a
+         persistent per-request fp32 state pool. Returns [y, new_state_pool].)");
 
     m.def(
       "selective_scan", &selective_scan,

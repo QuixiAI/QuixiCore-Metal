@@ -1342,6 +1342,36 @@ def mla_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
 
 
+@register("gdn")
+def gdn_cases(be, preset, formats):
+    """GatedDeltaNet recurrence (Qwen3-Next mixer). Sequential over time per (req, hv, dv)
+    simdgroup; decode (seq=1 per request) and prefill shapes. No framework baseline."""
+    tk = be.tk()
+    rng = np.random.default_rng(33)
+    shapes = _pick(preset, [([1] * 16, 2, 8, 64, 64)],
+                   [([1] * 64, 2, 8, 128, 128), ([2048] * 2, 2, 8, 128, 128)],
+                   [([1] * 64, 2, 8, 128, 128), ([2048] * 2, 2, 8, 128, 128),
+                    ([512] * 8, 4, 16, 128, 128)])
+    for lens, Hk, Hv, Dk, Dv in shapes:
+        T, R = sum(lens), len(lens)
+        cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        q = (0.3 * rng.standard_normal((T, Hk, Dk))).astype(np.float32)
+        k = (0.3 * rng.standard_normal((T, Hk, Dk))).astype(np.float32)
+        v = (0.3 * rng.standard_normal((T, Hv, Dv))).astype(np.float32)
+        g = rng.uniform(0.9, 1.0, (T, Hv)).astype(np.float32)
+        beta = rng.uniform(0.2, 0.8, (T, Hv)).astype(np.float32)
+        pool = np.zeros((R, Hv, Dv, Dk), np.float32)
+        slots = np.arange(R, dtype=np.int32)
+        args = [be.array(q, "bf16"), be.array(k, "bf16"), be.array(v, "bf16"),
+                be.array(g, "bf16"), be.array(beta, "bf16"), be.array(pool, "f32"),
+                be.int_array(cu), be.int_array(slots)]
+        label = f"R{R}_L{lens[0]}_Hv{Hv}_Dk{Dk}"
+        yield Case("gdn", label, {"R": R, "L": lens[0], "Hv": Hv, "Dk": Dk}, "bf16",
+                   target=lambda a=args: tk.gdn_recur(*a)[0],
+                   baselines={}, ref=None,
+                   flops=2.0 * T * Hv * (2 * Dv * Dk + Dv * Dk))
+
+
 @register("selective_scan")
 def selective_scan_cases(be, preset, formats):
     """Mamba-1 S6 scan: sequential-in-time, parallel-over-state. No framework baseline

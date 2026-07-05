@@ -1768,6 +1768,32 @@ static at::Tensor moe_grouped_gemm_swiglu_mps(const at::Tensor& A_in, const at::
   return out;
 }
 
+// GatedDeltaNet delta-rule linear attention (varlen packed + persistent fp32 state pool).
+static std::tuple<at::Tensor, at::Tensor> gdn_recur_mps(
+    const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in,
+    const at::Tensor& g_in, const at::Tensor& beta_in, const at::Tensor& pool_in,
+    const at::Tensor& cu_in, const at::Tensor& slots_in, bool load_initial) {
+  TORCH_CHECK(q_in.device().is_mps() && q_in.dim() == 3 && tk_is_float_dtype(q_in),
+              "gdn_recur: q must be a float (total_tokens, Hk, Dk) MPS tensor");
+  const int Hk = q_in.size(1), Dk = q_in.size(2);
+  const int Hv = v_in.size(1), Dv = v_in.size(2);
+  TORCH_CHECK(Dk == 64 || Dk == 128, "gdn_recur: Dk must be 64 or 128");
+  TORCH_CHECK(Hv % Hk == 0, "gdn_recur: Hv must be a multiple of Hk");
+  auto q = q_in.contiguous(), k = k_in.to(q_in.scalar_type()).contiguous();
+  auto v = v_in.to(q_in.scalar_type()).contiguous();
+  auto g = g_in.to(q_in.scalar_type()).contiguous();
+  auto beta = beta_in.to(q_in.scalar_type()).contiguous();
+  auto cu = cu_in.to(at::kInt).contiguous(), slots = slots_in.to(at::kInt).contiguous();
+  const int R = cu.size(0) - 1;
+  auto pool = pool_in.to(at::kFloat).contiguous().clone();
+  auto y = at::empty_like(v);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_gdn_recur(e, q, k, v, g, beta, pool, cu, slots, y, R, Hk, Hv, Dv, Dk,
+                         load_initial ? 1 : 0, tk_type_name(q));
+  });
+  return {y, pool};
+}
+
 // Mamba-1 (S6) selective scan (dense + varlen). Functional: state is cloned and the clone
 // updated in place; returns (out, new_state).
 static std::tuple<at::Tensor, at::Tensor> selective_scan_mps(
@@ -3314,6 +3340,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_grouped_gemm", &moe_grouped_gemm_mps, "ThunderMittens MoE grouped expert GEMM (MPS)");
   m.def("moe_grouped_gemm_rect", &moe_grouped_gemm_rect_mps, "ThunderMittens MoE rectangular grouped GEMM (MPS)");
   m.def("moe_grouped_gemm_swiglu", &moe_grouped_gemm_swiglu_mps, "ThunderMittens MoE fused SiLU-GLU GEMM1 (MPS)");
+  m.def("gdn_recur", &gdn_recur_mps,
+        "ThunderMittens GatedDeltaNet linear attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"), pybind11::arg("g"),
+        pybind11::arg("beta"), pybind11::arg("state_pool"), pybind11::arg("cu_seqlens"),
+        pybind11::arg("slot_mapping"), pybind11::arg("load_initial") = true);
   m.def("selective_scan", &selective_scan_mps,
         "ThunderMittens Mamba-1 selective scan (MPS)",
         pybind11::arg("u"), pybind11::arg("delta"), pybind11::arg("A"), pybind11::arg("B"),
