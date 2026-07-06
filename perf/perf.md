@@ -1,7 +1,7 @@
-# ThunderMittens Metal Performance Handbook
+# QuixiCore Metal Performance Handbook
 
 This document is the operating guide for optimizing every kernel under
-`ThunderMittens/kernels/` for Apple Metal. The goal is not to collect tricks. The
+`kernels/` for Apple Metal. The goal is not to collect tricks. The
 goal is to run a disciplined loop: find references, form a bottleneck hypothesis,
 measure a clean baseline, run controlled experiments, keep only verified wins,
 and record enough detail that the next pass can start from evidence instead of
@@ -39,7 +39,7 @@ competitive without being faster.
 
 ## Repo Facts To Preserve
 
-Core kernel sources are in `ThunderMittens/kernels/<kernel>/`:
+Core kernel sources are in `kernels/<family>/<operation>/`:
 
 - Elementwise and row kernels: `add_rt`, `gelu`, `layernorm`, `rms_norm`,
   `rotary`, `softmax`, `glu`, `hadamard`, `add_norm` (fused add+norm(+fp8)).
@@ -63,19 +63,20 @@ can sit in the SLC and report above-DRAM bandwidth — A/B comparisons remain
 valid, absolute GB/s near or above peak means "cache-resident", not "magic".
 
 The MLX extension builds all active kernels from
-`ThunderMittens/kernels/CMakeLists.txt`. Python dispatch lives in
-`ThunderMittens/kernels/tk/__init__.py`, with MLX bindings in
-`ThunderMittens/kernels/bindings.cpp` and PyTorch MPS support under
-`ThunderMittens/kernels/tk_torch/`.
+`bindings/python/CMakeLists.txt`. Python dispatch lives in
+`bindings/python/tk/__init__.py`, with MLX bindings in
+`bindings/python/bindings.cpp` and PyTorch MPS support under
+`bindings/pytorch_mps/`.
 
-Correctness tests live beside kernels:
+Correctness tests mirror the kernel taxonomy:
 
 ```bash
-cd ThunderMittens/kernels
-python -m pytest */correctness/ tk_torch/tests/ tests_parity/ -q
+scripts/test correctness
+scripts/test mps
+scripts/test parity
 ```
 
-Legacy timing entry points (`kernels/time_perf.py`, `time_gemm.py`,
+Legacy timing entry points (`perf/harness/time_perf.py`, `time_gemm.py`,
 `time_attn.py`, `time_layernorm.py`) predate the harness and time one call per
 sync; prefer `perf/bench_kernels.py` for anything that will be recorded.
 
@@ -133,7 +134,7 @@ earlier phases and have been cleaned from disk — re-clone into `.reference/`
 Use targeted searches, for example:
 
 ```bash
-rg -n "kernel_name|algorithm_name|qgemv|mul_mv|softmax|rope" .reference ThunderMittens/kernels
+rg -n "kernel_name|algorithm_name|qgemv|mul_mv|softmax|rope" .reference kernels
 find .reference -path '*metal*' -o -path '*kernels*' | sort
 ```
 
@@ -193,7 +194,7 @@ Benchmark against at least three baselines:
 - Naive decomposed baseline: for fused or quant kernels, materialize the obvious
   intermediate and call a framework primitive, for example
   `dequantize(wq) @ x`.
-- Current ThunderMittens baseline: current `tk.<kernel>` implementation before
+- Current QuixiCore Metal baseline: current `tk.<kernel>` implementation before
   the experiment.
 
 For quantized decode, the decisive metric is effective weight bandwidth:
@@ -564,13 +565,12 @@ path, device, and summary instead.
 Before applying an optimization permanently:
 
 ```bash
-cd ThunderMittens/kernels
-python -m pytest <kernel>/correctness/ -q
-python -m pytest tests_parity/ -q
+python -m pytest tests/correctness/<family>/<operation> -q
+scripts/test parity -q
 python <relevant benchmark script or harness>
 ```
 
-For shared substrate changes under `ThunderMittens/include/`, also run the
+For shared substrate changes under `include/metal/`, also run the
 broader kernel correctness suite and the Xcode primitive tests described in
 `docs/porting/primitives.md`.
 

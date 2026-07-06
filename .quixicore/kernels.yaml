@@ -7,91 +7,96 @@ status_values:
   - planned
   - unsupported
   - capability_gated
-layout: legacy_migration
+layout: canonical
 families:
   norms:
     status: implemented
     paths:
-      - ThunderMittens/kernels/rms_norm
-      - ThunderMittens/kernels/layernorm
-      - ThunderMittens/kernels/add_norm
-      - ThunderMittens/kernels/qk_norm_rope
+      - kernels/norms/rms_norm
+      - kernels/norms/layernorm
+      - kernels/norms/add_norm
+      - kernels/norms/qk_norm_rope
   activations:
     status: implemented
     paths:
-      - ThunderMittens/kernels/gelu
-      - ThunderMittens/kernels/glu
-      - ThunderMittens/kernels/softmax
+      - kernels/activations/gelu
+      - kernels/activations/glu
+      - kernels/activations/softmax
   attention:
     status: implemented
     paths:
-      - ThunderMittens/kernels/attn_fwd
-      - ThunderMittens/kernels/attn_bwd
-      - ThunderMittens/kernels/attn_causal
-      - ThunderMittens/kernels/attn_varlen
-      - ThunderMittens/kernels/attn_q
-      - ThunderMittens/kernels/paged_attn_v2
-      - ThunderMittens/kernels/mla
-      - ThunderMittens/kernels/rotary
-      - ThunderMittens/kernels/rope_kv
+      - kernels/attention/attn_fwd
+      - kernels/attention/attn_bwd
+      - kernels/attention/attn_causal
+      - kernels/attention/attn_multiwarp
+      - kernels/attention/attn_varlen
+      - kernels/attention/attn_q
+      - kernels/attention/paged_attn_v2
+      - kernels/attention/mla
+      - kernels/attention/rotary
+      - kernels/attention/rope_kv
   linear_attention:
     status: implemented
     paths:
-      - ThunderMittens/kernels/based
-      - ThunderMittens/kernels/hedgehog
-      - ThunderMittens/kernels/linear_attn
-      - ThunderMittens/kernels/lin_attn_causal
-      - ThunderMittens/kernels/lin_attn_decay
-      - ThunderMittens/kernels/gdn
+      - kernels/linear_attention/based
+      - kernels/linear_attention/hedgehog
+      - kernels/linear_attention/linear_attn
+      - kernels/linear_attention/lin_attn_causal
+      - kernels/linear_attention/lin_attn_decay
+      - kernels/linear_attention/gdn
   ssm:
     status: implemented
     paths:
-      - ThunderMittens/kernels/mamba2
-      - ThunderMittens/kernels/selective_scan
-      - ThunderMittens/kernels/fftconv
+      - kernels/ssm/mamba2
+      - kernels/ssm/selective_scan
+      - kernels/ssm/fftconv
   matmul:
     status: implemented
     paths:
-      - ThunderMittens/kernels/matmul_custom
-      - ThunderMittens/kernels/gemm_staged
-      - ThunderMittens/kernels/cmplx_matmul
-      - ThunderMittens/kernels/flux
+      - kernels/matmul/matmul_custom
+      - kernels/matmul/gemm_staged
+      - kernels/matmul/cmplx_matmul
+      - kernels/matmul/flux
   quantization:
     status: implemented
     paths:
-      - ThunderMittens/kernels/act_quant
-      - ThunderMittens/kernels/quant_rt
-      - ThunderMittens/kernels/qgemm
-      - ThunderMittens/kernels/qgemm_int
-      - ThunderMittens/kernels/qgemv
-      - ThunderMittens/kernels/qgemv_int
-      - ThunderMittens/kernels/lm_head
-      - ThunderMittens/kernels/turboquant
+      - kernels/quantization/act_quant
+      - kernels/quantization/quant_rt
+      - kernels/quantization/qgemm
+      - kernels/quantization/qgemm_int
+      - kernels/quantization/qgemv
+      - kernels/quantization/qgemv_int
+      - kernels/quantization/qflux
+      - kernels/quantization/lm_head
+      - kernels/quantization/turboquant
   moe:
     status: implemented
     paths:
-      - ThunderMittens/kernels/moe
+      - kernels/moe/moe
   sampling:
     status: implemented
     paths:
-      - ThunderMittens/kernels/sampling
+      - kernels/sampling/sampling
   serving:
     status: implemented
     paths:
-      - ThunderMittens/kernels/kv_cache
-      - ThunderMittens/kernels/indexer
-      - ThunderMittens/kernels/minference
+      - kernels/serving/kv_cache
+      - kernels/serving/indexer
+      - kernels/serving/minference
+      - kernels/serving/embedding
   optimizers:
     status: implemented
     paths:
-      - ThunderMittens/kernels/optim
+      - kernels/optimizers/optim
   collectives:
     status: planned
     paths: []
   utils:
     status: implemented
     paths:
-      - ThunderMittens/kernels/hadamard
-      - ThunderMittens/kernels/marginal
-      - ThunderMittens/kernels/add_rt
-notes: Family-level manifest. Operation-level paths should be added as kernels move into the canonical family/operation tree.
+      - kernels/utils/hadamard
+      - kernels/utils/marginal
+      - kernels/utils/add_rt
+      - kernels/utils/dropout
+      - kernels/utils/cross_entropy
+notes: Canonical family-level manifest. Operation-level metadata can now be added without legacy path translation.

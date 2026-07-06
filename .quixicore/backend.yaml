@@ -14,4 +14,4 @@ integrations:
   - Xcode
   - MLX
   - PyTorch MPS
-notes: Native Apple Metal backend with MLX and PyTorch MPS integrations. Current ThunderMittens tree is migrating toward the shared QuixiCore family/operation taxonomy.
+notes: Native Apple Metal backend with MLX and PyTorch MPS integrations. Kernel sources now use the shared QuixiCore family/operation taxonomy.

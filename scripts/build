@@ -6,24 +6,27 @@ if [ $# -gt 0 ]; then
   shift
 fi
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python_bin="${PYTHON:-python3}"
+
 case "${target}" in
   help)
     echo "Usage: scripts/build <target>"
-    echo "Targets: xcode, mlx, kernels, pytorch_mps"
+    echo "Targets: xcode, mlx, python, kernels, pytorch_mps"
     ;;
   xcode)
-    xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens build "$@"
+    xcodebuild -project "${repo_root}/QuixiCoreMetal.xcodeproj" -scheme QuixiCoreMetal build "$@"
     ;;
   mlx)
-    cd ThunderMittens/mlx
-    CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}" pip install -e ".[dev]" "$@"
+    cd "${repo_root}/bindings/mlx"
+    CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}" "${python_bin}" -m pip install -e ".[dev]" "$@"
     ;;
-  kernels)
-    cd ThunderMittens/kernels
-    python3 setup.py build_ext -j"${QUIXICORE_BUILD_JOBS:-8}" --inplace "$@"
+  python|kernels)
+    cd "${repo_root}/bindings/python"
+    "${python_bin}" setup.py build_ext -j"${QUIXICORE_BUILD_JOBS:-8}" --inplace "$@"
     ;;
   pytorch_mps)
-    pip install -e ThunderMittens/kernels/tk_torch "$@"
+    "${python_bin}" -m pip install -e "${repo_root}/bindings/pytorch_mps" "$@"
     ;;
   *)
     echo "Unknown build target: ${target}" >&2

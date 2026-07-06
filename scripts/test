@@ -6,23 +6,73 @@ if [ $# -gt 0 ]; then
   shift
 fi
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+python_bin="${PYTHON:-python3}"
+export PYTHONPATH="${repo_root}/bindings/python:${repo_root}/bindings/pytorch_mps:${PYTHONPATH:-}"
+
+can_run_torch_mps() {
+  "${python_bin}" - <<'PY'
+import sys
+
+try:
+    import torch
+except Exception:
+    print("Skipping PyTorch MPS tests: torch is not installed.")
+    sys.exit(1)
+
+if not torch.backends.mps.is_available():
+    print("Skipping PyTorch MPS tests: torch.backends.mps is not available.")
+    sys.exit(1)
+PY
+}
+
+can_run_parity() {
+  "${python_bin}" - <<'PY'
+import sys
+
+try:
+    import mlx.core  # noqa: F401
+except Exception:
+    print("Skipping parity tests: mlx is not installed.")
+    sys.exit(1)
+
+try:
+    import torch
+except Exception:
+    print("Skipping parity tests: torch is not installed.")
+    sys.exit(1)
+
+if not torch.backends.mps.is_available():
+    print("Skipping parity tests: torch.backends.mps is not available.")
+    sys.exit(1)
+PY
+}
+
 case "${target}" in
   help)
     echo "Usage: scripts/test <target>"
-    echo "Targets: mlx, mps, parity, xcode"
+    echo "Targets: correctness, mlx, mps, parity, python, xcode"
     ;;
-  mlx)
-    cd ThunderMittens/kernels
-    python3 -m pytest */correctness/ "$@"
+  correctness|mlx)
+    "${python_bin}" -m pytest "${repo_root}/tests/correctness" "$@"
     ;;
   mps)
-    python3 -m pytest ThunderMittens/kernels/tk_torch/tests "$@"
+    if ! can_run_torch_mps; then
+      exit 0
+    fi
+    "${python_bin}" -m pytest "${repo_root}/bindings/pytorch_mps/tests" "$@"
     ;;
   parity)
-    python3 -m pytest ThunderMittens/kernels/tests_parity "$@"
+    if ! can_run_parity; then
+      exit 0
+    fi
+    "${python_bin}" -m pytest "${repo_root}/tests/correctness/parity" "$@"
+    ;;
+  python)
+    "${python_bin}" -m pytest "${repo_root}/bindings/python/tk/tests" "$@"
     ;;
   xcode)
-    xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens test "$@"
+    xcodebuild -project "${repo_root}/QuixiCoreMetal.xcodeproj" -scheme QuixiCoreMetal build-for-testing "$@"
     ;;
   *)
     echo "Unknown test target: ${target}" >&2

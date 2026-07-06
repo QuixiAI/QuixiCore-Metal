@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""ThunderMittens kernel benchmark harness (schema v1).
+"""QuixiCore Metal kernel benchmark harness (schema v1).
 
-Covers every active kernel family under ThunderMittens/kernels/ with, per case:
+Covers every active kernel family under kernels/ with, per case:
   - the tk target kernel,
   - a framework baseline (mx.* / mx.fast.* / torch.*) when one exists,
   - a naive decomposed baseline for fused/quant kernels (e.g. dequantize(wq) @ x),
@@ -42,9 +42,11 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-KERNELS_DIR = REPO_ROOT / "ThunderMittens" / "kernels"
-if str(KERNELS_DIR) not in sys.path:
-    sys.path.insert(0, str(KERNELS_DIR))
+PYTHON_BINDINGS_DIR = REPO_ROOT / "bindings" / "python"
+PYTORCH_MPS_BINDINGS_DIR = REPO_ROOT / "bindings" / "pytorch_mps"
+for _path in (PYTHON_BINDINGS_DIR, PYTORCH_MPS_BINDINGS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 RESULTS_ROOT = Path(__file__).resolve().parent / "results"
 SCHEMA_VERSION = 1
@@ -259,7 +261,7 @@ def write_outputs(rows, meta, out_dir):
         for r in rows:
             f.write(json.dumps(r) + "\n")
     # summary table
-    lines = ["# ThunderMittens kernel benchmarks", ""]
+    lines = ["# QuixiCore Metal kernel benchmarks", ""]
     lines.append(f"- `{meta['git']}` · {meta.get('device','?')} · backend `{meta['backend']}` · "
                  f"preset `{meta['preset']}` · warmup/iters {meta['warmup']}/{meta['iters']}")
     lines.append("")

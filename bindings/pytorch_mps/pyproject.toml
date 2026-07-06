@@ -1,0 +1,38 @@
+# Standalone packaging for the PyTorch (Apple MPS) backend of the QuixiCore Metal
+# kernels. Deliberately separate from the MLX-backed Python package: a
+# PyTorch user needs neither MLX nor the CMake/nanobind build — only PyTorch and
+# Xcode's Metal toolchain.
+#
+# torch is a RUNTIME dependency only: the ObjC++ extension JIT-compiles at import
+# via torch.utils.cpp_extension.load, and the metallib is built at import via
+# `xcrun metal`. Nothing torch-related is needed at install time.
+#
+# The version floor is intentionally loose so it is satisfied by existing installs
+# (including nightlies) and pip will not swap out your PyTorch.
+#
+# NOT expressible here, but required: the Xcode Metal toolchain
+# (`xcodebuild -downloadComponent MetalToolchain`). See README.md.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tk-torch"
+version = "0.0.0"
+description = "QuixiCore Metal kernels for PyTorch (Apple Metal / MPS backend)"
+requires-python = ">=3.9"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["tk_torch"]
+package-dir = { "tk_torch" = "tk_torch" }
+include-package-data = true
+
+[tool.setuptools.package-data]
+# Needed at import for the JIT build (editable installs resolve these in-tree;
+# bundling for distributable wheels is future work).
+tk_torch = ["torch_kernels.mm"]

@@ -2,5 +2,8 @@
 set -euo pipefail
 
 rm -rf build .pytest_cache
-rm -rf ThunderMittens/kernels/build ThunderMittens/kernels/*.egg-info
+rm -rf bindings/python/build bindings/python/*.egg-info bindings/python/tk.egg-info
+rm -rf bindings/python/tk/_ext*.so bindings/python/tk/*.dylib bindings/python/tk/*.metallib
+rm -rf bindings/pytorch_mps/*.egg-info bindings/pytorch_mps/tk_torch/*.metallib
+rm -rf bindings/mlx/build bindings/mlx/*.egg-info
 find . -type d -name __pycache__ -prune -exec rm -rf {} +

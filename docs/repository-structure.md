@@ -23,10 +23,15 @@ QuixiCore-Metal/
     performance.md
     backend-notes.md
 
-  include/quixicore/metal/
-    backend.hpp
-    runtime.hpp
-    ops.hpp
+  include/
+    metal/
+      MetalSingle.hpp
+      tk.metal
+      ops/
+    quixicore/metal/
+      backend.hpp
+      runtime.hpp
+      ops.hpp
 
   src/
     runtime/
@@ -80,9 +85,8 @@ QuixiCore-Metal/
   QuixiCoreMetal.xcodeproj/
 ```
 
-During migration, the existing `ThunderMittens/` tree can remain. Apply the
-same taxonomy under `ThunderMittens/kernels/` until files move into top-level
-`kernels/`.
+The previous monolithic source tree has been moved into this canonical layout.
+New work should land directly under the top-level taxonomy below.
 
 ## Xcode Structure
 
@@ -243,20 +247,20 @@ scripts/clean
 For Metal these scripts should wrap `xcodebuild`, MLX/PyTorch extension builds,
 or direct command-line Metal tooling as appropriate.
 
-## Current Migration Map
+## Completed Migration Map
 
-| Current area | Target area |
+| Former area | Current area |
 | --- | --- |
 | `ThunderMittens/kernels/*` | `kernels/<family>/<operation>/` |
 | `ThunderMittens/kernels/tk_torch` | `bindings/pytorch_mps/` |
 | `ThunderMittens/mlx` | `bindings/mlx/` |
-| `ThunderMittens/include` | `include/` and `kernels/common/` |
+| `ThunderMittens/include` | `include/metal/` and `kernels/common/` |
 | `ThunderMittens/tests` | `tests/` |
 | `ThunderMittens/kernels/tests_parity` | `tests/correctness/` |
 | `ThunderMittens.xcodeproj` | `QuixiCoreMetal.xcodeproj/` |
 
-Move files in behavior-preserving steps. Rename APIs only when synchronizing
-the CUDA, Metal, ROCm, XPU, and Gaudi bindings deliberately.
+Rename APIs only when synchronizing the CUDA, Metal, ROCm, XPU, and Gaudi
+bindings deliberately.
 
 ## Rules For New Work
 

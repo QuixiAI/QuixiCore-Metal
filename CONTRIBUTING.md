@@ -14,16 +14,13 @@ implementation techniques.
 
 ## Adding Or Changing A Kernel
 
-1. Put source under `kernels/<family>/<operation>/` when adding new work.
-2. During migration, source may remain under `ThunderMittens/kernels/`, but it
-   should follow the same semantic family taxonomy.
-3. Keep framework glue in `bindings/`; do not hide MLX or MPS bindings inside
+1. Put source under `kernels/<family>/<operation>/`.
+2. Keep framework glue in `bindings/`; do not hide MLX or MPS bindings inside
    kernel directories.
-4. Add or update correctness coverage under `tests/correctness/<family>/<operation>/`
-   or the current legacy test location.
-5. Add or update benchmark coverage under `perf/`.
-6. Update `.quixicore/kernels.yaml`.
-7. Update `.quixicore/quant-formats.yaml` when quant layouts, packing, or
+3. Add or update correctness coverage under `tests/correctness/<family>/<operation>/`.
+4. Add or update benchmark coverage under `perf/`.
+5. Update `.quixicore/kernels.yaml`.
+6. Update `.quixicore/quant-formats.yaml` when quant layouts, packing, or
    supported formats change.
 
 ## Required Checks
