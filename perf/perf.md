@@ -7,7 +7,8 @@ measure a clean baseline, run controlled experiments, keep only verified wins,
 and record enough detail that the next pass can start from evidence instead of
 memory.
 
-The running notebook for the effort is `perf/optimization_status.md`.
+The running notebook for the effort is `perf/optimization_status.md`. Baseline
+snapshots live in `perf/baseline_status.md`.
 
 ## Principles
 

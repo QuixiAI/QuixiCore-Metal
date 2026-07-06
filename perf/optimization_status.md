@@ -1,4 +1,31 @@
-# ThunderMittens — performance status
+# QuixiCore Metal Optimization Status
+
+This is the running notebook for Metal kernel implementation and optimization.
+Raw output belongs under `perf/results/`; stable conclusions belong here.
+
+## Entry Template
+
+Use this structure for every kernel family or optimization pass:
+
+```text
+## YYYY-MM-DD: <kernel or pass name>
+
+Status: not started | baselining | experimenting | candidate | landed | deferred.
+Current implementation:
+Current public route:
+References inspected:
+Correctness:
+Baseline:
+Experiments:
+Decision:
+Open questions:
+Raw results:
+```
+
+Record enough context to reproduce the run: Apple Silicon model, macOS version,
+Xcode/Metal toolchain version, integration path, command, git commit or
+working-tree label, dtype, shape, quant format, warmups, iterations, median,
+variance, correctness tolerance, and observed error.
 
 ## Wave-10 K5: EAGLE spec-decode input-prep builders (2026-07-05)
 
