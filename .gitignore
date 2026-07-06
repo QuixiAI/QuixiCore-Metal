@@ -36,10 +36,6 @@ DerivedData/
 # (see bigpicture.md). Large; do not commit.
 .reference/
 
-# Agent guidance files — local only, never commit (see memory: no-ai-coauthor)
-AGENTS.md
-CLAUDE.md
-
 # macOS
 .DS_Store
 
