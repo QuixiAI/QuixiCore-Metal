@@ -285,3 +285,7 @@ the `tau_tail` / `packbits` / `permute_cols` utilities) are ported from
 **[metal-forge](https://github.com/AlpinDale)** by **[AlpinDale](https://github.com/AlpinDale)**
 ([@AlpinDale](https://x.com/AlpinDale)) — thank you for the reference implementations that made these
 kernels possible.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
