@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-help}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+case "${target}" in
+  help)
+    echo "Usage: scripts/build <target>"
+    echo "Targets: xcode, mlx, kernels, pytorch_mps"
+    ;;
+  xcode)
+    xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens build "$@"
+    ;;
+  mlx)
+    cd ThunderMittens/mlx
+    CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-8}" pip install -e ".[dev]" "$@"
+    ;;
+  kernels)
+    cd ThunderMittens/kernels
+    python3 setup.py build_ext -j"${QUIXICORE_BUILD_JOBS:-8}" --inplace "$@"
+    ;;
+  pytorch_mps)
+    pip install -e ThunderMittens/kernels/tk_torch "$@"
+    ;;
+  *)
+    echo "Unknown build target: ${target}" >&2
+    exit 2
+    ;;
+esac

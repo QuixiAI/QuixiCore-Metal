@@ -1,0 +1,97 @@
+schema_version: 0.1
+backend: metal
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+  - capability_gated
+layout: legacy_migration
+families:
+  norms:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/rms_norm
+      - ThunderMittens/kernels/layernorm
+      - ThunderMittens/kernels/add_norm
+      - ThunderMittens/kernels/qk_norm_rope
+  activations:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/gelu
+      - ThunderMittens/kernels/glu
+      - ThunderMittens/kernels/softmax
+  attention:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/attn_fwd
+      - ThunderMittens/kernels/attn_bwd
+      - ThunderMittens/kernels/attn_causal
+      - ThunderMittens/kernels/attn_varlen
+      - ThunderMittens/kernels/attn_q
+      - ThunderMittens/kernels/paged_attn_v2
+      - ThunderMittens/kernels/mla
+      - ThunderMittens/kernels/rotary
+      - ThunderMittens/kernels/rope_kv
+  linear_attention:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/based
+      - ThunderMittens/kernels/hedgehog
+      - ThunderMittens/kernels/linear_attn
+      - ThunderMittens/kernels/lin_attn_causal
+      - ThunderMittens/kernels/lin_attn_decay
+      - ThunderMittens/kernels/gdn
+  ssm:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/mamba2
+      - ThunderMittens/kernels/selective_scan
+      - ThunderMittens/kernels/fftconv
+  matmul:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/matmul_custom
+      - ThunderMittens/kernels/gemm_staged
+      - ThunderMittens/kernels/cmplx_matmul
+      - ThunderMittens/kernels/flux
+  quantization:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/act_quant
+      - ThunderMittens/kernels/quant_rt
+      - ThunderMittens/kernels/qgemm
+      - ThunderMittens/kernels/qgemm_int
+      - ThunderMittens/kernels/qgemv
+      - ThunderMittens/kernels/qgemv_int
+      - ThunderMittens/kernels/lm_head
+      - ThunderMittens/kernels/turboquant
+  moe:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/moe
+  sampling:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/sampling
+  serving:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/kv_cache
+      - ThunderMittens/kernels/indexer
+      - ThunderMittens/kernels/minference
+  optimizers:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/optim
+  collectives:
+    status: planned
+    paths: []
+  utils:
+    status: implemented
+    paths:
+      - ThunderMittens/kernels/hadamard
+      - ThunderMittens/kernels/marginal
+      - ThunderMittens/kernels/add_rt
+notes: Family-level manifest. Operation-level paths should be added as kernels move into the canonical family/operation tree.

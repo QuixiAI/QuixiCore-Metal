@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "QuixiCore Metal uses Xcode plus MLX and PyTorch MPS extension builds."
+if command -v xcodebuild >/dev/null 2>&1; then
+  xcodebuild -version
+else
+  echo "xcodebuild was not found on PATH."
+fi
+
+if command -v xcrun >/dev/null 2>&1; then
+  xcrun --find metal || true
+fi

@@ -1,0 +1,28 @@
+schema_version: 0.1
+backend: metal
+formats:
+  gguf:
+    status: implemented
+    notes: GGUF legacy, k-quant, and i-quant weight formats.
+  mx:
+    status: implemented
+    notes: MXFP8, MXFP6, MXFP4-style formats implemented in Metal software paths.
+  fp8:
+    status: implemented
+    notes: fp8 weight, activation, and KV-cache paths.
+  fp4:
+    status: implemented
+    notes: fp4/nvfp4-style software dequant and GEMM paths.
+  bitnet:
+    status: implemented
+    notes: BitNet ternary weight paths.
+  turboquant:
+    status: implemented
+    notes: TurboQuant KV codec and Hadamard/FWHT support.
+status_values:
+  - implemented
+  - partial
+  - experimental
+  - planned
+  - unsupported
+notes: Format details should be expanded into operation-level coverage as the manifests become stricter.

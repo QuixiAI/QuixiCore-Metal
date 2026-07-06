@@ -1,0 +1,17 @@
+backend: metal
+name: QuixiCore Metal
+repo: QuixiAI/QuixiCore-Metal
+umbrella: QuixiAI/QuixiCore
+contract: v0.1
+status: active
+targets:
+  - apple_silicon
+  - apple_gpu_family_7
+  - apple_gpu_family_8
+upstream: HazyResearch/ThunderKittens
+integrations:
+  - Metal
+  - Xcode
+  - MLX
+  - PyTorch MPS
+notes: Native Apple Metal backend with MLX and PyTorch MPS integrations. Current ThunderMittens tree is migrating toward the shared QuixiCore family/operation taxonomy.

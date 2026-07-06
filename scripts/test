@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+target="${1:-help}"
+if [ $# -gt 0 ]; then
+  shift
+fi
+
+case "${target}" in
+  help)
+    echo "Usage: scripts/test <target>"
+    echo "Targets: mlx, mps, parity, xcode"
+    ;;
+  mlx)
+    cd ThunderMittens/kernels
+    python3 -m pytest */correctness/ "$@"
+    ;;
+  mps)
+    python3 -m pytest ThunderMittens/kernels/tk_torch/tests "$@"
+    ;;
+  parity)
+    python3 -m pytest ThunderMittens/kernels/tests_parity "$@"
+    ;;
+  xcode)
+    xcodebuild -project ThunderMittens.xcodeproj -scheme ThunderMittens test "$@"
+    ;;
+  *)
+    echo "Unknown test target: ${target}" >&2
+    exit 2
+    ;;
+esac
