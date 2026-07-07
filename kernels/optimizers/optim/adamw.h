@@ -26,6 +26,22 @@ std::vector<array> adamw(
     int step,
     StreamOrDevice s = {});
 
+std::vector<array> adamw_masked(
+    const array& param,
+    const array& grad,
+    const array& m,
+    const array& v,
+    float lr,
+    float beta1,
+    float beta2,
+    float eps,
+    float weight_decay,
+    int step,
+    const array& mask,
+    int seg_size,
+    int mask_mode = 0,
+    StreamOrDevice s = {});
+
 class AdamW : public Primitive {
  public:
   AdamW(Stream stream, float lr, float b1, float b2, float eps, float wd, int step)
@@ -49,6 +65,34 @@ class AdamW : public Primitive {
  private:
   float lr_, b1_, b2_, eps_, wd_;
   int step_;
+};
+
+class AdamWMasked : public Primitive {
+ public:
+  AdamWMasked(Stream stream, float lr, float b1, float b2, float eps, float wd, int step,
+              int seg_size, int mask_mode)
+      : Primitive(stream), lr_(lr), b1_(b1), b2_(b2), eps_(eps), wd_(wd), step_(step),
+        seg_size_(seg_size), mask_mode_(mask_mode) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AdamWMasked"; }
+  void print(std::ostream& os) override { os << "AdamWMasked"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const AdamWMasked&>(other);
+    return lr_ == o.lr_ && b1_ == o.b1_ && b2_ == o.b2_ && eps_ == o.eps_ &&
+           wd_ == o.wd_ && step_ == o.step_ && seg_size_ == o.seg_size_ &&
+           mask_mode_ == o.mask_mode_;
+  }
+
+ private:
+  float lr_, b1_, b2_, eps_, wd_;
+  int step_, seg_size_, mask_mode_;
 };
 
 } // namespace mlx::core

@@ -40,6 +40,8 @@ _METAL_SOURCES = [
     _kernel_source("ssm/selective_scan/selective_scan.metal"),
     _kernel_source("linear_attention/gdn/gdn.metal"),
     _kernel_source("quantization/act_quant/act_quant.metal"),
+    _kernel_source("quantization/fake_quant/fake_quant.metal"),
+    _kernel_source("quantization/weight_quant_ternary/weight_quant_ternary.metal"),
     _kernel_source("serving/minference/minference.metal"),
     _kernel_source("quantization/turboquant/turboquant.metal"),
     _kernel_source("utils/marginal/marginal.metal"),
@@ -61,6 +63,7 @@ _METAL_SOURCES = [
     _kernel_source("attention/attn_varlen/attn_varlen.metal"),
     _kernel_source("quantization/lm_head/lm_head.metal"),
     _kernel_source("utils/cross_entropy/cross_entropy.metal"),
+    _kernel_source("utils/kd_kl_topk/kd_kl_topk.metal"),
     _kernel_source("matmul/flux/flux.metal"),
     _kernel_source("matmul/gemm_staged/gemm_staged.metal"),
     _kernel_source("attention/attn_multiwarp/attn_multiwarp.metal"),
@@ -294,6 +297,14 @@ def adamw(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step):
     """AdamW step. Returns (param', m', v'); m/v are fp32 moment state, step (t) >= 1. MPS."""
     return tuple(_ext.adamw(param, grad, m, v, float(lr), float(beta1), float(beta2),
                             float(eps), float(weight_decay), int(step)))
+
+
+def adamw_masked(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step,
+                 mask, seg_size, mask_mode=0):
+    """Segment-masked AdamW. mask_mode=0 skips inactive segment updates; mask_mode=1 skips only decay."""
+    return tuple(_ext.adamw_masked(param, grad, m, v, float(lr), float(beta1), float(beta2),
+                                   float(eps), float(weight_decay), int(step),
+                                   mask, int(seg_size), int(mask_mode)))
 
 
 def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",
@@ -616,6 +627,17 @@ def cross_entropy_bwd(logits, targets, lse, grad_out, ignore_index, label_smooth
                                   float(label_smoothing), float(z_loss), float(softcap))
 
 
+def kd_kl_topk_fwd(logits, t_idx, t_prob, invtemp=1.0, tail_mode=0):
+    """Sparse-teacher KD-KL forward over a top-k teacher cache. Returns (loss, lse). MPS."""
+    return tuple(_ext.kd_kl_topk_fwd(logits, t_idx, t_prob, float(invtemp), int(tail_mode)))
+
+
+def kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, invtemp=1.0, tail_mode=0):
+    """Sparse-teacher KD-KL backward. Returns grad_logits. MPS."""
+    return _ext.kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, float(invtemp),
+                               int(tail_mode))
+
+
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
                        block_table: torch.Tensor, context_lens: torch.Tensor,
                        scale: float = 0.0, partition_size: int = 512, window: int = 0,
@@ -841,6 +863,27 @@ def silu_mul_quant_fp8_group(x, gate, group_size=128, ue8m0=False, act="swiglu",
     """Fused gated-activation -> per-group fp8 (scale (rows, D/G); ue8m0 = 2^k scales). MPS."""
     return tuple(_ext.silu_mul_quant_fp8_group(x, gate, group_size, ue8m0,
                                                _ACTQ_MODES[act], float(alpha), float(limit)))
+
+
+def fake_quant_int8(x: torch.Tensor):
+    """One-pass per-token int8 fake quant. Returns (x_q bf16, codes int8, scale f32). MPS."""
+    return tuple(_ext.fake_quant_int8(x))
+
+
+def silu_mul_fake_quant_int8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated activation plus per-token int8 fake quant. Returns (x_q, codes, scale). MPS."""
+    return tuple(_ext.silu_mul_fake_quant_int8(x, gate, _ACTQ_MODES[act],
+                                               float(alpha), float(limit)))
+
+
+def weight_quant_ternary(w: torch.Tensor, group_k: int = 32):
+    """Latent weight (N,K) or (E,N,K) -> (packed bitnet blocks, dequantized bf16). MPS."""
+    return tuple(_ext.weight_quant_ternary(w, int(group_k)))
+
+
+def weight_quant_ternary_pt(w: torch.Tensor):
+    """Per-tensor BitNet ternary quantization -> (packed bitnet blocks, dequantized bf16). MPS."""
+    return tuple(_ext.weight_quant_ternary_pt(w))
 
 
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):

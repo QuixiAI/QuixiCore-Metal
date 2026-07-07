@@ -27,6 +27,85 @@ Xcode/Metal toolchain version, integration path, command, git commit or
 working-tree label, dtype, shape, quant format, warmups, iterations, median,
 variance, correctness tolerance, and observed error.
 
+## 2026-07-07: BitNet training kernel port
+
+Status: landed.
+
+Current implementation: ported the production BitNet training kernels that were missing from
+QuixiCore Metal:
+`weight_quant_ternary` / `weight_quant_ternary_pt`, `fake_quant_int8`,
+`silu_mul_fake_quant_int8`, `kd_kl_topk_fwd` / `kd_kl_topk_bwd`, and `adamw_masked`.
+Added MLX primitives, PyTorch MPS wrappers, Metal source registration, manifest paths,
+correctness tests, MPS tests, and benchmark cases.
+
+Current public route: `tk.weight_quant_ternary`, `tk.weight_quant_ternary_pt`,
+`tk.fake_quant_int8`, `tk.silu_mul_fake_quant_int8`, `tk.kd_kl_topk_fwd`,
+`tk.kd_kl_topk_bwd`, and `tk.adamw_masked`; all auto-route to MLX or `tk_torch`
+based on tensor type.
+
+References inspected:
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/weight_quant_ternary.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/fake_quant.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/kd_kl_topk.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/optimizers/optim/adamw.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/perf/bitnet_training_kernels.md`
+- Rejected after inspection: `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/qgemm_bwd.metal`
+  and `/Users/eric/BitNet/bitnet_train/metal/kernels/matmul/gemm_v3/gemm_v3.metal`.
+  BitNet's notebook records `qgemm_bwd` losing to `torch.matmul` on every measured shape and
+  `gemm_v3` reaching 94-99% of MPS without beating it, so neither is a QuixiCore win to expose.
+
+Correctness:
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
+  passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test correctness -q
+  tests/correctness/quantization/weight_quant_ternary
+  tests/correctness/quantization/fake_quant tests/correctness/utils/kd_kl_topk
+  tests/correctness/optimizers/optim/test_adamw.py` ran the correctness suite and passed:
+  1420 passed, 27 skipped.
+- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/build pytorch_mps` passed.
+- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/test mps -q` passed:
+  452 passed.
+
+Focused perf run:
+- Integration path: MLX Python extension.
+- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Xcode 26.6
+  (17F113), Metal 32023.883, Python 3.12.9, MLX 0.21.1.
+- Working-tree label: `e484dc7-dirty`.
+- Command: `/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python perf/bench_kernels.py
+  --backend mlx --preset quick --kernel fake_quant,weight_quant_ternary,kd_kl_topk,adamw_masked
+  --warmup 5 --iters 20 --out-dir perf/results/2026-07-07/bitnet-port-quick`
+- Raw results: `perf/results/2026-07-07/bitnet-port-quick/`.
+
+| kernel | dtype/path | shape | median ms | p20/p80 ms | CV | baseline | speedup | rel err | decision |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| fake_quant plain | bf16 MLX | T512 D2880 | 0.0200 | 0.0195/0.0216 | 0.5619 | quantize_then_dequant 0.0438 | 2.19 | 6.45e-03 | keep |
+| fake_quant swiglu | bf16 MLX | T512 D2880 | 0.0320 | 0.0304/0.0415 | 0.3738 | swiglu_then_quant_dequant 0.0631 | 1.97 | 3.46e-03 | keep |
+| fake_quant plain | bf16 MLX | T4096 D2880 | 0.1383 | 0.1351/0.1953 | 0.5535 | quantize_then_dequant 0.3286 | 2.38 | 5.95e-03 | keep |
+| fake_quant swiglu | bf16 MLX | T4096 D2880 | 0.2851 | 0.2766/0.3211 | 0.2518 | swiglu_then_quant_dequant 0.5296 | 1.86 | 3.39e-03 | keep |
+| weight_quant_ternary | bf16 MLX | N512 K2880 G32 | 0.0443 | 0.0441/0.0452 | 0.1691 | framework_deq_only 0.1323 | 2.99 | 2.88e-03 | keep |
+| weight_quant_ternary | bf16 MLX | N4096 K2880 G32 | 0.2877 | 0.2855/0.2943 | 0.1763 | framework_deq_only 0.9898 | 3.44 | 3.48e-03 | keep |
+| weight_quant_ternary_pt | bf16 MLX | E2 N512 K2880 | 0.0805 | 0.0793/0.0886 | 0.2181 | framework_deq_only 0.2986 | 3.71 | 2.30e-03 | keep |
+| kd_kl_topk tail0 | f32 MLX | T256 V32000 K32 | 0.5136 | 0.5023/0.5583 | 0.0539 | none | n/a | 1.66e-07 | keep |
+| kd_kl_topk tail1 | f32 MLX | T256 V32000 K32 | 0.4775 | 0.4701/0.4949 | 0.0584 | none | n/a | 8.30e-08 | keep |
+| kd_kl_topk tail0 | f32 MLX | T1024 V32000 K32 | 0.7561 | 0.7454/0.7716 | 0.2550 | none | n/a | 1.28e-07 | keep |
+| kd_kl_topk tail1 | f32 MLX | T1024 V32000 K32 | 0.7493 | 0.7386/0.7636 | 0.2480 | none | n/a | 6.38e-08 | keep |
+| adamw_masked mode0 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3177 | 0.3141/0.3283 | 0.3174 | unmasked_adamw 0.2981 | 0.94 | 5.38e-08 | keep as semantic path |
+| adamw_masked mode1 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3435 | 0.3385/0.3496 | 0.1060 | unmasked_adamw 0.2914 | 0.85 | 5.38e-08 | keep as semantic path |
+| adamw_masked mode0 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.2584 | 1.1901/1.6126 | 0.1472 | unmasked_adamw 1.1074 | 0.88 | 5.33e-08 | keep as semantic path |
+| adamw_masked mode1 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.0982 | 1.0900/1.1216 | 0.1075 | unmasked_adamw 1.1169 | 1.02 | 5.32e-08 | keep as semantic path |
+
+Decision: keep the production BitNet kernels. `fake_quant*` and `weight_quant_ternary*`
+are clear wins over decomposed framework paths. `kd_kl_topk` has no useful decomposed baseline
+because its value is avoiding dense teacher materialization, but the sparse fwd+bwd path passed
+dense-reference checks and is fast enough for the intended training route. `adamw_masked` is
+not a speedup over unmasked AdamW and should not be marketed as one; it is kept for the segment
+mask semantics. Reject `qgemm_bwd` and `gemm_v3` for this port because the source project's own
+measurements do not show a Metal win.
+
+Open questions: add a future dense-teacher KD baseline if a training harness exposes the exact
+end-to-end loss path; revisit `adamw_masked` only if segment sparsity is high enough to justify
+a compacted-index variant.
+
 ## Wave-10 K5: EAGLE spec-decode input-prep builders (2026-07-05)
 
 Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with

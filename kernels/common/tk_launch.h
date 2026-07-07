@@ -77,6 +77,7 @@ inline std::string quant_tensor_encode_fp8_kernel_name(const std::string& t) { r
 inline std::string quant_tensor_encode_int8_kernel_name(const std::string& t) { return "quant_tensor_encode_int8_" + t; }
 inline std::string quantize_per_token_fp8_kernel_name(const std::string& t) { return "quantize_per_token_fp8_" + t; }
 inline std::string quantize_per_token_int8_kernel_name(const std::string& t) { return "quantize_per_token_int8_" + t; }
+inline std::string weight_quant_ternary_kernel_name(const std::string& t) { return "weight_quant_ternary_" + t; }
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
@@ -1007,6 +1008,92 @@ void launch_quantize_per_token_int8(E& e, typename E::in_t x, typename E::out_t 
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
+// ----- weight_quant_ternary: W@0(E,N,K) -> wq@1(u8 bitnet blocks), w_deq@2(bf16).
+//        K@3 group_k@4 N@5; grid (N,E,1), one simdgroup per row. -----
+template <class E>
+void launch_weight_quant_ternary(E& e, typename E::in_t w, typename E::out_t wq,
+                                 typename E::out_t w_deq, int NE, int N, int K, int group_k,
+                                 const std::string& type_name) {
+  e.pipeline(weight_quant_ternary_kernel_name(type_name));
+  e.in(w, 0); e.out(wq, 1); e.out(w_deq, 2);
+  e.bytes(K, 3); e.bytes(group_k, 4); e.bytes(N, 5);
+  e.dispatch(N, NE, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_weight_quant_zero_float(E& e, typename E::out_t p, int n) {
+  e.pipeline("weight_quant_zero_float");
+  e.out(p, 0); e.bytes(n, 1);
+  e.dispatch((n + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+// ----- weight_quant_ternary_pt: one absmean scale per (N,K) slice. -----
+template <class E>
+void launch_weight_quant_ternary_abssum(E& e, typename E::in_t w, typename E::out_t abssum,
+                                        int NE, int NK, const std::string& type_name) {
+  e.pipeline("weight_quant_ternary_abssum_" + type_name);
+  e.in(w, 0); e.out(abssum, 1); e.bytes(NK, 2);
+  const int t16 = (NK + 15) / 16;
+  e.dispatch((t16 + 255) / 256, NE, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_weight_quant_ternary_pt_encode(E& e, typename E::in_t w, typename E::in_t abssum,
+                                           typename E::out_t wq, typename E::out_t w_deq,
+                                           int NE, int N, int K, const std::string& type_name) {
+  e.pipeline("weight_quant_ternary_pt_encode_" + type_name);
+  e.in(w, 0); e.in(abssum, 1); e.out(wq, 2); e.out(w_deq, 3);
+  e.bytes(K, 4); e.bytes(N, 5);
+  e.dispatch(N, NE, 1, 32, 1, 1);
+}
+
+// ----- kd_kl_topk sparse-teacher distillation loss. -----
+template <class E>
+void launch_kd_kl_topk_fwd(E& e, typename E::in_t logits, typename E::in_t t_idx,
+                           typename E::in_t t_prob, typename E::out_t loss,
+                           typename E::out_t lse, int rows, int V, int K, float invtemp,
+                           int tail_mode, const std::string& type_name) {
+  e.pipeline("kd_kl_topk_fwd_" + type_name);
+  e.in(logits, 0); e.in(t_idx, 1); e.in(t_prob, 2); e.out(loss, 3); e.out(lse, 4);
+  e.bytes(V, 5); e.bytes(K, 6); e.bytes(invtemp, 7); e.bytes(tail_mode, 8);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_kd_kl_topk_bwd(E& e, typename E::in_t logits, typename E::in_t t_idx,
+                           typename E::in_t t_prob, typename E::in_t lse,
+                           typename E::in_t grad_out, typename E::out_t grad_logits,
+                           int rows, int V, int K, float invtemp, int tail_mode,
+                           const std::string& type_name) {
+  e.pipeline("kd_kl_topk_bwd_" + type_name);
+  e.in(logits, 0); e.in(t_idx, 1); e.in(t_prob, 2); e.in(lse, 3); e.in(grad_out, 4);
+  e.out(grad_logits, 5);
+  e.bytes(V, 6); e.bytes(K, 7); e.bytes(invtemp, 8); e.bytes(tail_mode, 9);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+// ----- fake_quant_int8: x@0 -> x_q@1(bf16) codes@2(i8) scale@3(f32). -----
+template <class E>
+void launch_fake_quant_int8(E& e, typename E::in_t x, typename E::out_t x_q,
+                            typename E::out_t codes, typename E::out_t scale,
+                            int rows, int D, const std::string& type_name) {
+  e.pipeline("fake_quant_int8_" + type_name);
+  e.in(x, 0); e.out(x_q, 1); e.out(codes, 2); e.out(scale, 3);
+  e.bytes(D, 4);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_silu_mul_fake_quant_int8(E& e, typename E::in_t x, typename E::in_t gate,
+                                     typename E::out_t x_q, typename E::out_t codes,
+                                     typename E::out_t scale, int rows, int D, int mode,
+                                     float alpha, float limit, const std::string& type_name) {
+  e.pipeline("silu_mul_fake_quant_int8_" + type_name);
+  e.in(x, 0); e.in(gate, 1); e.out(x_q, 2); e.out(codes, 3); e.out(scale, 4);
+  e.bytes(D, 5); e.bytes(mode, 6); e.bytes(alpha, 7); e.bytes(limit, 8);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
 // ----- fp8 norm epilogues: codes=e4m3(norm(x+residual)*w[+b]/scale). res_out=x+residual (bf16).
 //        static: inv_scale param; dyn: per-row absmax/448 -> scale output. grid (M,1,1). -----
 template <class E>
@@ -1284,6 +1371,24 @@ void launch_adamw(E& e, typename E::in_t param, typename E::in_t grad, typename 
   e.out(param_out, 4); e.out(m_out, 5); e.out(v_out, 6);
   e.bytes(lr, 7); e.bytes(beta1, 8); e.bytes(beta2, 9); e.bytes(eps, 10); e.bytes(wd, 11);
   e.bytes(bc1, 12); e.bytes(bc2, 13); e.bytes(n, 14);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// Masked AdamW: mask[gid / seg_size] controls cold segments. mask_mode 0 skips the entire update;
+// mask_mode 1 applies gradient/moment updates but skips decoupled weight decay on inactive segments.
+template <class E>
+void launch_adamw_masked(E& e, typename E::in_t param, typename E::in_t grad, typename E::in_t m,
+                         typename E::in_t v, typename E::out_t param_out, typename E::out_t m_out,
+                         typename E::out_t v_out, float lr, float beta1, float beta2, float eps,
+                         float wd, float bc1, float bc2, uint32_t n, typename E::in_t mask,
+                         uint32_t seg_size, int mask_mode, const std::string& type_name) {
+  e.pipeline("adamw_masked_" + type_name);
+  e.in(param, 0); e.in(grad, 1); e.in(m, 2); e.in(v, 3);
+  e.out(param_out, 4); e.out(m_out, 5); e.out(v_out, 6);
+  e.bytes(lr, 7); e.bytes(beta1, 8); e.bytes(beta2, 9); e.bytes(eps, 10); e.bytes(wd, 11);
+  e.bytes(bc1, 12); e.bytes(bc2, 13); e.bytes(n, 14);
+  e.in(mask, 15); e.bytes(seg_size, 16); e.bytes(mask_mode, 17);
   constexpr int threads = 256;
   e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
 }

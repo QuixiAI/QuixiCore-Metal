@@ -42,6 +42,46 @@ kernel void adamw(device const T     *param     [[buffer(0)]],
     v_out[gid] = v;
 }
 
+template <typename T>
+kernel void adamw_masked(device const T     *param     [[buffer(0)]],
+                         device const T     *grad      [[buffer(1)]],
+                         device const float *m_in      [[buffer(2)]],
+                         device const float *v_in      [[buffer(3)]],
+                         device T           *param_out [[buffer(4)]],
+                         device float       *m_out     [[buffer(5)]],
+                         device float       *v_out     [[buffer(6)]],
+                         constant float &lr        [[buffer(7)]],
+                         constant float &beta1     [[buffer(8)]],
+                         constant float &beta2     [[buffer(9)]],
+                         constant float &eps       [[buffer(10)]],
+                         constant float &wd        [[buffer(11)]],
+                         constant float &bc1       [[buffer(12)]],
+                         constant float &bc2       [[buffer(13)]],
+                         constant uint  &n         [[buffer(14)]],
+                         device const uchar *mask  [[buffer(15)]],
+                         constant uint &seg_size   [[buffer(16)]],
+                         constant int &mask_mode   [[buffer(17)]],
+                         uint gid [[thread_position_in_grid]]) {
+    if (gid >= n) { return; }
+    const bool active = mask[gid / seg_size] != 0;
+    if (!active && mask_mode == 0) {
+        param_out[gid] = param[gid];
+        m_out[gid] = m_in[gid];
+        v_out[gid] = v_in[gid];
+        return;
+    }
+    const float g = float(grad[gid]);
+    const float m = beta1 * m_in[gid] + (1.0f - beta1) * g;
+    const float v = beta2 * v_in[gid] + (1.0f - beta2) * g * g;
+    const float mhat = m / bc1;
+    const float vhat = v / bc2;
+    const float p = float(param[gid]);
+    const float decay = active ? wd : 0.0f;
+    param_out[gid] = T(p - lr * (mhat / (metal::sqrt(vhat) + eps) + decay * p));
+    m_out[gid] = m;
+    v_out[gid] = v;
+}
+
 #define instantiate_adamw(type_name, T)                                          \
   template [[host_name("adamw_" #type_name)]] [[kernel]] void                     \
   adamw<T>(device const T *param [[buffer(0)]], device const T *grad [[buffer(1)]], \
@@ -56,3 +96,20 @@ kernel void adamw(device const T     *param     [[buffer(0)]],
 instantiate_adamw(float32, float)
 instantiate_adamw(float16, half)
 instantiate_adamw(bfloat16, bf16)
+
+#define instantiate_adamw_masked(type_name, T)                                      \
+  template [[host_name("adamw_masked_" #type_name)]] [[kernel]] void                \
+  adamw_masked<T>(device const T *param [[buffer(0)]], device const T *grad [[buffer(1)]], \
+    device const float *m_in [[buffer(2)]], device const float *v_in [[buffer(3)]], \
+    device T *param_out [[buffer(4)]], device float *m_out [[buffer(5)]],           \
+    device float *v_out [[buffer(6)]], constant float &lr [[buffer(7)]],            \
+    constant float &beta1 [[buffer(8)]], constant float &beta2 [[buffer(9)]],       \
+    constant float &eps [[buffer(10)]], constant float &wd [[buffer(11)]],          \
+    constant float &bc1 [[buffer(12)]], constant float &bc2 [[buffer(13)]],         \
+    constant uint &n [[buffer(14)]], device const uchar *mask [[buffer(15)]],       \
+    constant uint &seg_size [[buffer(16)]], constant int &mask_mode [[buffer(17)]], \
+    uint gid [[thread_position_in_grid]]);
+
+instantiate_adamw_masked(float32, float)
+instantiate_adamw_masked(float16, half)
+instantiate_adamw_masked(bfloat16, bf16)

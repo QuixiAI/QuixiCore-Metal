@@ -1415,6 +1415,203 @@ def logit_transform_cases(be, preset, formats):
                        target=thunk, baselines={}, ref=None, bytes_moved=2.0 * T * V * 4)
 
 
+def _fake_quant_deq_np(x):
+    amax = np.abs(x).max(axis=-1)
+    scale = (amax / 127.0).astype(np.float32)
+    inv = np.where(scale > 0, 1.0 / scale, 0.0).astype(np.float32)
+    codes = np.clip(np.rint(x * inv[..., None]), -127, 127).astype(np.int8)
+    return codes.astype(np.float32) * scale.astype(np.float16).astype(np.float32)[..., None]
+
+
+def _swiglu_np(x, gate):
+    return x / (1.0 + np.exp(-x)) * gate
+
+
+def _fake_quant_deq_baseline(be, x):
+    tk = be.tk()
+    codes, scale = tk.quantize_per_token_int8(x)
+    if be.name == "mlx":
+        return codes.astype(x.dtype) * scale[..., None].astype(x.dtype)
+    return codes.to(x.dtype) * scale[:, None].to(x.dtype)
+
+
+def _ternary_deq_baseline(be, w, group_k):
+    if be.name == "mlx":
+        mx = be.mx
+        *prefix, K = w.shape
+        wg = mx.reshape(w, (*prefix, K // group_k, group_k))
+        s = mx.maximum(mx.mean(mx.abs(wg), axis=-1, keepdims=True), 1.0e-5)
+        q = mx.clip(mx.round(wg / s), -1, 1)
+        return mx.reshape(q * s.astype(mx.float16), w.shape)
+    torch = be.torch
+    *prefix, K = w.shape
+    wg = w.reshape(*prefix, K // group_k, group_k)
+    s = torch.clamp(torch.mean(torch.abs(wg), dim=-1, keepdim=True), min=1.0e-5)
+    q = torch.clamp(torch.round(wg / s), -1, 1)
+    return (q * s.to(torch.float16)).reshape(w.shape)
+
+
+def _ternary_pt_deq_baseline(be, w):
+    if be.name == "mlx":
+        mx = be.mx
+        if len(w.shape) == 2:
+            s = mx.maximum(mx.mean(mx.abs(w)), 1.0e-5)
+        else:
+            s = mx.maximum(mx.mean(mx.abs(w), axis=(-2, -1), keepdims=True), 1.0e-5)
+        return mx.clip(mx.round(w / s), -1, 1) * s.astype(mx.float16)
+    torch = be.torch
+    if len(w.shape) == 2:
+        s = torch.clamp(torch.mean(torch.abs(w)), min=1.0e-5)
+    else:
+        s = torch.clamp(torch.mean(torch.abs(w), dim=(-2, -1), keepdim=True), min=1.0e-5)
+    return torch.clamp(torch.round(w / s), -1, 1) * s.to(torch.float16)
+
+
+def _logsumexp_np(z):
+    m = z.max(axis=-1, keepdims=True)
+    return (m + np.log(np.exp(z - m).sum(axis=-1, keepdims=True))).squeeze(-1)
+
+
+def _kd_topk_grad_np(logits, idx, prob, grad_out, invtemp, tail_mode):
+    z = logits * invtemp
+    lse = _logsumexp_np(z)
+    q = np.exp(z - lse[:, None])
+    grad = np.zeros_like(logits, np.float32)
+    for t in range(idx.shape[0]):
+        valid = idx[t] >= 0
+        ii = idx[t, valid]
+        pp = prob[t, valid]
+        P = pp.sum()
+        S = q[t, ii].sum()
+        if tail_mode == 0:
+            pt = pp / max(P, 1e-30)
+            grad[t] = q[t]
+            grad[t, ii] -= pt
+        else:
+            tail = max(1.0 - P, 0.0)
+            tail_c = tail / max(1.0 - S, 1e-30) if tail > 0 else 0.0
+            grad[t] = (P - tail_c * S) * q[t]
+            grad[t, ii] += -pp + tail_c * q[t, ii]
+        grad[t] *= grad_out[t] * invtemp
+    return grad
+
+
+def _adamw_masked_param_np(p, g, m, v, lr, b1, b2, eps, wd, step, active, mask_mode):
+    m_new = b1 * m + (1.0 - b1) * g
+    v_new = b2 * v + (1.0 - b2) * g * g
+    mhat = m_new / (1.0 - b1 ** step)
+    vhat = v_new / (1.0 - b2 ** step)
+    decay = wd * active.astype(np.float32)
+    p_new = p - lr * (mhat / (np.sqrt(vhat) + eps) + decay * p)
+    if mask_mode == 0:
+        p_new = np.where(active, p_new, p)
+    return p_new.astype(np.float32)
+
+
+@register("fake_quant")
+def fake_quant_cases(be, preset, formats):
+    """BitNet one-pass fake quant: current port vs decomposed quantize_per_token_int8 + dequant."""
+    tk = be.tk()
+    rng = np.random.default_rng(36)
+    shapes = _pick(preset, [(512, 2048)], [(512, 2880), (4096, 2880)],
+                   [(512, 2880), (4096, 2880), (4096, 11008)])
+    for T, D in shapes:
+        x = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+        g = (0.5 * rng.standard_normal((T, D))).astype(np.float32)
+        x_d, g_d = be.array(x, "bf16"), be.array(g, "bf16")
+        x_ref = be.to_numpy(x_d)
+        g_ref = be.to_numpy(g_d)
+        yield Case("fake_quant", f"plain_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   target=lambda x_d=x_d: tk.fake_quant_int8(x_d),
+                   out_to_numpy=lambda o: be.to_numpy(o[0]),
+                   baselines={"quantize_then_dequant":
+                              lambda x_d=x_d: _fake_quant_deq_baseline(be, x_d)},
+                   ref=_fake_quant_deq_np(x_ref),
+                   bytes_moved=float(2 * T * D * 2 + T * D + T * 4))
+        yield Case("fake_quant", f"swiglu_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   target=lambda x_d=x_d, g_d=g_d: tk.silu_mul_fake_quant_int8(x_d, g_d),
+                   out_to_numpy=lambda o: be.to_numpy(o[0]),
+                   baselines={"swiglu_then_quant_dequant":
+                              lambda x_d=x_d, g_d=g_d:
+                                  _fake_quant_deq_baseline(be, tk.swiglu(x_d, g_d))},
+                   ref=_fake_quant_deq_np(_swiglu_np(x_ref, g_ref)),
+                   bytes_moved=float(3 * T * D * 2 + T * D + T * 4))
+
+
+@register("weight_quant_ternary")
+def weight_quant_ternary_cases(be, preset, formats):
+    """BitNet weight quantization port vs framework decomposed dequant-only baseline."""
+    from tk.quant import dequantize_bitnet, quantize_bitnet
+
+    tk = be.tk()
+    rng = np.random.default_rng(37)
+    shapes = _pick(preset, [(512, 2048)], [(512, 2880), (4096, 2880)],
+                   [(512, 2880), (4096, 2880), (4096, 11008)])
+    for N, K in shapes:
+        w = (0.05 * rng.standard_normal((N, K))).astype(np.float32)
+        w_d = be.array(w, "bf16")
+        w_ref = be.to_numpy(w_d)
+        q_ref = quantize_bitnet(w_ref)
+        yield Case("weight_quant_ternary", f"group32_N{N}_K{K}",
+                   {"N": N, "K": K, "group_k": 32}, "bf16",
+                   target=lambda w_d=w_d: tk.weight_quant_ternary(w_d, group_k=32),
+                   out_to_numpy=lambda o: be.to_numpy(o[1]),
+                   baselines={"framework_deq_only":
+                              lambda w_d=w_d: _ternary_deq_baseline(be, w_d, 32)},
+                   ref=dequantize_bitnet(q_ref), bytes_moved=float(3 * N * K * 2))
+    for E, N, K in _pick(preset, [(2, 256, 2048)], [(2, 512, 2880)],
+                         [(2, 512, 2880), (4, 512, 2880)]):
+        w = (0.05 * rng.standard_normal((E, N, K))).astype(np.float32)
+        w_d = be.array(w, "bf16")
+        w_ref = be.to_numpy(w_d)
+        ref = np.zeros_like(w_ref, dtype=np.float32)
+        for e in range(E):
+            s = max(float(np.abs(w_ref[e]).mean()), 1e-5)
+            ref[e] = np.clip(np.rint(w_ref[e] / s), -1, 1) * np.float16(s).astype(np.float32)
+        yield Case("weight_quant_ternary", f"pt_E{E}_N{N}_K{K}",
+                   {"E": E, "N": N, "K": K}, "bf16",
+                   target=lambda w_d=w_d: tk.weight_quant_ternary_pt(w_d),
+                   out_to_numpy=lambda o: be.to_numpy(o[1]),
+                   baselines={"framework_deq_only":
+                              lambda w_d=w_d: _ternary_pt_deq_baseline(be, w_d)},
+                   ref=ref, bytes_moved=float(3 * E * N * K * 2))
+
+
+@register("kd_kl_topk")
+def kd_kl_topk_cases(be, preset, formats):
+    """Sparse teacher KD-KL fwd+bwd over top-k teacher caches."""
+    tk = be.tk()
+    rng = np.random.default_rng(38)
+    shapes = _pick(preset, [(256, 32000, 32)], [(256, 32000, 32), (1024, 32000, 32)],
+                   [(256, 32000, 32), (1024, 32000, 32), (1024, 128256, 32)])
+    for T, V, K in shapes:
+        logits = (rng.standard_normal((T, V)) * 1.3).astype(np.float32)
+        raw = rng.random((T, K)).astype(np.float32)
+        prob = raw / raw.sum(axis=-1, keepdims=True)
+        idx = np.empty((T, K), np.int32)
+        for t in range(T):
+            idx[t] = rng.choice(V, size=K, replace=False)
+        grad_out = rng.standard_normal(T).astype(np.float32)
+        logits_d = be.array(logits, "f32")
+        idx_d, prob_d, grad_d = be.int_array(idx), be.array(prob, "f32"), be.array(grad_out, "f32")
+        invtemp = 0.5
+        for tail_mode in [0, 1]:
+            yield Case("kd_kl_topk", f"tail{tail_mode}_T{T}_V{V}_K{K}",
+                       {"T": T, "V": V, "K": K}, "f32",
+                       target=lambda logits_d=logits_d, idx_d=idx_d, prob_d=prob_d, grad_d=grad_d,
+                                     invtemp=invtemp, tail_mode=tail_mode:
+                           (lambda loss_lse:
+                            (loss_lse[0],
+                             tk.kd_kl_topk_bwd(logits_d, idx_d, prob_d, loss_lse[1],
+                                               grad_d, invtemp=invtemp, tail_mode=tail_mode)))(
+                               tk.kd_kl_topk_fwd(logits_d, idx_d, prob_d,
+                                                 invtemp=invtemp, tail_mode=tail_mode)),
+                       out_to_numpy=lambda o: be.to_numpy(o[1]),
+                       baselines={}, ref=_kd_topk_grad_np(logits, idx, prob, grad_out,
+                                                          invtemp, tail_mode),
+                       bytes_moved=float((2 * T * V + 2 * T * K) * 4))
+
+
 @register("act_quant")
 def act_quant_cases(be, preset, formats):
     """Fused gated-activation -> quant vs the unfused glu -> quantize_per_token chain
@@ -2150,6 +2347,40 @@ def adamw_cases(be, preset, formats):
                    target=lambda p_d=p_d, g_d=g_d, m_d=m_d, v_d=v_d:
                        tk.adamw(p_d, g_d, m_d, v_d, step=1),
                    baselines={}, ref=None, bytes_moved=float(5 * numel * 4))
+
+
+@register("adamw_masked")
+def adamw_masked_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(239)
+    lr, b1, b2, eps, wd, step = 1.0e-3, 0.9, 0.999, 1.0e-8, 0.05, 3
+    seg_size = 256
+    for numel in _pick(preset, [4 << 20], [4 << 20, 16 << 20], [16 << 20, 64 << 20]):
+        p = rng.standard_normal((numel,)).astype(np.float32) * 0.1
+        g = rng.standard_normal((numel,)).astype(np.float32)
+        m = np.zeros((numel,), np.float32)
+        v = np.zeros((numel,), np.float32)
+        mask = (rng.random((numel + seg_size - 1) // seg_size) > 0.35).astype(np.uint8)
+        active = np.repeat(mask.astype(bool), seg_size)[:numel]
+        p_d, g_d = be.array(p, "f32"), be.array(g, "f32")
+        m_d, v_d, mask_d = be.array(m, "f32"), be.array(v, "f32"), be.raw_array(mask)
+        for mode in [0, 1]:
+            yield Case("adamw_masked", f"mode{mode}_numel{numel}",
+                       {"numel": numel, "seg_size": seg_size, "active": float(active.mean())},
+                       "f32",
+                       target=lambda p_d=p_d, g_d=g_d, m_d=m_d, v_d=v_d, mask_d=mask_d, mode=mode:
+                           tk.adamw_masked(p_d, g_d, m_d, v_d, lr=lr, beta1=b1, beta2=b2,
+                                           eps=eps, weight_decay=wd, step=step, mask=mask_d,
+                                           seg_size=seg_size, mask_mode=mode),
+                       out_to_numpy=lambda o: be.to_numpy(o[0]),
+                       baselines={"unmasked_adamw":
+                                  lambda p_d=p_d, g_d=g_d, m_d=m_d, v_d=v_d:
+                                      tk.adamw(p_d, g_d, m_d, v_d, lr=lr, beta1=b1,
+                                               beta2=b2, eps=eps, weight_decay=wd,
+                                               step=step)},
+                       ref=_adamw_masked_param_np(p, g, m, v, lr, b1, b2, eps, wd,
+                                                  step, active, mode),
+                       bytes_moved=float(5 * numel * 4 + mask.size))
 
 
 @register("rms_norm_add")

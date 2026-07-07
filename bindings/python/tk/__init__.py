@@ -515,6 +515,21 @@ def adamw(param, grad, m, v, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, weight_d
     return out[0], out[1], out[2]
 
 
+def adamw_masked(param, grad, m, v, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8,
+                 weight_decay=0.0, step=1, mask=None, seg_size=1, mask_mode=0):
+    """Segment-masked AdamW. mask_mode=0 skips inactive segment updates; mask_mode=1 skips only
+    decoupled decay on inactive segments. Accepts mlx.array or torch.Tensor (MPS)."""
+    if mask is None:
+        raise ValueError("adamw_masked: mask is required")
+    if _is_torch(param):
+        return _torch().adamw_masked(param, grad, m, v, lr, beta1, beta2, eps, weight_decay,
+                                     step, mask, seg_size, mask_mode)
+    out = _mlx().adamw_masked(param, grad, m, v, float(lr), float(beta1), float(beta2),
+                              float(eps), float(weight_decay), int(step), mask,
+                              int(seg_size), int(mask_mode))
+    return out[0], out[1], out[2]
+
+
 def gelu_backward(x, dy):
     """GELU (tanh approx) backward: dx = dy * gelu'(x). Elementwise; returns x's shape. Matches
     torch autograd for F.gelu(approximate='tanh'). Accepts mlx.array or torch.Tensor (MPS)."""
@@ -1115,6 +1130,50 @@ def silu_mul_quant_fp8_group(x, gate, group_size=128, ue8m0=False, act="swiglu",
     return out[0], out[1]
 
 
+def fake_quant_int8(x):
+    """One-pass per-token int8 fake quant. Returns (x_q bf16, codes int8, scale f32).
+
+    x_q uses the half-rounded scale grid consumed by the W2A8 integer paths. Accepts
+    mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().fake_quant_int8(x)
+    out = _mlx().fake_quant_int8(x)
+    return out[0], out[1], out[2]
+
+
+def silu_mul_fake_quant_int8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
+    """Fused gated activation plus one-pass int8 fake quant. Returns (x_q, codes, scale).
+
+    act is "swiglu" or "swiglu_oai". Accepts mlx.array or torch.Tensor (MPS).
+    """
+    mode = {"swiglu": 0, "swiglu_oai": 1}[act]
+    if _is_torch(x):
+        return _torch().silu_mul_fake_quant_int8(x, gate, act=act, alpha=alpha, limit=limit)
+    out = _mlx().silu_mul_fake_quant_int8(x, gate, mode, float(alpha), float(limit))
+    return out[0], out[1], out[2]
+
+
+def weight_quant_ternary(w, group_k=32):
+    """BitNet latent weight quantization. (N,K) or (E,N,K) -> (packed u8 bitnet blocks,
+    w_deq bf16) using per-group absmean along K. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(w):
+        return _torch().weight_quant_ternary(w, int(group_k))
+    out = _mlx().weight_quant_ternary(w, int(group_k))
+    return out[0], out[1]
+
+
+def weight_quant_ternary_pt(w):
+    """BitNet per-tensor absmean quantization. Returns (packed u8 bitnet blocks, w_deq bf16).
+
+    For 3D expert stacks, the scale is per (N,K) slice. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(w):
+        return _torch().weight_quant_ternary_pt(w)
+    wq, w_deq, _ = _mlx().weight_quant_ternary_pt(w)[:3]
+    return wq, w_deq
+
+
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
     """Per-group dynamic fp8 e4m3 along the last axis (canonical group 128 — the activation
     side of block-quantized GEMMs). Returns (codes u8, scale (rows, D/G) f32); ue8m0 rounds
@@ -1610,6 +1669,27 @@ def cross_entropy_grad(logits, targets, lse, grad_out, ignore_index=-100, label_
         grad_out = mx.full((logits.shape[0],), val, dtype=mx.float32)
     return _mlx().cross_entropy_bwd(logits, targets, lse, grad_out, int(ignore_index),
                                     float(label_smoothing), float(z_loss), float(softcap))
+
+
+def kd_kl_topk_fwd(logits, t_idx, t_prob, invtemp=1.0, tail_mode=0):
+    """Sparse-teacher KD-KL forward for top-k teacher caches. Returns (loss, lse).
+
+    tail_mode=0 renormalizes the teacher top-k mass; tail_mode=1 treats non-top-k mass as one
+    other bucket. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(logits):
+        return _torch().kd_kl_topk_fwd(logits, t_idx, t_prob, float(invtemp), int(tail_mode))
+    out = _mlx().kd_kl_topk_fwd(logits, t_idx, t_prob, float(invtemp), int(tail_mode))
+    return out[0], out[1]
+
+
+def kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, invtemp=1.0, tail_mode=0):
+    """Sparse-teacher KD-KL backward. Returns grad_logits. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(logits):
+        return _torch().kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out,
+                                       float(invtemp), int(tail_mode))
+    return _mlx().kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out,
+                                 float(invtemp), int(tail_mode))
 
 
 def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100,

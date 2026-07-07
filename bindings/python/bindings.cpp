@@ -68,6 +68,8 @@
 #include "selective_scan/selective_scan.h"
 #include "gdn/gdn.h"
 #include "act_quant/act_quant.h"
+#include "fake_quant/fake_quant.h"
+#include "weight_quant_ternary/weight_quant_ternary.h"
 #include "minference/minference.h"
 #include "turboquant/turboquant.h"
 #include "marginal/marginal.h"
@@ -91,6 +93,7 @@
 #include "attn_varlen/attn_varlen.h"
 #include "lm_head/lm_head.h"
 #include "cross_entropy/cross_entropy.h"
+#include "kd_kl_topk/kd_kl_topk.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
 #include "attn_multiwarp/attn_multiwarp.h"
@@ -670,6 +673,30 @@ NB_MODULE(_ext, m) {
       R"(fused gated-activation -> per-group fp8 (scale (rows, D/G); ue8m0 = 2^k scales).)");
 
     m.def(
+      "fake_quant_int8", &fake_quant_int8,
+      "x"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(one-pass per-token int8 fake quant: returns (x_q bf16, codes i8, scale f32).)");
+
+    m.def(
+      "silu_mul_fake_quant_int8", &silu_mul_fake_quant_int8,
+      "x"_a, "gate"_a, "mode"_a = 0, "alpha"_a = 1.702f, "limit"_a = 7.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused gated activation plus one-pass int8 fake quant: returns (x_q, codes, scale).)");
+
+    m.def(
+      "weight_quant_ternary", &weight_quant_ternary,
+      "w"_a, "group_k"_a = 32,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(BitNet ternary weight quantization: returns (packed u8 bitnet blocks, w_deq bf16).)");
+
+    m.def(
+      "weight_quant_ternary_pt", &weight_quant_ternary_pt,
+      "w"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(BitNet per-tensor ternary weight quantization: returns (packed, w_deq, scratch).)");
+
+    m.def(
       "quantize_per_group_fp8", &quantize_per_group_fp8,
       "x"_a, "group_size"_a = 128, "ue8m0"_a = false,
       nb::kw_only(), "stream"_a = nb::none(),
@@ -1125,6 +1152,29 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         AdamW step: returns (param', m', v') from (param, grad, m, v) and step t.
+      )");
+
+    m.def(
+      "adamw_masked",
+      &adamw_masked,
+      "param"_a,
+      "grad"_a,
+      "m"_a,
+      "v"_a,
+      "lr"_a,
+      "beta1"_a,
+      "beta2"_a,
+      "eps"_a,
+      "weight_decay"_a,
+      "step"_a,
+      "mask"_a,
+      "seg_size"_a,
+      "mask_mode"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        Masked AdamW step for segmented/cold parameters. mask_mode 0 skips inactive
+        segment updates; mask_mode 1 skips only decoupled decay on inactive segments.
       )");
 
     m.def(
@@ -1604,6 +1654,32 @@ NB_MODULE(_ext, m) {
       R"(
         fused cross-entropy backward: grad_logits (T,V), out-of-place
       )");
+
+    m.def(
+      "kd_kl_topk_fwd",
+      &kd_kl_topk_fwd,
+      "logits"_a,
+      "t_idx"_a,
+      "t_prob"_a,
+      "invtemp"_a = 1.0f,
+      "tail_mode"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(sparse-teacher KD-KL forward over top-k teacher probabilities. Returns (loss, lse).)");
+
+    m.def(
+      "kd_kl_topk_bwd",
+      &kd_kl_topk_bwd,
+      "logits"_a,
+      "t_idx"_a,
+      "t_prob"_a,
+      "lse"_a,
+      "grad_out"_a,
+      "invtemp"_a = 1.0f,
+      "tail_mode"_a = 0,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(sparse-teacher KD-KL backward. Returns grad_logits.)");
 
     m.def(
       "flux_gelu",

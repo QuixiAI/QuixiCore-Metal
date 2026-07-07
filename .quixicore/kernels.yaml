@@ -61,7 +61,9 @@ families:
     status: implemented
     paths:
       - kernels/quantization/act_quant
+      - kernels/quantization/fake_quant
       - kernels/quantization/quant_rt
+      - kernels/quantization/weight_quant_ternary
       - kernels/quantization/qgemm
       - kernels/quantization/qgemm_int
       - kernels/quantization/qgemv
@@ -95,6 +97,7 @@ families:
     status: implemented
     paths:
       - kernels/utils/hadamard
+      - kernels/utils/kd_kl_topk
       - kernels/utils/marginal
       - kernels/utils/add_rt
       - kernels/utils/dropout

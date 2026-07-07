@@ -7,6 +7,7 @@ Run from the repository root:
 
 import math
 
+import numpy as np
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -21,6 +22,65 @@ import tk_torch  # noqa: E402
 def _maxdiff(a, b):
     torch.mps.synchronize()
     return (a.float() - b.float()).abs().max().item()
+
+
+def _fake_quant_ref(x):
+    amax = np.abs(x).max(axis=-1)
+    scale = (amax / 127.0).astype(np.float32)
+    inv = np.where(scale > 0, 1.0 / scale, 0.0).astype(np.float32)
+    codes = np.clip(np.rint(x * inv[..., None]), -127, 127).astype(np.int8)
+    deq = codes.astype(np.float32) * scale.astype(np.float16).astype(np.float32)[..., None]
+    return deq, codes, scale
+
+
+def _adamw_np(p, g, m, v, lr, b1, b2, eps, wd, t, update_mask=None, decay_mask=None):
+    m_new = b1 * m + (1.0 - b1) * g
+    v_new = b2 * v + (1.0 - b2) * g * g
+    mhat = m_new / (1.0 - b1 ** t)
+    vhat = v_new / (1.0 - b2 ** t)
+    decay = wd if decay_mask is None else wd * decay_mask.astype(np.float32)
+    p_new = p - lr * (mhat / (np.sqrt(vhat) + eps) + decay * p)
+    if update_mask is not None:
+        keep = ~update_mask
+        p_new = np.where(keep, p, p_new)
+        m_new = np.where(keep, m, m_new)
+        v_new = np.where(keep, v, v_new)
+    return p_new.astype(np.float32), m_new.astype(np.float32), v_new.astype(np.float32)
+
+
+def _logsumexp(z):
+    m = z.max(axis=-1, keepdims=True)
+    return (m + np.log(np.exp(z - m).sum(axis=-1, keepdims=True))).squeeze(-1)
+
+
+def _kd_topk_ref(logits, idx, prob, grad_out, invtemp, tail_mode):
+    z = logits * invtemp
+    lse = _logsumexp(z)
+    q = np.exp(z - lse[:, None])
+    T, _ = idx.shape
+    loss = np.zeros(T, np.float32)
+    grad = np.zeros_like(logits, np.float32)
+    for t in range(T):
+        valid = idx[t] >= 0
+        ii = idx[t, valid]
+        pp = prob[t, valid]
+        P = pp.sum()
+        S = q[t, ii].sum()
+        if tail_mode == 0:
+            pt = pp / max(P, 1e-30)
+            loss[t] = np.sum(pt * (np.log(np.maximum(pt, 1e-30)) - np.log(q[t, ii])))
+            grad[t] = q[t]
+            grad[t, ii] -= pt
+        else:
+            loss[t] = np.sum(pp * (np.log(np.maximum(pp, 1e-30)) - np.log(q[t, ii])))
+            tail = max(1.0 - P, 0.0)
+            tail_c = tail / max(1.0 - S, 1e-30) if tail > 0 else 0.0
+            if tail > 0:
+                loss[t] += tail * (np.log(max(tail, 1e-30)) - np.log(max(1.0 - S, 1e-30)))
+            grad[t] = (P - tail_c * S) * q[t]
+            grad[t, ii] += -pp + tail_c * q[t, ii]
+        grad[t] *= grad_out[t] * invtemp
+    return loss, lse.astype(np.float32), grad
 
 
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
@@ -1301,6 +1361,137 @@ def test_adamw_vs_torch(wd):
         assert np.allclose(p, pt.detach().cpu().numpy(), atol=1e-5), (t, np.abs(p - pt.detach().cpu().numpy()).max())
         assert np.allclose(m, st["exp_avg"].cpu().numpy(), atol=1e-5)
         assert np.allclose(v, st["exp_avg_sq"].cpu().numpy(), atol=1e-6)
+
+
+def test_adamw_masked_modes():
+    rng = np.random.default_rng(14)
+    D, seg_size = 256, 16
+    lr, b1, b2, eps, wd, step = 1e-3, 0.9, 0.999, 1e-8, 0.05, 3
+    p = (0.1 * rng.standard_normal(D)).astype(np.float32)
+    g = rng.standard_normal(D).astype(np.float32)
+    m = np.zeros(D, np.float32)
+    v = np.zeros(D, np.float32)
+    mask = np.array([1, 0, 1, 1, 0, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1], dtype=np.uint8)
+    active = np.repeat(mask.astype(bool), seg_size)[:D]
+
+    args = (torch.from_numpy(p).to("mps"), torch.from_numpy(g).to("mps"),
+            torch.from_numpy(m).to("mps"), torch.from_numpy(v).to("mps"),
+            lr, b1, b2, eps, wd, step, torch.from_numpy(mask).to("mps"), seg_size)
+
+    pm, mm, vm = tk_torch.adamw_masked(*args, mask_mode=0)
+    ref_p, ref_m, ref_v = _adamw_np(p, g, m, v, lr, b1, b2, eps, wd, step,
+                                    update_mask=active, decay_mask=active)
+    assert np.allclose(pm.cpu().numpy(), ref_p, atol=1e-5)
+    assert np.allclose(mm.cpu().numpy(), ref_m, atol=1e-5)
+    assert np.allclose(vm.cpu().numpy(), ref_v, atol=1e-6)
+
+    pd, md, vd = tk_torch.adamw_masked(*args, mask_mode=1)
+    ref_p, ref_m, ref_v = _adamw_np(p, g, m, v, lr, b1, b2, eps, wd, step,
+                                    decay_mask=active)
+    assert np.allclose(pd.cpu().numpy(), ref_p, atol=1e-5)
+    assert np.allclose(md.cpu().numpy(), ref_m, atol=1e-5)
+    assert np.allclose(vd.cpu().numpy(), ref_v, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_fake_quant_int8_mps(dtype):
+    rng = np.random.default_rng(15)
+    x = (2.0 * rng.standard_normal((7, 128))).astype(np.float32)
+    xt = torch.from_numpy(x).to(dtype).to("mps")
+    x_post = xt.float().cpu().numpy()
+    x_q, codes, scale = tk_torch.fake_quant_int8(xt)
+    torch.mps.synchronize()
+
+    ref_deq, ref_codes, ref_scale = _fake_quant_ref(x_post)
+    np.testing.assert_array_equal(codes.cpu().numpy(), ref_codes)
+    np.testing.assert_allclose(scale.cpu().numpy(), ref_scale, rtol=1e-3, atol=1e-8)
+    np.testing.assert_allclose(x_q.float().cpu().numpy(), ref_deq, rtol=1 / 128, atol=1e-6)
+
+
+def test_silu_mul_fake_quant_int8_mps():
+    rng = np.random.default_rng(16)
+    x = torch.from_numpy(rng.standard_normal((5, 64)).astype(np.float32)).to(torch.bfloat16).to("mps")
+    gate = torch.from_numpy(rng.standard_normal((5, 64)).astype(np.float32)).to(torch.bfloat16).to("mps")
+    x_q, codes, scale = tk_torch.silu_mul_fake_quant_int8(x, gate)
+    torch.mps.synchronize()
+
+    xf = x.float().cpu().numpy()
+    gf = gate.float().cpu().numpy()
+    ref_deq, ref_codes, ref_scale = _fake_quant_ref((xf / (1.0 + np.exp(-xf))) * gf)
+    np.testing.assert_array_equal(codes.cpu().numpy(), ref_codes)
+    np.testing.assert_allclose(scale.cpu().numpy(), ref_scale, rtol=1e-3, atol=1e-8)
+    np.testing.assert_allclose(x_q.float().cpu().numpy(), ref_deq, rtol=1 / 128, atol=1e-6)
+
+
+def test_weight_quant_ternary_mps():
+    from tk.quant import dequantize_bitnet, quantize_bitnet
+
+    rng = np.random.default_rng(17)
+    w = (0.05 * rng.standard_normal((33, 64))).astype(np.float32)
+    wt = torch.from_numpy(w).to(torch.bfloat16).to("mps")
+    w_post = wt.float().cpu().numpy()
+    wq, w_deq = tk_torch.weight_quant_ternary(wt, group_k=32)
+    torch.mps.synchronize()
+
+    got = wq.cpu().numpy()
+    ref = quantize_bitnet(w_post)
+    np.testing.assert_array_equal(got[:, :, 2:], ref[:, :, 2:])
+    got_scale = np.ascontiguousarray(got[:, :, :2]).reshape(w.shape[0], -1).view(np.float16)
+    ref_scale = np.ascontiguousarray(ref[:, :, :2]).reshape(w.shape[0], -1).view(np.float16)
+    np.testing.assert_allclose(got_scale.astype(np.float32), ref_scale.astype(np.float32),
+                               rtol=2 ** -10, atol=0)
+    np.testing.assert_allclose(w_deq.float().cpu().numpy(), dequantize_bitnet(got),
+                               rtol=1 / 128, atol=1e-6)
+
+
+def test_weight_quant_ternary_pt_mps():
+    rng = np.random.default_rng(18)
+    w = (0.05 * rng.standard_normal((2, 8, 64))).astype(np.float32)
+    wt = torch.from_numpy(w).to(torch.float32).to("mps")
+    wq, w_deq = tk_torch.weight_quant_ternary_pt(wt)
+    torch.mps.synchronize()
+
+    got = wq.cpu().numpy()
+    deq = w_deq.float().cpu().numpy()
+    for e in range(w.shape[0]):
+        s = max(float(np.abs(w[e]).mean()), 1e-5)
+        scales = got[e, :, :, :2].reshape(w.shape[1], -1).view(np.float16).astype(np.float32)
+        np.testing.assert_allclose(scales, np.float16(s).astype(np.float32),
+                                   rtol=2 ** -10, atol=0)
+        q = np.clip(np.rint(w[e] / s), -1, 1)
+        np.testing.assert_allclose(deq[e], q * np.float16(s).astype(np.float32),
+                                   rtol=1 / 64, atol=1e-6)
+
+
+@pytest.mark.parametrize("tail_mode", [0, 1])
+def test_kd_kl_topk_mps(tail_mode):
+    rng = np.random.default_rng(19 + tail_mode)
+    T, V, K = 4, 96, 9
+    logits = (rng.standard_normal((T, V)) * 1.3).astype(np.float32)
+    teacher = rng.random((T, V)).astype(np.float64)
+    teacher /= teacher.sum(axis=-1, keepdims=True)
+    idx = np.argsort(-teacher, axis=-1)[:, :K].astype(np.int32)
+    prob = np.take_along_axis(teacher.astype(np.float32), idx, axis=-1)
+    idx[1, -2:] = -1
+    prob[1, -2:] = 0.0
+    grad_out = rng.standard_normal(T).astype(np.float32)
+    invtemp = 0.5
+
+    loss, lse = tk_torch.kd_kl_topk_fwd(torch.from_numpy(logits).to("mps"),
+                                        torch.from_numpy(idx).to("mps"),
+                                        torch.from_numpy(prob).to("mps"),
+                                        invtemp=invtemp, tail_mode=tail_mode)
+    grad = tk_torch.kd_kl_topk_bwd(torch.from_numpy(logits).to("mps"),
+                                   torch.from_numpy(idx).to("mps"),
+                                   torch.from_numpy(prob).to("mps"), lse,
+                                   torch.from_numpy(grad_out).to("mps"),
+                                   invtemp=invtemp, tail_mode=tail_mode)
+    torch.mps.synchronize()
+
+    ref_loss, ref_lse, ref_grad = _kd_topk_ref(logits, idx, prob, grad_out, invtemp, tail_mode)
+    np.testing.assert_allclose(loss.cpu().numpy(), ref_loss, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(lse.cpu().numpy(), ref_lse, rtol=2e-5, atol=2e-5)
+    np.testing.assert_allclose(grad.cpu().numpy(), ref_grad, rtol=2e-5, atol=2e-5)
 
 
 @pytest.mark.parametrize("p", [0.0, 0.3, 0.7])

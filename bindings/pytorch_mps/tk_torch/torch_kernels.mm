@@ -599,6 +599,40 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> adamw_mps(
   return {p_out, m_out, v_out};
 }
 
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> adamw_masked_mps(
+    const at::Tensor& param_in, const at::Tensor& grad_in, const at::Tensor& m_in,
+    const at::Tensor& v_in, double lr, double beta1, double beta2, double eps,
+    double weight_decay, int64_t step, const at::Tensor& mask_in, int64_t seg_size,
+    int64_t mask_mode) {
+  TORCH_CHECK(param_in.device().is_mps() && tk_is_float_dtype(param_in),
+              "adamw_masked: param must be a float MPS tensor");
+  TORCH_CHECK(m_in.scalar_type() == at::kFloat && v_in.scalar_type() == at::kFloat,
+              "adamw_masked: moment state m, v must be float32");
+  TORCH_CHECK(param_in.sizes() == grad_in.sizes() && param_in.sizes() == m_in.sizes() &&
+              param_in.sizes() == v_in.sizes(), "adamw_masked: shapes must match");
+  TORCH_CHECK(step >= 1, "adamw_masked: step (t) must be >= 1");
+  TORCH_CHECK(mask_in.scalar_type() == at::kByte, "adamw_masked: mask must be uint8");
+  TORCH_CHECK(seg_size >= 1, "adamw_masked: seg_size must be >= 1");
+  TORCH_CHECK(mask_mode == 0 || mask_mode == 1, "adamw_masked: mask_mode must be 0 or 1");
+  auto param = param_in.contiguous();
+  auto grad = grad_in.to(param.scalar_type()).contiguous();
+  auto m = m_in.contiguous(), v = v_in.contiguous(), mask = mask_in.contiguous();
+  const uint32_t n = static_cast<uint32_t>(param.numel());
+  TORCH_CHECK((int64_t)mask.numel() * seg_size >= (int64_t)n,
+              "adamw_masked: mask covers fewer than numel/seg_size segments");
+  auto p_out = at::empty_like(param), m_out = at::empty_like(m), v_out = at::empty_like(v);
+  const float bc1 = 1.0f - std::pow(static_cast<float>(beta1), static_cast<float>(step));
+  const float bc2 = 1.0f - std::pow(static_cast<float>(beta2), static_cast<float>(step));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_adamw_masked(e, param, grad, m, v, p_out, m_out, v_out, static_cast<float>(lr),
+                            static_cast<float>(beta1), static_cast<float>(beta2),
+                            static_cast<float>(eps), static_cast<float>(weight_decay), bc1, bc2,
+                            n, mask, static_cast<uint32_t>(seg_size),
+                            static_cast<int>(mask_mode), tk_type_name(param));
+  });
+  return {p_out, m_out, v_out};
+}
+
 static at::Tensor embedding_lookup_mps(const at::Tensor& token_ids_in, const at::Tensor& table_in,
                                        const at::Tensor& pos_table_in, double scale) {
   TORCH_CHECK(token_ids_in.device().is_mps() && token_ids_in.dim() == 1,
@@ -3081,6 +3115,136 @@ static std::tuple<at::Tensor, at::Tensor> quantize_per_token_int8_mps(const at::
   return {codes, scale};
 }
 
+static std::tuple<at::Tensor, at::Tensor, int, int, int, at::Tensor> weight_quant_prep(
+    const at::Tensor& w_in, const char* name) {
+  TORCH_CHECK(w_in.device().is_mps() && tk_is_float_dtype(w_in),
+              name, ": W must be float32/float16/bfloat16 MPS");
+  TORCH_CHECK(w_in.dim() == 2 || w_in.dim() == 3, name, ": W must be (N,K) or (E,N,K)");
+  auto w = w_in.contiguous();
+  const int E = w.dim() == 3 ? w.size(0) : 1;
+  const int N = w.size(-2), K = w.size(-1);
+  TORCH_CHECK(K % 32 == 0, name, ": K must be a multiple of 32");
+  std::vector<int64_t> qshape(w.sizes().begin(), w.sizes().end() - 1);
+  qshape.push_back(K / 32);
+  qshape.push_back(10);
+  auto wq = at::empty(qshape, w.options().dtype(at::kByte));
+  auto w_deq = at::empty(w.sizes(), w.options().dtype(at::kBFloat16));
+  return {wq, w_deq, E, N, K, w};
+}
+
+static std::tuple<at::Tensor, at::Tensor> weight_quant_ternary_mps(
+    const at::Tensor& w_in, int64_t group_k) {
+  auto [wq, w_deq, E, N, K, w] = weight_quant_prep(w_in, "weight_quant_ternary");
+  TORCH_CHECK(group_k >= 32 && group_k % 32 == 0 && K % group_k == 0,
+              "weight_quant_ternary: group_k must be a multiple of 32 that divides K");
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_weight_quant_ternary(e, w, wq, w_deq, E, N, K, static_cast<int>(group_k),
+                                    tk_type_name(w));
+  });
+  return {wq, w_deq};
+}
+
+static std::tuple<at::Tensor, at::Tensor> weight_quant_ternary_pt_mps(const at::Tensor& w_in) {
+  auto [wq, w_deq, E, N, K, w] = weight_quant_prep(w_in, "weight_quant_ternary_pt");
+  auto abssum = at::zeros({E}, w.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_weight_quant_ternary_abssum(e, w, abssum, E, N * K, tk_type_name(w));
+    tk::launch_weight_quant_ternary_pt_encode(e, w, abssum, wq, w_deq, E, N, K, tk_type_name(w));
+  });
+  return {wq, w_deq};
+}
+
+static std::tuple<at::Tensor, at::Tensor> kd_kl_topk_fwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& t_idx_in, const at::Tensor& t_prob_in,
+    double invtemp, int64_t tail_mode) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "kd_kl_topk_fwd: logits must be a float MPS tensor");
+  TORCH_CHECK(t_idx_in.scalar_type() == at::kInt && t_prob_in.scalar_type() == at::kFloat,
+              "kd_kl_topk_fwd: t_idx int32, t_prob float32");
+  TORCH_CHECK(logits_in.dim() == 2 && t_idx_in.dim() == 2 && t_idx_in.sizes() == t_prob_in.sizes()
+              && t_idx_in.size(0) == logits_in.size(0), "kd_kl_topk_fwd: shape mismatch");
+  TORCH_CHECK(tail_mode == 0 || tail_mode == 1, "kd_kl_topk_fwd: tail_mode must be 0 or 1");
+  auto logits = logits_in.contiguous();
+  auto t_idx = t_idx_in.contiguous();
+  auto t_prob = t_prob_in.contiguous();
+  const int rows = logits.size(0), V = logits.size(1), K = t_idx.size(1);
+  auto loss = at::empty({rows}, logits.options().dtype(at::kFloat));
+  auto lse = at::empty({rows}, logits.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kd_kl_topk_fwd(e, logits, t_idx, t_prob, loss, lse, rows, V, K,
+                              static_cast<float>(invtemp), static_cast<int>(tail_mode),
+                              tk_type_name(logits));
+  });
+  return {loss, lse};
+}
+
+static at::Tensor kd_kl_topk_bwd_mps(
+    const at::Tensor& logits_in, const at::Tensor& t_idx_in, const at::Tensor& t_prob_in,
+    const at::Tensor& lse_in, const at::Tensor& grad_out_in, double invtemp,
+    int64_t tail_mode) {
+  TORCH_CHECK(logits_in.device().is_mps() && tk_is_float_dtype(logits_in),
+              "kd_kl_topk_bwd: logits must be a float MPS tensor");
+  TORCH_CHECK(t_idx_in.scalar_type() == at::kInt && t_prob_in.scalar_type() == at::kFloat,
+              "kd_kl_topk_bwd: t_idx int32, t_prob float32");
+  TORCH_CHECK(tail_mode == 0 || tail_mode == 1, "kd_kl_topk_bwd: tail_mode must be 0 or 1");
+  auto logits = logits_in.contiguous();
+  auto t_idx = t_idx_in.contiguous();
+  auto t_prob = t_prob_in.contiguous();
+  auto lse = lse_in.to(at::kFloat).contiguous();
+  auto grad_out = grad_out_in.to(at::kFloat).contiguous();
+  const int rows = logits.size(0), V = logits.size(1), K = t_idx.size(1);
+  auto grad = at::empty_like(logits);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kd_kl_topk_bwd(e, logits, t_idx, t_prob, lse, grad_out, grad, rows, V, K,
+                              static_cast<float>(invtemp), static_cast<int>(tail_mode),
+                              tk_type_name(logits));
+  });
+  return grad;
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> fake_quant_int8_mps(
+    const at::Tensor& x_in) {
+  TORCH_CHECK(x_in.device().is_mps(), "fake_quant_int8: x must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(x_in), "fake_quant_int8: x must be float32/float16/bfloat16");
+  auto x = x_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D % 4 == 0, "fake_quant_int8: last dimension must be a multiple of 4");
+  const int rows = static_cast<int>(x.numel() / D);
+  auto x_q = at::empty(x.sizes(), x.options().dtype(at::kBFloat16));
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_fake_quant_int8(e, x, x_q, codes, scale, rows, D, tk_type_name(x));
+  });
+  return {x_q, codes, scale};
+}
+
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> silu_mul_fake_quant_int8_mps(
+    const at::Tensor& x_in, const at::Tensor& gate_in, int64_t mode, double alpha, double limit) {
+  TORCH_CHECK(x_in.device().is_mps(), "silu_mul_fake_quant_int8: x must be an MPS tensor");
+  TORCH_CHECK(tk_is_float_dtype(x_in), "silu_mul_fake_quant_int8: x must be float");
+  TORCH_CHECK(x_in.sizes() == gate_in.sizes() && x_in.scalar_type() == gate_in.scalar_type(),
+              "silu_mul_fake_quant_int8: x/gate must match");
+  auto x = x_in.contiguous();
+  auto gate = gate_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D % 4 == 0, "silu_mul_fake_quant_int8: last dimension must be a multiple of 4");
+  const int rows = static_cast<int>(x.numel() / D);
+  auto x_q = at::empty(x.sizes(), x.options().dtype(at::kBFloat16));
+  auto codes = at::empty(x.sizes(), x.options().dtype(at::kChar));
+  std::vector<int64_t> sshape(x.sizes().begin(), x.sizes().end() - 1);
+  if (sshape.empty()) sshape.push_back(1);
+  auto scale = at::empty(sshape, x.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_silu_mul_fake_quant_int8(e, x, gate, x_q, codes, scale, rows, D,
+                                        static_cast<int>(mode), static_cast<float>(alpha),
+                                        static_cast<float>(limit), tk_type_name(x));
+  });
+  return {x_q, codes, scale};
+}
+
 static at::Tensor attn_causal_mps(const at::Tensor& q_in, const at::Tensor& k_in,
                                   const at::Tensor& v_in, double softcap,
                                   const c10::optional<at::Tensor>& sinks_in) {
@@ -3976,6 +4140,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("gelu_bwd", &gelu_bwd_mps, "ThunderMittens GELU backward (MPS)");
   m.def("dropout", &dropout_mps, "ThunderMittens inverted dropout fwd/bwd (MPS)");
   m.def("adamw", &adamw_mps, "ThunderMittens AdamW optimizer step (MPS)");
+  m.def("adamw_masked", &adamw_masked_mps, "ThunderMittens masked AdamW optimizer step (MPS)");
   m.def("embedding_lookup", &embedding_lookup_mps, "ThunderMittens token embedding lookup (MPS)");
   m.def("embedding_backward", &embedding_backward_mps,
         "ThunderMittens embedding backward / scatter-add grad (MPS)");
@@ -4095,6 +4260,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("gate"), pybind11::arg("group_size") = 128,
         pybind11::arg("ue8m0") = false, pybind11::arg("mode") = 0,
         pybind11::arg("alpha") = 1.702, pybind11::arg("limit") = 7.0);
+  m.def("fake_quant_int8", &fake_quant_int8_mps,
+        "BitNet one-pass per-token int8 fake quant (MPS)");
+  m.def("silu_mul_fake_quant_int8", &silu_mul_fake_quant_int8_mps,
+        "BitNet fused gated activation + int8 fake quant (MPS)",
+        pybind11::arg("x"), pybind11::arg("gate"), pybind11::arg("mode") = 0,
+        pybind11::arg("alpha") = 1.702, pybind11::arg("limit") = 7.0);
+  m.def("weight_quant_ternary", &weight_quant_ternary_mps,
+        "BitNet ternary weight quantization (MPS)", pybind11::arg("w"),
+        pybind11::arg("group_k") = 32);
+  m.def("weight_quant_ternary_pt", &weight_quant_ternary_pt_mps,
+        "BitNet per-tensor ternary weight quantization (MPS)");
   m.def("quantize_per_group_fp8", &quantize_per_group_fp8_mps,
         "per-group dynamic fp8 quant (MPS)", pybind11::arg("x"),
         pybind11::arg("group_size") = 128, pybind11::arg("ue8m0") = false);
@@ -4211,6 +4387,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "ThunderMittens fused LM-head + sampling over quantized weights (MPS)");
   m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "ThunderMittens fused cross-entropy fwd (MPS)");
   m.def("cross_entropy_bwd", &cross_entropy_bwd_mps, "ThunderMittens fused cross-entropy bwd (MPS)");
+  m.def("kd_kl_topk_fwd", &kd_kl_topk_fwd_mps, "BitNet sparse-teacher KD-KL fwd (MPS)",
+        pybind11::arg("logits"), pybind11::arg("t_idx"), pybind11::arg("t_prob"),
+        pybind11::arg("invtemp") = 1.0, pybind11::arg("tail_mode") = 0);
+  m.def("kd_kl_topk_bwd", &kd_kl_topk_bwd_mps, "BitNet sparse-teacher KD-KL bwd (MPS)",
+        pybind11::arg("logits"), pybind11::arg("t_idx"), pybind11::arg("t_prob"),
+        pybind11::arg("lse"), pybind11::arg("grad_out"), pybind11::arg("invtemp") = 1.0,
+        pybind11::arg("tail_mode") = 0);
   m.def("flux_gelu", &flux_gelu_mps, "ThunderMittens fused GEMM+GELU (MPS)");
   m.def("flux_gate", &flux_gate_mps, "ThunderMittens fused GEMM+gate+residual (MPS)");
   m.def("gemm_staged", &gemm_staged_mps, "ThunderMittens staged multi-simdgroup GEMM (MPS)");
