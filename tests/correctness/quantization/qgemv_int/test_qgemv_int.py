@@ -11,7 +11,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import qgemv_w8a8, qgemv_w2a8
+from tk import qgemv_w8a8, qgemv_w2a8, qgemv_w2a8_v2
 from tk.quant import quantize_w8a8, quantize_act_int8, quantize_bitnet, dequantize_bitnet
 
 
@@ -46,12 +46,17 @@ def test_w2a8_vs_int_oracle(nk):
     _, Xq, xs = quantize_act_int8(X)
     a_scale = float(xs[0, 0])
     got = qgemv_w2a8(mx.array(Wq), mx.array(Xq), mx.array(np.array([a_scale], np.float16)))
+    got_v2 = qgemv_w2a8_v2(mx.array(Wq), mx.array(Xq), mx.array(np.array([a_scale], np.float16)))
     mx.eval(got)
+    mx.eval(got_v2)
     g = np.array(got).astype(np.float32)
+    g2 = np.array(got_v2).astype(np.float32)
     # per-group int sums * absmean scale == dequantize(Wq) . Xq ; then * a_scale
     ref = (dequantize_bitnet(Wq).astype(np.float32) @ Xq.astype(np.float32)) * a_scale
     rel = np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9)
+    rel2 = np.abs(g2 - ref).max() / (np.abs(ref).max() + 1e-9)
     assert rel < 2e-2, f"W2A8 vs int oracle rel {rel}"
+    assert rel2 < 2e-2, f"W2A8 v2 vs int oracle rel {rel2}"
 
 
 if __name__ == "__main__":

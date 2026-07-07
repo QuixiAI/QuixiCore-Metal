@@ -27,6 +27,57 @@ Xcode/Metal toolchain version, integration path, command, git commit or
 working-tree label, dtype, shape, quant format, warmups, iterations, median,
 variance, correctness tolerance, and observed error.
 
+## 2026-07-07: BitNet remaining kernel parity port
+
+Status: landed as parity/coverage; no performance claim.
+
+Current implementation: ported the remaining first-party BitNet Metal kernels that were absent
+from QuixiCore Metal: `attn_decode`, `fake_quant_fp8`, `kd_kl_dense`, `qgemm_bwd`,
+`qgemm_w2a8_fused`, `quantize_tq2_0`, `ternary_stats`, and `gemm_v3`. Also added
+`tq2_0` dequant/GEMM/GEMV/MoE format support, `qgemv_w2a8_v2`, dynamic-width `rms_norm`,
+and MoE backward helpers.
+
+Current public route: MLX and PyTorch MPS bindings expose the new kernels through `tk` and
+`tk_torch`; manifests include the new paths and `tq2_0` format metadata.
+
+References inspected:
+- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/torch_kernels.mm`
+- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/__init__.py`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/`
+
+Correctness:
+- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Metal 32023.883,
+  Python 3.12.9.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
+  passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build pytorch_mps`
+  passed.
+- `PYTHONPATH=/Users/eric/QuixiCore/QuixiCore-Metal/bindings/pytorch_mps
+  /Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python -c 'import tk_torch; ...'`
+  compiled/imported the PyTorch metallib and ObjC++ extension; all checked new symbols were present.
+- Targeted correctness command:
+  `.venv/bin/python -m pytest -q tests/correctness/quantization/quantize_tq2_0
+  tests/correctness/quantization/ternary_stats tests/correctness/utils/kd_kl_dense
+  tests/correctness/attention/attn_decode tests/correctness/quantization/qgemv_int/test_qgemv_int.py`
+  passed: 14 passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test mps -q`
+  passed: 452 passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test python -q`
+  passed: 44 passed.
+- Direct PyTorch MPS smoke checked `quantize_tq2_0`, dense KD-KL fwd/bwd, and `attn_decode`
+  against CPU references; passed.
+
+Baseline: not run for this parity port.
+
+Experiments: none. This was a source/API parity port, not a focused optimization pass.
+
+Decision: keep the ported kernels as coverage and interoperability surface. The previous
+performance decision for `qgemm_bwd` and `gemm_v3` still stands: do not present them as Metal
+speedups without a new focused benchmark showing a win on priority shapes.
+
+Open questions: run a focused benchmark before any future speedup claim or routing preference
+change for these kernels.
+
 ## 2026-07-07: BitNet training kernel port
 
 Status: landed.

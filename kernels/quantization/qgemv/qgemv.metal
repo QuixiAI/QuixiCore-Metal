@@ -160,6 +160,7 @@ instantiate_qdequant("qdequant_iq2_xxs", iq2_xxs);
 instantiate_qdequant("qdequant_iq2_xs", iq2_xs);
 instantiate_qdequant("qdequant_iq3_xxs", iq3_xxs);
 instantiate_qdequant("qdequant_iq1_s", iq1_s);
+instantiate_qdequant("qdequant_tq2_0", tq2_0);
 
 instantiate_qgemv("qgemv_q8_0_small", q8_0);
 instantiate_qgemv("qgemv_q4_0_small", q4_0);
@@ -172,6 +173,7 @@ instantiate_qgemv("qgemv_mxfp8", mxfp8);
 instantiate_qgemv("qgemv_nvfp4", nvfp4);
 instantiate_qgemv("qgemv_mxfp4", mxfp4);
 instantiate_qgemv("qgemv_bitnet", bitnet);
+instantiate_qgemv("qgemv_tq2_0", tq2_0);
 instantiate_qgemv("qgemv_iq4_nl", iq4_nl);
 instantiate_qgemv("qgemv_iq4_xs", iq4_xs);
 instantiate_qgemv("qgemv_iq2_xxs", iq2_xxs);

@@ -44,6 +44,16 @@ array qgemv_w2a8(const array& wq, const array& xq, const array& a_scale, StreamO
                std::make_shared<QGemvW2A8>(to_stream(s)), {wq, xq, a_scale});
 }
 
+array qgemv_w2a8_v2(const array& wq, const array& xq, const array& a_scale, StreamOrDevice s) {
+  assert(wq.dtype() == uint8 && xq.dtype() == int8 && a_scale.dtype() == float16);
+  assert(wq.ndim() == 3 && "qgemv_w2a8_v2: wq (N, K/32, 10) bitnet blocks");
+  const int N = wq.shape(0), K = wq.shape(1) * 32;
+  assert(xq.shape(0) == K && "qgemv_w2a8_v2: xq rows==K");
+  (void)N; (void)K;
+  return array({wq.shape(0), 1}, float16,
+               std::make_shared<QGemvW2A8V2>(to_stream(s)), {wq, xq, a_scale});
+}
+
 void QGemvW8A8::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
 void QGemvW8A8::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
 void QGemvW8A8::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
@@ -81,5 +91,24 @@ std::vector<array> QGemvW2A8::vjp(const std::vector<array>&, const std::vector<a
   throw std::runtime_error("QGemvW2A8 has no vjp."); }
 std::pair<std::vector<array>, std::vector<int>> QGemvW2A8::vmap(const std::vector<array>&, const std::vector<int>&) {
   throw std::runtime_error("QGemvW2A8 has no vmap."); }
+
+void QGemvW2A8V2::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
+void QGemvW2A8V2::eval_cpu(const std::vector<array>& in, std::vector<array>& out) { eval(in, out); }
+void QGemvW2A8V2::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& wq = inputs[0]; auto& xq = inputs[1]; auto& as = inputs[2];
+  auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int N = wq.shape(0), K = wq.shape(1) * 32;
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_qgemv_w2a8_v2(enc, out, wq, xq, as, N, K);
+}
+std::vector<array> QGemvW2A8V2::jvp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemvW2A8V2 has no jvp."); }
+std::vector<array> QGemvW2A8V2::vjp(const std::vector<array>&, const std::vector<array>&, const std::vector<int>&, const std::vector<array>&) {
+  throw std::runtime_error("QGemvW2A8V2 has no vjp."); }
+std::pair<std::vector<array>, std::vector<int>> QGemvW2A8V2::vmap(const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("QGemvW2A8V2 has no vmap."); }
 
 } // namespace mlx::core

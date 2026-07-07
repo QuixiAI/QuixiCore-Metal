@@ -593,6 +593,166 @@ instantiate_moe_grouped_gemm_rect(bfloat16, bf16)
 instantiate_moe_grouped_gemm_swiglu(float32, float)
 instantiate_moe_grouped_gemm_swiglu(bfloat16, bf16)
 
+// Dense-weight backward kernels for the padded grouped MoE schedule.
+template <typename T, unsigned N_BLOCK, unsigned K_BLOCK, unsigned M_BLOCK>
+kernel void moe_grouped_gemm_bwd_dx(device T *dx                     [[buffer(0)]],
+                                    device T *dy                     [[buffer(1)]],
+                                    device T *W                      [[buffer(2)]],
+                                    device const int *expert_of_tile [[buffer(3)]],
+                                    constant int &total_rows         [[buffer(4)]],
+                                    constant int &K_dim              [[buffer(5)]],
+                                    constant int &N_out              [[buffer(6)]],
+                                    uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                    uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;
+    const int OX = (int)threadgroup_id.x;
+    const int e = expert_of_tile[OY];
+    if (e < 0) { return; }
+
+    constexpr const int N_BE = N_BLOCK * TILE_DIM, M_BE = M_BLOCK * TILE_DIM, K_BE = K_BLOCK * TILE_DIM;
+    using global_layout = gl<T, 1, 1, -1, -1>;
+    global_layout gl_dy(dy, nullptr, nullptr, total_rows, N_out);
+    global_layout gl_w(W + (long)e * K_dim * N_out, nullptr, nullptr, K_dim, N_out);
+    global_layout gl_d(dx, nullptr, nullptr, total_rows, K_dim);
+
+    rt<T, N_BE, K_BE> a_reg;
+    rt<T, M_BE, K_BE, ducks::rt_layout::col> b_reg;
+    rt<float, N_BE, M_BE> d_reg;
+    zero(d_reg);
+    for (int c = 0; c < N_out / K_BE; c++) {
+        load(a_reg, gl_dy, {0, 0, OY, c}, simd_lane_id);
+        load(b_reg, gl_w, {0, 0, OX, c}, simd_lane_id);
+        mma_ABt(d_reg, a_reg, b_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, OY, OX}, simd_lane_id);
+}
+
+template <typename T, unsigned N_BLOCK, unsigned K_BLOCK, unsigned M_BLOCK>
+kernel void moe_grouped_gemm_bwd_dw(device T *dw                     [[buffer(0)]],
+                                    device T *A                      [[buffer(1)]],
+                                    device T *dy                     [[buffer(2)]],
+                                    device const int *off_pad        [[buffer(3)]],
+                                    constant int &total_rows         [[buffer(4)]],
+                                    constant int &K_dim              [[buffer(5)]],
+                                    constant int &N_out              [[buffer(6)]],
+                                    uint3 threadgroup_id [[threadgroup_position_in_grid]],
+                                    uint  simd_lane_id   [[thread_index_in_simdgroup]]) {
+    const int NX = (int)threadgroup_id.x;
+    const int KY = (int)threadgroup_id.y;
+    const int e  = (int)threadgroup_id.z;
+    const int start = off_pad[e], end = off_pad[e + 1];
+
+    constexpr const int N_BE = N_BLOCK * TILE_DIM, M_BE = M_BLOCK * TILE_DIM, K_BE = K_BLOCK * TILE_DIM;
+    using global_layout = gl<T, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, K_dim);
+    global_layout gl_dy(dy, nullptr, nullptr, total_rows, N_out);
+    global_layout gl_d(dw + (long)e * K_dim * N_out, nullptr, nullptr, K_dim, N_out);
+
+    rt<T, K_BE, N_BE, ducks::rt_layout::col> a_reg;
+    rt<T, K_BE, M_BE> b_reg;
+    rt<float, N_BE, M_BE> d_reg;
+    zero(d_reg);
+    for (int r = start / K_BE; r < end / K_BE; r++) {
+        load(a_reg, gl_a, {0, 0, r, KY}, simd_lane_id);
+        load(b_reg, gl_dy, {0, 0, r, NX}, simd_lane_id);
+        mma_AtB(d_reg, a_reg, b_reg, d_reg);
+    }
+    store(gl_d, d_reg, {0, 0, KY, NX}, simd_lane_id);
+}
+
+#define instantiate_moe_grouped_gemm_bwd(type_name, T)                          \
+  template [[host_name("moe_grouped_gemm_bwd_dx_" #type_name)]] [[kernel]] void \
+  moe_grouped_gemm_bwd_dx<T, 4, 2, 4>(device T *dx [[buffer(0)]],               \
+                                      device T *dy [[buffer(1)]],               \
+                                      device T *W [[buffer(2)]],                \
+                                      device const int *expert_of_tile [[buffer(3)]], \
+                                      constant int &total_rows [[buffer(4)]],   \
+                                      constant int &K_dim [[buffer(5)]],        \
+                                      constant int &N_out [[buffer(6)]],        \
+                                      uint3 threadgroup_id [[threadgroup_position_in_grid]], \
+                                      uint simd_lane_id [[thread_index_in_simdgroup]]); \
+  template [[host_name("moe_grouped_gemm_bwd_dw_" #type_name)]] [[kernel]] void \
+  moe_grouped_gemm_bwd_dw<T, 4, 2, 4>(device T *dw [[buffer(0)]],               \
+                                      device T *A [[buffer(1)]],                \
+                                      device T *dy [[buffer(2)]],               \
+                                      device const int *off_pad [[buffer(3)]],  \
+                                      constant int &total_rows [[buffer(4)]],   \
+                                      constant int &K_dim [[buffer(5)]],        \
+                                      constant int &N_out [[buffer(6)]],        \
+                                      uint3 threadgroup_id [[threadgroup_position_in_grid]], \
+                                      uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+instantiate_moe_grouped_gemm_bwd(float32, float)
+instantiate_moe_grouped_gemm_bwd(bfloat16, bf16)
+
+template <typename T>
+kernel void moe_finalize_bwd(device const T     *grad_out     [[buffer(0)]],
+                             device const T     *expert_out   [[buffer(1)]],
+                             device const int   *inv_idx      [[buffer(2)]],
+                             device T           *grad_eo      [[buffer(3)]],
+                             device float       *grad_w       [[buffer(4)]],
+                             device const float *topk_weights [[buffer(5)]],
+                             constant int &K [[buffer(6)]],
+                             constant int &Hdim [[buffer(7)]],
+                             uint token [[threadgroup_position_in_grid]],
+                             uint lane  [[thread_index_in_simdgroup]]) {
+    const long gbase = (long)token * Hdim;
+    for (int k = 0; k < K; ++k) {
+        const long pos = inv_idx[(long)token * K + k];
+        const float w = topk_weights[(long)token * K + k];
+        float dot = 0.0f;
+        for (int h = (int)lane; h < Hdim; h += 32) {
+            const float g = float(grad_out[gbase + h]);
+            grad_eo[pos * Hdim + h] = T(w * g);
+            dot += float(expert_out[pos * Hdim + h]) * g;
+        }
+        dot = metal::simd_sum(dot);
+        if (lane == 0) { grad_w[(long)token * K + k] = dot; }
+    }
+}
+
+template <typename T>
+kernel void moe_gather_bwd(device const T   *dA      [[buffer(0)]],
+                           device const int *inv_idx [[buffer(1)]],
+                           device T         *dx      [[buffer(2)]],
+                           constant int &K [[buffer(3)]],
+                           constant int &Hdim [[buffer(4)]],
+                           uint token [[threadgroup_position_in_grid]],
+                           uint lane  [[thread_index_in_simdgroup]]) {
+    const long obase = (long)token * Hdim;
+    for (int h = (int)lane; h < Hdim; h += 32) {
+        float acc = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            acc += float(dA[(long)inv_idx[(long)token * K + k] * Hdim + h]);
+        }
+        dx[obase + h] = T(acc);
+    }
+}
+
+#define instantiate_moe_bwd_glue(type_name, T)                                  \
+  template [[host_name("moe_finalize_bwd_" #type_name)]] [[kernel]] void        \
+  moe_finalize_bwd<T>(device const T *grad_out [[buffer(0)]],                   \
+                      device const T *expert_out [[buffer(1)]],                 \
+                      device const int *inv_idx [[buffer(2)]],                  \
+                      device T *grad_eo [[buffer(3)]],                          \
+                      device float *grad_w [[buffer(4)]],                       \
+                      device const float *topk_weights [[buffer(5)]],           \
+                      constant int &K [[buffer(6)]],                            \
+                      constant int &Hdim [[buffer(7)]],                         \
+                      uint token [[threadgroup_position_in_grid]],              \
+                      uint lane [[thread_index_in_simdgroup]]);                 \
+  template [[host_name("moe_gather_bwd_" #type_name)]] [[kernel]] void          \
+  moe_gather_bwd<T>(device const T *dA [[buffer(0)]],                           \
+                    device const int *inv_idx [[buffer(1)]],                    \
+                    device T *dx [[buffer(2)]],                                 \
+                    constant int &K [[buffer(3)]],                              \
+                    constant int &Hdim [[buffer(4)]],                           \
+                    uint token [[threadgroup_position_in_grid]],                \
+                    uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_moe_bwd_glue(float32, float)
+instantiate_moe_bwd_glue(bfloat16, bf16)
+
 // ---------------------------------------------------------------------------
 // Quantized grouped expert GEMMs. Same segmented single-expert-per-tile structure as the dense
 // kernels above, but W is weight-only-quantized and dequantized straight into the simdgroup
@@ -816,6 +976,7 @@ kernel void moe_grouped_gemm_swiglu_q(device bf16 *out                 [[buffer(
 instantiate_moe_gemm_q(mxfp4, mxfp4)
 instantiate_moe_gemm_q(kU4, kU4)
 instantiate_moe_gemm_q(fp8_e4m3, fp8_e4m3)
+instantiate_moe_gemm_q(tq2_0, tq2_0)
 instantiate_moe_gemm_q(q8_0, q8_0)
 instantiate_moe_gemm_q(nvfp4, nvfp4)
 instantiate_moe_gemm_q(q4_K, q4_K)

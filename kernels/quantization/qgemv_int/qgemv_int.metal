@@ -89,4 +89,42 @@ kernel void qgemv_w2a8(
     if (lane == 0) D[row] = half(facc * float(a_scale[0]));
 }
 
+// W2A8 v2: one whole BitNet block per lane, streaming contiguous weight blocks
+// and applying each group scale once per 32-code subtotal.
+kernel void qgemv_w2a8_v2(
+    device   half*  D       [[buffer(0)]],
+    device   uchar* Wq      [[buffer(1)]],
+    device   char*  Xq      [[buffer(2)]],
+    device   half*  a_scale [[buffer(3)]],
+    const constant int &N [[buffer(4)]],
+    const constant int &K [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]]) {
+    const int row = tgid.x;
+    const int bpr = K / bitnet::block_k;
+    device const uchar* row_base = Wq + (uint)(row * bpr) * bitnet::block_bytes;
+    float lane_acc = 0.0f;
+    for (int g = (int)lane; g < bpr; g += 32) {
+        device const uchar* base = row_base + (uint)g * bitnet::block_bytes;
+        const half gscale = ((device const half*)base)[0];
+        const uint4 x0 = ((device const uint4*)(Xq + g * 32))[0];
+        const uint4 x1 = ((device const uint4*)(Xq + g * 32))[1];
+        int isum = 0, xsum = 0;
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < 4; ++j) {
+            const uint b2 = (uint)((device const ushort*)(base + 2))[j];
+            const uint lo = b2 & 0xFFu, hi = (b2 >> 8) & 0xFFu;
+            const uint s0 = (lo | (lo << 6) | (lo << 12) | (lo << 18)) & 0x03030303u;
+            const uint s1 = (hi | (hi << 6) | (hi << 12) | (hi << 18)) & 0x03030303u;
+            const uint xa = (j < 2) ? x0[2 * j] : x1[2 * (j - 2)];
+            const uint xb = (j < 2) ? x0[2 * j + 1] : x1[2 * (j - 2) + 1];
+            isum += idot4(s0, xa) + idot4(s1, xb);
+            xsum += idot4(0x01010101u, xa) + idot4(0x01010101u, xb);
+        }
+        lane_acc += float(isum - xsum) * float(gscale);
+    }
+    const float facc = metal::simd_sum(lane_acc);
+    if (lane == 0) D[row] = half(facc * float(a_scale[0]));
+}
+
 }

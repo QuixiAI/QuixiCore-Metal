@@ -1,6 +1,7 @@
 // Copyright © 2023-2024 Apple Inc.
 
 #include <stdexcept>
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -463,7 +464,7 @@ int tk_moe_q_block_k(const std::string& f) {
   if (f == "mxfp4" || f == "fp8_e4m3" || f == "q8_0") return 32;
   if (f == "nvfp4") return 16;
   if (f == "kU4") return 128;
-  if (f == "q4_K") return 256;
+  if (f == "q4_K" || f == "tq2_0") return 256;
   return -1;
 }
 } // namespace
@@ -619,6 +620,163 @@ void MoeGroupedGemmSwiglu::eval_gpu(const std::vector<array>& inputs, std::vecto
                                      type_to_name(a));
 }
 
+// --------------------- MoE backward kernels ---------------------
+
+array moe_grouped_gemm_bwd_dx(
+    const array& dy, const array& W, const array& expert_of_tile, StreamOrDevice s) {
+  if (dy.ndim() != 2 || W.ndim() != 3) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dx: dy (rows,N), W (E,K,N)");
+  }
+  if (dy.dtype() != W.dtype() || (dy.dtype() != float32 && dy.dtype() != bfloat16)) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dx: dy/W must be matching float32/bfloat16");
+  }
+  const int total_rows = dy.shape(0), N_out = dy.shape(1), K_dim = W.shape(1);
+  if (W.shape(2) != N_out || total_rows % 32 != 0 || K_dim % 32 != 0 || N_out % 16 != 0) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dx: rows%32, K%32, N%16 required");
+  }
+  if (expert_of_tile.ndim() != 1 || expert_of_tile.shape(0) != total_rows / 32) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dx: expert_of_tile must be (rows/32,)");
+  }
+  return array({total_rows, K_dim}, dy.dtype(), std::make_shared<MoeGroupedGemmBwdDx>(to_stream(s)),
+               {contiguous(dy, false, s), contiguous(W, false, s),
+                contiguous(astype(expert_of_tile, int32, s), false, s)});
+}
+
+array moe_grouped_gemm_bwd_dw(
+    const array& A, const array& dy, const array& off_pad, int num_experts, StreamOrDevice s) {
+  if (A.ndim() != 2 || dy.ndim() != 2 || A.shape(0) != dy.shape(0)) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dw: A (rows,K), dy (rows,N)");
+  }
+  if (A.dtype() != dy.dtype() || (A.dtype() != float32 && A.dtype() != bfloat16)) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dw: A/dy must be matching float32/bfloat16");
+  }
+  const int total_rows = A.shape(0), K_dim = A.shape(1), N_out = dy.shape(1);
+  if (num_experts <= 0 || off_pad.size() != num_experts + 1) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dw: off_pad must be (num_experts+1,)");
+  }
+  if (total_rows % 32 != 0 || K_dim % 32 != 0 || N_out % 32 != 0) {
+    throw std::invalid_argument("moe_grouped_gemm_bwd_dw: rows/K/N % 32 required");
+  }
+  return array({num_experts, K_dim, N_out}, A.dtype(),
+               std::make_shared<MoeGroupedGemmBwdDw>(to_stream(s), num_experts),
+               {contiguous(A, false, s), contiguous(dy, false, s),
+                contiguous(astype(off_pad, int32, s), false, s)});
+}
+
+std::vector<array> moe_finalize_bwd(
+    const array& grad_out, const array& expert_out, const array& inv_idx,
+    const array& topk_weights, StreamOrDevice s) {
+  if (grad_out.ndim() != 2 || expert_out.ndim() != 2 || topk_weights.ndim() != 2) {
+    throw std::invalid_argument("moe_finalize_bwd: grad_out (T,H), expert_out (P,H), weights (T,K)");
+  }
+  if (grad_out.dtype() != expert_out.dtype() ||
+      (grad_out.dtype() != float32 && grad_out.dtype() != bfloat16)) {
+    throw std::invalid_argument("moe_finalize_bwd: grad_out/expert_out dtype mismatch");
+  }
+  const int T = grad_out.shape(0), H = grad_out.shape(1), K = topk_weights.shape(1);
+  if (expert_out.shape(1) != H || topk_weights.shape(0) != T || inv_idx.size() != T * K) {
+    throw std::invalid_argument("moe_finalize_bwd: shape mismatch");
+  }
+  return array::make_arrays(
+      {expert_out.shape(), {T, K}},
+      {expert_out.dtype(), float32},
+      std::make_shared<MoeFinalizeBwd>(to_stream(s)),
+      {contiguous(grad_out, false, s), contiguous(expert_out, false, s),
+       contiguous(astype(inv_idx, int32, s), false, s),
+       contiguous(astype(topk_weights, float32, s), false, s)});
+}
+
+array moe_gather_bwd(const array& dA, const array& inv_idx, int k, StreamOrDevice s) {
+  if (dA.ndim() != 2 || k <= 0 || inv_idx.ndim() != 1 || inv_idx.size() % k != 0) {
+    throw std::invalid_argument("moe_gather_bwd: dA (P,H), inv_idx (T*k), k > 0");
+  }
+  if (dA.dtype() != float32 && dA.dtype() != bfloat16) {
+    throw std::invalid_argument("moe_gather_bwd: dA must be float32 or bfloat16");
+  }
+  const int T = static_cast<int>(inv_idx.size() / k);
+  return array({T, dA.shape(1)}, dA.dtype(), std::make_shared<MoeGatherBwd>(to_stream(s), k),
+               {contiguous(dA, false, s), contiguous(astype(inv_idx, int32, s), false, s)});
+}
+
+void MoeGroupedGemmBwdDx::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGroupedGemmBwdDx has no CPU implementation.");
+}
+void MoeGroupedGemmBwdDw::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGroupedGemmBwdDw has no CPU implementation.");
+}
+void MoeFinalizeBwd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeFinalizeBwd has no CPU implementation.");
+}
+void MoeGatherBwd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("MoeGatherBwd has no CPU implementation.");
+}
+
+void MoeGroupedGemmBwdDx::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& dy = inputs[0];
+  auto& w = inputs[1];
+  auto& eot = inputs[2];
+  auto& dx = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dx.set_data(allocator::malloc_or_wait(dx.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_grouped_gemm_bwd_dx(
+      enc, dx, dy, w, eot, dy.shape(0), w.shape(1), dy.shape(1), type_to_name(dy));
+}
+
+void MoeGroupedGemmBwdDw::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& a = inputs[0];
+  auto& dy = inputs[1];
+  auto& off_pad = inputs[2];
+  auto& dw = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dw.set_data(allocator::malloc_or_wait(dw.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_grouped_gemm_bwd_dw(
+      enc, dw, a, dy, off_pad, num_experts_, a.shape(0), a.shape(1), dy.shape(1),
+      type_to_name(a));
+}
+
+void MoeFinalizeBwd::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& grad_out = inputs[0];
+  auto& expert_out = inputs[1];
+  auto& inv_idx = inputs[2];
+  auto& weights = inputs[3];
+  auto& grad_eo = outputs[0];
+  auto& grad_w = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  grad_eo.set_data(allocator::malloc_or_wait(grad_eo.nbytes()));
+  grad_w.set_data(allocator::malloc_or_wait(grad_w.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_kv_cache_zero(
+      enc, grad_eo, grad_eo, static_cast<uint64_t>(grad_eo.size()), type_to_name(grad_eo));
+  tk::launch_moe_finalize_bwd(
+      enc, grad_out, expert_out, inv_idx, grad_eo, grad_w, weights,
+      grad_out.shape(0), weights.shape(1), grad_out.shape(1), type_to_name(grad_out));
+}
+
+void MoeGatherBwd::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& dA = inputs[0];
+  auto& inv = inputs[1];
+  auto& dx = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  dx.set_data(allocator::malloc_or_wait(dx.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_moe_gather_bwd(
+      enc, dA, inv, dx, dx.shape(0), k_, dx.shape(1), type_to_name(dA));
+}
+
 #define TK_MOE_NO_AUTODIFF(CLASS, LABEL)                                     \
   std::vector<array> CLASS::jvp(                                             \
       const std::vector<array>&, const std::vector<array>&,                  \
@@ -643,5 +801,9 @@ TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwiglu, "MoeGroupedGemmSwiglu")
 TK_MOE_NO_AUTODIFF(MoeRouteGrouped, "MoeRouteGrouped")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmRectQ, "MoeGroupedGemmRectQ")
 TK_MOE_NO_AUTODIFF(MoeGroupedGemmSwigluQ, "MoeGroupedGemmSwigluQ")
+TK_MOE_NO_AUTODIFF(MoeGroupedGemmBwdDx, "MoeGroupedGemmBwdDx")
+TK_MOE_NO_AUTODIFF(MoeGroupedGemmBwdDw, "MoeGroupedGemmBwdDw")
+TK_MOE_NO_AUTODIFF(MoeFinalizeBwd, "MoeFinalizeBwd")
+TK_MOE_NO_AUTODIFF(MoeGatherBwd, "MoeGatherBwd")
 
 } // namespace mlx::core

@@ -1142,6 +1142,14 @@ def fake_quant_int8(x):
     return out[0], out[1], out[2]
 
 
+def fake_quant_fp8(x):
+    """Per-tensor e4m3 fake quant. Returns (x_fq, scale). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().fake_quant_fp8(x)
+    out = _mlx().fake_quant_fp8(x)
+    return out[0], out[1]
+
+
 def silu_mul_fake_quant_int8(x, gate, act="swiglu", alpha=1.702, limit=7.0):
     """Fused gated activation plus one-pass int8 fake quant. Returns (x_q, codes, scale).
 
@@ -1172,6 +1180,28 @@ def weight_quant_ternary_pt(w):
         return _torch().weight_quant_ternary_pt(w)
     wq, w_deq, _ = _mlx().weight_quant_ternary_pt(w)[:3]
     return wq, w_deq
+
+
+def quantize_tq2_0(w):
+    """Quantize weights to llama.cpp/GGUF TQ2_0 ternary blocks. Returns (wq, w_deq)."""
+    if _is_torch(w):
+        return _torch().quantize_tq2_0(w)
+    out = _mlx().quantize_tq2_0(w)
+    return out[0], out[1]
+
+
+def ternary_stats(wq):
+    """Packed BitNet blocks -> per-row {-1,0,+1} code counts int32 (rows,3)."""
+    if _is_torch(wq):
+        return _torch().ternary_stats(wq)
+    return _mlx().ternary_stats(wq)
+
+
+def code_flip_count(a, b):
+    """Packed BitNet blocks -> per-row number of changed ternary codes."""
+    if _is_torch(a):
+        return _torch().code_flip_count(a, b)
+    return _mlx().code_flip_count(a, b)
 
 
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
@@ -1481,6 +1511,35 @@ def moe_finalize(expert_out, inv_idx, topk_weights, k):
     return _mlx().moe_finalize(expert_out, inv_idx, topk_weights, k)
 
 
+def moe_grouped_gemm_bwd_dx(dy, W, expert_of_tile):
+    """MoE grouped-GEMM backward dX over the padded schedule."""
+    if _is_torch(dy):
+        return _torch().moe_grouped_gemm_bwd_dx(dy, W, expert_of_tile)
+    return _mlx().moe_grouped_gemm_bwd_dx(dy, W, expert_of_tile)
+
+
+def moe_grouped_gemm_bwd_dw(A, dy, off_pad, num_experts):
+    """MoE grouped-GEMM backward dW per expert over padded segments."""
+    if _is_torch(A):
+        return _torch().moe_grouped_gemm_bwd_dw(A, dy, off_pad, int(num_experts))
+    return _mlx().moe_grouped_gemm_bwd_dw(A, dy, off_pad, int(num_experts))
+
+
+def moe_finalize_bwd(grad_out, expert_out, inv_idx, topk_weights):
+    """Backward of moe_finalize. Returns (grad_expert_out, grad_weights)."""
+    if _is_torch(grad_out):
+        return _torch().moe_finalize_bwd(grad_out, expert_out, inv_idx, topk_weights)
+    out = _mlx().moe_finalize_bwd(grad_out, expert_out, inv_idx, topk_weights)
+    return out[0], out[1]
+
+
+def moe_gather_bwd(dA, inv_idx, k):
+    """Backward of moe_gather: dx[t] = sum_k dA[inv_idx[t*k+k]]."""
+    if _is_torch(dA):
+        return _torch().moe_gather_bwd(dA, inv_idx, int(k))
+    return _mlx().moe_gather_bwd(dA, inv_idx, int(k))
+
+
 def argmax_sample(logits):
     """Greedy sampling: argmax token index over the last (vocab) axis. Returns int32.
 
@@ -1690,6 +1749,38 @@ def kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, invtemp=1.0, tail_mode=
                                        float(invtemp), int(tail_mode))
     return _mlx().kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out,
                                  float(invtemp), int(tail_mode))
+
+
+def kd_kl_dense_fwd(t_logits, s_logits, invtemp=1.0):
+    """Dense-teacher KD-KL forward. Returns (loss, lse_t, lse_s)."""
+    if _is_torch(t_logits):
+        return _torch().kd_kl_dense_fwd(t_logits, s_logits, float(invtemp))
+    out = _mlx().kd_kl_dense_fwd(t_logits, s_logits, float(invtemp))
+    return out[0], out[1], out[2]
+
+
+def kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, invtemp=1.0):
+    """Dense-teacher KD-KL backward. Returns grad_s."""
+    if _is_torch(t_logits):
+        return _torch().kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, float(invtemp))
+    return _mlx().kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, float(invtemp))
+
+
+def kd_ce_fused_fwd(t_logits, s_logits, targets, invtemp=1.0):
+    """Fused CE + dense-KD forward. Returns (ce, kd, lse_sr, lse_st, lse_t)."""
+    if _is_torch(t_logits):
+        return tuple(_torch().kd_ce_fused_fwd(t_logits, s_logits, targets, float(invtemp)))
+    out = _mlx().kd_ce_fused_fwd(t_logits, s_logits, targets, float(invtemp))
+    return out[0], out[1], out[2], out[3], out[4]
+
+
+def kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t, go_ce, go_kd, invtemp=1.0):
+    """Fused CE + dense-KD backward. Returns combined grad_s."""
+    if _is_torch(t_logits):
+        return _torch().kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                                        go_ce, go_kd, float(invtemp))
+    return _mlx().kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                                  go_ce, go_kd, float(invtemp))
 
 
 def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100,
@@ -2225,6 +2316,13 @@ def gemm_staged(x, y):
     return _mlx().gemm_staged(x, y)
 
 
+def gemm_v3(x, y):
+    """Academic 2x2-warp staged GEMM variant. Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(x):
+        return _torch().gemm_v3(x, y)
+    return _mlx().gemm_v3(x, y)
+
+
 def attn_multiwarp(q, k, v):
     """Multi-warp flash attention forward (shared K/V). Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(q):
@@ -2427,6 +2525,13 @@ def qgemm_direct(wq, x, format="q8_0"):
     return _mlx().qgemm_direct(wq, x, format=format)
 
 
+def qgemm_bwd(grad_y, wq, format="bitnet"):
+    """Packed-weight BitNet backward GEMM: grad_x = grad_y @ dequant(wq)."""
+    if _is_torch(grad_y):
+        return _torch().qgemm_bwd(grad_y, wq)
+    return _mlx().qgemm_bwd(grad_y, wq, format=format)
+
+
 def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp="auto"):
     """Quantized-KV flash attention: softmax(QK^T)·V with K,V given as quantized blocks (format).
     q bf16 (B,H,N,D); kq/vq uint8 (B,H,N,D/block_k,block_bytes) -> bf16 (B,H,N,D). D in {64,128}.
@@ -2438,6 +2543,13 @@ def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp="auto"):
     if _is_torch(q):
         return _torch().attn_q(q, kq, vq, format, causal, multiwarp)
     return _mlx().attn_q(q, kq, vq, format=format, causal=causal, multiwarp=multiwarp)
+
+
+def attn_decode(q, k, v):
+    """Batch-1 GQA attention decode against dense KV cache: q (Hq,D), k/v (Tk,Hkv,D)."""
+    if _is_torch(q):
+        return _torch().attn_decode(q, k, v)
+    return _mlx().attn_decode(q, k, v)
 
 
 def qgemm_actorder(wq, x, perm, w_format="kU4B8", fused=False):
@@ -2481,6 +2593,13 @@ def qgemm_w2a8(wq, xq, a_scale):
     return _mlx().qgemm_w2a8(wq, xq, a_scale)
 
 
+def qgemm_w2a8_fused(wq, x):
+    """Fused per-token int8 activation quant + BitNet W2A8 GEMM."""
+    if _is_torch(wq):
+        return _torch().qgemm_w2a8_fused(wq, x)
+    return _mlx().qgemm_w2a8_fused(wq, x)
+
+
 def qgemm_fp8_block2d(wq, x, scale2d):
     """fp8_block2d GEMM: codes-only fp8 weights (N,K/128,128) + a separate (N/128,K/128) tile scale
     (storage-optimal fp8_block). x (K,M) f16 -> (N,M) f16. Accepts mlx.array or torch.Tensor (MPS)."""
@@ -2506,12 +2625,22 @@ def qgemv_w8a8(wq, xq, w_scale, a_scale):
     return _mlx().qgemv_w8a8(wq, xq, w_scale, a_scale)
 
 
-def qgemv_w2a8(wq, xq, a_scale):
+def qgemv_w2a8(wq, xq, a_scale, version=2):
     """BitNet W2A8 decode GEMV: ternary 2-bit weight (bitnet blocks) x int8 act (K,1) -> int32,
-    per-group absmean scale * a_scale -> (N,1) half. Accepts mlx.array or torch.Tensor (MPS)."""
+    per-group absmean scale * a_scale -> (N,1) half. version=2 selects the newer decode kernel.
+    Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(wq):
-        return _torch().qgemv_w2a8(wq, xq, a_scale)
+        return _torch().qgemv_w2a8(wq, xq, a_scale, int(version))
+    if int(version) == 2:
+        return _mlx().qgemv_w2a8_v2(wq, xq, a_scale)
     return _mlx().qgemv_w2a8(wq, xq, a_scale)
+
+
+def qgemv_w2a8_v2(wq, xq, a_scale):
+    """BitNet W2A8 decode GEMV v2, one packed block per lane."""
+    if _is_torch(wq):
+        return _torch().qgemv_w2a8_v2(wq, xq, a_scale)
+    return _mlx().qgemv_w2a8_v2(wq, xq, a_scale)
 
 
 def qgemv(wq, x, format="q8_0"):

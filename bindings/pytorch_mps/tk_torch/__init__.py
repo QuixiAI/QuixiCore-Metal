@@ -41,7 +41,10 @@ _METAL_SOURCES = [
     _kernel_source("linear_attention/gdn/gdn.metal"),
     _kernel_source("quantization/act_quant/act_quant.metal"),
     _kernel_source("quantization/fake_quant/fake_quant.metal"),
+    _kernel_source("quantization/fake_quant_fp8/fake_quant_fp8.metal"),
     _kernel_source("quantization/weight_quant_ternary/weight_quant_ternary.metal"),
+    _kernel_source("quantization/quantize_tq2_0/quantize_tq2_0.metal"),
+    _kernel_source("quantization/ternary_stats/ternary_stats.metal"),
     _kernel_source("serving/minference/minference.metal"),
     _kernel_source("quantization/turboquant/turboquant.metal"),
     _kernel_source("utils/marginal/marginal.metal"),
@@ -64,8 +67,10 @@ _METAL_SOURCES = [
     _kernel_source("quantization/lm_head/lm_head.metal"),
     _kernel_source("utils/cross_entropy/cross_entropy.metal"),
     _kernel_source("utils/kd_kl_topk/kd_kl_topk.metal"),
+    _kernel_source("utils/kd_kl_dense/kd_kl_dense.metal"),
     _kernel_source("matmul/flux/flux.metal"),
     _kernel_source("matmul/gemm_staged/gemm_staged.metal"),
+    _kernel_source("matmul/gemm_v3/gemm_v3.metal"),
     _kernel_source("attention/attn_multiwarp/attn_multiwarp.metal"),
     _kernel_source("linear_attention/linear_attn/linear_attn.metal"),
     _kernel_source("linear_attention/hedgehog/hedgehog.metal"),
@@ -77,10 +82,13 @@ _METAL_SOURCES = [
     _kernel_source("matmul/cmplx_matmul/cmplx_matmul.metal"),
     _kernel_source("ssm/fftconv/fftconv.metal"),
     _kernel_source("quantization/qgemm/qgemm.metal"),
+    _kernel_source("quantization/qgemm_bwd/qgemm_bwd.metal"),
+    _kernel_source("quantization/qgemm_fused/qgemm_fused.metal"),
     _kernel_source("quantization/qgemv/qgemv.metal"),
     _kernel_source("quantization/qflux/qflux.metal"),
     _kernel_source("quantization/qgemv_int/qgemv_int.metal"),
     _kernel_source("attention/attn_q/attn_q.metal"),
+    _kernel_source("attention/attn_decode/attn_decode.metal"),
     _kernel_source("quantization/qgemm_int/qgemm_int.metal"),
 ]
 
@@ -151,7 +159,8 @@ def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float =
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
-    """RMSNorm over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
+    """RMSNorm over the last axis. bf16 MPS tensors; static kernels for D in {256,512,768,1024},
+    dynamic kernel for other D multiples of 4."""
     return _ext.rms_norm(x, weight, float(eps))
 
 
@@ -601,6 +610,11 @@ def attn_window(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, window: int,
     return _ext.attn_window(q, k, v, window, softcap=float(softcap), sinks=sinks)
 
 
+def attn_decode(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor):
+    """Batch-1 GQA attention decode. q (Hq,D), caches (Tk,Hkv,D), D <= 128. MPS."""
+    return _ext.attn_decode(q, key_cache, value_cache)
+
+
 def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     """Fused LM-head + sampling: token id per row of h without materializing (T,V) logits.
     mode 0=argmax, 1=categorical, 2=top-k. bias (V,) or a 1-elem dummy. Returns (T,) int32. MPS."""
@@ -636,6 +650,28 @@ def kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, invtemp=1.0, tail_mode=
     """Sparse-teacher KD-KL backward. Returns grad_logits. MPS."""
     return _ext.kd_kl_topk_bwd(logits, t_idx, t_prob, lse, grad_out, float(invtemp),
                                int(tail_mode))
+
+
+def kd_kl_dense_fwd(t_logits, s_logits, invtemp=1.0):
+    """Dense-teacher KD-KL forward. Returns (loss, lse_t, lse_s). MPS."""
+    return tuple(_ext.kd_kl_dense_fwd(t_logits, s_logits, float(invtemp)))
+
+
+def kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, invtemp=1.0):
+    """Dense-teacher KD-KL backward. Returns grad wrt student logits. MPS."""
+    return _ext.kd_kl_dense_bwd(t_logits, s_logits, lse_t, lse_s, grad_out, float(invtemp))
+
+
+def kd_ce_fused_fwd(t_logits, s_logits, targets, invtemp=1.0):
+    """Fused CE + dense-KD forward. Returns (ce, kd, lse_sr, lse_st, lse_t). MPS."""
+    return tuple(_ext.kd_ce_fused_fwd(t_logits, s_logits, targets, float(invtemp)))
+
+
+def kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                    go_ce, go_kd, invtemp=1.0):
+    """Fused CE + dense-KD backward. Returns combined grad wrt student logits. MPS."""
+    return _ext.kd_ce_fused_bwd(t_logits, s_logits, targets, lse_sr, lse_st, lse_t,
+                                go_ce, go_kd, float(invtemp))
 
 
 def paged_attention_v2(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Tensor,
@@ -886,6 +922,51 @@ def weight_quant_ternary_pt(w: torch.Tensor):
     return tuple(_ext.weight_quant_ternary_pt(w))
 
 
+def gemm_v3(a: torch.Tensor, b: torch.Tensor):
+    """Staged GEMM variant. A (N,K), B (K,M), with N/M multiples of 64 and K multiple of 32. MPS."""
+    return _ext.gemm_v3(a, b)
+
+
+def qgemm_bwd(grad_y: torch.Tensor, wq: torch.Tensor):
+    """BitNet ternary backward GEMM: grad_y (M,N) @ dequant(wq) -> (M,K). MPS."""
+    return _ext.qgemm_bwd(grad_y, wq)
+
+
+def quantize_tq2_0(w: torch.Tensor):
+    """Pack W (N,K) or (E,N,K) into llama.cpp TQ2_0 blocks. Returns (wq, w_deq). MPS."""
+    return tuple(_ext.quantize_tq2_0(w))
+
+
+def qdequant(wq: torch.Tensor, format: str = "q8_0"):
+    """Packed quant blocks (N, K/block_k, block_bytes) -> dense fp16 (N,K). MPS."""
+    return _ext.qdequant(wq, format)
+
+
+def dequantize_tq2_0(wq: torch.Tensor):
+    """TQ2_0 packed blocks (N, K/256, 66) -> dense fp16 (N,K). MPS."""
+    return _ext.qdequant(wq, "tq2_0")
+
+
+def ternary_stats(wq: torch.Tensor):
+    """Packed BitNet blocks -> int32 (rows, 3) counts of {-1, 0, +1} codes per row. MPS."""
+    return _ext.ternary_stats(wq)
+
+
+def code_flip_count(wq_a: torch.Tensor, wq_b: torch.Tensor):
+    """Per-row count of ternary code differences between two identically-shaped packs. MPS."""
+    return _ext.code_flip_count(wq_a, wq_b)
+
+
+def fake_quant_fp8(x: torch.Tensor):
+    """Per-tensor e4m3 fake quant. Returns (x_fq, scale). MPS."""
+    return tuple(_ext.fake_quant_fp8(x))
+
+
+def qgemm_w2a8_fused(wq, x):
+    """Fused per-token int8 activation quantization plus BitNet W2A8 GEMM. MPS."""
+    return _ext.qgemm_w2a8_fused(wq, x)
+
+
 def quantize_per_group_fp8(x, group_size=128, ue8m0=False):
     """Per-group dynamic fp8 e4m3. Returns (codes u8, scale (rows, D/G) f32). MPS."""
     return tuple(_ext.quantize_per_group_fp8(x, group_size, ue8m0))
@@ -1024,6 +1105,26 @@ def moe_grouped_gemm_swiglu_q(A, W1q, expert_of_tile, format="mxfp4", bias=None,
 def moe_finalize(expert_out: torch.Tensor, inv_idx: torch.Tensor, topk_weights: torch.Tensor, k: int):
     """out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim). MPS."""
     return _ext.moe_finalize(expert_out, inv_idx, topk_weights, int(k))
+
+
+def moe_grouped_gemm_bwd_dx(dy, W, expert_of_tile):
+    """MoE grouped GEMM backward dX over the padded expert schedule. MPS."""
+    return _ext.moe_grouped_gemm_bwd_dx(dy, W, expert_of_tile)
+
+
+def moe_grouped_gemm_bwd_dw(A, dy, off_pad, num_experts):
+    """MoE grouped GEMM backward dW per padded expert segment. MPS."""
+    return _ext.moe_grouped_gemm_bwd_dw(A, dy, off_pad, int(num_experts))
+
+
+def moe_finalize_bwd(grad_out, expert_out, inv_pad, topk_weights):
+    """Backward of moe_finalize. Returns (grad_expert_out, grad_weights). MPS."""
+    return tuple(_ext.moe_finalize_bwd(grad_out, expert_out, inv_pad, topk_weights))
+
+
+def moe_gather_bwd(dA, inv_pad, k):
+    """Backward of moe_gather: sum routed copies back to token order. MPS."""
+    return _ext.moe_gather_bwd(dA, inv_pad, int(k))
 
 
 def argmax_sample(logits: torch.Tensor):
@@ -1306,6 +1407,11 @@ def qgemv_w8a8(wq, xq, w_scale, a_scale):
     return _ext.qgemv_w8a8(wq, xq, w_scale, a_scale)
 
 
-def qgemv_w2a8(wq, xq, a_scale):
-    """BitNet W2A8 decode GEMV: ternary 2-bit weight x int8 act -> int32, per-group scale. MPS."""
-    return _ext.qgemv_w2a8(wq, xq, a_scale)
+def qgemv_w2a8(wq, xq, a_scale, version=2):
+    """BitNet W2A8 decode GEMV. version=2 selects the newer decode kernel. MPS."""
+    return _ext.qgemv_w2a8(wq, xq, a_scale, int(version))
+
+
+def qgemv_w2a8_v2(wq, xq, a_scale):
+    """BitNet W2A8 decode GEMV v2. MPS."""
+    return _ext.qgemv_w2a8_v2(wq, xq, a_scale)

@@ -69,7 +69,10 @@
 #include "gdn/gdn.h"
 #include "act_quant/act_quant.h"
 #include "fake_quant/fake_quant.h"
+#include "fake_quant_fp8/fake_quant_fp8.h"
 #include "weight_quant_ternary/weight_quant_ternary.h"
+#include "quantize_tq2_0/quantize_tq2_0.h"
+#include "ternary_stats/ternary_stats.h"
 #include "minference/minference.h"
 #include "turboquant/turboquant.h"
 #include "marginal/marginal.h"
@@ -94,8 +97,10 @@
 #include "lm_head/lm_head.h"
 #include "cross_entropy/cross_entropy.h"
 #include "kd_kl_topk/kd_kl_topk.h"
+#include "kd_kl_dense/kd_kl_dense.h"
 #include "flux/flux.h"
 #include "gemm_staged/gemm_staged.h"
+#include "gemm_v3/gemm_v3.h"
 #include "attn_multiwarp/attn_multiwarp.h"
 #include "linear_attn/linear_attn.h"
 #include "hedgehog/hedgehog.h"
@@ -107,10 +112,13 @@
 #include "cmplx_matmul/cmplx_matmul.h"
 #include "fftconv/fftconv.h"
 #include "qgemm/qgemm.h"
+#include "qgemm_bwd/qgemm_bwd.h"
+#include "qgemm_fused/qgemm_fused.h"
 #include "qgemv/qgemv.h"
 #include "qflux/qflux.h"
 #include "qgemv_int/qgemv_int.h"
 #include "attn_q/attn_q.h"
+#include "attn_decode/attn_decode.h"
 #include "qgemm_int/qgemm_int.h"
 
 namespace nb = nanobind;
@@ -679,6 +687,12 @@ NB_MODULE(_ext, m) {
       R"(one-pass per-token int8 fake quant: returns (x_q bf16, codes i8, scale f32).)");
 
     m.def(
+      "fake_quant_fp8", &fake_quant_fp8,
+      "x"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(per-tensor e4m3 fake quant: returns (x_fq, scale, scratch).)");
+
+    m.def(
       "silu_mul_fake_quant_int8", &silu_mul_fake_quant_int8,
       "x"_a, "gate"_a, "mode"_a = 0, "alpha"_a = 1.702f, "limit"_a = 7.0f,
       nb::kw_only(), "stream"_a = nb::none(),
@@ -695,6 +709,24 @@ NB_MODULE(_ext, m) {
       "w"_a,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(BitNet per-tensor ternary weight quantization: returns (packed, w_deq, scratch).)");
+
+    m.def(
+      "quantize_tq2_0", &quantize_tq2_0,
+      "w"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(TQ2_0 GGUF ternary weight quantization: returns (packed block_tq2_0 bytes, w_deq bf16).)");
+
+    m.def(
+      "ternary_stats", &ternary_stats,
+      "wq"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(packed BitNet ternary blocks -> per-row {-1,0,+1} counts int32 (rows,3).)");
+
+    m.def(
+      "code_flip_count", &code_flip_count,
+      "a"_a, "b"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(packed BitNet ternary blocks -> per-row count of code changes between a and b.)");
 
     m.def(
       "quantize_per_group_fp8", &quantize_per_group_fp8,
@@ -802,6 +834,30 @@ NB_MODULE(_ext, m) {
       R"(
         MoE finalize: out[t] = sum_k weight[t,k] * expert_out[inv_idx[t*k+k]]. Returns (T, Hdim).
       )");
+
+    m.def(
+      "moe_grouped_gemm_bwd_dx", &moe_grouped_gemm_bwd_dx,
+      "dy"_a, "W"_a, "expert_of_tile"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(MoE backward grouped GEMM: dx = dy @ W[e]^T over the padded schedule.)");
+
+    m.def(
+      "moe_grouped_gemm_bwd_dw", &moe_grouped_gemm_bwd_dw,
+      "A"_a, "dy"_a, "off_pad"_a, "num_experts"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(MoE backward grouped GEMM: dW[e] = A^T @ dy per padded expert segment.)");
+
+    m.def(
+      "moe_finalize_bwd", &moe_finalize_bwd,
+      "grad_out"_a, "expert_out"_a, "inv_idx"_a, "topk_weights"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(MoE finalize backward: returns (grad_expert_out zero-padded, grad_weights).)");
+
+    m.def(
+      "moe_gather_bwd", &moe_gather_bwd,
+      "dA"_a, "inv_idx"_a, "k"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(MoE gather backward: dx[t] = sum_k dA[inv_idx[t*k+k]].)");
 
     m.def(
       "argmax_sample",
@@ -1682,6 +1738,56 @@ NB_MODULE(_ext, m) {
       R"(sparse-teacher KD-KL backward. Returns grad_logits.)");
 
     m.def(
+      "kd_kl_dense_fwd",
+      &kd_kl_dense_fwd,
+      "t_logits"_a,
+      "s_logits"_a,
+      "invtemp"_a = 1.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(dense-teacher KD-KL forward. Returns (loss, lse_t, lse_s).)");
+
+    m.def(
+      "kd_kl_dense_bwd",
+      &kd_kl_dense_bwd,
+      "t_logits"_a,
+      "s_logits"_a,
+      "lse_t"_a,
+      "lse_s"_a,
+      "grad_out"_a,
+      "invtemp"_a = 1.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(dense-teacher KD-KL backward. Returns grad_s.)");
+
+    m.def(
+      "kd_ce_fused_fwd",
+      &kd_ce_fused_fwd,
+      "t_logits"_a,
+      "s_logits"_a,
+      "targets"_a,
+      "invtemp"_a = 1.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(fused CE + dense-KD forward. Returns (ce, kd, lse_sr, lse_st, lse_t).)");
+
+    m.def(
+      "kd_ce_fused_bwd",
+      &kd_ce_fused_bwd,
+      "t_logits"_a,
+      "s_logits"_a,
+      "targets"_a,
+      "lse_sr"_a,
+      "lse_st"_a,
+      "lse_t"_a,
+      "go_ce"_a,
+      "go_kd"_a,
+      "invtemp"_a = 1.0f,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(fused CE + dense-KD backward. Returns combined grad_s.)");
+
+    m.def(
       "flux_gelu",
       &flux_gelu,
       "x"_a,
@@ -1716,6 +1822,17 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         multi-simdgroup threadgroup-staged GEMM: x @ y
+      )");
+
+    m.def(
+      "gemm_v3",
+      &gemm_v3,
+      "x"_a,
+      "y"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        academic 2x2-warp staged GEMM: x @ y
       )");
 
     m.def(
@@ -1948,6 +2065,18 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "qgemm_bwd",
+      &qgemm_bwd,
+      "grad_y"_a,
+      "wq"_a,
+      "format"_a = "bitnet",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        BitNet packed-weight backward GEMM: grad_x = grad_y @ dequant(wq)
+      )");
+
+    m.def(
       "qgemv",
       &qgemv,
       "wq"_a,
@@ -1996,6 +2125,16 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "attn_decode",
+      &attn_decode,
+      "q"_a, "k"_a, "v"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        batch-1 GQA decode attention over dense KV: q (Hq,D), k/v (Tk,Hkv,D)
+      )");
+
+    m.def(
       "qgemv_w2a8",
       &qgemv_w2a8,
       "wq"_a, "xq"_a, "a_scale"_a,
@@ -2003,6 +2142,16 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         BitNet W2A8 decode GEMV: ternary 2-bit weight x int8 activation -> int32, per-group scale
+      )");
+
+    m.def(
+      "qgemv_w2a8_v2",
+      &qgemv_w2a8_v2,
+      "wq"_a, "xq"_a, "a_scale"_a,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        BitNet W2A8 decode GEMV v2: one packed block per lane
       )");
 
     m.def(
@@ -2016,4 +2165,10 @@ NB_MODULE(_ext, m) {
       "wq"_a, "xq"_a, "a_scale"_a,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(BitNet W2A8 prefill GEMM (ternary 2-bit x int8 -> int32))");
+
+    m.def(
+      "qgemm_w2a8_fused", &qgemm_w2a8_fused,
+      "wq"_a, "x"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(BitNet fused per-token int8 activation quant + W2A8 GEMM.)");
 }

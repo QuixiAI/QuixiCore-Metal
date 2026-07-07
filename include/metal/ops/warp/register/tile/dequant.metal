@@ -461,6 +461,26 @@ struct bitnet {
     static METAL_FUNC half gscale(device const uchar* base) { return ((device const half*)base)[0]; }
 };
 
+// ---- tq2_0 : llama.cpp/ggml native ternary (TQ2_0 GGUF). 256-element block,
+//   per-block absmax half scale, 2-bit codes in {0,1,2} -> d*(code-1).
+//   ggml layout { uint8 qs[64]; half d; } = 66 bytes: scale last, and element
+//   128j + 32n + m lives in qs[32j + m] at bits 2n.
+struct tq2_0 {
+    constant static constexpr const int block_k     = 256;
+    constant static constexpr const int block_bytes = 66;
+    static METAL_FUNC half dequant(device const uchar* base, int col) {
+        const half d = ((device const half*)(base + 64))[0];
+        const uint q = (base[((col >> 7) << 5) + (col & 31)] >> (((col >> 5) & 3) * 2)) & 0x3;
+        return d * half((int)q - 1);
+    }
+    static METAL_FUNC int code(device const uchar* base, int col) {
+        return (int)((base[((col >> 7) << 5) + (col & 31)] >> (((col >> 5) & 3) * 2)) & 0x3) - 1;
+    }
+    static METAL_FUNC half gscale(device const uchar* base) {
+        return ((device const half*)(base + 64))[0];
+    }
+};
+
 // ============================ Phase 4: float sub-formats =========================================
 // ---- e5m2 : per-group (32) half-scaled fp8 e5m2. { half scale; uint8 qs[32]; } — 34 bytes. ----
 struct e5m2 {

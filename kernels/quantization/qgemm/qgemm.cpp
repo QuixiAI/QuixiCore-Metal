@@ -24,7 +24,7 @@ namespace mlx::core {
 
 // block_k for each supported format (weights per quant block).
 static int format_block_k(const std::string& fmt) {
-  if (fmt == "q4_K" || fmt == "iq4_xs" || fmt == "iq2_xxs" || fmt == "iq2_xs" || fmt == "iq3_xxs" || fmt == "iq1_s" || fmt == "q2_K" || fmt == "q3_K" || fmt == "q5_K" || fmt == "q6_K") return 256;
+  if (fmt == "q4_K" || fmt == "iq4_xs" || fmt == "iq2_xxs" || fmt == "iq2_xs" || fmt == "iq3_xxs" || fmt == "iq1_s" || fmt == "q2_K" || fmt == "q3_K" || fmt == "q5_K" || fmt == "q6_K" || fmt == "tq2_0") return 256;
   if (fmt == "kU4B8" || fmt == "kU4" || fmt == "fp8_block") return 128;
   if (fmt == "hqq") return 64;
   if (fmt == "nvfp4") return 16;

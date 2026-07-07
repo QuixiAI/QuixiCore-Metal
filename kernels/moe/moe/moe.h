@@ -101,6 +101,16 @@ array moe_grouped_gemm_swiglu_q(
     bool has_bias, int inter, int act_mode, float alpha, float limit,
     const std::string& format, StreamOrDevice s = {});
 
+array moe_grouped_gemm_bwd_dx(
+    const array& dy, const array& W, const array& expert_of_tile, StreamOrDevice s = {});
+array moe_grouped_gemm_bwd_dw(
+    const array& A, const array& dy, const array& off_pad, int num_experts,
+    StreamOrDevice s = {});
+std::vector<array> moe_finalize_bwd(
+    const array& grad_out, const array& expert_out, const array& inv_idx,
+    const array& topk_weights, StreamOrDevice s = {});
+array moe_gather_bwd(const array& dA, const array& inv_idx, int k, StreamOrDevice s = {});
+
 class MoeRouteTopk : public Primitive {
  public:
   MoeRouteTopk(Stream stream, int k) : Primitive(stream), k_(k) {}
@@ -351,6 +361,85 @@ class MoeFinalize : public Primitive {
   void print(std::ostream& os) override { os << "MoeFinalize"; }
   bool is_equivalent(const Primitive& other) const override {
     return k_ == static_cast<const MoeFinalize&>(other).k_;
+  }
+
+ private:
+  int k_;
+};
+
+class MoeGroupedGemmBwdDx : public Primitive {
+ public:
+  explicit MoeGroupedGemmBwdDx(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmBwdDx"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmBwdDx"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class MoeGroupedGemmBwdDw : public Primitive {
+ public:
+  explicit MoeGroupedGemmBwdDw(Stream stream, int num_experts)
+      : Primitive(stream), num_experts_(num_experts) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGroupedGemmBwdDw"; }
+  void print(std::ostream& os) override { os << "MoeGroupedGemmBwdDw"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return num_experts_ == static_cast<const MoeGroupedGemmBwdDw&>(other).num_experts_;
+  }
+
+ private:
+  int num_experts_;
+};
+
+class MoeFinalizeBwd : public Primitive {
+ public:
+  explicit MoeFinalizeBwd(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeFinalizeBwd"; }
+  void print(std::ostream& os) override { os << "MoeFinalizeBwd"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class MoeGatherBwd : public Primitive {
+ public:
+  explicit MoeGatherBwd(Stream stream, int k) : Primitive(stream), k_(k) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "MoeGatherBwd"; }
+  void print(std::ostream& os) override { os << "MoeGatherBwd"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return k_ == static_cast<const MoeGatherBwd&>(other).k_;
   }
 
  private:

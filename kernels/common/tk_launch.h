@@ -196,6 +196,16 @@ void launch_matmul_custom(E& e, typename E::out_t o, typename E::in_t a, typenam
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
 }
 
+// ----- gemm_v3: D(out)@0 A@1 B@2 ; N@3 K@4 M@5 ; grid (M/64,N/64,1), 128 threads. -----
+template <class E>
+void launch_gemm_v3(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                    int N, int K, int M, const std::string& type_name) {
+  e.pipeline("gemm_v3_" + type_name);
+  e.out(d, 0); e.in(a, 1); e.in(b, 2);
+  e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
+  e.dispatch(M / 64, N / 64, 1, 128, 1, 1);
+}
+
 // ----- attn_fwd: q@0 k@1 v@2 -> o@3 ; N@4(u32) H@5(u32) ; grid (N/8, H, B) group (32,1,1) -----
 template <class E>
 void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
@@ -232,6 +242,17 @@ void launch_attn_q(E& e, typename E::in_t q, typename E::in_t kq, typename E::in
     e.dispatch(static_cast<int>(N) / 8, static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- attn_decode: q@0(Hq,D) kc@1 vc@2(Tk,Hkv,D) -> out@3(Hq,D). -----
+template <class E>
+void launch_attn_decode(E& e, typename E::in_t q, typename E::in_t kc, typename E::in_t vc,
+                        typename E::out_t out, int Tk, int Hq, int Hkv, int D,
+                        const std::string& type_name) {
+  e.pipeline("attn_decode_" + type_name);
+  e.in(q, 0); e.in(kc, 1); e.in(vc, 2); e.out(out, 3);
+  e.bytes(Tk, 4); e.bytes(Hq, 5); e.bytes(Hkv, 6); e.bytes(D, 7);
+  e.dispatch(Hq, 1, 1, 32, 1, 1);
+}
+
 // ----- rms_norm: x@0 w@1 -> o@2 ; M@3(u32) eps@4(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
 void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
@@ -239,6 +260,14 @@ void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
   e.pipeline(rms_norm_kernel_name(D));
   e.in(x, 0); e.in(w, 1); e.out(o, 2);
   e.bytes(M, 3); e.bytes(eps, 4);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_rms_norm_dyn(E& e, typename E::in_t x, typename E::in_t w,
+                         typename E::out_t o, uint32_t M, int D, float eps) {
+  e.pipeline("mittens::rms_norm_dyn");
+  e.in(x, 0); e.in(w, 1); e.out(o, 2);
+  e.bytes(M, 3); e.bytes(eps, 4); e.bytes(D, 5);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 template <class E>
@@ -443,6 +472,28 @@ void launch_moe_grouped_gemm_swiglu(Enc& e, typename Enc::out_t out, typename En
   e.dispatch(inter / 32, total_rows / 32, 1, 32, 1, 1);
 }
 
+template <class Enc>
+void launch_moe_grouped_gemm_bwd_dx(Enc& e, typename Enc::out_t dx, typename Enc::in_t dy,
+                                    typename Enc::in_t w, typename Enc::in_t expert_of_tile,
+                                    int total_rows, int K_dim, int N_out,
+                                    const std::string& type_name) {
+  e.pipeline("moe_grouped_gemm_bwd_dx_" + type_name);
+  e.out(dx, 0); e.in(dy, 1); e.in(w, 2); e.in(expert_of_tile, 3);
+  e.bytes(total_rows, 4); e.bytes(K_dim, 5); e.bytes(N_out, 6);
+  e.dispatch(K_dim / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+template <class Enc>
+void launch_moe_grouped_gemm_bwd_dw(Enc& e, typename Enc::out_t dw, typename Enc::in_t a,
+                                    typename Enc::in_t dy, typename Enc::in_t off_pad,
+                                    int NE, int total_rows, int K_dim, int N_out,
+                                    const std::string& type_name) {
+  e.pipeline("moe_grouped_gemm_bwd_dw_" + type_name);
+  e.out(dw, 0); e.in(a, 1); e.in(dy, 2); e.in(off_pad, 3);
+  e.bytes(total_rows, 4); e.bytes(K_dim, 5); e.bytes(N_out, 6);
+  e.dispatch(N_out / 32, K_dim / 32, NE, 32, 1, 1);
+}
+
 // ----- gdn_recur (GatedDeltaNet): q@0 k@1 v@2 g@3 beta@4 state_pool@5(f32) cu_seqlens@6(i32)
 //        slot_mapping@7(i32) -> y@8 ; R@9 Hk@10 Hv@11 Dv@12 load_initial@13 ;
 //        grid (Dv, 1, R*Hv), 32 thr (lanes partition Dk; Dk in {64,128} via kernel name). -----
@@ -623,6 +674,28 @@ void launch_moe_finalize(Enc& e, typename Enc::in_t expert_out, typename Enc::in
   e.in(expert_out, 0); e.in(inv_idx, 1); e.in(topk_weights, 2); e.out(out, 3);
   e.bytes(k, 4); e.bytes(Hdim, 5);
   e.dispatch(num_tokens, 1, 1, 32, 1, 1);
+}
+
+template <class Enc>
+void launch_moe_finalize_bwd(Enc& e, typename Enc::in_t grad_out, typename Enc::in_t expert_out,
+                             typename Enc::in_t inv_idx, typename Enc::out_t grad_eo,
+                             typename Enc::out_t grad_w, typename Enc::in_t topk_weights,
+                             int T, int K, int Hdim, const std::string& type_name) {
+  e.pipeline("moe_finalize_bwd_" + type_name);
+  e.in(grad_out, 0); e.in(expert_out, 1); e.in(inv_idx, 2); e.out(grad_eo, 3);
+  e.out(grad_w, 4); e.in(topk_weights, 5);
+  e.bytes(K, 6); e.bytes(Hdim, 7);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
+template <class Enc>
+void launch_moe_gather_bwd(Enc& e, typename Enc::in_t dA, typename Enc::in_t inv_idx,
+                           typename Enc::out_t dx, int T, int K, int Hdim,
+                           const std::string& type_name) {
+  e.pipeline("moe_gather_bwd_" + type_name);
+  e.in(dA, 0); e.in(inv_idx, 1); e.out(dx, 2);
+  e.bytes(K, 3); e.bytes(Hdim, 4);
+  e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
 // ----- argmax (greedy sampling): logits@0 -> out_idx@1(i32) ; V@2(i32) ; grid (rows,1,1), 32 thr.
@@ -1021,6 +1094,16 @@ void launch_weight_quant_ternary(E& e, typename E::in_t w, typename E::out_t wq,
 }
 
 template <class E>
+void launch_quantize_tq2_0(E& e, typename E::in_t w, typename E::out_t wq,
+                           typename E::out_t w_deq, int NE, int N, int K,
+                           const std::string& type_name) {
+  e.pipeline("quantize_tq2_0_" + type_name);
+  e.in(w, 0); e.out(wq, 1); e.out(w_deq, 2);
+  e.bytes(K, 3); e.bytes(N, 4);
+  e.dispatch(N, NE, 1, 32, 1, 1);
+}
+
+template <class E>
 void launch_weight_quant_zero_float(E& e, typename E::out_t p, int n) {
   e.pipeline("weight_quant_zero_float");
   e.out(p, 0); e.bytes(n, 1);
@@ -1072,6 +1155,57 @@ void launch_kd_kl_topk_bwd(E& e, typename E::in_t logits, typename E::in_t t_idx
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
+template <class E>
+void launch_kd_kl_dense_fwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::out_t loss, typename E::out_t lse_t,
+                            typename E::out_t lse_s, int rows, int V, float invtemp,
+                            const std::string& type_name) {
+  e.pipeline("kd_kl_dense_fwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.out(loss, 2); e.out(lse_t, 3); e.out(lse_s, 4);
+  e.bytes(V, 5); e.bytes(invtemp, 6);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_kd_kl_dense_bwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::in_t lse_t, typename E::in_t lse_s,
+                            typename E::in_t grad_out, typename E::out_t grad_s,
+                            int rows, int V, float invtemp, const std::string& type_name) {
+  e.pipeline("kd_kl_dense_bwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.in(lse_t, 2); e.in(lse_s, 3); e.in(grad_out, 4);
+  e.out(grad_s, 5);
+  e.bytes(V, 6); e.bytes(invtemp, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_kd_ce_fused_fwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::in_t targets, typename E::out_t ce,
+                            typename E::out_t kd, typename E::out_t lse_sr,
+                            typename E::out_t lse_st, typename E::out_t lse_t,
+                            int rows, int V, float invtemp, const std::string& type_name) {
+  e.pipeline("kd_ce_fused_fwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.in(targets, 2);
+  e.out(ce, 3); e.out(kd, 4); e.out(lse_sr, 5); e.out(lse_st, 6); e.out(lse_t, 7);
+  e.bytes(V, 8); e.bytes(invtemp, 9);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_kd_ce_fused_bwd(E& e, typename E::in_t t_logits, typename E::in_t s_logits,
+                            typename E::in_t targets, typename E::in_t lse_sr,
+                            typename E::in_t lse_st, typename E::in_t lse_t,
+                            typename E::in_t go_ce, typename E::in_t go_kd,
+                            typename E::out_t grad_s, int rows, int V, float invtemp,
+                            const std::string& type_name) {
+  e.pipeline("kd_ce_fused_bwd_" + type_name);
+  e.in(t_logits, 0); e.in(s_logits, 1); e.in(targets, 2); e.in(lse_sr, 3);
+  e.in(lse_st, 4); e.in(lse_t, 5); e.in(go_ce, 6); e.in(go_kd, 7);
+  e.out(grad_s, 8);
+  e.bytes(V, 9); e.bytes(invtemp, 10);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
 // ----- fake_quant_int8: x@0 -> x_q@1(bf16) codes@2(i8) scale@3(f32). -----
 template <class E>
 void launch_fake_quant_int8(E& e, typename E::in_t x, typename E::out_t x_q,
@@ -1091,6 +1225,33 @@ void launch_silu_mul_fake_quant_int8(E& e, typename E::in_t x, typename E::in_t 
   e.pipeline("silu_mul_fake_quant_int8_" + type_name);
   e.in(x, 0); e.in(gate, 1); e.out(x_q, 2); e.out(codes, 3); e.out(scale, 4);
   e.bytes(D, 5); e.bytes(mode, 6); e.bytes(alpha, 7); e.bytes(limit, 8);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_fake_quant_fp8(E& e, typename E::in_t x, typename E::in_t scale_u,
+                           typename E::out_t x_fq, typename E::out_t scale_out, int n,
+                           const std::string& type_name) {
+  e.pipeline("fake_quant_fp8_" + type_name);
+  e.in(x, 0); e.in(scale_u, 1); e.out(x_fq, 2); e.out(scale_out, 3);
+  e.bytes(n, 4);
+  const int t4 = (n + 3) / 4;
+  e.dispatch((t4 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_ternary_stats(E& e, typename E::in_t wq, typename E::out_t counts,
+                          int rows, int nblocks) {
+  e.pipeline("ternary_stats");
+  e.in(wq, 0); e.out(counts, 1); e.bytes(nblocks, 2);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_code_flip_count(E& e, typename E::in_t wq_a, typename E::in_t wq_b,
+                            typename E::out_t flips, int rows, int nblocks) {
+  e.pipeline("code_flip_count");
+  e.in(wq_a, 0); e.in(wq_b, 1); e.out(flips, 2); e.bytes(nblocks, 3);
   e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
@@ -2518,6 +2679,15 @@ void launch_qgemv_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+template <class E>
+void launch_qgemv_w2a8_v2(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t xq,
+                          typename E::in_t ascale, int N, int K) {
+  e.pipeline("mittens::qgemv_w2a8_v2");
+  e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
+  e.bytes(N, 4); e.bytes(K, 5);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
 // ----- marginal utilities (marginal.metal). tau_tail flat 1D grid; packbits 1 thr/byte;
 //        segment_packbits 1 thr/output-byte; permute_cols 2D (cols, rows). -----
 template <class E>
@@ -2811,6 +2981,25 @@ void launch_qgemm_w2a8(E& e, typename E::out_t d, typename E::in_t wq, typename 
   e.out(d, 0); e.in(wq, 1); e.in(xq, 2); e.in(ascale, 3);
   e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
   e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_qgemm_w2a8_fused(E& e, typename E::out_t d, typename E::in_t wq,
+                             typename E::in_t x, int M, int N, int K,
+                             const std::string& type_name) {
+  e.pipeline("qgemm_w2a8_fused_" + type_name);
+  e.out(d, 0); e.in(wq, 1); e.in(x, 2);
+  e.bytes(N, 3); e.bytes(K, 4);
+  e.dispatch(M, 1, 1, 128, 1, 1);
+}
+
+template <class E>
+void launch_qgemm_bwd(E& e, typename E::out_t d, typename E::in_t g, typename E::in_t wq,
+                      int M, int N, int K, const std::string& fmt) {
+  e.pipeline("qgemm_bwd_" + fmt);
+  e.out(d, 0); e.in(g, 1); e.in(wq, 2);
+  e.bytes(M, 3); e.bytes(N, 4); e.bytes(K, 5);
+  e.dispatch(K / 32, M / 32, 1, 64, 1, 1);
 }
 
 // ----- qflux_gelu (quantized fused GEMM+GELU): D@0 Wq@1 X@2 bias@3 ; N@4 K@5 M@6 (i32) ;

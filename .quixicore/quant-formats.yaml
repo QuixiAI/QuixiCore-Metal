@@ -16,6 +16,9 @@ formats:
   bitnet:
     status: implemented
     notes: BitNet ternary weight paths.
+  tq2_0:
+    status: implemented
+    notes: llama.cpp/GGUF native ternary TQ2_0 blocks for quantize/dequant, qgemm/qgemv, and quantized MoE paths.
   turboquant:
     status: implemented
     notes: TurboQuant KV codec and Hadamard/FWHT support.

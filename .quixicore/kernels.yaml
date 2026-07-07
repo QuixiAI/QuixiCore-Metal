@@ -28,6 +28,7 @@ families:
       - kernels/attention/attn_fwd
       - kernels/attention/attn_bwd
       - kernels/attention/attn_causal
+      - kernels/attention/attn_decode
       - kernels/attention/attn_multiwarp
       - kernels/attention/attn_varlen
       - kernels/attention/attn_q
@@ -55,6 +56,7 @@ families:
     paths:
       - kernels/matmul/matmul_custom
       - kernels/matmul/gemm_staged
+      - kernels/matmul/gemm_v3
       - kernels/matmul/cmplx_matmul
       - kernels/matmul/flux
   quantization:
@@ -62,9 +64,14 @@ families:
     paths:
       - kernels/quantization/act_quant
       - kernels/quantization/fake_quant
+      - kernels/quantization/fake_quant_fp8
       - kernels/quantization/quant_rt
+      - kernels/quantization/quantize_tq2_0
       - kernels/quantization/weight_quant_ternary
+      - kernels/quantization/ternary_stats
       - kernels/quantization/qgemm
+      - kernels/quantization/qgemm_bwd
+      - kernels/quantization/qgemm_fused
       - kernels/quantization/qgemm_int
       - kernels/quantization/qgemv
       - kernels/quantization/qgemv_int
@@ -98,6 +105,7 @@ families:
     paths:
       - kernels/utils/hadamard
       - kernels/utils/kd_kl_topk
+      - kernels/utils/kd_kl_dense
       - kernels/utils/marginal
       - kernels/utils/add_rt
       - kernels/utils/dropout

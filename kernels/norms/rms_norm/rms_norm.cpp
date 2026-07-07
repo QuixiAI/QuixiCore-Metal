@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <stdexcept>
 #include <sstream>
 
 #include "mlx/backend/common/copy.h"
@@ -30,8 +31,8 @@ namespace mlx::core {
  *  RMSNorm over the last axis:
  *      y = x * rsqrt(mean(x^2) + eps) * weight
  *
- *  Inputs are assumed bf16 and row-contiguous. The last dim D must be one of
- *  the instantiated widths {256, 512, 768, 1024}.
+ *  Inputs are assumed bf16 and row-contiguous. Common widths use dedicated
+ *  kernels; other widths use the dynamic-D kernel when D is a multiple of 4.
  **/
 array rms_norm(
     const array& x,
@@ -42,8 +43,9 @@ array rms_norm(
   assert(x.dtype() == bfloat16 && weight.dtype() == bfloat16);
   const int D = x.shape(-1);
   assert(weight.ndim() == 1 && weight.shape(0) == D);
-  assert((D == 256 || D == 512 || D == 768 || D == 1024) &&
-         "rms_norm: last dim must be 256, 512, 768, or 1024");
+  if (D % 4 != 0) {
+    throw std::invalid_argument("rms_norm: last dim must be a multiple of 4");
+  }
 
   return array(
       /* const std::vector<int>& shape = */ x.shape(),
@@ -91,7 +93,11 @@ void RMSNorm::eval_gpu(
 
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_rms_norm(enc, x, weight, out, M, D, eps_);
+  if (D == 256 || D == 512 || D == 768 || D == 1024) {
+    tk::launch_rms_norm(enc, x, weight, out, M, D, eps_);
+  } else {
+    tk::launch_rms_norm_dyn(enc, x, weight, out, M, D, eps_);
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -63,6 +63,32 @@ instantiate_rms_norm(512);
 instantiate_rms_norm(768);
 instantiate_rms_norm(1024);
 
+// Dynamic-D RMSNorm for wider or non-instantiated widths. One simdgroup handles
+// a row with two strided passes over bf16_4 chunks. Requires D % 4 == 0.
+kernel void rms_norm_dyn(device   bf16  *x      [[buffer(0)]],
+                         device   bf16  *weight [[buffer(1)]],
+                         device   bf16  *o      [[buffer(2)]],
+                         constant uint  &M      [[buffer(3)]],
+                         constant float &eps    [[buffer(4)]],
+                         constant int   &D      [[buffer(5)]],
+                         uint3 blockIdx [[threadgroup_position_in_grid]],
+                         uint  laneId   [[thread_index_in_simdgroup]]) {
+    const long base = (long)blockIdx.x * D;
+    const int nchunks = D / 4;
+    float ss = 0.0f;
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 v = float4(((device const bf16_4*)(x + base))[c]);
+        ss += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+    }
+    ss = metal::simd_sum(ss);
+    const float inv = metal::rsqrt(ss / (float)D + eps);
+    for (int c = (int)laneId; c < nchunks; c += 32) {
+        const float4 v = float4(((device const bf16_4*)(x + base))[c]) * inv;
+        const float4 w = float4(((device const bf16_4*)(weight))[c]);
+        ((device bf16_4*)(o + base))[c] = bf16_4(v * w);
+    }
+}
+
 // RMSNorm backward, dX only (dW = sum_rows dY*x*rstd is a cheap framework reduction). Per row, with
 // m = dY*W and s = sum_j m_j x_j:  dX_i = rstd*m_i - (rstd^3 * s / D) * x_i  (Liger's factorization).
 // rstd (rows,) is precomputed in the framework. One simdgroup per row; any D; T templated.
