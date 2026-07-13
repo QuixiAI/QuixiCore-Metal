@@ -25,7 +25,8 @@ set(KERNEL_FAMILY_INCLUDE_DIRS
     "${KERNELS_ROOT}/sampling"
     "${KERNELS_ROOT}/serving"
     "${KERNELS_ROOT}/ssm"
-    "${KERNELS_ROOT}/utils")
+    "${KERNELS_ROOT}/utils"
+    "${KERNELS_ROOT}/vision")
 
 set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.cpp"
@@ -90,7 +91,12 @@ set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/quantization/qgemv_int/qgemv_int.cpp"
     "${KERNELS_ROOT}/attention/attn_q/attn_q.cpp"
     "${KERNELS_ROOT}/attention/attn_decode/attn_decode.cpp"
-    "${KERNELS_ROOT}/quantization/qgemm_int/qgemm_int.cpp")
+    "${KERNELS_ROOT}/quantization/qgemm_int/qgemm_int.cpp"
+    "${KERNELS_ROOT}/attention/swin_attn/swin_attn.cpp"
+    "${KERNELS_ROOT}/matmul/decode_linear/decode_linear.cpp"
+    "${KERNELS_ROOT}/quantization/dequant_gather/dequant_gather.cpp"
+    "${KERNELS_ROOT}/vision/edge_mlp/edge_mlp.cpp"
+    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.cpp")
 
 set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.metal"
@@ -155,7 +161,12 @@ set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/quantization/qgemv_int/qgemv_int.metal"
     "${KERNELS_ROOT}/attention/attn_q/attn_q.metal"
     "${KERNELS_ROOT}/attention/attn_decode/attn_decode.metal"
-    "${KERNELS_ROOT}/quantization/qgemm_int/qgemm_int.metal")
+    "${KERNELS_ROOT}/quantization/qgemm_int/qgemm_int.metal"
+    "${KERNELS_ROOT}/attention/swin_attn/swin_attn.metal"
+    "${KERNELS_ROOT}/matmul/decode_linear/decode_linear.metal"
+    "${KERNELS_ROOT}/quantization/dequant_gather/dequant_gather.metal"
+    "${KERNELS_ROOT}/vision/edge_mlp/edge_mlp.metal"
+    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.metal")
 
 find_package(MLX CONFIG REQUIRED)
 find_package(

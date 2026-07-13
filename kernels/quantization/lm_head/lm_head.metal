@@ -177,6 +177,98 @@ instantiate_lm_head_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_q("q4_0_bfloat16", q4_0, bf16)
 
+// Q6_K f32 specialization. Unlike the generic quantized LM head, this keeps
+// the exact GGUF dequant product in fp32 instead of first
+// rounding each weight through half. It shares the standard argcat ABI and
+// reduce kernel, so batch rows, bias, temperature, and deterministic Gumbel
+// sampling follow the normal QuixiCore contract.
+METAL_FUNC float lmh_f16_bits_to_f32(ushort value) {
+    const uint sign = uint(value & 0x8000) << 16;
+    const uint exponent = (value >> 10) & 0x1f;
+    const uint mantissa = value & 0x03ff;
+    if (exponent == 0) {
+        const float magnitude = ldexp(float(mantissa), -24);
+        return sign != 0 ? -magnitude : magnitude;
+    }
+    if (exponent == 31) {
+        return as_type<float>(sign | 0x7f800000 | (mantissa << 13));
+    }
+    return as_type<float>(sign | ((exponent + 112) << 23) | (mantissa << 13));
+}
+
+METAL_FUNC float lmh_q6_k_dot(device const uchar *row_weights,
+                              device const float *input,
+                              int blocks_per_row) {
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        device const uchar *block = row_weights + (long)block_index * 210;
+        device const uchar *ql = block;
+        device const uchar *qh = block + 128;
+        device const char *scales = (device const char *)(block + 192);
+        const ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8);
+        const float d = lmh_f16_bits_to_f32(d_bits);
+        for (int chunk = 0; chunk < 2; ++chunk) {
+            for (int group = 0; group < 4; ++group) {
+                for (int item = 0; item < 32; ++item) {
+                    const uchar ql_byte = ql[chunk * 64 + item + 32 * (group & 1)];
+                    const uint nibble = (group & 2) ? (ql_byte >> 4) : (ql_byte & 0x0f);
+                    const uint high = (qh[chunk * 32 + item] >> (2 * group)) & 3;
+                    const int quant = int(nibble | (high << 4)) - 32;
+                    const int scale_index = chunk * 8 + (item >> 4) + group * 2;
+                    const int column =
+                        block_index * 256 + chunk * 128 + group * 32 + item;
+                    sum += d * float(int(scales[scale_index])) * float(quant) * input[column];
+                }
+            }
+        }
+    }
+    return sum;
+}
+
+[[host_name("lm_head_argcat_partials_q_q6_K_float32")]]
+kernel void lm_head_argcat_partials_q_q6_K_float32(
+    device const float *h [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device float *part_val [[buffer(2)]],
+    device int *part_id [[buffer(3)]],
+    device const float *bias [[buffer(4)]],
+    constant int &V [[buffer(5)]],
+    constant int &K [[buffer(6)]],
+    constant int &TILE_V [[buffer(7)]],
+    constant int &num_vtiles [[buffer(8)]],
+    constant float &invtemp [[buffer(9)]],
+    constant uint &seed [[buffer(10)]],
+    constant int &use_gumbel [[buffer(11)]],
+    constant int &use_bias [[buffer(12)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int vtile = int(tgid.x);
+    const int token = int(tgid.y);
+    const int v0 = vtile * TILE_V;
+    const int v1 = min(v0 + TILE_V, V);
+    const int blocks_per_row = K / 256;
+    const int row_bytes = blocks_per_row * 210;
+    device const float *hrow = h + (long)token * K;
+    float best = LMH_NEG_INF;
+    int best_id = v0 + int(lane) < v1 ? v0 + int(lane) : v0;
+    for (int vocab = v0 + int(lane); vocab < v1; vocab += 32) {
+        float value = lmh_q6_k_dot(Wq + (long)vocab * row_bytes, hrow, blocks_per_row);
+        value *= invtemp;
+        if (use_bias) value += bias[vocab];
+        if (use_gumbel) value += rng_gumbel(seed, uint(token), uint(vocab));
+        if (value > best || (value == best && vocab < best_id)) {
+            best = value;
+            best_id = vocab;
+        }
+    }
+    simd_argmax(best, best_id);
+    if (lane == 0) {
+        const long offset = (long)token * num_vtiles + vtile;
+        part_val[offset] = best;
+        part_id[offset] = best_id;
+    }
+}
+
 // ---- top-k ----
 template <typename T>
 kernel void lm_head_topk_partials(device const T     *h          [[buffer(0)]],
@@ -483,3 +575,134 @@ instantiate_lm_head_topp_q("q4_0_bfloat16", q4_0, bf16)
 instantiate_lm_head(float32, float)
 instantiate_lm_head(float16, half)
 instantiate_lm_head(bfloat16, bf16)
+
+// ---- Constrained greedy LM head ----
+// Fuses dense projection, grammar-mask lookup, greedy selection, and the
+// selected-token log-probability. The normalizer intentionally includes masked
+// tokens because the reference applies its grammar mask after log_softmax.
+template <typename T>
+kernel void lm_head_constrained_partials(
+    device const T *h [[buffer(0)]],
+    device const T *W [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device const uchar *forbidden [[buffer(3)]],
+    device const int *previous [[buffer(4)]],
+    device float *part_max [[buffer(5)]],
+    device float *part_sum [[buffer(6)]],
+    device float *part_best [[buffer(7)]],
+    device int *part_id [[buffer(8)]],
+    constant int &V [[buffer(9)]],
+    constant int &K [[buffer(10)]],
+    constant int &TILE_V [[buffer(11)]],
+    constant int &num_vtiles [[buffer(12)]],
+    constant int &use_bias [[buffer(13)]],
+    constant int &eos_id [[buffer(14)]],
+    constant int &forbid_eos [[buffer(15)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int vtile = int(tgid.x);
+    const int token = int(tgid.y);
+    const int v0 = vtile * TILE_V;
+    const int v1 = min(v0 + TILE_V, V);
+    const int nk4 = K % 4 == 0 ? K / 4 : 0;
+    device const T *hrow = h + (long)token * K;
+    device const metal::vec<T, 4> *h4 = (device const metal::vec<T, 4> *)hrow;
+    float mine[8];
+    int nmine = 0;
+    float local_max = LMH_NEG_INF;
+    float valid_best = LMH_NEG_INF;
+    int valid_id = 0x7fffffff;
+    const int prev = previous[token];
+    for (int vocab = v0 + int(lane); vocab < v1; vocab += 32) {
+        device const T *wrow = W + (long)vocab * K;
+        device const metal::vec<T, 4> *w4 = (device const metal::vec<T, 4> *)wrow;
+        float dot_acc = 0.0f;
+        for (int j = 0; j < nk4; ++j) {
+            dot_acc += dot(float4(w4[j]), float4(h4[j]));
+        }
+        for (int j = nk4 * 4; j < K; ++j) {
+            dot_acc += float(wrow[j]) * float(hrow[j]);
+        }
+        T rounded = T(dot_acc);
+        if (use_bias) rounded = rounded + T(bias[vocab]);
+        const float logit = float(rounded);
+        mine[nmine++] = logit;
+        local_max = max(local_max, logit);
+        bool allowed = false;
+        if (prev >= 0 && prev < V) {
+            allowed = forbidden[(long)prev * V + vocab] == 0 &&
+                      !(forbid_eos && vocab == eos_id);
+        }
+        if (allowed &&
+            (logit > valid_best || (logit == valid_best && vocab < valid_id))) {
+            valid_best = logit;
+            valid_id = vocab;
+        }
+    }
+    const float tile_max = simd_max(local_max);
+    float local_sum = 0.0f;
+    for (int j = 0; j < nmine; ++j) local_sum += exp(mine[j] - tile_max);
+    const float tile_sum = simd_sum(local_sum);
+    simd_argmax(valid_best, valid_id);
+    if (lane == 0) {
+        const long offset = (long)token * num_vtiles + vtile;
+        part_max[offset] = tile_max;
+        part_sum[offset] = tile_sum;
+        part_best[offset] = valid_best;
+        part_id[offset] = valid_id;
+    }
+}
+
+kernel void lm_head_constrained_reduce(
+    device const float *part_max [[buffer(0)]],
+    device const float *part_sum [[buffer(1)]],
+    device const float *part_best [[buffer(2)]],
+    device const int *part_id [[buffer(3)]],
+    device int *out_token [[buffer(4)]],
+    device float *out_logprob [[buffer(5)]],
+    constant int &num_vtiles [[buffer(6)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const long base = (long)token * num_vtiles;
+    float maximum = LMH_NEG_INF;
+    float best = LMH_NEG_INF;
+    int best_id = 0x7fffffff;
+    for (int tile = int(lane); tile < num_vtiles; tile += 32) {
+        maximum = max(maximum, part_max[base + tile]);
+        const float candidate = part_best[base + tile];
+        const int candidate_id = part_id[base + tile];
+        if (candidate > best || (candidate == best && candidate_id < best_id)) {
+            best = candidate;
+            best_id = candidate_id;
+        }
+    }
+    maximum = simd_max(maximum);
+    float normalizer = 0.0f;
+    for (int tile = int(lane); tile < num_vtiles; tile += 32) {
+        normalizer += part_sum[base + tile] * exp(part_max[base + tile] - maximum);
+    }
+    normalizer = simd_sum(normalizer);
+    simd_argmax(best, best_id);
+    if (lane == 0) {
+        const bool found = best_id != 0x7fffffff;
+        out_token[token] = found ? best_id : -1;
+        out_logprob[token] = found ? best - (maximum + log(normalizer)) : -INFINITY;
+    }
+}
+
+#define instantiate_lm_head_constrained(type_name, T)                         \
+  template [[host_name("lm_head_constrained_partials_" #type_name)]] [[kernel]] void \
+  lm_head_constrained_partials<T>(device const T *h [[buffer(0)]],           \
+    device const T *W [[buffer(1)]], device const float *bias [[buffer(2)]], \
+    device const uchar *forbidden [[buffer(3)]], device const int *previous [[buffer(4)]], \
+    device float *part_max [[buffer(5)]], device float *part_sum [[buffer(6)]], \
+    device float *part_best [[buffer(7)]], device int *part_id [[buffer(8)]], \
+    constant int &V [[buffer(9)]], constant int &K [[buffer(10)]],           \
+    constant int &TILE_V [[buffer(11)]], constant int &num_vtiles [[buffer(12)]], \
+    constant int &use_bias [[buffer(13)]], constant int &eos_id [[buffer(14)]], \
+    constant int &forbid_eos [[buffer(15)]],                                 \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_lm_head_constrained(float32, float)
+instantiate_lm_head_constrained(float16, half)
+instantiate_lm_head_constrained(bfloat16, bf16)

@@ -1149,3 +1149,64 @@ Wave-5 serving/training kernels (they shipped correctness-first, un-profiled).
   already sub-20 µs (fixed-slot / single-threadgroup scan) — not hotspots.
 - **min_p / apply_token_bitmask / spec_verify_linear** run at 46–756 GB/s over the (T,V) logits —
   bandwidth-bound and already near the floor for a full-vocab pass.
+
+## Fused and specialized kernel integration pass (2026-07-13)
+
+Focused hypothesis: the specialized kernels should win when fusion removes an
+intermediate tensor or packed GGUF reads avoid expanded weights. Serial
+one-simdgroup mappings may lose to framework matmul/SDPA on realistic vision
+shapes and must remain non-default when they do.
+
+Environment: Apple M4 Max MacBook Pro (16 CPU cores, 128 GB), macOS 26.5.1
+(25F80), Xcode 26.6 (17F113), Apple Metal 32023.883 / Metal toolchain
+17.6.109.0, Python 3.12.9, MLX 0.21.1, and PyTorch 2.12.1 MPS. Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel kernel_extensions --warmup 20 --iters 50
+.venv/bin/python perf/bench_kernels.py --backend torch --preset quick \
+  --kernel kernel_extensions --warmup 20 --iters 50
+```
+
+The harness uses a one-second clock ramp, at least 50 ms of per-thunk warmup,
+adaptive batching to at least 2 ms/sample, 20 requested warmups, 50 measured
+samples, and reports medians. P20/p80 and CV are in the raw JSONL. Target CV
+ranged 0.010–0.247 on MLX and 0.008–0.151 on MPS because a few launch-bound
+cases had isolated OS/queue outliers; their central p20/p80 bands remained
+narrow (for example MLX Q6_K gather 0.0099–0.0106 ms). Runs overlapping an
+unrelated compiler workload were discarded. Final raw results:
+
+- `perf/results/2026-07-13/153245-mlx-quick/`
+- `perf/results/2026-07-13/153405-torch-quick/`
+
+All 16 cases passed their in-run oracle. Maximum relative error was 3.07e-3
+(bfloat16 patch merge); all three dequant-gather formats and token-selection
+cases were exact. The Q6_K gather result includes an MPS fast-math halfway-case
+regression that pins FP32 operation order and one final FP16 rounding. Focused
+MLX tests and the dedicated MPS extension suite cover the same paths and edge shapes.
+
+| Kernel / integration path | dtype / format | priority shape | MLX candidate / baseline ms | MPS candidate / baseline ms | Decision |
+|---|---|---|---:|---:|---|
+| dynamic LayerNorm | bf16 | R8,D1536 | 0.0115 / 0.0115 | 0.0301 / 0.0193 | Route dynamic widths to framework LayerNorm; retain `use_kernel=True`. |
+| decode add + LayerNorm | bf16 | R8,D256 | 0.0126 / 0.0192 | 0.0257 / 0.0764 | Keep default (1.53× / 2.97×). |
+| head-major GQA decode | f32 | B4,Hq8,Hkv2,T256,D32 | 0.0335 / 0.0332 | 0.1090 / 0.0975 | Route to framework SDPA; retain `use_kernel=True`. |
+| Swin window attention | f32 | BW8,N144,H4,D32 | 0.3754 / 0.1110 | 0.3859 / 0.1661 | Reject as default; framework SDPA is 3.38× / 2.32× faster. Retain `use_kernel=True`. |
+| patch merge + LayerNorm | bf16 | B1,96x96,C128 | 0.0356 / 0.0427 | 0.0403 / 0.0787 | Keep default (1.20× / 1.95×). |
+| pairwise edge MLP | f32 | B1,L64,H256,C7 | 1.3840 / 0.1687 | 1.3267 / 0.1385 | Reject as default; framework composition is 8.20× / 9.58× faster. Retain `use_kernel=True`. |
+| decode linear + erf-GELU | f32 | B1,K256,N256 | 0.0097 / 0.0336 | 0.0125 / 0.0383 | Keep default (3.47× / 3.07×). |
+| q8_0 decode linear + epilogue | f32 / q8_0 | B1,K256,N256 | 0.0105 / 0.0332 | 0.0113 / 0.0422 | Keep default (3.16× / 3.74×). |
+| Flux erf-GELU | f32 | N128,K64,M128 | 0.0088 / 0.0331 | 0.0127 / 0.0352 | Keep default (3.77× / 2.76×). |
+| dequant gather | f16 / q4_0 | R4096,D256,T256 | 0.0091 / 0.0319 | 0.0201 / 0.0786 | Keep default (3.50× / 3.91×). |
+| dequant gather | f16 / q8_0 | R4096,D256,T256 | 0.0093 / 0.0268 | 0.0180 / 0.0760 | Keep default (2.87× / 4.23×). |
+| dequant gather | f16 / q6_K | R4096,D1536,T256 | 0.0102 / 0.0352 | 0.0265 / 0.0830 | Keep default (3.45× / 3.13×). |
+| fp32 qgemv | f32 / q4_0 | N6144,K1536 | 0.0196 / 0.0523 | 0.0353 / 0.0894 | Keep packed path (2.67× / 2.53×). |
+| fp32 qgemv | f32 / q6_K | N1536,K1536 | 0.0127 / 0.0168 | 0.0163 / 0.0278 | Keep packed path (1.32× / 1.71×). |
+| fused Q6_K LM argmax | f32 / q6_K | T1,V32768,K1536 | 0.2633 / 0.1390 | 0.4367 / 0.1851 | Reject as default versus packed qgemv+argmax; route T=1 through qgemv, retain `fused=True`. |
+| constrained LM head | f32 | T8,V357,K256 | 0.0358 / 0.1133 | 0.0699 / 0.2270 | Keep default (3.17× / 3.25×). |
+
+The baseline is the public framework SDPA path for attention, the
+framework/decomposed path for other fused operations, an FP32 expanded-table
+gather with one final FP16 cast or pre-dequantized matmul for packed formats,
+and packed qgemv+argmax for the Q6_K LM-head routing comparison. No speed claim
+is made for the five retained non-default kernels. The implementations and
+benchmark routing are accepted with the keep/reject decisions above.

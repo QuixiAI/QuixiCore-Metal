@@ -74,6 +74,33 @@ std::vector<array> layernorm_add(
       {x, residual, weight, bias});
 }
 
+std::vector<array> decode_layernorm_add(
+    const array& x,
+    const array& residual,
+    const array& weight,
+    const array& bias,
+    float eps,
+    StreamOrDevice s) {
+  const auto dtype = x.dtype();
+  if ((dtype != float32 && dtype != bfloat16) || x.ndim() < 1 || x.size() == 0 ||
+      residual.shape() != x.shape() || residual.dtype() != dtype) {
+    throw std::invalid_argument(
+        "decode_layernorm_add: x/residual must have the same fp32 or bf16 shape");
+  }
+  const int dimension = x.shape(-1);
+  if (dimension <= 0 || weight.dtype() != dtype || bias.dtype() != dtype ||
+      weight.ndim() != 1 || bias.ndim() != 1 || weight.shape(0) != dimension ||
+      bias.shape(0) != dimension) {
+    throw std::invalid_argument(
+        "decode_layernorm_add: weight/bias must match the positive final dimension");
+  }
+  return array::make_arrays(
+      {x.shape(), x.shape()}, {dtype, dtype},
+      std::make_shared<DecodeLayerNormAdd>(to_stream(s), eps),
+      {contiguous(x, false, s), contiguous(residual, false, s),
+       contiguous(weight, false, s), contiguous(bias, false, s)});
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 // CPU (no fallback yet — use mx.fast.{rms_norm,layer_norm} on (x+residual))
 ///////////////////////////////////////////////////////////////////////////////
@@ -84,6 +111,10 @@ void RMSNormAdd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
 
 void LayerNormAdd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("LayerNormAdd has no CPU implementation.");
+}
+
+void DecodeLayerNormAdd::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("DecodeLayerNormAdd has no CPU implementation.");
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -135,6 +166,23 @@ void LayerNormAdd::eval_gpu(
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   tk::launch_layernorm_add(enc, x, residual, weight, bias, out, res_out, M, D, eps_);
+}
+
+void DecodeLayerNormAdd::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& normalized = outputs[0];
+  auto& summed = outputs[1];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  normalized.set_data(allocator::malloc_or_wait(normalized.nbytes()));
+  summed.set_data(allocator::malloc_or_wait(summed.nbytes()));
+  const int dimension = inputs[0].shape(-1);
+  const int rows = static_cast<int>(inputs[0].size() / dimension);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_decode_layernorm_add(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], normalized, summed,
+      rows, dimension, eps_, type_to_name(inputs[0]));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -404,5 +452,6 @@ std::pair<std::vector<array>, std::vector<int>> AddNormFp8::vmap(
 
 TK_NORM_NO_AUTODIFF(RMSNormAdd, "RMSNormAdd")
 TK_NORM_NO_AUTODIFF(LayerNormAdd, "LayerNormAdd")
+TK_NORM_NO_AUTODIFF(DecodeLayerNormAdd, "DecodeLayerNormAdd")
 
 } // namespace mlx::core

@@ -599,6 +599,12 @@ static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>
 gelu(thread RT &dst, thread const RT &src) {
     unary_map<base_ops::gelu, RT>(dst, src);
 }
+/** @brief Applies erf-based GELU element-wise to a register tile. */
+template<typename RT>
+static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type
+gelu_erf(thread RT &dst, thread const RT &src) {
+    unary_map<base_ops::gelu_erf, RT>(dst, src);
+}
 /** @brief Applies SiLU/swish element-wise to a register tile (for SwiGLU). */
 template<typename RT>
 static METAL_FUNC typename metal::enable_if<ducks::is_register_tile<RT>(), void>::type

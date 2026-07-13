@@ -35,10 +35,22 @@ def _is_torch(x):
 
 
 # --- dispatching kernels ---
-def layernorm(x, weight, bias, eps=1e-5):
-    """LayerNorm over the last axis. Accepts mlx.array or torch.Tensor (MPS)."""
+def layernorm(x, weight, bias, eps=1e-5, use_kernel=None):
+    """LayerNorm over the last axis. Accepts mlx.array or torch.Tensor (MPS).
+
+    Dynamic widths default to the framework LayerNorm after measurement;
+    ``use_kernel=True`` keeps the Metal parity path. Established fixed widths
+    remain kernel-default.
+    """
+    fixed_width = x.shape[-1] in (256, 512, 768, 1024)
     if _is_torch(x):
+        if use_kernel is False or (use_kernel is None and not fixed_width):
+            import torch.nn.functional as F
+            return F.layer_norm(x, (x.shape[-1],), weight, bias, eps)
         return _torch().layernorm(x, weight, bias, eps)
+    if use_kernel is False or (use_kernel is None and not fixed_width):
+        import mlx.core as mx
+        return mx.fast.layer_norm(x, weight, bias, eps)
     return _mlx().layernorm(x, weight, bias, eps=eps)
 
 
@@ -403,6 +415,15 @@ def layernorm_add(x, residual, weight, bias, eps=1e-5):
     if _is_torch(x):
         return _torch().layernorm_add(x, residual, weight, bias, eps)
     return _mlx().layernorm_add(x, residual, weight, bias, eps=eps)
+
+
+def decode_layernorm_add(x, residual, weight, bias, eps=1e-5):
+    """Decode-compatible residual-add + LayerNorm. The sum is rounded to the input dtype before
+    statistics, matching a materialized model graph. Returns (normalized, summed)."""
+    if _is_torch(x):
+        return _torch().decode_layernorm_add(x, residual, weight, bias, float(eps))
+    out = _mlx().decode_layernorm_add(x, residual, weight, bias, float(eps))
+    return out[0], out[1]
 
 
 def rms_norm_add_fp8(x, residual, weight, eps=1e-5, scale=None):
@@ -1837,7 +1858,7 @@ def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100
 _LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2, "topp": 3}
 
 
-_LM_QUANT_BLOCK_K = {"q8_0": 32, "q4_0": 32}
+_LM_QUANT_BLOCK_K = {"q8_0": 32, "q4_0": 32, "q6_K": 256}
 
 
 def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None, fused=False,
@@ -1845,8 +1866,9 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     """LM-head + sampling: a decode token per row of h. h (T, K), W (V, K) row-major, both
     fp16/bf16/f32. mode in {"argmax", "categorical", "topk", "topp"}.
 
-    format ("q8_0"/"q4_0") selects the fused quantized-weight path: W is the packed weight tensor
-    (dequantized on read, no logits materialization); supports all four modes. For "topp" the fused
+    format ("q8_0"/"q4_0"/"q6_K") selects a packed quantized-weight path. Q6_K at T=1 defaults to
+    packed qgemv plus the sampler because it is faster; fused=True selects its no-materialization
+    argmax/categorical path. Q8_0/Q4_0 use the fused path. For "topp" the fused
     quant path over-selects the top-k' candidate pool (k = the cap, default 32) then does a nucleus
     (top-p, threshold top_p) reduce over that pool — the standard "top-k then top-p" (the pool's
     softmax approximates the full normalizer for the peaked LM-head distribution). bias is an
@@ -1861,10 +1883,32 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     if format is not None:
         if format not in _LM_QUANT_BLOCK_K:
             raise ValueError(f"lm_head_sample: quant format must be one of {list(_LM_QUANT_BLOCK_K)}")
-        m = _LM_HEAD_MODES[mode]
         kk = int(k) if int(k) > 0 else (32 if mode in ("topk", "topp") else 0)
         V = W.shape[0]
         K = W.shape[1] * _LM_QUANT_BLOCK_K[format]   # packed Wq is (V, K/block_k, block_bytes)
+        # The Q6_K fused row-dot is slower than the packed qgemv specialization
+        # at the priority T=1 decode shape. Materialize only that one logits row
+        # by default; fused=True preserves the no-materialization kernel path.
+        if format == "q6_K" and h.shape[0] == 1 and not fused:
+            if _is_torch(h):
+                logits = qgemv(W, h.transpose(0, 1), format).transpose(0, 1)
+                if bias is not None:
+                    logits = logits + bias.to(logits.dtype)
+            else:
+                import mlx.core as mx
+                logits = mx.swapaxes(qgemv(W, mx.swapaxes(h, 0, 1), format), 0, 1)
+                if bias is not None:
+                    logits = logits + bias.astype(logits.dtype)
+            if mode == "argmax":
+                return argmax_sample(logits)
+            if mode == "categorical":
+                return sample_categorical(logits, temperature=temperature, seed=seed)
+            if mode == "topk":
+                return top_k_sample(logits, kk, temperature=temperature, seed=seed)
+            return top_p_sample(logits, top_p, temperature=temperature, seed=seed)
+        m = _LM_HEAD_MODES[mode]
+        if format == "q6_K" and mode not in ("argmax", "categorical"):
+            raise ValueError("lm_head_sample: fused Q6_K supports argmax/categorical only")
         if _is_torch(h):
             import torch
             b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
@@ -1913,6 +1957,21 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     if mode == "categorical":
         return sample_categorical(logits, temperature=temperature, seed=seed)
     return top_k_sample(logits, k, temperature=temperature, seed=seed)
+
+
+def lm_head_constrained(h, W, forbidden, previous, bias=None, eos_id=-1, forbid_eos=False):
+    """Dense LM projection with a row-conditioned uint8 grammar mask. Returns greedy token ids
+    and selected-token log-probabilities without materializing logits."""
+    if _is_torch(h):
+        import torch
+        b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
+        return _torch().lm_head_constrained(
+            h, W, b, forbidden, previous, int(eos_id), bool(forbid_eos))
+    import mlx.core as mx
+    b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
+    out = _mlx().lm_head_constrained(
+        h, W, b, forbidden, previous, int(eos_id), bool(forbid_eos))
+    return out[0], out[1]
 
 
 def beam_advance(logits, cum_log_probs, beam_width):
@@ -2301,6 +2360,13 @@ def flux_gelu(x, w, bias):
     return _mlx().flux_gelu(x, w, bias)
 
 
+def flux_gelu_erf(x, w, bias):
+    """Fused erf-GELU(x @ w + bias) with the exact erf activation contract."""
+    if _is_torch(x):
+        return _torch().flux_gelu_erf(x, w, bias)
+    return _mlx().flux_gelu_erf(x, w, bias)
+
+
 def flux_gate(x, w, bias, gate, residual):
     """Fused (x @ w + bias) * gate + residual. Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(x):
@@ -2552,6 +2618,123 @@ def attn_decode(q, k, v):
     return _mlx().attn_decode(q, k, v)
 
 
+def attn_decode_bh(q, k, v, context_length, use_kernel=False):
+    """Batched head-major GQA decode: q (B,Hq,D), k/v (B,Hkv,cache_T,D).
+
+    Framework SDPA is the measured default. ``use_kernel=True`` retains the
+    head-major Metal kernel as an explicit parity/optimization path.
+    """
+    if use_kernel:
+        if _is_torch(q):
+            return _torch().attn_decode_bh(q, k, v, int(context_length))
+        return _mlx().attn_decode_bh(q, k, v, int(context_length))
+    if _is_torch(q):
+        import torch.nn.functional as F
+        return F.scaled_dot_product_attention(
+            q.unsqueeze(-2), k[:, :, :int(context_length)], v[:, :, :int(context_length)],
+            enable_gqa=True).squeeze(-2)
+    import mlx.core as mx
+    return mx.fast.scaled_dot_product_attention(
+        q[:, :, None, :], k[:, :, :int(context_length)], v[:, :, :int(context_length)],
+        scale=q.shape[-1] ** -0.5)[:, :, 0, :]
+
+
+def swin_attn_d32(qkv, relative_bias, mask=None, windows_per_image=0, use_kernel=False):
+    """Swin window attention over packed qkv (BW,N,3,H,32).
+
+    Framework SDPA is the measured default. ``use_kernel=True`` retains the
+    serial-query Metal kernel as an explicit parity/optimization path.
+    """
+    if mask is not None and int(windows_per_image) == 0:
+        windows_per_image = mask.shape[0]
+    if use_kernel:
+        if _is_torch(qkv):
+            import torch
+            m = mask if mask is not None else torch.zeros(1, dtype=torch.float32, device=qkv.device)
+            return _torch().swin_attn_d32(qkv, relative_bias, m, int(windows_per_image))
+        import mlx.core as mx
+        m = mask if mask is not None else mx.zeros((1,), dtype=mx.float32)
+        return _mlx().swin_attn_d32(qkv, relative_bias, m, int(windows_per_image))
+    if _is_torch(qkv):
+        import torch
+        import torch.nn.functional as F
+        q, k, v = (qkv[:, :, i].permute(0, 2, 1, 3) for i in range(3))
+        additive = relative_bias.unsqueeze(0)
+        if mask is not None:
+            index = torch.arange(qkv.shape[0], device=qkv.device) % int(windows_per_image)
+            additive = additive + mask.index_select(0, index).unsqueeze(1)
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=additive, scale=32 ** -0.5).permute(0, 2, 1, 3)
+    import mlx.core as mx
+    q, k, v = (mx.transpose(qkv[:, :, i], (0, 2, 1, 3)) for i in range(3))
+    additive = relative_bias[None]
+    if mask is not None:
+        index = mx.arange(qkv.shape[0]) % int(windows_per_image)
+        additive = additive + mx.take(mask, index, axis=0)[:, None]
+    return mx.transpose(mx.fast.scaled_dot_product_attention(
+        q, k, v, scale=32 ** -0.5, mask=additive), (0, 2, 1, 3))
+
+
+def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
+    """Fused Swin 2x2 patch gather and LayerNorm in [x00,x10,x01,x11] order."""
+    if _is_torch(x):
+        return _torch().patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+    return _mlx().patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+
+
+def edge_mlp_256x7(hidden, first_weight, first_bias, second_weight, second_bias,
+                   use_kernel=False):
+    """Fixed pairwise 512->256->7 edge MLP. Returns (B,7,L,L).
+
+    The framework composition is the measured default. ``use_kernel=True``
+    runs the fixed-shape Metal kernel.
+    """
+    if use_kernel:
+        if _is_torch(hidden):
+            return _torch().edge_mlp_256x7(
+                hidden, first_weight, first_bias, second_weight, second_bias)
+        return _mlx().edge_mlp_256x7(
+            hidden, first_weight, first_bias, second_weight, second_bias)
+    if _is_torch(hidden):
+        import torch
+        import torch.nn.functional as F
+        left = hidden @ first_weight[:, :256].transpose(0, 1)
+        right = hidden @ first_weight[:, 256:].transpose(0, 1) + first_bias
+        activation = F.gelu(left[:, :, None, :] + right[:, None, :, :], approximate="none")
+        return torch.einsum("bijh,ch->bcij", activation, second_weight) + second_bias[None, :, None, None]
+    import mlx.core as mx
+    left = mx.matmul(hidden, mx.swapaxes(first_weight[:, :256], 0, 1))
+    right = mx.matmul(hidden, mx.swapaxes(first_weight[:, 256:], 0, 1)) + first_bias
+    joined = left[:, :, None, :] + right[:, None, :, :]
+    activation = 0.5 * joined * (1.0 + mx.erf(joined * (2.0 ** -0.5)))
+    return mx.einsum("bijh,ch->bcij", activation, second_weight) + second_bias[None, :, None, None]
+
+
+def decode_linear(x, weight, bias, gelu=False):
+    """Latency-oriented decode linear with optional erf GELU."""
+    if _is_torch(x):
+        return _torch().decode_linear(x, weight, bias, bool(gelu))
+    return _mlx().decode_linear(x, weight, bias, bool(gelu))
+
+
+def decode_linear_residual(x, weight, bias, residual):
+    """Decode linear with a residual addition after input-dtype rounding."""
+    if _is_torch(x):
+        return _torch().decode_linear_residual(x, weight, bias, residual)
+    return _mlx().decode_linear_residual(x, weight, bias, residual)
+
+
+def decode_linear_q8(x, weight, bias, residual=None, gelu=False):
+    """q8_0 decode linear with optional erf GELU and residual."""
+    use_residual = residual is not None
+    placeholder = residual if use_residual else x
+    if _is_torch(x):
+        return _torch().decode_linear_q8(
+            x, weight, bias, placeholder, bool(gelu), bool(use_residual))
+    return _mlx().decode_linear_q8(
+        x, weight, bias, placeholder, bool(gelu), bool(use_residual))
+
+
 def qgemm_actorder(wq, x, perm, w_format="kU4B8", fused=False):
     """GPTQ act-order (desc_act): the weight is quantized in g_idx-permuted column (K) order so its
     groups are contiguous; recover W@X by gathering the activation rows by the same permutation, then
@@ -2645,11 +2828,18 @@ def qgemv_w2a8_v2(wq, xq, a_scale):
 
 def qgemv(wq, x, format="q8_0"):
     """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. wq packed weight blocks
-    (N, K//block_k, block_bytes) uint8; x is (K, 1) float16 -> (N, 1) float16.
+    (N, K//block_k, block_bytes) uint8; x is (K,1) float16, or fp32 for q4_0/q6_K.
     Accepts mlx.array or torch.Tensor (MPS)."""
     if _is_torch(wq):
         return _torch().qgemv(wq, x, format)
     return _mlx().qgemv(wq, x, format=format)
+
+
+def dequant_gather(table, ids, format, scale=1.0):
+    """Gather packed q4_0/q8_0/q6_K rows directly to fp16; invalid ids yield zero rows."""
+    if _is_torch(table):
+        return _torch().dequant_gather(table, ids, format, float(scale))
+    return _mlx().dequant_gather(table, ids, format, float(scale))
 
 
 def qflux_gelu(wq, x, bias, format="q8_0"):

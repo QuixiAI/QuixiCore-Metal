@@ -51,6 +51,22 @@ def test_qgemm_routes_m1_to_qgemv():
     assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
 
 
+@pytest.mark.parametrize("fmt", ["q4_0", "q6_K"])
+def test_qgemv_float32_paths(fmt):
+    """The fp32 decode specializations preserve fp32 activation/output dtype."""
+    quantize, dequantize = QUANT_FORMATS[fmt]
+    N, K = 67, 512
+    rng = np.random.default_rng(91)
+    weight = (0.2 * rng.standard_normal((N, K))).astype(np.float32)
+    x = (0.3 * rng.standard_normal((K, 1))).astype(np.float32)
+    packed = quantize(weight)
+    got = qgemv(mx.array(packed), mx.array(x), format=fmt)
+    mx.eval(got)
+    ref = dequantize(packed).astype(np.float32) @ x
+    assert got.dtype == mx.float32 and got.shape == (N, 1)
+    np.testing.assert_allclose(np.array(got), ref, rtol=3e-4, atol=3e-4)
+
+
 if __name__ == "__main__":
     for fmt in sorted(QUANT_FORMATS):
         for shp in SHAPES:

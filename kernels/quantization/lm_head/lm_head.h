@@ -44,6 +44,61 @@ array lm_head_sample_q(
     float top_p = 0.0f,   // mode 3 (topp): nucleus threshold; k = over-selected candidate cap
     StreamOrDevice s = {});
 
+/** Dense LM head with a row-conditioned grammar mask. Returns
+ *  [selected_token (T,) int32, selected_logprob (T,) fp32]. `forbidden` is a
+ *  uint8 (V,V) matrix indexed by (previous_token, candidate_token). */
+std::vector<array> lm_head_constrained(
+    const array& h,
+    const array& W,
+    const array& bias,
+    const array& forbidden,
+    const array& previous,
+    int eos_id = -1,
+    bool forbid_eos = false,
+    StreamOrDevice s = {});
+
+class LmHeadConstrainedPartials : public Primitive {
+ public:
+  LmHeadConstrainedPartials(
+      Stream stream, int vocab, int hidden, int use_bias, int eos_id, bool forbid_eos)
+      : Primitive(stream), vocab_(vocab), hidden_(hidden), use_bias_(use_bias),
+        eos_id_(eos_id), forbid_eos_(forbid_eos) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadConstrainedPartials"; }
+  void print(std::ostream& os) override { os << "LmHeadConstrainedPartials"; }
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  int vocab_;
+  int hidden_;
+  int use_bias_;
+  int eos_id_;
+  bool forbid_eos_;
+};
+
+class LmHeadConstrainedReduce : public Primitive {
+ public:
+  explicit LmHeadConstrainedReduce(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadConstrainedReduce"; }
+  void print(std::ostream& os) override { os << "LmHeadConstrainedReduce"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
 class LmHeadArgcatPartialsQ : public Primitive {
  public:
   LmHeadArgcatPartialsQ(Stream stream, int use_gumbel, float invtemp, uint32_t seed, int use_bias,

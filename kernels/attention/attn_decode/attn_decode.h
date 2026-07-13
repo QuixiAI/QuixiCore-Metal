@@ -9,6 +9,13 @@ namespace mlx::core {
 
 array attn_decode(const array& q, const array& k, const array& v, StreamOrDevice s = {});
 
+array attn_decode_bh(
+    const array& q,
+    const array& k,
+    const array& v,
+    int context_length,
+    StreamOrDevice s = {});
+
 class AttnDecode : public Primitive {
  public:
   explicit AttnDecode(Stream stream) : Primitive(stream) {}
@@ -23,6 +30,26 @@ class AttnDecode : public Primitive {
   const char* name() const { return "AttnDecode"; }
   void print(std::ostream& os) override { os << "AttnDecode"; }
   bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class AttnDecodeBh : public Primitive {
+ public:
+  AttnDecodeBh(Stream stream, int context_length)
+      : Primitive(stream), context_length_(context_length) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "AttnDecodeBh"; }
+  void print(std::ostream& os) override { os << "AttnDecodeBh"; }
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  int context_length_;
 };
 
 } // namespace mlx::core

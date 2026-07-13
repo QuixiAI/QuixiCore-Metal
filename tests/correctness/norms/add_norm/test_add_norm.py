@@ -11,7 +11,8 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import rms_norm_add, layernorm_add, rms_norm_add_fp8, layernorm_add_fp8
+from tk import (decode_layernorm_add, layernorm_add, layernorm_add_fp8,
+                rms_norm_add, rms_norm_add_fp8)
 from tk.quant import _e4m3_decode_arr
 
 
@@ -73,6 +74,31 @@ def test_layernorm_add(shape):
     assert mx.allclose(added, added_ref, atol=2e-2, rtol=2e-2)
     assert mx.allclose(out, out_ref, atol=2e-2, rtol=2e-2), \
         f"max {mx.max(mx.abs(out.astype(mx.float32)-out_ref.astype(mx.float32))).item()}"
+
+
+@pytest.mark.parametrize("dtype,atol", [(mx.float32, 4e-4), (mx.bfloat16, 3e-2)])
+def test_decode_layernorm_add_materialized_rounding(dtype, atol):
+    eps, shape = 1e-5, (3, 37)
+    rng = np.random.default_rng(37)
+    x, residual = [
+        mx.array((0.4 * rng.standard_normal(shape)).astype(np.float32)).astype(dtype)
+        for _ in range(2)
+    ]
+    weight = mx.array((0.8 + 0.1 * rng.standard_normal(shape[-1])).astype(np.float32)).astype(dtype)
+    bias = mx.array((0.05 * rng.standard_normal(shape[-1])).astype(np.float32)).astype(dtype)
+    got, summed = decode_layernorm_add(x, residual, weight, bias, eps)
+
+    rounded = (x.astype(mx.float32) + residual.astype(mx.float32)).astype(dtype)
+    values = rounded.astype(mx.float32)
+    mean = values.mean(-1, keepdims=True)
+    variance = (values * values).mean(-1, keepdims=True) - mean * mean
+    ref = ((values - mean) * mx.rsqrt(mx.maximum(variance, 0) + eps) *
+           weight.astype(mx.float32) + bias.astype(mx.float32)).astype(dtype)
+    mx.eval(got, summed, ref, rounded)
+    np.testing.assert_allclose(np.array(summed.astype(mx.float32)),
+                               np.array(rounded.astype(mx.float32)), rtol=0, atol=0)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)),
+                               np.array(ref.astype(mx.float32)), rtol=atol, atol=atol)
 
 
 FP8_SHAPES = [(8, 256), (4, 512), (16, 768), (3, 1024)]

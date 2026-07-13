@@ -153,6 +153,105 @@ def test_quant(fmt, dtype, mode):
             assert tok[t] == P.argmax() or (P.max() - P[tok[t]]) < 1e-2
 
 
+@pytest.mark.parametrize("mode", ["argmax", "categorical"])
+@pytest.mark.parametrize("fused", [False, True])
+def test_q6_k_float32(mode, fused):
+    """The Q6_K LM-head path supports fp32 argmax and categorical decode."""
+    from tk.quant import quantize_q6_K, dequantize_q6_K
+    T, V, K = 3, 1025, 512
+    rng = np.random.default_rng(57)
+    weight = (0.2 * rng.standard_normal((V, K))).astype(np.float32)
+    packed = quantize_q6_K(weight)
+    h = (0.25 * rng.standard_normal((T, K))).astype(np.float32)
+    temperature, seed = 0.8, 19
+    tok = np.array(tk.lm_head_sample(
+        mx.array(h), mx.array(packed), mode=mode, temperature=temperature,
+        seed=seed, format="q6_K", fused=fused))
+    logits = h.astype(np.float64) @ dequantize_q6_K(packed).astype(np.float64).T
+    for t in range(T):
+        scores = logits[t]
+        if mode == "categorical":
+            scores = scores / temperature + np.array([_gumbel(seed, t, v) for v in range(V)])
+        assert tok[t] == scores.argmax() or (scores.max() - scores[tok[t]]) < 2e-3
+
+
+@pytest.mark.parametrize("forbid_eos", [False, True])
+def test_lm_head_constrained_matches_post_logsoftmax_mask(forbid_eos):
+    rng = np.random.default_rng(83 + forbid_eos)
+    T, V, K, eos_id = 4, 67, 31, 2
+    h = (0.15 * rng.standard_normal((T, K))).astype(np.float32)
+    weight = (0.2 * rng.standard_normal((V, K))).astype(np.float32)
+    bias = (0.04 * rng.standard_normal(V)).astype(np.float32)
+    forbidden = (rng.random((V, V)) < 0.18).astype(np.uint8)
+    previous = np.array([0, 7, 31, 66], np.int32)
+    # Keep at least one legal token per exercised grammar row.
+    forbidden[previous, 0] = 0
+    got_token, got_logprob = tk.lm_head_constrained(
+        mx.array(h), mx.array(weight), mx.array(forbidden), mx.array(previous),
+        bias=mx.array(bias), eos_id=eos_id, forbid_eos=forbid_eos)
+    mx.eval(got_token, got_logprob)
+
+    logits = (h @ weight.T).astype(np.float32)
+    logits = (logits + bias).astype(np.float32)
+    maximum = logits.max(-1, keepdims=True)
+    log_z = maximum[:, 0] + np.log(np.exp(logits - maximum).sum(-1))
+    expected = []
+    for t in range(T):
+        allowed = forbidden[previous[t]] == 0
+        if forbid_eos:
+            allowed[eos_id] = False
+        masked = np.where(allowed, logits[t], -np.inf)
+        expected.append(int(masked.argmax()))
+    expected = np.array(expected, np.int32)
+    expected_logprob = logits[np.arange(T), expected] - log_z
+    np.testing.assert_array_equal(np.array(got_token), expected)
+    np.testing.assert_allclose(np.array(got_logprob), expected_logprob, rtol=3e-4, atol=3e-4)
+
+
+def test_lm_head_constrained_no_legal_token_or_invalid_previous():
+    rng = np.random.default_rng(89)
+    T, V, K = 3, 17, 13
+    h = (0.1 * rng.standard_normal((T, K))).astype(np.float32)
+    weight = (0.1 * rng.standard_normal((V, K))).astype(np.float32)
+    forbidden = np.ones((V, V), np.uint8)
+    previous = np.array([-1, V, 0], np.int32)
+    token, logprob = tk.lm_head_constrained(
+        mx.array(h), mx.array(weight), mx.array(forbidden), mx.array(previous))
+    mx.eval(token, logprob)
+    np.testing.assert_array_equal(np.array(token), np.full(T, -1, np.int32))
+    np.testing.assert_array_equal(np.array(logprob), np.full(T, -np.inf, np.float32))
+
+
+def test_lm_head_constrained_bfloat16_path():
+    rng = np.random.default_rng(97)
+    T, V, K = 3, 29, 21
+    h = mx.array((0.12 * rng.standard_normal((T, K))).astype(np.float32)).astype(mx.bfloat16)
+    weight = mx.array((0.15 * rng.standard_normal((V, K))).astype(np.float32)).astype(
+        mx.bfloat16)
+    bias = mx.array((0.03 * rng.standard_normal(V)).astype(np.float32)).astype(mx.bfloat16)
+    forbidden = (rng.random((V, V)) < 0.2).astype(np.uint8)
+    previous = np.array([0, 7, 17], np.int32)
+    forbidden[previous, 0] = 0
+    token, logprob = tk.lm_head_constrained(
+        h, weight, mx.array(forbidden), mx.array(previous), bias=bias)
+    mx.eval(token, logprob)
+
+    # Mirror the kernel's two bf16 epilogue roundings: projection first, then
+    # bias addition. The log-softmax reduction itself remains fp32.
+    projected = np.array(h.astype(mx.float32)) @ np.array(weight.astype(mx.float32)).T
+    rounded = mx.array(projected).astype(mx.bfloat16)
+    logits_m = (rounded + bias).astype(mx.bfloat16)
+    mx.eval(logits_m)
+    logits = np.array(logits_m.astype(mx.float32))
+    allowed = forbidden[previous] == 0
+    expected = np.where(allowed, logits, -np.inf).argmax(-1).astype(np.int32)
+    maximum = logits.max(-1)
+    log_z = maximum + np.log(np.exp(logits - maximum[:, None]).sum(-1))
+    expected_logprob = logits[np.arange(T), expected] - log_z
+    np.testing.assert_array_equal(np.array(token), expected)
+    np.testing.assert_allclose(np.array(logprob), expected_logprob, rtol=3e-2, atol=3e-2)
+
+
 @pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
 @pytest.mark.parametrize("k", [1, 8, 32])
 def test_quant_topk(fmt, k):

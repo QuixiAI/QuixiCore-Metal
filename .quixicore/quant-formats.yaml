@@ -3,7 +3,7 @@ backend: metal
 formats:
   gguf:
     status: implemented
-    notes: GGUF legacy, k-quant, and i-quant weight formats.
+    notes: GGUF legacy, k-quant, and i-quant weight formats, including fused q4_0/q8_0/q6_K row gather and fp32 q4_0/q6_K decode paths.
   mx:
     status: implemented
     notes: MXFP8, MXFP6, MXFP4-style formats implemented in Metal software paths.

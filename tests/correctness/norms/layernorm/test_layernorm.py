@@ -26,6 +26,8 @@ SHAPES = [
     (4, 64, 512),
     (1, 256, 768),
     (8, 256),  # 2D input, D=256
+    (3, 320),  # Dynamic-width decode path
+    (2, 1536),
 ]
 
 
@@ -38,7 +40,9 @@ def test_layernorm_matches_mlx(shape):
     w = mx.random.normal((D,)).astype(mx.bfloat16)
     b = mx.random.normal((D,)).astype(mx.bfloat16)
 
-    got = layernorm(x, w, b, eps=eps)
+    # Exercise the Metal implementation explicitly; dynamic widths default to
+    # the measured framework route at the public API layer.
+    got = layernorm(x, w, b, eps=eps, use_kernel=True)
     exp_mlx = mx.fast.layer_norm(x, w, b, eps)
     exp_ref = ref_layernorm(x, w, b, eps)
     mx.eval(got, exp_mlx, exp_ref)

@@ -90,6 +90,11 @@ _METAL_SOURCES = [
     _kernel_source("attention/attn_q/attn_q.metal"),
     _kernel_source("attention/attn_decode/attn_decode.metal"),
     _kernel_source("quantization/qgemm_int/qgemm_int.metal"),
+    _kernel_source("attention/swin_attn/swin_attn.metal"),
+    _kernel_source("matmul/decode_linear/decode_linear.metal"),
+    _kernel_source("quantization/dequant_gather/dequant_gather.metal"),
+    _kernel_source("vision/edge_mlp/edge_mlp.metal"),
+    _kernel_source("vision/patch_merge/patch_merge.metal"),
 ]
 
 
@@ -124,7 +129,7 @@ _ext._set_library(str(_METALLIB))
 
 
 def layernorm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float = 1e-5):
-    """LayerNorm over the last axis. bf16 MPS tensors; D in {256,512,768,1024}."""
+    """LayerNorm over the last axis. bf16 MPS tensors; D divisible by four."""
     return _ext.layernorm(x, weight, bias, float(eps))
 
 
@@ -196,6 +201,11 @@ def layernorm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
                   bias: torch.Tensor, eps: float = 1e-5):
     """Fused residual-add + LayerNorm. Returns (out, x+residual). bf16 MPS; D in {256,512,768,1024}."""
     return _ext.layernorm_add(x, residual, weight, bias, float(eps))
+
+
+def decode_layernorm_add(x, residual, weight, bias, eps=1e-5):
+    """Decode-compatible add + LayerNorm with input-dtype rounding before statistics."""
+    return tuple(_ext.decode_layernorm_add(x, residual, weight, bias, float(eps)))
 
 
 def rms_norm_add_fp8(x, residual, weight, eps: float = 1e-5, scale=None):
@@ -615,6 +625,43 @@ def attn_decode(q: torch.Tensor, key_cache: torch.Tensor, value_cache: torch.Ten
     return _ext.attn_decode(q, key_cache, value_cache)
 
 
+def attn_decode_bh(q, key_cache, value_cache, context_length):
+    """Batched head-major GQA decode. q (B,Hq,D), caches (B,Hkv,cache_T,D)."""
+    return _ext.attn_decode_bh(q, key_cache, value_cache, int(context_length))
+
+
+def swin_attn_d32(qkv, relative_bias, mask, windows_per_image=0):
+    """Swin packed-QKV window attention for head dimension 32."""
+    return _ext.swin_attn_d32(qkv, relative_bias, mask, int(windows_per_image))
+
+
+def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
+    """Fused Swin 2x2 patch gather + LayerNorm."""
+    return _ext.patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+
+
+def edge_mlp_256x7(hidden, first_weight, first_bias, second_weight, second_bias):
+    """Fixed pairwise 512->256->7 edge MLP; returns (B,7,L,L)."""
+    return _ext.edge_mlp_256x7(
+        hidden, first_weight, first_bias, second_weight, second_bias)
+
+
+def decode_linear(x, weight, bias, gelu=False):
+    """Latency-oriented decode linear with optional erf GELU."""
+    return _ext.decode_linear(x, weight, bias, bool(gelu))
+
+
+def decode_linear_residual(x, weight, bias, residual):
+    """Decode linear with materialized-order residual addition."""
+    return _ext.decode_linear_residual(x, weight, bias, residual)
+
+
+def decode_linear_q8(x, weight, bias, residual, gelu=False, use_residual=False):
+    """q8_0 decode linear with optional erf GELU and residual."""
+    return _ext.decode_linear_q8(
+        x, weight, bias, residual, bool(gelu), bool(use_residual))
+
+
 def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     """Fused LM-head + sampling: token id per row of h without materializing (T,V) logits.
     mode 0=argmax, 1=categorical, 2=top-k. bias (V,) or a 1-elem dummy. Returns (T,) int32. MPS."""
@@ -622,10 +669,16 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
 
 
 def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed, top_p=0.0):
-    """Fused LM-head + sampling over quantized (q8_0/q4_0) weights. mode 0=argmax, 1=categorical,
+    """Fused LM-head + sampling over quantized q8_0/q4_0/q6_K weights. mode 0=argmax, 1=categorical,
     2=topk, 3=topp (nucleus over the top-k candidate pool, top_p in (0,1]). Returns (T,) int32. MPS."""
     return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode), int(topk),
                                  float(temperature), int(seed), float(top_p))
+
+
+def lm_head_constrained(h, W, bias, forbidden, previous, eos_id=-1, forbid_eos=False):
+    """Dense grammar-constrained LM head; returns (token ids, selected log-probabilities)."""
+    return tuple(_ext.lm_head_constrained(
+        h, W, bias, forbidden, previous, int(eos_id), bool(forbid_eos)))
 
 
 def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss, softcap=0.0):
@@ -1248,6 +1301,11 @@ def flux_gelu(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor):
     return _ext.flux_gelu(x, w, bias)
 
 
+def flux_gelu_erf(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor):
+    """Fused erf-GELU(x @ w + bias)."""
+    return _ext.flux_gelu_erf(x, w, bias)
+
+
 def flux_gate(x: torch.Tensor, w: torch.Tensor, bias: torch.Tensor,
               gate: torch.Tensor, residual: torch.Tensor):
     """Fused (x @ w + bias) * gate + residual. f32/bf16 MPS; N%32, M%32, K%16."""
@@ -1378,8 +1436,13 @@ def qgemm_fp8_scaled(wq, xq, w_scale, a_scale):
 
 
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
-    """Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. x (K, 1) float16 -> (N, 1). MPS."""
+    """Quantized GEMV. x is float16, or fp32 for q4_0/q6_K."""
     return _ext.qgemv(wq, x, format)
+
+
+def dequant_gather(table, ids, format, scale=1.0):
+    """Gather packed q4_0/q8_0/q6_K rows directly to fp16."""
+    return _ext.dequant_gather(table, ids, str(format), float(scale))
 
 
 def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: str = "q8_0"):

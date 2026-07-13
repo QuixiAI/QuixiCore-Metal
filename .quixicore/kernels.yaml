@@ -36,6 +36,7 @@ families:
       - kernels/attention/mla
       - kernels/attention/rotary
       - kernels/attention/rope_kv
+      - kernels/attention/swin_attn
   linear_attention:
     status: implemented
     paths:
@@ -59,6 +60,7 @@ families:
       - kernels/matmul/gemm_v3
       - kernels/matmul/cmplx_matmul
       - kernels/matmul/flux
+      - kernels/matmul/decode_linear
   quantization:
     status: implemented
     paths:
@@ -77,7 +79,13 @@ families:
       - kernels/quantization/qgemv_int
       - kernels/quantization/qflux
       - kernels/quantization/lm_head
+      - kernels/quantization/dequant_gather
       - kernels/quantization/turboquant
+  vision:
+    status: implemented
+    paths:
+      - kernels/vision/patch_merge
+      - kernels/vision/edge_mlp
   moe:
     status: implemented
     paths:

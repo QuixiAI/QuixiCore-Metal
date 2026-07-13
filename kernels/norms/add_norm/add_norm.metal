@@ -116,6 +116,59 @@ kernel void layernorm_add(device   bf16  *x        [[buffer(0)]],
     store(gl_o, xv, {0, 0, row, 0}, laneId);
 }
 
+// Exact materialized residual-add + LayerNorm semantics for one-token decode.
+// The sum is rounded to T before statistics, matching a framework `x +
+// residual` tensor followed by LayerNorm. Unlike the register-tiled fast path,
+// this accepts dynamic D and both fp32 and bf16.
+template <typename T>
+kernel void decode_layernorm_add(
+    device const T *input [[buffer(0)]],
+    device const T *residual [[buffer(1)]],
+    device const T *weight [[buffer(2)]],
+    device const T *bias [[buffer(3)]],
+    device T *normalized [[buffer(4)]],
+    device T *summed [[buffer(5)]],
+    constant int &rows [[buffer(6)]],
+    constant int &dimension [[buffer(7)]],
+    constant float &epsilon [[buffer(8)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    if (int(row) >= rows) return;
+    const long base = (long)row * dimension;
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (int index = int(lane); index < dimension; index += 32) {
+        const T rounded = T(float(input[base + index]) + float(residual[base + index]));
+        summed[base + index] = rounded;
+        const float value = float(rounded);
+        sum += value;
+        sumsq += value * value;
+    }
+    sum = metal::simd_sum(sum);
+    sumsq = metal::simd_sum(sumsq);
+    const float mean = sum / float(dimension);
+    const float variance = metal::max(sumsq / float(dimension) - mean * mean, 0.0f);
+    const float inverse = metal::rsqrt(variance + epsilon);
+    for (int index = int(lane); index < dimension; index += 32) {
+        const float value = float(summed[base + index]);
+        normalized[base + index] =
+            T((value - mean) * inverse * float(weight[index]) + float(bias[index]));
+    }
+}
+
+#define instantiate_decode_layernorm_add(type_name, T)                        \
+  template [[host_name("decode_layernorm_add_" #type_name)]] [[kernel]]     \
+  void decode_layernorm_add<T>(device const T *input [[buffer(0)]],          \
+    device const T *residual [[buffer(1)]], device const T *weight [[buffer(2)]], \
+    device const T *bias [[buffer(3)]], device T *normalized [[buffer(4)]],  \
+    device T *summed [[buffer(5)]], constant int &rows [[buffer(6)]],        \
+    constant int &dimension [[buffer(7)]], constant float &epsilon [[buffer(8)]], \
+    uint row [[threadgroup_position_in_grid]],                               \
+    uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_decode_layernorm_add(float32, float)
+instantiate_decode_layernorm_add(bfloat16, bf16)
+
 // ---------------------------------------------------------------------------
 // fp8 e4m3 epilogue variants: emit uint8 codes = e4m3(norm(x+residual)*weight / scale)
 // directly from the register-resident normed vector (no bf16 round-trip). res_out is

@@ -41,6 +41,17 @@ std::vector<array> layernorm_add(
     float eps = 1e-5f,
     StreamOrDevice s = {});
 
+/** Decode-compatible residual-add + LayerNorm. Unlike layernorm_add, this
+ *  preserves the materialized model order by rounding x+residual to the input
+ *  dtype before computing statistics. Supports fp32/bf16 and dynamic D. */
+std::vector<array> decode_layernorm_add(
+    const array& x,
+    const array& residual,
+    const array& weight,
+    const array& bias,
+    float eps = 1e-5f,
+    StreamOrDevice s = {});
+
 /**
  *  fp8 e4m3 epilogue variants: out = e4m3(norm(x+residual)*weight[+bias] / scale) as uint8
  *  codes, plus res_out = x+residual (bf16). Static returns [codes, res_out]; dynamic (per-row
@@ -174,6 +185,25 @@ class LayerNormAdd : public Primitive {
 
   const char* name() const { return "LayerNormAdd"; }
   void print(std::ostream& os) override { os << "LayerNormAdd"; }
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  float eps_;
+};
+
+class DecodeLayerNormAdd : public Primitive {
+ public:
+  DecodeLayerNormAdd(Stream stream, float eps) : Primitive(stream), eps_(eps) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "DecodeLayerNormAdd"; }
+  void print(std::ostream& os) override { os << "DecodeLayerNormAdd"; }
   bool is_equivalent(const Primitive& other) const override;
 
  private:

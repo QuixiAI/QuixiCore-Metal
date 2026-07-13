@@ -295,6 +295,38 @@ TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, gelu,
     float2 inner = 0.7978845608f * (xf + 0.044715f * xf * xf * xf);
     float2 th = float2(1.0f) - 2.0f / (metal::exp(inner + inner) + float2(1.0f));
     return bf16_2(0.5f * xf * (float2(1.0f) + th));)
+
+/** Erf-based GELU using the Abramowitz-Stegun approximation. */
+struct gelu_erf {
+    TEMPLATE_OPS_SINGLE(
+        T z = x * T(0.7071067811865475f);
+        T az = metal::abs(z);
+        T t = T(1) / (T(1) + T(0.3275911f) * az);
+        T polynomial = (((((T(1.061405429f) * t - T(1.453152027f)) * t
+                          + T(1.421413741f)) * t - T(0.284496736f)) * t
+                          + T(0.254829592f)) * t);
+        T erf_value = metal::copysign(T(1) - polynomial * metal::exp(-az * az), z);
+        return T(0.5f) * x * (T(1) + erf_value);
+    )
+};
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16, gelu_erf,
+    float xf = (float)x;
+    float z = xf * 0.7071067811865475f;
+    float az = metal::abs(z);
+    float t = 1.0f / (1.0f + 0.3275911f * az);
+    float p = (((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t
+                 - 0.284496736f) * t + 0.254829592f) * t);
+    float erf_value = metal::copysign(1.0f - p * metal::exp(-az * az), z);
+    return bf16(0.5f * xf * (1.0f + erf_value));)
+TEMPLATE_OPS_OVERRIDE_SINGLE(bf16_2, gelu_erf,
+    float2 xf = (float2)x;
+    float2 z = xf * 0.7071067811865475f;
+    float2 az = metal::abs(z);
+    float2 t = float2(1.0f) / (float2(1.0f) + 0.3275911f * az);
+    float2 p = (((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t
+                  - 0.284496736f) * t + 0.254829592f) * t);
+    float2 erf_value = metal::copysign(float2(1.0f) - p * metal::exp(-az * az), z);
+    return bf16_2(0.5f * xf * (float2(1.0f) + erf_value));)
 /**
  * @brief SiLU / swish activation: silu(x) = x / (1 + exp(-x)) = x * sigmoid(x). (For SwiGLU.)
  */

@@ -18,6 +18,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "tk_launch.h"
 
@@ -118,16 +119,27 @@ static void tk_encode(F fn) {
 // ----------------------------- kernels -----------------------------
 static at::Tensor layernorm_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                 const at::Tensor& b_in, double eps) {
-  TORCH_CHECK(x_in.device().is_mps(), "layernorm: x must be an MPS tensor");
-  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "layernorm: x must be bfloat16");
+  TORCH_CHECK(x_in.device().is_mps() && w_in.device().is_mps() &&
+              b_in.device().is_mps(), "layernorm: inputs must be MPS tensors");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16 &&
+              w_in.scalar_type() == at::kBFloat16 &&
+              b_in.scalar_type() == at::kBFloat16 && x_in.dim() > 0,
+              "layernorm: inputs must be bfloat16 and x must have at least one dimension");
+  const int D = x_in.size(-1);
+  TORCH_CHECK(D > 0 && D % 4 == 0 && w_in.dim() == 1 && b_in.dim() == 1 &&
+              w_in.size(0) == D && b_in.size(0) == D,
+              "layernorm: weight/bias must match a positive last dim divisible by 4");
   auto x = x_in.contiguous(), w = w_in.contiguous(), b = b_in.contiguous();
-  const int D = x.size(-1);
-  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
-              "layernorm: last dim must be 256/512/768/1024");
   const uint32_t M = static_cast<uint32_t>(x.numel() / D);
   auto out = at::empty_like(x);
   const float eps_f = static_cast<float>(eps);
-  tk_encode([&](TorchEncoder& e) { tk::launch_layernorm(e, x, w, b, out, M, D, eps_f); });
+  tk_encode([&](TorchEncoder& e) {
+    if (D == 256 || D == 512 || D == 768 || D == 1024) {
+      tk::launch_layernorm(e, x, w, b, out, M, D, eps_f);
+    } else {
+      tk::launch_layernorm_dyn(e, x, w, b, out, M, D, eps_f);
+    }
+  });
   return out;
 }
 
@@ -3773,21 +3785,39 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
   return out;
 }
 
-// Fused LM-head + sampling over quantized (q8_0/q4_0) weights (dequantized on read).
+// Fused LM-head + sampling over quantized q8_0/q4_0/q6_K weights (dequantized on read).
 static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
                                        const at::Tensor& bias_in, int64_t V, int64_t K,
                                        const std::string& fmt, int64_t mode, int64_t topk,
                                        double temperature, int64_t seed, double top_p) {
-  TORCH_CHECK(h_in.device().is_mps() && tk_is_float_dtype(h_in),
-              "lm_head_sample_q: h must be a float MPS tensor");
+  TORCH_CHECK(h_in.device().is_mps() && Wq_in.device().is_mps() &&
+              bias_in.device().is_mps() && tk_is_float_dtype(h_in),
+              "lm_head_sample_q: inputs must be MPS and h must be floating point");
   TORCH_CHECK(h_in.dim() == 2 && h_in.size(1) == K, "lm_head_sample_q: h must be (T, K)");
   TORCH_CHECK(mode >= 0 && mode <= 3,
               "lm_head_sample_q: mode 0=argmax, 1=categorical, 2=topk, 3=topp");
+  TORCH_CHECK(temperature > 0.0, "lm_head_sample_q: temperature must be positive");
+  int block_k = 0, block_bytes = 0;
+  if (fmt == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (fmt == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (fmt == "q6_K") {
+    block_k = 256; block_bytes = 210;
+    TORCH_CHECK(h_in.scalar_type() == at::kFloat && mode <= 1,
+                "lm_head_sample_q: q6_K requires fp32 h and argmax/categorical mode");
+  } else {
+    TORCH_CHECK(false, "lm_head_sample_q: format must be q8_0, q4_0, or q6_K");
+  }
+  TORCH_CHECK(K % block_k == 0 && Wq_in.scalar_type() == at::kByte && Wq_in.dim() == 3 &&
+              Wq_in.size(0) == V && Wq_in.size(1) == K / block_k &&
+              Wq_in.size(2) == block_bytes,
+              "lm_head_sample_q: packed weight shape does not match V/K/format");
   constexpr int TILE_V = 256;
   auto h = h_in.contiguous();
   auto Wq = Wq_in.to(at::kByte).contiguous();
   auto bias = bias_in.to(at::kFloat).contiguous();
   const int T = h.size(0);
+  TORCH_CHECK(T > 0 && V > 0 && K > 0,
+              "lm_head_sample_q: T, V, and K must be positive");
   const int num_vtiles = (static_cast<int>(V) + TILE_V - 1) / TILE_V;
   const int use_bias = bias.numel() > 1 ? 1 : 0;
   const std::string tn = tk_type_name(h);
@@ -4346,9 +4376,13 @@ static at::Tensor qgemm_actorder_k_mps(const at::Tensor& wq_in, const at::Tensor
 
 static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                             const std::string& format) {
-  TORCH_CHECK(wq_in.device().is_mps(), "qgemv: wq must be an MPS tensor");
+  TORCH_CHECK(wq_in.device().is_mps() && x_in.device().is_mps(),
+              "qgemv: inputs must be MPS tensors");
   TORCH_CHECK(wq_in.scalar_type() == at::kByte, "qgemv: wq must be uint8 packed blocks");
-  TORCH_CHECK(x_in.scalar_type() == at::kHalf, "qgemv: x must be float16");
+  TORCH_CHECK(x_in.scalar_type() == at::kHalf ||
+              (x_in.scalar_type() == at::kFloat &&
+               (format == "q4_0" || format == "q6_K")),
+              "qgemv: x must be float16, or fp32 for q4_0/q6_K");
   auto wq = wq_in.contiguous(), x = x_in.contiguous();
   TORCH_CHECK(wq.dim() == 3 && x.dim() == 2 && x.size(1) == 1, "qgemv: wq (N,K/bk,bytes), x (K,1)");
   const int block_k = (format == "q4_K" || format == "iq4_xs" || format == "iq2_xxs" || format == "iq2_xs" || format == "iq3_xxs" || format == "iq1_s" || format == "q2_K" || format == "q3_K" || format == "q5_K" || format == "q6_K" || format == "tq2_0") ? 256
@@ -4356,9 +4390,16 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                     : (format == "hqq") ? 64
                     : (format == "nvfp4") ? 16 : 32;
   const int N = wq.size(0), K = (int)wq.size(1) * block_k;
-  TORCH_CHECK(x.size(0) == K, "qgemv: x rows must equal K");
+  TORCH_CHECK(x.size(0) == K && N > 0 && K > 0,
+              "qgemv: x rows must equal K; N and K must be positive");
+  TORCH_CHECK(x.scalar_type() != at::kFloat ||
+              (format == "q4_0" && wq.size(2) == 18) ||
+              (format == "q6_K" && wq.size(2) == 210),
+              "qgemv: fp32 packed block width does not match format");
   auto out = at::empty({N, 1}, x.options());
-  tk_encode([&](TorchEncoder& e) { tk::launch_qgemv(e, out, wq, x, N, K, format); });
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qgemv(e, out, wq, x, N, K, format, tk_type_name(x));
+  });
   return out;
 }
 
@@ -4470,6 +4511,315 @@ static at::Tensor qgemm_w2a8_mps(const at::Tensor& wq_in, const at::Tensor& xq_i
   auto out = at::empty({N, M}, as.options());
   tk_encode([&](TorchEncoder& e) { tk::launch_qgemm_w2a8(e, out, wq, xq, as, N, K, M); });
   return out;
+}
+
+// ---------------------- Fused and specialized kernels ----------------------
+
+static std::tuple<at::Tensor, at::Tensor> decode_layernorm_add_mps(
+    const at::Tensor& x_in, const at::Tensor& residual_in,
+    const at::Tensor& weight_in, const at::Tensor& bias_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps() && residual_in.device().is_mps() &&
+              weight_in.device().is_mps() && bias_in.device().is_mps() &&
+              tk_is_float_dtype(x_in) && x_in.dim() > 0 && x_in.numel() > 0,
+              "decode_layernorm_add: inputs must be non-empty MPS tensors");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kBFloat16,
+              "decode_layernorm_add: dtype must be fp32 or bf16");
+  TORCH_CHECK(residual_in.sizes() == x_in.sizes() &&
+              residual_in.scalar_type() == x_in.scalar_type(),
+              "decode_layernorm_add: residual must match x");
+  const int dimension = x_in.size(-1);
+  TORCH_CHECK(dimension > 0 && weight_in.dim() == 1 && bias_in.dim() == 1 &&
+              weight_in.size(0) == dimension && bias_in.size(0) == dimension &&
+              weight_in.scalar_type() == x_in.scalar_type() &&
+              bias_in.scalar_type() == x_in.scalar_type(),
+              "decode_layernorm_add: weight/bias must match final dimension and dtype");
+  auto x = x_in.contiguous(), residual = residual_in.contiguous();
+  auto weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  auto normalized = at::empty_like(x), summed = at::empty_like(x);
+  const int rows = x.numel() / dimension;
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_layernorm_add(
+        e, x, residual, weight, bias, normalized, summed, rows, dimension,
+        static_cast<float>(eps), tk_type_name(x));
+  });
+  return {normalized, summed};
+}
+
+static at::Tensor attn_decode_bh_mps(
+    const at::Tensor& q_in, const at::Tensor& k_in, const at::Tensor& v_in,
+    int64_t context_length) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in),
+              "attn_decode_bh: q must be float MPS");
+  TORCH_CHECK(k_in.device().is_mps() && v_in.device().is_mps() &&
+              q_in.dim() == 3 && k_in.dim() == 4 && v_in.sizes() == k_in.sizes(),
+              "attn_decode_bh: q (B,Hq,D), k/v (B,Hkv,cache_T,D)");
+  TORCH_CHECK(q_in.scalar_type() == k_in.scalar_type() &&
+              k_in.scalar_type() == v_in.scalar_type(), "attn_decode_bh: dtypes must match");
+  const int B = q_in.size(0), Hq = q_in.size(1), D = q_in.size(2);
+  const int Hkv = k_in.size(1), cache_T = k_in.size(2);
+  TORCH_CHECK(B > 0 && Hq > 0 && D > 0 && k_in.size(0) == B &&
+              k_in.size(3) == D && D <= 128 && cache_T > 0 && Hkv > 0 &&
+              Hq % Hkv == 0 && context_length > 0 && context_length <= cache_T,
+              "attn_decode_bh: incompatible shapes/context length");
+  auto q = q_in.contiguous(), k = k_in.contiguous(), v = v_in.contiguous();
+  auto out = at::empty_like(q);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_decode_bh(e, q, k, v, out, B, static_cast<int>(context_length),
+                              cache_T, Hq, Hkv, D, tk_type_name(q));
+  });
+  return out;
+}
+
+static at::Tensor swin_attn_d32_mps(
+    const at::Tensor& qkv_in, const at::Tensor& relative_bias_in,
+    const at::Tensor& mask_in, int64_t windows_per_image) {
+  TORCH_CHECK(qkv_in.device().is_mps() && relative_bias_in.device().is_mps() &&
+              mask_in.device().is_mps() && tk_is_float_dtype(qkv_in),
+              "swin_attn_d32: inputs must be MPS and qkv must be floating point");
+  TORCH_CHECK(qkv_in.dim() == 5 && qkv_in.size(2) == 3 && qkv_in.size(4) == 32,
+              "swin_attn_d32: qkv must be (BW,N,3,H,32)");
+  const int BW = qkv_in.size(0), N = qkv_in.size(1), H = qkv_in.size(3);
+  TORCH_CHECK(BW > 0 && N > 0 && H > 0 && windows_per_image >= 0,
+              "swin_attn_d32: BW, N, and H must be positive; windows_per_image cannot be negative");
+  TORCH_CHECK(relative_bias_in.scalar_type() == qkv_in.scalar_type() &&
+              relative_bias_in.dim() == 3 && relative_bias_in.size(0) == H &&
+              relative_bias_in.size(1) == N && relative_bias_in.size(2) == N,
+              "swin_attn_d32: relative_bias must be (H,N,N) with qkv dtype");
+  const bool has_mask = mask_in.dim() == 3;
+  TORCH_CHECK((!has_mask && mask_in.numel() == 1) ||
+              (has_mask && windows_per_image > 0 &&
+               mask_in.size(0) == windows_per_image &&
+               mask_in.size(1) == N && mask_in.size(2) == N),
+              "swin_attn_d32: mask must be (windows_per_image,N,N) or scalar placeholder");
+  auto qkv = qkv_in.contiguous(), relative_bias = relative_bias_in.contiguous();
+  auto mask = mask_in.to(at::kFloat).contiguous();
+  auto output = at::empty({BW, N, H, 32}, qkv.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_swin_attn_d32(e, qkv, relative_bias, mask, output, BW, N, H,
+                             static_cast<int>(windows_per_image), has_mask ? 1 : 0,
+                             tk_type_name(qkv));
+  });
+  return output;
+}
+
+static at::Tensor patch_merge_layernorm_mps(
+    const at::Tensor& input_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, int64_t height, int64_t width, double eps) {
+  TORCH_CHECK(input_in.device().is_mps() && weight_in.device().is_mps() &&
+              bias_in.device().is_mps() && input_in.scalar_type() == at::kBFloat16 &&
+              input_in.dim() == 3 && height > 0 && width > 0,
+              "patch_merge_layernorm: input must be bf16 (B,H*W,C)");
+  const int B = input_in.size(0), C = input_in.size(2), D = 4 * C;
+  TORCH_CHECK(B > 0 && C > 0 && input_in.size(1) == height * width && weight_in.dim() == 1 &&
+              bias_in.dim() == 1 && weight_in.size(0) == D && bias_in.size(0) == D &&
+              weight_in.scalar_type() == at::kBFloat16 &&
+              bias_in.scalar_type() == at::kBFloat16,
+              "patch_merge_layernorm: spatial or weight/bias shape mismatch");
+  auto input = input_in.contiguous(), weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  const int patches = ((static_cast<int>(height) + 1) / 2) *
+                      ((static_cast<int>(width) + 1) / 2);
+  auto output = at::empty({B, patches, D}, input.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_patch_merge_layernorm(e, input, weight, bias, output, B,
+                                     static_cast<int>(height), static_cast<int>(width), C,
+                                     static_cast<float>(eps));
+  });
+  return output;
+}
+
+static at::Tensor edge_mlp_256x7_mps(
+    const at::Tensor& hidden_in, const at::Tensor& first_weight_in,
+    const at::Tensor& first_bias_in, const at::Tensor& second_weight_in,
+    const at::Tensor& second_bias_in) {
+  TORCH_CHECK(hidden_in.device().is_mps() && first_weight_in.device().is_mps() &&
+              first_bias_in.device().is_mps() && second_weight_in.device().is_mps() &&
+              second_bias_in.device().is_mps() &&
+              (hidden_in.scalar_type() == at::kFloat ||
+               hidden_in.scalar_type() == at::kBFloat16) &&
+              hidden_in.dim() == 3 && hidden_in.size(2) == 256,
+              "edge_mlp_256x7: hidden must be fp32/bf16 (B,L,256)");
+  const auto dtype = hidden_in.scalar_type();
+  TORCH_CHECK(hidden_in.size(0) > 0 && hidden_in.size(1) > 0 &&
+              first_weight_in.sizes() == at::IntArrayRef({256, 512}) &&
+              first_bias_in.sizes() == at::IntArrayRef({256}) &&
+              second_weight_in.sizes() == at::IntArrayRef({7, 256}) &&
+              second_bias_in.sizes() == at::IntArrayRef({7}) &&
+              first_weight_in.scalar_type() == dtype && first_bias_in.scalar_type() == dtype &&
+              second_weight_in.scalar_type() == dtype && second_bias_in.scalar_type() == dtype,
+              "edge_mlp_256x7: expected weights (256,512)/(7,256) and biases (256,)/(7,)");
+  auto hidden = hidden_in.contiguous(), first_weight = first_weight_in.contiguous();
+  auto first_bias = first_bias_in.contiguous(), second_weight = second_weight_in.contiguous();
+  auto second_bias = second_bias_in.contiguous();
+  const int B = hidden.size(0), L = hidden.size(1);
+  auto output = at::empty({B, 7, L, L}, hidden.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_edge_mlp_256x7(e, hidden, first_weight, first_bias, second_weight,
+                              second_bias, output, B, L, tk_type_name(hidden));
+  });
+  return output;
+}
+
+static void check_decode_linear(
+    const at::Tensor& x, const at::Tensor& weight, const at::Tensor& bias,
+    const char* name) {
+  TORCH_CHECK(x.device().is_mps() && weight.device().is_mps() && bias.device().is_mps() &&
+              (x.scalar_type() == at::kFloat ||
+              x.scalar_type() == at::kBFloat16) && x.dim() == 2 && weight.dim() == 2 &&
+              bias.dim() == 1 && x.scalar_type() == weight.scalar_type() &&
+              x.scalar_type() == bias.scalar_type() && x.size(1) == weight.size(1) &&
+              bias.size(0) == weight.size(0) && x.size(0) > 0 && x.size(1) > 0 &&
+              weight.size(0) > 0, name,
+              ": expected x (B,K), weight (N,K), bias (N,), same fp32/bf16 dtype");
+}
+
+static at::Tensor decode_linear_mps(
+    const at::Tensor& x_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, bool gelu) {
+  check_decode_linear(x_in, weight_in, bias_in, "decode_linear");
+  auto x = x_in.contiguous(), weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  const int B = x.size(0), K = x.size(1), N = weight.size(0);
+  auto output = at::empty({B, N}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_linear(e, x, weight, bias, output, B, K, N, gelu,
+                             tk_type_name(x));
+  });
+  return output;
+}
+
+static at::Tensor decode_linear_residual_mps(
+    const at::Tensor& x_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, const at::Tensor& residual_in) {
+  check_decode_linear(x_in, weight_in, bias_in, "decode_linear_residual");
+  TORCH_CHECK(residual_in.device().is_mps() && residual_in.dim() == 2 &&
+              residual_in.size(0) == x_in.size(0) &&
+              residual_in.size(1) == weight_in.size(0) &&
+              residual_in.scalar_type() == x_in.scalar_type(),
+              "decode_linear_residual: residual must be (B,N) with x dtype");
+  auto x = x_in.contiguous(), weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  auto residual = residual_in.contiguous();
+  const int B = x.size(0), K = x.size(1), N = weight.size(0);
+  auto output = at::empty({B, N}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_linear_residual(e, x, weight, bias, residual, output, B, K, N,
+                                      tk_type_name(x));
+  });
+  return output;
+}
+
+static at::Tensor decode_linear_q8_mps(
+    const at::Tensor& x_in, const at::Tensor& weight_in, const at::Tensor& bias_in,
+    const at::Tensor& residual_in, bool gelu, bool use_residual) {
+  TORCH_CHECK(x_in.device().is_mps() && weight_in.device().is_mps() &&
+              bias_in.device().is_mps() && residual_in.device().is_mps() &&
+              (x_in.scalar_type() == at::kFloat ||
+              x_in.scalar_type() == at::kBFloat16) && x_in.dim() == 2 &&
+              weight_in.scalar_type() == at::kByte && weight_in.dim() == 3 &&
+              weight_in.size(2) == 34, "decode_linear_q8: bad input/packed weight");
+  const int B = x_in.size(0), K = x_in.size(1), N = weight_in.size(0);
+  TORCH_CHECK(B > 0 && K > 0 && N > 0 && K % 32 == 0 &&
+              weight_in.size(1) == K / 32 && bias_in.dim() == 1 &&
+              bias_in.size(0) == N && bias_in.scalar_type() == x_in.scalar_type(),
+              "decode_linear_q8: packed K or bias mismatch");
+  TORCH_CHECK(!use_residual || (residual_in.dim() == 2 && residual_in.size(0) == B &&
+              residual_in.size(1) == N && residual_in.scalar_type() == x_in.scalar_type()),
+              "decode_linear_q8: residual must be (B,N) with x dtype");
+  auto x = x_in.contiguous(), weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  auto residual = residual_in.contiguous();
+  auto output = at::empty({B, N}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_linear_q8(e, x, weight, bias, residual, output, B, K, N,
+                                gelu, use_residual, tk_type_name(x));
+  });
+  return output;
+}
+
+static at::Tensor dequant_gather_mps(
+    const at::Tensor& table_in, const at::Tensor& ids_in,
+    const std::string& format, double scale) {
+  int block_k = 0, block_bytes = 0;
+  if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else { TORCH_CHECK(false, "dequant_gather: format must be q4_0, q8_0, or q6_K"); }
+  TORCH_CHECK(table_in.device().is_mps() && ids_in.device().is_mps() &&
+              table_in.scalar_type() == at::kByte && table_in.dim() == 3 &&
+              table_in.size(0) > 0 && table_in.size(1) > 0 &&
+              table_in.size(2) == block_bytes && ids_in.numel() > 0,
+              "dequant_gather: table must be packed uint8 (rows,blocks,block_bytes)");
+  auto table = table_in.contiguous(), ids = ids_in.to(at::kInt).contiguous();
+  const int rows = table.size(0), columns = table.size(1) * block_k;
+  auto shape = ids.sizes().vec();
+  shape.push_back(columns);
+  auto output = at::empty(shape, table.options().dtype(at::kHalf));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_dequant_gather(e, table, ids, output, rows, columns, ids.numel(),
+                              static_cast<float>(scale), format);
+  });
+  return output;
+}
+
+static std::tuple<at::Tensor, at::Tensor> lm_head_constrained_mps(
+    const at::Tensor& h_in, const at::Tensor& weight_in, const at::Tensor& bias_in,
+    const at::Tensor& forbidden_in, const at::Tensor& previous_in,
+    int64_t eos_id, bool forbid_eos) {
+  TORCH_CHECK(h_in.device().is_mps() && weight_in.device().is_mps() &&
+              bias_in.device().is_mps() && forbidden_in.device().is_mps() &&
+              previous_in.device().is_mps() && tk_is_float_dtype(h_in) && h_in.dim() == 2 &&
+              weight_in.dim() == 2 && h_in.size(1) == weight_in.size(1) &&
+              h_in.scalar_type() == weight_in.scalar_type(),
+              "lm_head_constrained: h (T,K), weight (V,K), same float dtype");
+  const int T = h_in.size(0), K = h_in.size(1), V = weight_in.size(0);
+  TORCH_CHECK(T > 0 && K > 0 && V > 0,
+              "lm_head_constrained: T, K, and V must be positive");
+  TORCH_CHECK(forbidden_in.scalar_type() == at::kByte && forbidden_in.dim() == 2 &&
+              forbidden_in.size(0) == V && forbidden_in.size(1) == V,
+              "lm_head_constrained: forbidden must be uint8 (V,V)");
+  TORCH_CHECK(previous_in.numel() == T, "lm_head_constrained: previous must have T ids");
+  TORCH_CHECK(!forbid_eos || (eos_id >= 0 && eos_id < V),
+              "lm_head_constrained: invalid eos_id");
+  const int use_bias = bias_in.numel() > 1 ? 1 : 0;
+  TORCH_CHECK(!use_bias || (bias_in.dim() == 1 && bias_in.size(0) == V),
+              "lm_head_constrained: bias must be (V,) or scalar placeholder");
+  constexpr int TILE_V = 256;
+  const int num_vtiles = (V + TILE_V - 1) / TILE_V;
+  auto h = h_in.contiguous(), weight = weight_in.contiguous();
+  auto bias = bias_in.to(at::kFloat).contiguous();
+  auto forbidden = forbidden_in.contiguous(), previous = previous_in.to(at::kInt).contiguous();
+  auto f32 = h.options().dtype(at::kFloat), i32 = h.options().dtype(at::kInt);
+  auto part_max = at::empty({T, num_vtiles}, f32);
+  auto part_sum = at::empty({T, num_vtiles}, f32);
+  auto part_best = at::empty({T, num_vtiles}, f32);
+  auto part_id = at::empty({T, num_vtiles}, i32);
+  auto token = at::empty({T}, i32), logprob = at::empty({T}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_constrained_partials(
+        e, h, weight, bias, forbidden, previous, part_max, part_sum, part_best, part_id,
+        V, K, TILE_V, num_vtiles, use_bias, static_cast<int>(eos_id),
+        forbid_eos ? 1 : 0, T, tk_type_name(h));
+    tk::launch_lm_head_constrained_reduce(
+        e, part_max, part_sum, part_best, part_id, token, logprob, num_vtiles, T);
+  });
+  return {token, logprob};
+}
+
+static at::Tensor flux_gelu_erf_mps(
+    const at::Tensor& x_in, const at::Tensor& weight_in, const at::Tensor& bias_in) {
+  TORCH_CHECK(x_in.device().is_mps() && weight_in.device().is_mps() &&
+              bias_in.device().is_mps() && x_in.dim() == 2 && weight_in.dim() == 2 &&
+              x_in.size(1) == weight_in.size(0) && x_in.scalar_type() == weight_in.scalar_type() &&
+              bias_in.dim() == 1 && bias_in.size(0) == weight_in.size(1) &&
+              bias_in.scalar_type() == x_in.scalar_type() &&
+              (x_in.scalar_type() == at::kFloat || x_in.scalar_type() == at::kBFloat16),
+              "flux_gelu_erf: expected compatible fp32/bf16 GEMM inputs");
+  auto x = x_in.contiguous(), weight = weight_in.contiguous(), bias = bias_in.contiguous();
+  const int N = x.size(0), K = x.size(1), M = weight.size(1);
+  TORCH_CHECK(N > 0 && K > 0 && M > 0 && N % 32 == 0 && M % 32 == 0 && K % 16 == 0,
+              "flux_gelu_erf: N%32, M%32, K%16 required");
+  auto output = at::empty({N, M}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_flux_gelu_erf(e, output, x, weight, bias, N, K, M, tk_type_name(x));
+  });
+  return output;
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -4836,4 +5186,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qgemv_w2a8_v2", &qgemv_w2a8_v2_mps, "ThunderMittens BitNet W2A8 int decode GEMV v2 (MPS)");
   m.def("qgemm_w8a8", &qgemm_w8a8_mps, "ThunderMittens W8A8 int8 prefill GEMM (MPS)");
   m.def("qgemm_w2a8", &qgemm_w2a8_mps, "ThunderMittens BitNet W2A8 prefill GEMM (MPS)");
+  m.def("decode_layernorm_add", &decode_layernorm_add_mps,
+        "decode-compatible residual-add + LayerNorm (MPS)");
+  m.def("attn_decode_bh", &attn_decode_bh_mps,
+        "batched head-major GQA attention decode (MPS)");
+  m.def("swin_attn_d32", &swin_attn_d32_mps,
+        "Swin packed-QKV window attention, D=32 (MPS)");
+  m.def("patch_merge_layernorm", &patch_merge_layernorm_mps,
+        "fused Swin patch merge + LayerNorm (MPS)");
+  m.def("edge_mlp_256x7", &edge_mlp_256x7_mps,
+        "fixed pairwise 512-to-256-to-7 edge MLP (MPS)");
+  m.def("decode_linear", &decode_linear_mps,
+        "latency-oriented decode linear with optional erf GELU (MPS)");
+  m.def("decode_linear_residual", &decode_linear_residual_mps,
+        "decode linear + materialized-order residual (MPS)");
+  m.def("decode_linear_q8", &decode_linear_q8_mps,
+        "q8_0 decode linear with optional GELU/residual (MPS)");
+  m.def("dequant_gather", &dequant_gather_mps,
+        "packed GGUF gather + direct fp16 dequantization (MPS)");
+  m.def("lm_head_constrained", &lm_head_constrained_mps,
+        "dense constrained LM head returning token and logprob (MPS)");
+  m.def("flux_gelu_erf", &flux_gelu_erf_mps,
+        "fused GEMM + erf GELU (MPS)");
 }

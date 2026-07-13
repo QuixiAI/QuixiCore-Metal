@@ -17,8 +17,8 @@ implemented natively for Apple GPUs.
 - Correctness, parity, and benchmark harnesses for the supported integrations.
 
 Kernel coverage includes normalization, activation, attention, linear attention,
-state-space, matmul, quantization, MoE, sampling, serving, optimizer, and utility
-operations. The exact supported surface is tracked in
+state-space, matmul, quantization, vision, MoE, sampling, serving, optimizer, and
+utility operations. The exact supported surface is tracked in
 [`.quixicore/kernels.yaml`](.quixicore/kernels.yaml).
 
 ## Requirements

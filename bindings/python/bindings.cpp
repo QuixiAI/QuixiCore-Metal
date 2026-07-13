@@ -120,6 +120,11 @@
 #include "attn_q/attn_q.h"
 #include "attn_decode/attn_decode.h"
 #include "qgemm_int/qgemm_int.h"
+#include "swin_attn/swin_attn.h"
+#include "decode_linear/decode_linear.h"
+#include "dequant_gather/dequant_gather.h"
+#include "edge_mlp/edge_mlp.h"
+#include "patch_merge/patch_merge.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -272,6 +277,12 @@ NB_MODULE(_ext, m) {
         fused residual-add + layernorm. Returns (out, x+residual):
         out = layernorm(x + residual) * weight + bias
       )");
+
+    m.def(
+      "decode_layernorm_add", &decode_layernorm_add,
+      "x"_a, "residual"_a, "weight"_a, "bias"_a,
+      "eps"_a = 1e-5f, nb::kw_only(), "stream"_a = nb::none(),
+      R"(decode-compatible residual-add + LayerNorm with materialized rounding semantics.)");
 
     m.def(
       "rms_norm_add_fp8", &rms_norm_add_fp8,
@@ -1680,6 +1691,13 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "lm_head_constrained", &lm_head_constrained,
+      "h"_a, "w"_a, "bias"_a, "forbidden"_a, "previous"_a,
+      "eos_id"_a = -1, "forbid_eos"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(dense projection + row-conditioned grammar mask + greedy token and log-probability.)");
+
+    m.def(
       "cross_entropy_fwd",
       &cross_entropy_fwd,
       "logits"_a,
@@ -1798,6 +1816,12 @@ NB_MODULE(_ext, m) {
       R"(
         fused GEMM + GELU: gelu(x @ w + bias)
       )");
+
+    m.def(
+      "flux_gelu_erf", &flux_gelu_erf,
+      "x"_a, "w"_a, "bias"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused GEMM + erf GELU.)");
 
     m.def(
       "flux_gate",
@@ -2089,6 +2113,12 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "dequant_gather", &dequant_gather,
+      "table"_a, "ids"_a, "format"_a, "scale"_a = 1.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(gather packed GGUF rows and dequantize directly to fp16.)");
+
+    m.def(
       "qflux_gelu",
       &qflux_gelu,
       "wq"_a,
@@ -2133,6 +2163,50 @@ NB_MODULE(_ext, m) {
       R"(
         batch-1 GQA decode attention over dense KV: q (Hq,D), k/v (Tk,Hkv,D)
       )");
+
+    m.def(
+      "attn_decode_bh", &attn_decode_bh,
+      "q"_a, "k"_a, "v"_a, "context_length"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(batched head-major GQA decode over a preallocated dense KV cache.)");
+
+    m.def(
+      "swin_attn_d32", &swin_attn_d32,
+      "qkv"_a, "relative_bias"_a, "mask"_a, "windows_per_image"_a = 0,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Swin window attention for packed qkv with head dimension 32.)");
+
+    m.def(
+      "patch_merge_layernorm", &patch_merge_layernorm,
+      "input"_a, "weight"_a, "bias"_a, "height"_a, "width"_a,
+      "eps"_a = 1e-5f, nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused Swin 2x2 patch gather and LayerNorm.)");
+
+    m.def(
+      "edge_mlp_256x7", &edge_mlp_256x7,
+      "hidden"_a, "first_weight"_a, "first_bias"_a,
+      "second_weight"_a, "second_bias"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fixed 512-to-256-to-7 pairwise edge MLP.)");
+
+    m.def(
+      "decode_linear", &decode_linear,
+      "x"_a, "weight"_a, "bias"_a, "gelu"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(latency-oriented decode linear with optional erf GELU.)");
+
+    m.def(
+      "decode_linear_residual", &decode_linear_residual,
+      "x"_a, "weight"_a, "bias"_a, "residual"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(decode linear plus materialized-order residual addition.)");
+
+    m.def(
+      "decode_linear_q8", &decode_linear_q8,
+      "x"_a, "weight"_a, "bias"_a, "residual"_a,
+      "gelu"_a = false, "use_residual"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(q8_0 decode linear with optional erf GELU and residual.)");
 
     m.def(
       "qgemv_w2a8",

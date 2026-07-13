@@ -74,6 +74,46 @@ std::pair<std::vector<array>, std::vector<int>> FluxGelu::vmap(
 bool FluxGelu::is_equivalent(const Primitive&) const { return true; }
 
 ///////////////////////////////////////////////////////////////////////////////
+// flux_gelu_erf
+///////////////////////////////////////////////////////////////////////////////
+
+array flux_gelu_erf(const array& x, const array& w, const array& bias, StreamOrDevice s) {
+  check_gemm_shapes(x, w);
+  assert(bias.ndim() == 1 && bias.shape(0) == w.shape(1) && bias.dtype() == x.dtype());
+  return array({x.shape(0), w.shape(1)}, x.dtype(),
+               std::make_shared<FluxGeluErf>(to_stream(s)), {x, w, bias});
+}
+
+void FluxGeluErf::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("FluxGeluErf has no CPU implementation.");
+}
+void FluxGeluErf::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& output = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_flux_gelu_erf(
+      enc, output, inputs[0], inputs[1], inputs[2], inputs[0].shape(0),
+      inputs[0].shape(1), inputs[1].shape(1), type_to_name(output));
+}
+std::vector<array> FluxGeluErf::jvp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("FluxGeluErf has no jvp implementation.");
+}
+std::vector<array> FluxGeluErf::vjp(
+    const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+    const std::vector<array>&) {
+  throw std::runtime_error("FluxGeluErf has no vjp implementation.");
+}
+std::pair<std::vector<array>, std::vector<int>> FluxGeluErf::vmap(
+    const std::vector<array>&, const std::vector<int>&) {
+  throw std::runtime_error("FluxGeluErf has no vmap implementation.");
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // flux_gate
 ///////////////////////////////////////////////////////////////////////////////
 

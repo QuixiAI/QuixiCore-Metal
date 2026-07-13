@@ -32,13 +32,20 @@ static int qgemv_block_k(const std::string& fmt) {
 
 array qgemv(const array& wq, const array& x, const std::string& format, StreamOrDevice s) {
   assert(wq.dtype() == uint8 && "qgemv: wq must be a packed uint8 weight-block array");
-  assert(x.dtype() == float16 && "qgemv: x must be float16");
+  assert((x.dtype() == float16 ||
+          (x.dtype() == float32 && (format == "q4_0" || format == "q6_K"))) &&
+         "qgemv: x must be float16, or float32 for q4_0/q6_K");
   assert(wq.ndim() == 3 && x.ndim() == 2 && x.shape(1) == 1 && "qgemv: wq (N,K/bk,bytes), x (K,1)");
   const int N = wq.shape(0);
   const int K = wq.shape(1) * qgemv_block_k(format);
   assert(x.shape(0) == K && "qgemv: x rows must equal K");
+  assert((x.dtype() != float32 ||
+          (format == "q4_0" && wq.shape(2) == 18) ||
+          (format == "q6_K" && wq.shape(2) == 210)) &&
+         "qgemv: fp32 packed block width does not match format");
+  assert(N > 0 && K > 0 && "qgemv: N and K must be positive");
   (void)N; (void)K;
-  return array({N, 1}, float16, std::make_shared<QGemv>(to_stream(s), format), {wq, x});
+  return array({N, 1}, x.dtype(), std::make_shared<QGemv>(to_stream(s), format), {wq, x});
 }
 
 void QGemv::eval(const std::vector<array>&, std::vector<array>&) { assert(false); }
@@ -54,7 +61,7 @@ void QGemv::eval_gpu(const std::vector<array>& inputs, std::vector<array>& outpu
   const int K = wq.shape(1) * qgemv_block_k(fmt_);
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_qgemv(enc, out, wq, x, N, K, fmt_);
+  tk::launch_qgemv(enc, out, wq, x, N, K, fmt_, type_to_name(x));
 }
 
 std::vector<array> QGemv::jvp(const std::vector<array>&, const std::vector<array>&,

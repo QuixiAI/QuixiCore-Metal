@@ -150,6 +150,14 @@ void launch_layernorm(E& e, typename E::in_t x, typename E::in_t w, typename E::
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 template <class E>
+void launch_layernorm_dyn(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t b,
+                          typename E::out_t o, uint32_t M, int D, float eps) {
+  e.pipeline("layernorm_dyn_bfloat16");
+  e.in(x, 0); e.in(w, 1); e.in(b, 2); e.out(o, 3);
+  e.bytes(M, 4); e.bytes(eps, 5); e.bytes(D, 6);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+template <class E>
 void launch_layernorm_bwd_dx(E& e, typename E::in_t x, typename E::in_t w, typename E::in_t dy,
                              typename E::in_t mean, typename E::in_t rstd, typename E::out_t dx,
                              int rows, int D, const std::string& type_name) {
@@ -253,6 +261,89 @@ void launch_attn_decode(E& e, typename E::in_t q, typename E::in_t kc, typename 
   e.dispatch(Hq, 1, 1, 32, 1, 1);
 }
 
+// Batched head-major decode: q (B,Hq,D), cache (B,Hkv,cache_T,D).
+template <class E>
+void launch_attn_decode_bh(E& e, typename E::in_t q, typename E::in_t kc,
+                           typename E::in_t vc, typename E::out_t out,
+                           int B, int Tk, int cache_T, int Hq, int Hkv, int D,
+                           const std::string& type_name) {
+  e.pipeline("attn_decode_bh_" + type_name);
+  e.in(q, 0); e.in(kc, 1); e.in(vc, 2); e.out(out, 3);
+  e.bytes(Tk, 4); e.bytes(Hq, 5); e.bytes(Hkv, 6); e.bytes(D, 7); e.bytes(cache_T, 8);
+  e.dispatch(Hq, B, 1, 32, 1, 1);
+}
+
+// Swin window attention over packed qkv (BW,N,3,H,32).
+template <class E>
+void launch_swin_attn_d32(E& e, typename E::in_t qkv, typename E::in_t relative_bias,
+                          typename E::in_t mask, typename E::out_t output,
+                          int BW, int N, int H, int windows_per_image, int has_mask,
+                          const std::string& type_name) {
+  e.pipeline("swin_attn_d32_" + type_name);
+  e.in(qkv, 0); e.in(relative_bias, 1); e.in(mask, 2); e.out(output, 3);
+  e.bytes(BW, 4); e.bytes(N, 5); e.bytes(H, 6);
+  e.bytes(windows_per_image, 7); e.bytes(has_mask, 8);
+  e.dispatch(N, H, BW, 32, 1, 1);
+}
+
+// Swin 2x2 gather + LayerNorm. One simdgroup per output patch.
+template <class E>
+void launch_patch_merge_layernorm(E& e, typename E::in_t input, typename E::in_t weight,
+                                  typename E::in_t bias, typename E::out_t output,
+                                  int B, int H, int W, int C, float eps) {
+  e.pipeline("patch_merge_layernorm_bfloat16");
+  e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.out(output, 3);
+  e.bytes(B, 4); e.bytes(H, 5); e.bytes(W, 6); e.bytes(C, 7); e.bytes(eps, 8);
+  e.dispatch(B * ((H + 1) / 2) * ((W + 1) / 2), 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_linear(E& e, typename E::in_t input, typename E::in_t weight,
+                          typename E::in_t bias, typename E::out_t output,
+                          int B, int K, int N, bool gelu, const std::string& type_name) {
+  e.pipeline("decode_linear_" + type_name);
+  e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.out(output, 3);
+  e.bytes(B, 4); e.bytes(K, 5); e.bytes(N, 6); e.bytes(gelu ? 1 : 0, 7);
+  e.dispatch(N, B, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_linear_residual(
+    E& e, typename E::in_t input, typename E::in_t weight,
+    typename E::in_t bias, typename E::in_t residual, typename E::out_t output,
+    int B, int K, int N, const std::string& type_name) {
+  e.pipeline("decode_linear_residual_" + type_name);
+  e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.in(residual, 3); e.out(output, 4);
+  e.bytes(B, 5); e.bytes(K, 6); e.bytes(N, 7);
+  e.dispatch(N, B, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_linear_q8(
+    E& e, typename E::in_t input, typename E::in_t weight,
+    typename E::in_t bias, typename E::in_t residual, typename E::out_t output,
+    int B, int K, int N, bool gelu, bool use_residual,
+    const std::string& type_name) {
+  e.pipeline("decode_linear_q8_" + type_name);
+  e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.in(residual, 3); e.out(output, 4);
+  e.bytes(B, 5); e.bytes(K, 6); e.bytes(N, 7);
+  e.bytes(gelu ? 1 : 0, 8); e.bytes(use_residual ? 1 : 0, 9);
+  e.dispatch(N, B, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_edge_mlp_256x7(
+    E& e, typename E::in_t hidden, typename E::in_t first_weight,
+    typename E::in_t first_bias, typename E::in_t second_weight,
+    typename E::in_t second_bias, typename E::out_t output,
+    int B, int L, const std::string& type_name) {
+  e.pipeline("edge_mlp_256x7_" + type_name);
+  e.in(hidden, 0); e.in(first_weight, 1); e.in(first_bias, 2);
+  e.in(second_weight, 3); e.in(second_bias, 4); e.out(output, 5);
+  e.bytes(B, 6); e.bytes(L, 7);
+  e.dispatch(L * L, B, 1, 256, 1, 1);
+}
+
 // ----- rms_norm: x@0 w@1 -> o@2 ; M@3(u32) eps@4(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
 void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
@@ -312,6 +403,19 @@ void launch_layernorm_add(E& e, typename E::in_t x, typename E::in_t r, typename
   e.in(x, 0); e.in(r, 1); e.in(w, 2); e.in(b, 3); e.out(o, 4); e.out(res_out, 5);
   e.bytes(M, 6); e.bytes(eps, 7);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_layernorm_add(
+    E& e, typename E::in_t input, typename E::in_t residual,
+    typename E::in_t weight, typename E::in_t bias,
+    typename E::out_t normalized, typename E::out_t summed,
+    int rows, int dimension, float eps, const std::string& type_name) {
+  e.pipeline("decode_layernorm_add_" + type_name);
+  e.in(input, 0); e.in(residual, 1); e.in(weight, 2); e.in(bias, 3);
+  e.out(normalized, 4); e.out(summed, 5);
+  e.bytes(rows, 6); e.bytes(dimension, 7); e.bytes(eps, 8);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- rope_kv_insert: k@0 v@1 cos@2 sin@3 positions@4(i32) slot_mapping@5(i64) ->
@@ -2153,6 +2257,34 @@ void launch_lm_head_argcat_reduce(E& e, typename E::in_t part_val, typename E::i
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
+template <class E>
+void launch_lm_head_constrained_partials(
+    E& e, typename E::in_t h, typename E::in_t W, typename E::in_t bias,
+    typename E::in_t forbidden, typename E::in_t previous,
+    typename E::out_t part_max, typename E::out_t part_sum,
+    typename E::out_t part_best, typename E::out_t part_id,
+    int V, int K, int TILE_V, int num_vtiles, int use_bias,
+    int eos_id, int forbid_eos, int T, const std::string& type_name) {
+  e.pipeline("lm_head_constrained_partials_" + type_name);
+  e.in(h, 0); e.in(W, 1); e.in(bias, 2); e.in(forbidden, 3); e.in(previous, 4);
+  e.out(part_max, 5); e.out(part_sum, 6); e.out(part_best, 7); e.out(part_id, 8);
+  e.bytes(V, 9); e.bytes(K, 10); e.bytes(TILE_V, 11); e.bytes(num_vtiles, 12);
+  e.bytes(use_bias, 13); e.bytes(eos_id, 14); e.bytes(forbid_eos, 15);
+  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_lm_head_constrained_reduce(
+    E& e, typename E::in_t part_max, typename E::in_t part_sum,
+    typename E::in_t part_best, typename E::in_t part_id,
+    typename E::out_t out_token, typename E::out_t out_logprob,
+    int num_vtiles, int T) {
+  e.pipeline("lm_head_constrained_reduce");
+  e.in(part_max, 0); e.in(part_sum, 1); e.in(part_best, 2); e.in(part_id, 3);
+  e.out(out_token, 4); e.out(out_logprob, 5); e.bytes(num_vtiles, 6);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
 // topk partials: h@0 W@1 -> part_val@2 part_id@3 ; bias@4 ; V@5 K@6 TILE_V@7 num_vtiles@8 topk@9
 //   use_bias@10 (i32) ; grid (num_vtiles, T) × 32.
 template <class E>
@@ -2251,6 +2383,16 @@ template <class E>
 void launch_flux_gelu(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
                       typename E::in_t bias, int N, int K, int M, const std::string& t) {
   e.pipeline(flux_gelu_kernel_name(t));
+  e.out(d, 0); e.in(a, 1); e.in(b, 2); e.in(bias, 3);
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
+  e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_flux_gelu_erf(E& e, typename E::out_t d, typename E::in_t a, typename E::in_t b,
+                          typename E::in_t bias, int N, int K, int M,
+                          const std::string& t) {
+  e.pipeline("flux_gelu_erf_" + t);
   e.out(d, 0); e.in(a, 1); e.in(b, 2); e.in(bias, 3);
   e.bytes(N, 4); e.bytes(K, 5); e.bytes(M, 6);
   e.dispatch(M / 32, N / 32, 1, 32, 1, 1);
@@ -2645,9 +2787,14 @@ void launch_qdequant_fp16(E& e, typename E::out_t w, typename E::in_t wq,
 //        grid (N,1,1), 32 threads (1 simdgroup) per output row. d = W @ x, x (K,1) half. -----
 template <class E>
 void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
-                  int N, int K, const std::string& fmt) {
+                  int N, int K, const std::string& fmt,
+                  const std::string& type_name = "float16") {
   const bool use_small = K <= 512 && (fmt == "q8_0" || fmt == "q4_0");
-  e.pipeline(use_small ? qgemv_kernel_name(fmt) + "_small" : qgemv_kernel_name(fmt));
+  if (type_name == "float32") {
+    e.pipeline(qgemv_kernel_name(fmt) + "_float32");
+  } else {
+    e.pipeline(use_small ? qgemv_kernel_name(fmt) + "_small" : qgemv_kernel_name(fmt));
+  }
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4);
   // one simdgroup per output row. Geometry experiments measured and REJECTED here: two ROWS
@@ -2655,6 +2802,18 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   // doubles register pressure) and two-simdgroup split-K (3-4x better at the small BitNet
   // shapes but 2-3x worse at the K=4096 LLM shapes, both half-split and interleaved).
   e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// Packed embedding/PLE gather: table@0 ids@1 -> fp16 output@2.
+template <class E>
+void launch_dequant_gather(E& e, typename E::in_t table, typename E::in_t ids,
+                           typename E::out_t output, int rows, int columns, int tokens,
+                           float scale, const std::string& fmt) {
+  e.pipeline("dequant_gather_" + fmt);
+  e.in(table, 0); e.in(ids, 1); e.out(output, 2);
+  e.bytes(rows, 3); e.bytes(columns, 4); e.bytes(tokens, 5); e.bytes(scale, 6);
+  const long spans = (long)tokens * (columns / 8);
+  e.dispatch(static_cast<int>((spans + 255) / 256), 1, 1, 256, 1, 1);
 }
 
 // ----- qgemv_w8a8 (W8A8 int8xint8 decode): D@0 Wq@1(int8) Xq@2(int8) w_scale@3 a_scale@4 ;

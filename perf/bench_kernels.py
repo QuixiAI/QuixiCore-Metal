@@ -2491,6 +2491,325 @@ def build_dynamic_tree_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(B * N * 4))
 
 
+# --------------------------------------------------------------------------- focused kernel extensions
+def _gelu_erf_np(x):
+    """The A&S erf-GELU approximation used by the fused Metal kernels."""
+    z = x * np.float32(0.7071067811865475)
+    az = np.abs(z)
+    t = 1.0 / (1.0 + np.float32(0.3275911) * az)
+    p = (((((np.float32(1.061405429) * t - np.float32(1.453152027)) * t
+            + np.float32(1.421413741)) * t - np.float32(0.284496736)) * t
+          + np.float32(0.254829592)) * t)
+    erf = np.copysign(1.0 - p * np.exp(-az * az), z)
+    return 0.5 * x * (1.0 + erf)
+
+
+def _gelu_erf_device(be, x):
+    if be.name == "mlx":
+        return 0.5 * x * (1.0 + be.mx.erf(x * (1.0 / math.sqrt(2.0))))
+    return be.torch.nn.functional.gelu(x, approximate="none")
+
+
+@register("kernel_extensions")
+def kernel_extension_cases(be, preset, formats):
+    """Focused A/B suite for fused and specialized kernel paths.
+
+    Hypothesis: fusion and packed-format reads should win on real decode/vision
+    shapes by removing intermediate tensors or expanded weights. Small shapes
+    are included to expose launch-bound regressions and guide public routing.
+    """
+    tk = be.tk()
+    rng = np.random.default_rng(260)
+
+    # Dynamic LayerNorm: the existing fixed-width route is the current baseline;
+    # this case covers a newly supported dynamic hidden width.
+    R, D = _pick(preset, (1, 320), (8, 1536), (64, 1536))
+    x_d = be.array(rng.standard_normal((R, D)).astype(np.float32), "bf16")
+    w_d = be.array((0.8 + 0.1 * rng.standard_normal(D)).astype(np.float32), "bf16")
+    b_d = be.array((0.05 * rng.standard_normal(D)).astype(np.float32), "bf16")
+    if be.name == "mlx":
+        norm_base = lambda: be.mx.fast.layer_norm(x_d, w_d, b_d, 1e-5)
+    else:
+        norm_base = lambda: be.torch.nn.functional.layer_norm(x_d, (D,), w_d, b_d, 1e-5)
+    xb = be.to_numpy(x_d).astype(np.float64)
+    mean = xb.mean(-1, keepdims=True)
+    ref = ((xb - mean) / np.sqrt(((xb - mean) ** 2).mean(-1, keepdims=True) + 1e-5) *
+           be.to_numpy(w_d).astype(np.float64) + be.to_numpy(b_d).astype(np.float64))
+    yield Case("layernorm", f"dynamic_R{R}_D{D}", {"R": R, "D": D}, "bf16",
+               target=lambda: tk.layernorm(x_d, w_d, b_d, use_kernel=True),
+               baselines={"framework_layer_norm": norm_base}, ref=ref,
+               bytes_moved=float(2 * R * D * 2))
+
+    # Materialized-order decode add + LayerNorm.
+    R, D = _pick(preset, (1, 37), (8, 256), (64, 256))
+    x_d = be.array((0.3 * rng.standard_normal((R, D))).astype(np.float32), "bf16")
+    r_d = be.array((0.3 * rng.standard_normal((R, D))).astype(np.float32), "bf16")
+    w_d = be.array((0.8 + 0.1 * rng.standard_normal(D)).astype(np.float32), "bf16")
+    b_d = be.array((0.05 * rng.standard_normal(D)).astype(np.float32), "bf16")
+    if be.name == "mlx":
+        def decode_norm_base():
+            summed = (x_d.astype(be.mx.float32) + r_d.astype(be.mx.float32)).astype(be.mx.bfloat16)
+            return be.mx.fast.layer_norm(summed, w_d, b_d, 1e-5), summed
+    else:
+        def decode_norm_base():
+            summed = (x_d.float() + r_d.float()).to(be.torch.bfloat16)
+            return be.torch.nn.functional.layer_norm(summed, (D,), w_d, b_d, 1e-5), summed
+    summed = (be.to_numpy(x_d) + be.to_numpy(r_d)).astype(np.float32)
+    if be.name == "mlx":
+        summed = be.to_numpy(be.array(summed, "bf16"))
+    else:
+        summed = be.to_numpy(be.array(summed, "bf16"))
+    mu = summed.mean(-1, keepdims=True)
+    ref = ((summed - mu) / np.sqrt((summed * summed).mean(-1, keepdims=True) - mu * mu + 1e-5) *
+           be.to_numpy(w_d) + be.to_numpy(b_d))
+    yield Case("decode_layernorm_add", f"R{R}_D{D}", {"R": R, "D": D}, "bf16",
+               target=lambda: tk.decode_layernorm_add(x_d, r_d, w_d, b_d),
+               out_to_numpy=lambda out: be.to_numpy(out[0]),
+               baselines={"add_then_framework_layer_norm": decode_norm_base}, ref=ref,
+               bytes_moved=float(4 * R * D * 2))
+
+    # Batched head-major GQA decode with a D=32 specialization.
+    B, Hq, Hkv, T, D = _pick(preset, (1, 4, 2, 17, 32),
+                             (4, 8, 2, 256, 32), (16, 8, 1, 480, 32))
+    q = (0.2 * rng.standard_normal((B, Hq, D))).astype(np.float32)
+    k = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
+    v = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
+    q_d, k_d, v_d = be.array(q), be.array(k), be.array(v)
+    group = Hq // Hkv
+    def attn_base():
+        return tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=False)
+    score = np.einsum("bhd,bhtd->bht", q, np.repeat(k, group, axis=1)) / math.sqrt(D)
+    prob = np.exp(score - score.max(-1, keepdims=True)); prob /= prob.sum(-1, keepdims=True)
+    ref = np.einsum("bht,bhtd->bhd", prob, np.repeat(v, group, axis=1))
+    yield Case("attn_decode_bh", f"B{B}_H{Hq}_{Hkv}_T{T}_D{D}",
+               {"B": B, "Hq": Hq, "Hkv": Hkv, "T": T, "D": D}, "f32",
+               target=lambda: tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=True),
+               baselines={"framework_sdpa": attn_base}, ref=ref,
+               bytes_moved=float((q.size + k.size + v.size + q.size) * 4))
+
+    # Swin's priority window is 12x12 (N=144) with D=32.
+    BW, N, H = _pick(preset, (2, 16, 2), (8, 144, 4), (64, 144, 4))
+    qkv = (0.12 * rng.standard_normal((BW, N, 3, H, 32))).astype(np.float32)
+    relative = (0.04 * rng.standard_normal((H, N, N))).astype(np.float32)
+    windows = min(BW, 4)
+    mask = np.zeros((windows, N, N), np.float32)
+    if windows > 1:
+        mask[1::2, :, N // 2:] = -10.0
+    qkv_d, relative_d, mask_d = be.array(qkv), be.array(relative), be.array(mask)
+    mask_full = mask[np.arange(BW) % windows]
+    def swin_base():
+        return tk.swin_attn_d32(
+            qkv_d, relative_d, mask_d, windows, use_kernel=False)
+    q0 = qkv[:, :, 0].transpose(0, 2, 1, 3)
+    k0 = qkv[:, :, 1].transpose(0, 2, 1, 3)
+    v0 = qkv[:, :, 2].transpose(0, 2, 1, 3)
+    score = q0 @ k0.swapaxes(-1, -2) / math.sqrt(32) + relative[None] + mask_full[:, None]
+    prob = np.exp(score - score.max(-1, keepdims=True)); prob /= prob.sum(-1, keepdims=True)
+    ref = (prob @ v0).transpose(0, 2, 1, 3)
+    yield Case("swin_attn", f"BW{BW}_N{N}_H{H}_D32", {"BW": BW, "N": N, "H": H, "D": 32},
+               "f32", target=lambda: tk.swin_attn_d32(
+                   qkv_d, relative_d, mask_d, windows, use_kernel=True),
+               baselines={"framework_window_sdpa": swin_base}, ref=ref,
+               flops=float(4 * BW * H * N * N * 32))
+
+    # Patch merge: real first-stage Swin resolution for quick/comprehensive.
+    B, height, width, C = _pick(preset, (1, 8, 8, 32),
+                                (1, 96, 96, 128), (4, 96, 96, 128))
+    x_d = be.array((0.2 * rng.standard_normal((B, height * width, C))).astype(np.float32), "bf16")
+    w_d = be.array((0.8 + 0.1 * rng.standard_normal(4 * C)).astype(np.float32), "bf16")
+    b_d = be.array((0.05 * rng.standard_normal(4 * C)).astype(np.float32), "bf16")
+    if be.name == "mlx":
+        def patch_base():
+            image = be.mx.reshape(x_d, (B, height, width, C))
+            merged = be.mx.concatenate((image[:, 0::2, 0::2], image[:, 1::2, 0::2],
+                                        image[:, 0::2, 1::2], image[:, 1::2, 1::2]), -1)
+            return be.mx.fast.layer_norm(be.mx.reshape(merged, (B, -1, 4 * C)), w_d, b_d, 1e-5)
+    else:
+        def patch_base():
+            image = x_d.reshape(B, height, width, C)
+            merged = be.torch.cat((image[:, 0::2, 0::2], image[:, 1::2, 0::2],
+                                   image[:, 0::2, 1::2], image[:, 1::2, 1::2]), -1)
+            return be.torch.nn.functional.layer_norm(merged.reshape(B, -1, 4 * C), (4 * C,), w_d, b_d, 1e-5)
+    xb = be.to_numpy(x_d).reshape(B, height, width, C)
+    merged = np.concatenate((xb[:, 0::2, 0::2], xb[:, 1::2, 0::2],
+                             xb[:, 0::2, 1::2], xb[:, 1::2, 1::2]), -1).reshape(B, -1, 4 * C)
+    mu = merged.mean(-1, keepdims=True)
+    ref = ((merged - mu) / np.sqrt(((merged - mu) ** 2).mean(-1, keepdims=True) + 1e-5) *
+           be.to_numpy(w_d) + be.to_numpy(b_d))
+    yield Case("patch_merge", f"B{B}_{height}x{width}_C{C}",
+               {"B": B, "H": height, "W": width, "C": C}, "bf16",
+               target=lambda: tk.patch_merge_layernorm(x_d, w_d, b_d, height, width),
+               baselines={"gather_concat_layer_norm": patch_base}, ref=ref,
+               bytes_moved=float(2 * B * height * width * C * 2))
+
+    # Fixed 512-to-256-to-7 pairwise edge head.
+    B, L = _pick(preset, (1, 8), (1, 64), (4, 128))
+    hidden = (0.05 * rng.standard_normal((B, L, 256))).astype(np.float32)
+    first_w = (0.04 * rng.standard_normal((256, 512))).astype(np.float32)
+    first_b = (0.03 * rng.standard_normal(256)).astype(np.float32)
+    second_w = (0.04 * rng.standard_normal((7, 256))).astype(np.float32)
+    second_b = (0.03 * rng.standard_normal(7)).astype(np.float32)
+    h_d, fw_d, fb_d = be.array(hidden), be.array(first_w), be.array(first_b)
+    sw_d, sb_d = be.array(second_w), be.array(second_b)
+    if be.name == "mlx":
+        def edge_base():
+            left = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, :256], 0, 1))
+            right = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, 256:], 0, 1)) + fb_d
+            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
+            return be.mx.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
+    else:
+        def edge_base():
+            left = h_d @ fw_d[:, :256].T
+            right = h_d @ fw_d[:, 256:].T + fb_d
+            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
+            return be.torch.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
+    left = hidden @ first_w[:, :256].T
+    right = hidden @ first_w[:, 256:].T + first_b
+    ref = np.einsum("bijh,ch->bcij", _gelu_erf_np(left[:, :, None] + right[:, None]), second_w)
+    ref += second_b[None, :, None, None]
+    yield Case("edge_mlp", f"B{B}_L{L}", {"B": B, "L": L, "hidden": 256, "classes": 7}, "f32",
+               target=lambda: tk.edge_mlp_256x7(
+                   h_d, fw_d, fb_d, sw_d, sb_d, use_kernel=True),
+               baselines={"materialized_pairwise_mlp": edge_base}, ref=ref,
+               flops=float(B * L * L * 2 * 256 * 7))
+
+    # Decode linear (dense + q8_0) and tiled Flux erf-GELU.
+    B, K, N = _pick(preset, (1, 65, 37), (1, 256, 256), (16, 256, 256))
+    x = (0.1 * rng.standard_normal((B, K))).astype(np.float32)
+    weight = (0.08 * rng.standard_normal((N, K))).astype(np.float32)
+    bias = (0.03 * rng.standard_normal(N)).astype(np.float32)
+    x_d, weight_d, bias_d = be.array(x), be.array(weight), be.array(bias)
+    dense_base = lambda: _gelu_erf_device(be, x_d @ (weight_d.T if be.name == "torch" else be.mx.swapaxes(weight_d, 0, 1)) + bias_d)
+    ref = _gelu_erf_np(x @ weight.T + bias)
+    yield Case("decode_linear", f"gelu_B{B}_K{K}_N{N}", {"B": B, "K": K, "N": N}, "f32",
+               target=lambda: tk.decode_linear(x_d, weight_d, bias_d, gelu=True),
+               baselines={"matmul_bias_erf_gelu": dense_base}, ref=ref,
+               flops=float(2 * B * K * N))
+
+    Kq = ((K + 31) // 32) * 32
+    xq = (0.1 * rng.standard_normal((B, Kq))).astype(np.float32)
+    wq, wdq = _packed_weight("q8_0", N, Kq, seed=261)
+    bias = (0.03 * rng.standard_normal(N)).astype(np.float32)
+    residual = (0.03 * rng.standard_normal((B, N))).astype(np.float32)
+    xq_d, wq_d, wdq_d = be.array(xq), be.raw_array(wq), be.array(wdq)
+    bias_d, residual_d = be.array(bias), be.array(residual)
+    q8_base = lambda: _gelu_erf_device(be, xq_d @ (wdq_d.T if be.name == "torch" else be.mx.swapaxes(wdq_d, 0, 1)) + bias_d) + residual_d
+    ref = _gelu_erf_np(xq @ wdq.T + bias) + residual
+    yield Case("decode_linear_q8", f"B{B}_K{Kq}_N{N}", {"B": B, "K": Kq, "N": N}, "f32", fmt="q8_0",
+               target=lambda: tk.decode_linear_q8(xq_d, wq_d, bias_d, residual_d, gelu=True),
+               baselines={"dequantized_matmul_epilogue": q8_base}, ref=ref,
+               weight_bytes=float(wq.nbytes), flops=float(2 * B * Kq * N))
+
+    FN, FK, FM = _pick(preset, (32, 16, 32), (128, 64, 128), (256, 256, 256))
+    fa = (0.08 * rng.standard_normal((FN, FK))).astype(np.float32)
+    fw = (0.08 * rng.standard_normal((FK, FM))).astype(np.float32)
+    fb = (0.03 * rng.standard_normal(FM)).astype(np.float32)
+    fa_d, fw_d, fb_d = be.array(fa), be.array(fw), be.array(fb)
+    yield Case("flux_gelu_erf", f"N{FN}_K{FK}_M{FM}", {"N": FN, "K": FK, "M": FM}, "f32",
+               target=lambda: tk.flux_gelu_erf(fa_d, fw_d, fb_d),
+               baselines={"matmul_bias_erf_gelu": lambda: _gelu_erf_device(be, fa_d @ fw_d + fb_d)},
+               ref=_gelu_erf_np(fa @ fw + fb), flops=float(2 * FN * FK * FM))
+
+    # Packed row gather for all three audited GGUF formats.
+    gather_formats = [f for f in ("q4_0", "q8_0", "q6_K") if formats is None or f in formats]
+    for fmt in gather_formats:
+        rows, columns, tokens = _pick(preset, (64, 256, 8),
+                                     (4096, 1536 if fmt == "q6_K" else 256, 256),
+                                     (32768, 1536 if fmt == "q6_K" else 256, 2048))
+        packed, dequantized = _packed_weight(fmt, rows, columns, seed=262)
+        ids = rng.integers(0, rows, size=tokens, dtype=np.int32)
+        packed_d, ids_d = be.raw_array(packed), be.int_array(ids)
+        # Match the kernel's one-final-rounding contract: the expanded
+        # framework baseline keeps the table in fp32 and casts only after the
+        # gathered row has been scaled.
+        table_d = be.array(dequantized)
+        scale = float(np.sqrt(1536.0))
+        if be.name == "mlx":
+            gather_base = lambda packed_d=packed_d, ids_d=ids_d, table_d=table_d: (
+                be.mx.take(table_d, ids_d, axis=0) * scale).astype(be.mx.float16)
+        else:
+            gather_base = lambda packed_d=packed_d, ids_d=ids_d, table_d=table_d: (
+                table_d.index_select(0, ids_d.long()) * scale).to(be.torch.float16)
+        ref = (dequantized[ids] * np.float32(scale)).astype(np.float16)
+        yield Case("dequant_gather", f"{fmt}_R{rows}_D{columns}_T{tokens}",
+                   {"rows": rows, "D": columns, "tokens": tokens}, "f16", fmt=fmt,
+                   target=lambda packed_d=packed_d, ids_d=ids_d, fmt=fmt:
+                       tk.dequant_gather(packed_d, ids_d, fmt, scale),
+                   baselines={"predequantized_framework_gather": gather_base}, ref=ref,
+                   weight_bytes=float(packed.nbytes))
+
+    # Packed fp32 q4_0/q6_K GEMV specializations.
+    qfmts = [f for f in ("q4_0", "q6_K") if formats is None or f in formats]
+    for fmt in qfmts:
+        N, K = _pick(preset, (67, 512),
+                     (6144 if fmt == "q4_0" else 1536, 1536),
+                     (12288 if fmt == "q4_0" else 6144, 1536))
+        packed, dequantized = _packed_weight(fmt, N, K, seed=263)
+        x = (0.2 * rng.standard_normal((K, 1))).astype(np.float32)
+        packed_d, x_d, dequant_d = be.raw_array(packed), be.array(x), be.array(dequantized)
+        gemv_base = lambda x_d=x_d, dequant_d=dequant_d: dequant_d @ x_d
+        yield Case("qgemv", f"f32_{fmt}_N{N}_K{K}", {"N": N, "K": K}, "f32", fmt=fmt,
+                   target=lambda packed_d=packed_d, x_d=x_d, fmt=fmt: tk.qgemv(packed_d, x_d, fmt),
+                   baselines={"predequantized_f32_matmul": gemv_base},
+                   ref=dequantized.astype(np.float64) @ x.astype(np.float64),
+                   weight_bytes=float(packed.nbytes), flops=float(2 * N * K))
+
+    # Q6_K two-stage vocabulary projection/argmax. Quick uses a substantial
+    # vocabulary while keeping the focused run practical on developer laptops.
+    V, K = _pick(preset, (1025, 512), (32768, 1536), (131072, 1536))
+    packed, dequantized = _packed_weight("q6_K", V, K, seed=264)
+    h = (0.15 * rng.standard_normal((1, K))).astype(np.float32)
+    packed_d, h_d, dequant_d = be.raw_array(packed), be.array(h), be.array(dequantized)
+    if be.name == "mlx":
+        lm_base = lambda: be.mx.argmax(be.mx.matmul(h_d, be.mx.swapaxes(dequant_d, 0, 1)), axis=-1)
+        lm_packed_base = lambda: be.mx.reshape(
+            be.mx.argmax(tk.qgemv(packed_d, be.mx.swapaxes(h_d, 0, 1), "q6_K")[:, 0], axis=0), (1,))
+    else:
+        lm_base = lambda: be.torch.argmax(h_d @ dequant_d.T, dim=-1).to(be.torch.int32)
+        lm_packed_base = lambda: be.torch.argmax(
+            tk.qgemv(packed_d, h_d.T, "q6_K")[:, 0], dim=0, keepdim=True).to(be.torch.int32)
+    yield Case("lm_head", f"q6_K_argmax_V{V}_K{K}", {"T": 1, "V": V, "K": K}, "f32", fmt="q6_K",
+               target=lambda: tk.lm_head_sample(
+                   h_d, packed_d, mode="argmax", format="q6_K", fused=True),
+               baselines={"predequantized_matmul_argmax": lm_base,
+                          "packed_qgemv_argmax": lm_packed_base},
+               ref=(h.astype(np.float64) @ dequantized.astype(np.float64).T).argmax(-1),
+               weight_bytes=float(packed.nbytes), flops=float(2 * V * K))
+
+    # Grammar-constrained dense LM head with a representative V=357, K=256 shape.
+    T, V, K = _pick(preset, (1, 67, 31), (8, 357, 256), (64, 357, 256))
+    h = (0.12 * rng.standard_normal((T, K))).astype(np.float32)
+    weight = (0.12 * rng.standard_normal((V, K))).astype(np.float32)
+    bias = (0.03 * rng.standard_normal(V)).astype(np.float32)
+    forbidden = (rng.random((V, V)) < 0.15).astype(np.uint8)
+    previous = rng.integers(0, V, size=T, dtype=np.int32)
+    forbidden[previous, 0] = 0
+    h_d, weight_d, bias_d = be.array(h), be.array(weight), be.array(bias)
+    forbidden_d, previous_d = be.raw_array(forbidden), be.int_array(previous)
+    if be.name == "mlx":
+        def constrained_base():
+            logits = be.mx.matmul(h_d, be.mx.swapaxes(weight_d, 0, 1)) + bias_d
+            allowed = be.mx.take(forbidden_d, previous_d, axis=0) == 0
+            token = be.mx.argmax(be.mx.where(allowed, logits, -float("inf")), axis=-1)
+            logprob = be.mx.take_along_axis(logits - be.mx.logsumexp(logits, axis=-1, keepdims=True),
+                                            token[:, None], axis=-1)[:, 0]
+            return token, logprob
+    else:
+        def constrained_base():
+            logits = h_d @ weight_d.T + bias_d
+            allowed = forbidden_d.index_select(0, previous_d.long()) == 0
+            token = be.torch.argmax(be.torch.where(allowed, logits, -float("inf")), dim=-1)
+            logprob = (logits - be.torch.logsumexp(logits, dim=-1, keepdim=True)).gather(1, token[:, None])[:, 0]
+            return token.to(be.torch.int32), logprob
+    logits = h @ weight.T + bias
+    ref = np.where(forbidden[previous] == 0, logits, -np.inf).argmax(-1)
+    yield Case("lm_head_constrained", f"T{T}_V{V}_K{K}", {"T": T, "V": V, "K": K}, "f32",
+               target=lambda: tk.lm_head_constrained(h_d, weight_d, forbidden_d, previous_d, bias=bias_d),
+               out_to_numpy=lambda out: be.to_numpy(out[0]),
+               baselines={"matmul_logsoftmax_mask_argmax": constrained_base}, ref=ref,
+               flops=float(2 * T * V * K))
+
+
 # --------------------------------------------------------------------------- runner
 def main():
     ap = argparse.ArgumentParser(description=__doc__,

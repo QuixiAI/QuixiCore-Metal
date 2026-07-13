@@ -47,6 +47,7 @@ QuixiCore-Metal/
     ssm/
     matmul/
     quantization/
+    vision/
     moe/
     sampling/
     serving/
@@ -108,6 +109,7 @@ QuixiCoreMetal
     ssm/
     matmul/
     quantization/
+    vision/
     moe/
     sampling/
     serving/
@@ -188,6 +190,8 @@ groups or framework buckets:
 - `matmul/`: dense GEMM, staged GEMM, complex matmul, Flux.
 - `quantization/`: act quant, runtime quant, qgemm, qgemv, quantized LM head,
   fp8/int8/fp4 packing, TurboQuant.
+- `vision/`: window-attention support operations, patch merging, and fixed
+  vision-model projection heads such as the pairwise edge MLP.
 - `moe/`: routing, expert alignment, gather/scatter, grouped GEMM, quantized
   MoE GEMM, LoRA alignment, finalize.
 - `sampling/`: sampling, logit transforms, penalties, rejection sampling, beam

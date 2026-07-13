@@ -30,8 +30,8 @@ namespace mlx::core {
  *  LayerNorm over the last axis:
  *      y = (x - mean(x)) * rsqrt(var(x) + eps) * weight + bias
  *
- *  Inputs are assumed bf16 and row-contiguous. The last dim D must be one of
- *  the instantiated widths {256, 512, 768, 1024}.
+ *  Inputs are assumed bf16 and row-contiguous. Common widths use fixed
+ *  instantiations; other widths divisible by four use the dynamic kernel.
  **/
 array layernorm(
     const array& x,
@@ -45,8 +45,8 @@ array layernorm(
   const int D = x.shape(-1);
   assert(weight.ndim() == 1 && weight.shape(0) == D);
   assert(bias.ndim() == 1 && bias.shape(0) == D);
-  assert((D == 256 || D == 512 || D == 768 || D == 1024) &&
-         "layernorm: last dim must be 256, 512, 768, or 1024");
+  assert(D > 0 && D % 4 == 0 &&
+         "layernorm: last dim must be positive and divisible by 4");
 
   return array(
       /* const std::vector<int>& shape = */ x.shape(),
@@ -98,7 +98,11 @@ void LayerNorm::eval_gpu(
   // Dispatch via the shared host ABI (one simdgroup per row; M threadgroups).
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
-  tk::launch_layernorm(enc, x, weight, bias, out, M, D, eps_);
+  if (D == 256 || D == 512 || D == 768 || D == 1024) {
+    tk::launch_layernorm(enc, x, weight, bias, out, M, D, eps_);
+  } else {
+    tk::launch_layernorm_dyn(enc, x, weight, bias, out, M, D, eps_);
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////

@@ -16,6 +16,7 @@ namespace mlx::core {
  *      y = (x - mean(x)) * rsqrt(var(x) + eps) * weight + bias
  *
  *  x is (..., D); weight and bias are (D,). bf16 in/out, fp32 compute.
+ *  D must be divisible by four.
  **/
 array layernorm(
     const array& x,      // Input array, normalized over the last axis

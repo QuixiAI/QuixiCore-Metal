@@ -108,6 +108,91 @@ kernel void qgemv_q4_0_fast(
     if (lane == 0) D[row] = half(acc);
 }
 
+// The f32 decode specializations preserve f32 activations and output instead
+// of routing through the fp16 decode contract. They are intentionally limited
+// to the q4_0 and q6_K GGUF layouts.
+[[host_name("qgemv_q4_0_float32")]]
+kernel void qgemv_q4_0_float32(
+    device float *D [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device const float *X [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int row = int(tgid.x);
+    const int bpr = K / q4_0::block_k;
+    device const uchar *row_base = Wq + (uint)(row * bpr) * q4_0::block_bytes;
+    const int block_offset = int(lane >> 1);
+    const int byte_start = int(lane & 1) * 8;
+    float acc = 0.0f;
+    for (int kb = block_offset; kb < bpr; kb += 16) {
+        device const uchar *block = row_base + (uint)kb * q4_0::block_bytes;
+        const float scale = float(((device const half *)block)[0]);
+        device const uchar *qs = block + 2 + byte_start;
+        const int x0 = (kb << 5) + byte_start;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            const uchar packed = qs[i];
+            acc += scale * float(int(packed & 0x0f) - 8) * X[x0 + i];
+            acc += scale * float(int(packed >> 4) - 8) * X[x0 + i + 16];
+        }
+    }
+    acc = metal::simd_sum(acc);
+    if (lane == 0) D[row] = acc;
+}
+
+METAL_FUNC float qgemv_f16_bits_to_f32(ushort value) {
+    const uint sign = uint(value & 0x8000) << 16;
+    const uint exponent = (value >> 10) & 0x1f;
+    const uint mantissa = value & 0x03ff;
+    if (exponent == 0) {
+        const float magnitude = metal::ldexp(float(mantissa), -24);
+        return sign != 0 ? -magnitude : magnitude;
+    }
+    if (exponent == 31) {
+        return as_type<float>(sign | 0x7f800000 | (mantissa << 13));
+    }
+    return as_type<float>(sign | ((exponent + 112) << 23) | (mantissa << 13));
+}
+
+[[host_name("qgemv_q6_K_float32")]]
+kernel void qgemv_q6_K_float32(
+    device float *D [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device const float *X [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int row = int(tgid.x);
+    const int blocks_per_row = K / 256;
+    device const uchar *row_weights = Wq + (long)row * blocks_per_row * 210;
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < blocks_per_row; ++block_index) {
+        device const uchar *block = row_weights + (long)block_index * 210;
+        device const uchar *ql = block;
+        device const uchar *qh = block + 128;
+        device const char *scales = (device const char *)(block + 192);
+        const ushort d_bits = ushort(block[208]) | (ushort(block[209]) << 8);
+        const float d = qgemv_f16_bits_to_f32(d_bits);
+        for (uint chunk = 0; chunk < 2; ++chunk) {
+            for (uint group = 0; group < 4; ++group) {
+                const uchar ql_byte = ql[chunk * 64 + lane + 32 * (group & 1)];
+                const uint nibble = (group & 2) ? (ql_byte >> 4) : (ql_byte & 0x0f);
+                const uint high = (qh[chunk * 32 + lane] >> (2 * group)) & 3;
+                const int quant = int(nibble | (high << 4)) - 32;
+                const uint scale_index = chunk * 8 + (lane >> 4) + group * 2;
+                const uint column =
+                    block_index * 256 + chunk * 128 + group * 32 + lane;
+                sum += d * float(int(scales[scale_index])) * float(quant) * X[column];
+            }
+        }
+    }
+    sum = metal::simd_sum(sum);
+    if (lane == 0) D[row] = sum;
+}
+
 #define instantiate_qgemv(name, FMT)                                          \
    template [[host_name(name)]] [[kernel]]                                    \
    void qgemv<FMT>(                                                           \

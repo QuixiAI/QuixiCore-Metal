@@ -102,7 +102,32 @@ array lm_head_sample_q(
     throw std::invalid_argument(
         "lm_head_sample_q: mode must be 0 (argmax), 1 (categorical), 2 (topk), 3 (topp)");
   }
+  if (!(temperature > 0.0f)) {
+    throw std::invalid_argument("lm_head_sample_q: temperature must be positive");
+  }
+  int block_k = 0;
+  int block_bytes = 0;
+  if (fmt == "q8_0") {
+    block_k = 32; block_bytes = 34;
+  } else if (fmt == "q4_0") {
+    block_k = 32; block_bytes = 18;
+  } else if (fmt == "q6_K") {
+    block_k = 256; block_bytes = 210;
+    if (h.dtype() != float32 || mode > 1) {
+      throw std::invalid_argument(
+          "lm_head_sample_q: q6_K requires fp32 h and supports argmax/categorical only");
+    }
+  } else {
+    throw std::invalid_argument("lm_head_sample_q: format must be q8_0, q4_0, or q6_K");
+  }
+  if (K % block_k != 0 || Wq.dtype() != uint8 || Wq.ndim() != 3 ||
+      Wq.shape(0) != V || Wq.shape(1) != K / block_k || Wq.shape(2) != block_bytes) {
+    throw std::invalid_argument("lm_head_sample_q: packed weight shape does not match V/K/format");
+  }
   const int T = h.shape(0);
+  if (T <= 0 || V <= 0 || K <= 0) {
+    throw std::invalid_argument("lm_head_sample_q: T, V, and K must be positive");
+  }
   const int num_vtiles = (V + LMH_TILE_V - 1) / LMH_TILE_V;
   const int use_bias = bias.size() > 1 ? 1 : 0;
   auto h_c = contiguous(h, false, s);
@@ -148,6 +173,100 @@ array lm_head_sample_q(
       {h_c, Wq_c, bias_c});
   return array({T}, int32, std::make_shared<LmHeadArgcatReduce>(to_stream(s)),
                {parts[0], parts[1]});
+}
+
+std::vector<array> lm_head_constrained(
+    const array& h,
+    const array& W,
+    const array& bias,
+    const array& forbidden,
+    const array& previous,
+    int eos_id,
+    bool forbid_eos,
+    StreamOrDevice s) {
+  if (h.ndim() != 2 || W.ndim() != 2 || h.shape(1) != W.shape(1) ||
+      h.dtype() != W.dtype() ||
+      !(h.dtype() == float32 || h.dtype() == float16 || h.dtype() == bfloat16)) {
+    throw std::invalid_argument(
+        "lm_head_constrained: h (T,K) and W (V,K) must share a floating dtype");
+  }
+  const int tokens = h.shape(0), vocab = W.shape(0), hidden = h.shape(1);
+  if (tokens <= 0 || vocab <= 0 || hidden <= 0) {
+    throw std::invalid_argument("lm_head_constrained: T, V, and K must be positive");
+  }
+  if (forbidden.dtype() != uint8 || forbidden.ndim() != 2 ||
+      forbidden.shape(0) != vocab || forbidden.shape(1) != vocab) {
+    throw std::invalid_argument("lm_head_constrained: forbidden must be uint8 (V,V)");
+  }
+  if (previous.size() != tokens) {
+    throw std::invalid_argument("lm_head_constrained: previous must contain one id per h row");
+  }
+  if (forbid_eos && (eos_id < 0 || eos_id >= vocab)) {
+    throw std::invalid_argument("lm_head_constrained: eos_id must be in range when forbidden");
+  }
+  const int use_bias = bias.size() > 1 ? 1 : 0;
+  if (use_bias && (bias.ndim() != 1 || bias.shape(0) != vocab)) {
+    throw std::invalid_argument("lm_head_constrained: bias must be (V,) or a scalar placeholder");
+  }
+  const int num_vtiles = (vocab + LMH_TILE_V - 1) / LMH_TILE_V;
+  auto bias_c = use_bias ? contiguous(astype(bias, float32, s), false, s)
+                         : zeros({1}, float32, s);
+  auto partials = array::make_arrays(
+      {{tokens, num_vtiles}, {tokens, num_vtiles}, {tokens, num_vtiles},
+       {tokens, num_vtiles}},
+      {float32, float32, float32, int32},
+      std::make_shared<LmHeadConstrainedPartials>(
+          to_stream(s), vocab, hidden, use_bias, eos_id, forbid_eos),
+      {contiguous(h, false, s), contiguous(W, false, s), bias_c,
+       contiguous(forbidden, false, s), contiguous(astype(previous, int32, s), false, s)});
+  return array::make_arrays(
+      {{tokens}, {tokens}}, {int32, float32},
+      std::make_shared<LmHeadConstrainedReduce>(to_stream(s)), partials);
+}
+
+void LmHeadConstrainedPartials::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadConstrainedPartials has no CPU implementation.");
+}
+void LmHeadConstrainedPartials::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  const int tokens = inputs[0].shape(0);
+  const int num_vtiles = outputs[0].shape(1);
+  tk::launch_lm_head_constrained_partials(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], outputs[0],
+      outputs[1], outputs[2], outputs[3], vocab_, hidden_, LMH_TILE_V,
+      num_vtiles, use_bias_, eos_id_, forbid_eos_ ? 1 : 0, tokens,
+      type_to_name(inputs[0]));
+}
+bool LmHeadConstrainedPartials::is_equivalent(const Primitive& other) const {
+  if (typeid(*this) != typeid(other)) return false;
+  auto& o = static_cast<const LmHeadConstrainedPartials&>(other);
+  return vocab_ == o.vocab_ && hidden_ == o.hidden_ && use_bias_ == o.use_bias_ &&
+      eos_id_ == o.eos_id_ && forbid_eos_ == o.forbid_eos_;
+}
+
+void LmHeadConstrainedReduce::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadConstrainedReduce has no CPU implementation.");
+}
+void LmHeadConstrainedReduce::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  outputs[0].set_data(allocator::malloc_or_wait(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc_or_wait(outputs[1].nbytes()));
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_lm_head_constrained_reduce(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1],
+      inputs[0].shape(1), inputs[0].shape(0));
 }
 
 void LmHeadArgcatPartialsQ::eval_cpu(const std::vector<array>&, std::vector<array>&) {
@@ -360,5 +479,7 @@ TK_LMH_NO_AUTODIFF(LmHeadTopkPartialsQ, "LmHeadTopkPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadToppPartialsQ, "LmHeadToppPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadTopkReduce, "LmHeadTopkReduce")
 TK_LMH_NO_AUTODIFF(LmHeadToppReduce, "LmHeadToppReduce")
+TK_LMH_NO_AUTODIFF(LmHeadConstrainedPartials, "LmHeadConstrainedPartials")
+TK_LMH_NO_AUTODIFF(LmHeadConstrainedReduce, "LmHeadConstrainedReduce")
 
 } // namespace mlx::core

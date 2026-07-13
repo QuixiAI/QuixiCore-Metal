@@ -77,6 +77,41 @@ instantiate_layernorm(512);
 instantiate_layernorm(768);
 instantiate_layernorm(1024);
 
+// Dynamic-D BF16 LayerNorm for Swin patch embedding/final patch merging and
+// other widths divisible by four. One simdgroup owns a row; device traffic is
+// vectorized as bf16_4 while reductions remain fp32.
+[[host_name("layernorm_dyn_bfloat16")]]
+kernel void layernorm_dyn(device const bf16 *x [[buffer(0)]],
+                          device const bf16 *weight [[buffer(1)]],
+                          device const bf16 *bias [[buffer(2)]],
+                          device bf16 *o [[buffer(3)]],
+                          constant uint &M [[buffer(4)]],
+                          constant float &eps [[buffer(5)]],
+                          constant int &D [[buffer(6)]],
+                          uint3 blockIdx [[threadgroup_position_in_grid]],
+                          uint laneId [[thread_index_in_simdgroup]]) {
+    const long base = (long)blockIdx.x * D;
+    const int nchunks = D / 4;
+    float sum = 0.0f;
+    float sumsq = 0.0f;
+    for (int c = int(laneId); c < nchunks; c += 32) {
+        const float4 value = float4(((device const bf16_4 *)(x + base))[c]);
+        sum += value.x + value.y + value.z + value.w;
+        sumsq += metal::dot(value, value);
+    }
+    sum = metal::simd_sum(sum);
+    sumsq = metal::simd_sum(sumsq);
+    const float mean = sum / float(D);
+    const float variance = metal::max(sumsq / float(D) - mean * mean, 0.0f);
+    const float inverse = metal::rsqrt(variance + eps);
+    for (int c = int(laneId); c < nchunks; c += 32) {
+        const float4 value = float4(((device const bf16_4 *)(x + base))[c]);
+        const float4 scale = float4(((device const bf16_4 *)weight)[c]);
+        const float4 shift = float4(((device const bf16_4 *)bias)[c]);
+        ((device bf16_4 *)(o + base))[c] = bf16_4((value - mean) * inverse * scale + shift);
+    }
+}
+
 // LayerNorm backward, dX only (dW = sum_rows dY*x_hat, dB = sum_rows dY are framework reductions).
 // With g = dY*W and x_hat = (x-mean)*rstd:  dX_i = rstd*(g_i - mean_j(g) - x_hat_i*mean_j(g*x_hat)).
 // mean/rstd (rows,) precomputed in the framework. One simdgroup per row; any D; T templated.

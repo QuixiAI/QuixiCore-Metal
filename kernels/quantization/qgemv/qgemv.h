@@ -10,7 +10,8 @@
 namespace mlx::core {
 
 /** Quantized GEMV (batch-1 decode): out = dequantize(wq) @ x. wq packed weight blocks
- *  (N, K/block_k, block_bytes) uint8 for `format`; x is (K, 1) float16; out is (N, 1) float16. */
+ *  (N, K/block_k, block_bytes) uint8 for `format`; x is (K, 1) float16, or fp32 for
+ *  q4_0/q6_K. The output uses the activation dtype. */
 array qgemv(const array& wq, const array& x, const std::string& format = "q8_0",
             StreamOrDevice s = {});
 
