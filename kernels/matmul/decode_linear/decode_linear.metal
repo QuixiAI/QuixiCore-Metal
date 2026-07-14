@@ -151,4 +151,263 @@ kernel void decode_linear_q8(
 instantiate_decode_linear_q8(float32, float)
 instantiate_decode_linear_q8(bfloat16, bf16)
 
+METAL_FUNC float decode_epilogue(float value, int activation) {
+    if (activation == 1) return glu_gelu_erf(value);
+    if (activation == 2) return value / (1.0f + metal::exp(-value));
+    return value;
+}
+
+template <typename T>
+METAL_FUNC float decode_dense_dot(
+    device const T *input, device const T *weight, long input_base,
+    long weight_base, int in_dim, uint lane) {
+    float accumulator = 0.0f;
+    for (int k = int(lane); k < in_dim; k += 32) {
+        accumulator += float(input[input_base + k]) * float(weight[weight_base + k]);
+    }
+    return metal::simd_sum(accumulator);
+}
+
+template <typename T, typename FMT>
+METAL_FUNC float decode_packed_dot(
+    device const T *input, device const uchar *weight, long input_base,
+    int output_channel, int in_dim, uint lane) {
+    const int blocks_per_row = in_dim / FMT::block_k;
+    const long row_base = (long)output_channel * blocks_per_row * FMT::block_bytes;
+    const int spans = in_dim / 8;
+    float accumulator = 0.0f;
+    for (int span = int(lane); span < spans; span += 32) {
+        const int col0 = span * 8;
+        const int block = col0 / FMT::block_k;
+        const int column_in_block = col0 % FMT::block_k;
+        device const uchar *base = weight + row_base + (long)block * FMT::block_bytes;
+        float values[8];
+        tk_dequant8_f32<FMT>(base, column_in_block, values);
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            accumulator += float(input[input_base + col0 + i]) * values[i];
+        }
+    }
+    return metal::simd_sum(accumulator);
+}
+
+// q4_0 stores the low and high 16-value halves in the same 16 packed bytes.
+// One lane consumes a whole block, so each scale and block address is decoded
+// once instead of being duplicated across a pair of lanes.
+template <typename T>
+METAL_FUNC float decode_packed_dot_q4(
+    device const T *input, device const uchar *weight, long input_base,
+    int output_channel, int in_dim, uint lane) {
+    const int blocks_per_row = in_dim / 32;
+    const long row_base = (long)output_channel * blocks_per_row * 18;
+    float accumulator = 0.0f;
+    for (int block = int(lane); block < blocks_per_row; block += 32) {
+        device const uchar *base = weight + row_base + (long)block * 18;
+        const float scale = float(((device const half *)base)[0]);
+        device const uchar *codes = base + 2;
+        const long x0 = input_base + block * 32;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            accumulator += float(input[x0 + i]) *
+                scale * float(int(packed & 0x0f) - 8);
+            accumulator += float(input[x0 + i + 16]) *
+                scale * float(int(packed >> 4) - 8);
+        }
+    }
+    return metal::simd_sum(accumulator);
+}
+
+#define specialize_decode_packed_dot_q4(T)                                  \
+  template <> METAL_FUNC float decode_packed_dot<T, q4_0>(                  \
+    device const T *input, device const uchar *weight, long input_base,     \
+    int output_channel, int in_dim, uint lane) {                             \
+    return decode_packed_dot_q4<T>(                                          \
+        input, weight, input_base, output_channel, in_dim, lane);            \
+  }
+
+specialize_decode_packed_dot_q4(float)
+specialize_decode_packed_dot_q4(half)
+specialize_decode_packed_dot_q4(bf16)
+
+// Unified dense decode-linear epilogue.  The operation is
+// residual + activation(x @ weight.T + bias), with each optional component
+// controlled by a scalar flag and a single output-dtype rounding at the store.
+template <typename T>
+kernel void decode_linear_epilogue_dense(
+    device const T *input [[buffer(0)]],
+    device const T *weight [[buffer(1)]],
+    device const T *bias [[buffer(2)]],
+    device const T *residual [[buffer(3)]],
+    device T *output [[buffer(4)]],
+    constant int &batch [[buffer(5)]],
+    constant int &in_dim [[buffer(6)]],
+    constant int &out_dim [[buffer(7)]],
+    constant int &activation [[buffer(8)]],
+    constant int &use_bias [[buffer(9)]],
+    constant int &use_residual [[buffer(10)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int output_channel = int(group.x);
+    const int batch_index = int(group.y);
+    if (output_channel >= out_dim || batch_index >= batch) return;
+    const long input_base = (long)batch_index * in_dim;
+    const long output_index = (long)batch_index * out_dim + output_channel;
+    float value = decode_dense_dot(
+        input, weight, input_base, (long)output_channel * in_dim, in_dim, lane);
+    if (lane == 0) {
+        if (use_bias != 0) value += float(bias[output_channel]);
+        value = decode_epilogue(value, activation);
+        if (use_residual != 0) value += float(residual[output_index]);
+        output[output_index] = T(value);
+    }
+}
+
+template <typename T, typename FMT>
+kernel void decode_linear_epilogue_packed(
+    device const T *input [[buffer(0)]],
+    device const uchar *weight [[buffer(1)]],
+    device const T *bias [[buffer(2)]],
+    device const T *residual [[buffer(3)]],
+    device T *output [[buffer(4)]],
+    constant int &batch [[buffer(5)]],
+    constant int &in_dim [[buffer(6)]],
+    constant int &out_dim [[buffer(7)]],
+    constant int &activation [[buffer(8)]],
+    constant int &use_bias [[buffer(9)]],
+    constant int &use_residual [[buffer(10)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int output_channel = int(group.x);
+    const int batch_index = int(group.y);
+    if (output_channel >= out_dim || batch_index >= batch) return;
+    const long input_base = (long)batch_index * in_dim;
+    const long output_index = (long)batch_index * out_dim + output_channel;
+    float value = decode_packed_dot<T, FMT>(
+        input, weight, input_base, output_channel, in_dim, lane);
+    if (lane == 0) {
+        if (use_bias != 0) value += float(bias[output_channel]);
+        value = decode_epilogue(value, activation);
+        if (use_residual != 0) value += float(residual[output_index]);
+        output[output_index] = T(value);
+    }
+}
+
+// Two projections share input reads and reduce together before the SwiGLU
+// epilogue: silu(gate) * up.
+template <typename T>
+kernel void decode_swiglu_dense(
+    device const T *input [[buffer(0)]],
+    device const T *gate_weight [[buffer(1)]],
+    device const T *up_weight [[buffer(2)]],
+    device const T *gate_bias [[buffer(3)]],
+    device const T *up_bias [[buffer(4)]],
+    device T *output [[buffer(5)]],
+    constant int &batch [[buffer(6)]],
+    constant int &in_dim [[buffer(7)]],
+    constant int &out_dim [[buffer(8)]],
+    constant int &use_bias [[buffer(9)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int n = int(group.x), b = int(group.y);
+    if (n >= out_dim || b >= batch) return;
+    const long input_base = (long)b * in_dim;
+    const long weight_base = (long)n * in_dim;
+    float gate = 0.0f, up = 0.0f;
+    for (int k = int(lane); k < in_dim; k += 32) {
+        const float x = float(input[input_base + k]);
+        gate += x * float(gate_weight[weight_base + k]);
+        up += x * float(up_weight[weight_base + k]);
+    }
+    gate = metal::simd_sum(gate);
+    up = metal::simd_sum(up);
+    if (lane == 0) {
+        if (use_bias != 0) {
+            gate += float(gate_bias[n]);
+            up += float(up_bias[n]);
+        }
+        const float activated = gate / (1.0f + metal::exp(-gate));
+        output[(long)b * out_dim + n] = T(activated * up);
+    }
+}
+
+template <typename T, typename FMT>
+kernel void decode_swiglu_packed(
+    device const T *input [[buffer(0)]],
+    device const uchar *gate_weight [[buffer(1)]],
+    device const uchar *up_weight [[buffer(2)]],
+    device const T *gate_bias [[buffer(3)]],
+    device const T *up_bias [[buffer(4)]],
+    device T *output [[buffer(5)]],
+    constant int &batch [[buffer(6)]],
+    constant int &in_dim [[buffer(7)]],
+    constant int &out_dim [[buffer(8)]],
+    constant int &use_bias [[buffer(9)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int n = int(group.x), b = int(group.y);
+    if (n >= out_dim || b >= batch) return;
+    const long input_base = (long)b * in_dim;
+    float gate = decode_packed_dot<T, FMT>(
+        input, gate_weight, input_base, n, in_dim, lane);
+    float up = decode_packed_dot<T, FMT>(
+        input, up_weight, input_base, n, in_dim, lane);
+    if (lane == 0) {
+        if (use_bias != 0) {
+            gate += float(gate_bias[n]);
+            up += float(up_bias[n]);
+        }
+        const float activated = gate / (1.0f + metal::exp(-gate));
+        output[(long)b * out_dim + n] = T(activated * up);
+    }
+}
+
+#define instantiate_decode_epilogue_dense(type_name, T)                      \
+  template [[host_name("decode_linear_epilogue_dense_" #type_name)]]        \
+  [[kernel]] void decode_linear_epilogue_dense<T>(                           \
+    device const T *input [[buffer(0)]], device const T *weight [[buffer(1)]], \
+    device const T *bias [[buffer(2)]], device const T *residual [[buffer(3)]], \
+    device T *output [[buffer(4)]], constant int &batch [[buffer(5)]],        \
+    constant int &in_dim [[buffer(6)]], constant int &out_dim [[buffer(7)]], \
+    constant int &activation [[buffer(8)]], constant int &use_bias [[buffer(9)]], \
+    constant int &use_residual [[buffer(10)]],                               \
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("decode_swiglu_dense_" #type_name)]] [[kernel]]      \
+  void decode_swiglu_dense<T>(                                               \
+    device const T *input [[buffer(0)]], device const T *gate_weight [[buffer(1)]], \
+    device const T *up_weight [[buffer(2)]], device const T *gate_bias [[buffer(3)]], \
+    device const T *up_bias [[buffer(4)]], device T *output [[buffer(5)]],   \
+    constant int &batch [[buffer(6)]], constant int &in_dim [[buffer(7)]],   \
+    constant int &out_dim [[buffer(8)]], constant int &use_bias [[buffer(9)]], \
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_decode_epilogue_packed(fmt_name, FMT, type_name, T)       \
+  template [[host_name("decode_linear_epilogue_" fmt_name "_" #type_name)]] \
+  [[kernel]] void decode_linear_epilogue_packed<T, FMT>(                     \
+    device const T *input [[buffer(0)]], device const uchar *weight [[buffer(1)]], \
+    device const T *bias [[buffer(2)]], device const T *residual [[buffer(3)]], \
+    device T *output [[buffer(4)]], constant int &batch [[buffer(5)]],        \
+    constant int &in_dim [[buffer(6)]], constant int &out_dim [[buffer(7)]], \
+    constant int &activation [[buffer(8)]], constant int &use_bias [[buffer(9)]], \
+    constant int &use_residual [[buffer(10)]],                               \
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("decode_swiglu_" fmt_name "_" #type_name)]] [[kernel]] \
+  void decode_swiglu_packed<T, FMT>(                                         \
+    device const T *input [[buffer(0)]], device const uchar *gate_weight [[buffer(1)]], \
+    device const uchar *up_weight [[buffer(2)]], device const T *gate_bias [[buffer(3)]], \
+    device const T *up_bias [[buffer(4)]], device T *output [[buffer(5)]],   \
+    constant int &batch [[buffer(6)]], constant int &in_dim [[buffer(7)]],   \
+    constant int &out_dim [[buffer(8)]], constant int &use_bias [[buffer(9)]], \
+    uint2 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_decode_epilogue_type(type_name, T)                       \
+  instantiate_decode_epilogue_dense(type_name, T)                            \
+  instantiate_decode_epilogue_packed("q4_0", q4_0, type_name, T)            \
+  instantiate_decode_epilogue_packed("q8_0", q8_0, type_name, T)            \
+  instantiate_decode_epilogue_packed("q6_K", q6_K, type_name, T)
+
+instantiate_decode_epilogue_type(float32, float)
+instantiate_decode_epilogue_type(float16, half)
+instantiate_decode_epilogue_type(bfloat16, bf16)
+
 } // namespace mittens

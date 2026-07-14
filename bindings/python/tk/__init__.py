@@ -1974,6 +1974,51 @@ def lm_head_constrained(h, W, forbidden, previous, bias=None, eos_id=-1, forbid_
     return out[0], out[1]
 
 
+def lm_head_masked(h, W, allow_mask, bias=None, format=None, topk=1,
+                   normalize="allowed"):
+    """Project directly into a packed per-row allow mask without materializing logits.
+
+    ``h`` is (T,K), dense ``W`` is (V,K), and packed ``W`` is
+    (V,K/block_k,block_bytes) with ``format`` in q4_0/q8_0/q6_K. ``allow_mask`` is
+    (T,ceil(V/32)) packed int32 words. Returns (ids, logprobs), each (T,topk).
+    ``normalize='allowed'`` normalizes over legal tokens; ``'full'`` preserves the
+    pre-mask full-vocabulary normalizer. Ties choose the lower token id.
+    """
+    if normalize not in ("allowed", "full"):
+        raise ValueError("lm_head_masked: normalize must be 'allowed' or 'full'")
+    fmt = "" if format is None else str(format)
+    if _is_torch(h):
+        import torch
+        b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
+        return _torch().lm_head_masked(
+            h, W, b, allow_mask, fmt, int(topk), normalize == "allowed")
+    import mlx.core as mx
+    b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
+    out = _mlx().lm_head_masked(
+        h, W, b, allow_mask, fmt, int(topk), normalize == "allowed")
+    return out[0], out[1]
+
+
+def lm_head_candidates(h, W, candidate_ids, offsets, bias=None, format=None, topk=1):
+    """Project only CSR-listed token candidates and return their top-k log-probabilities.
+
+    ``candidate_ids`` is flat, ``offsets`` has T+1 entries, and candidate ids within
+    each row must be unique. Log-probabilities normalize over valid listed candidates.
+    Dense and q4_0/q8_0/q6_K packed weights are supported.
+    """
+    fmt = "" if format is None else str(format)
+    if _is_torch(h):
+        import torch
+        b = bias if bias is not None else torch.zeros(1, dtype=torch.float32, device=h.device)
+        return _torch().lm_head_candidates(
+            h, W, b, candidate_ids, offsets, fmt, int(topk))
+    import mlx.core as mx
+    b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
+    out = _mlx().lm_head_candidates(
+        h, W, b, candidate_ids, offsets, fmt, int(topk))
+    return out[0], out[1]
+
+
 def beam_advance(logits, cum_log_probs, beam_width):
     """Beam-search advance: one fused log-softmax + cumulative-score + top-beam_width step with
     parent tracking. logits (B*BM, V), cum_log_probs (B, BM). Returns (next_token (B,BM) int32,
@@ -2639,6 +2684,108 @@ def attn_decode_bh(q, k, v, context_length, use_kernel=False):
         scale=q.shape[-1] ** -0.5)[:, :, 0, :]
 
 
+def decode_cache_attention(q, new_k, new_v, cos, sin, positions, context_lengths,
+                           key_cache, value_cache, q_weight=None, k_weight=None,
+                           eps=1e-6, gemma=False, softmax_scale=None,
+                           use_kernel=None):
+    """One functional dense-cache decode step.
+
+    Optionally RMS-normalizes Q/K, applies split-half RoPE, appends rotated K and raw V
+    at each batch row's ``context_lengths`` slot, then attends through that new token.
+    Shapes are q (B,Hq,D), new_k/new_v (B,Hkv,D), and caches
+    (B,Hkv,cache_T,D); D is 64 or 128. Returns (output, new_key_cache,
+    new_value_cache). ``context_lengths`` denotes the number of existing tokens.
+    Auto-routing uses the multi-SIMD-group Metal implementation; pass
+    ``use_kernel=False`` to select the equivalent framework composition.
+    """
+    do_q_norm = q_weight is not None
+    do_k_norm = k_weight is not None
+    scale = 0.0 if softmax_scale is None else float(softmax_scale)
+    if use_kernel is None:
+        use_kernel = True
+    if use_kernel and _is_torch(q):
+        import torch
+        qw = q_weight if do_q_norm else torch.zeros(1, dtype=q.dtype, device=q.device)
+        kw = k_weight if do_k_norm else torch.zeros(1, dtype=q.dtype, device=q.device)
+        return _torch().decode_cache_attention(
+            q, new_k, new_v, cos, sin, positions, context_lengths,
+            qw, kw, key_cache, value_cache, float(eps), do_q_norm,
+            do_k_norm, bool(gemma), scale)
+    if use_kernel:
+        import mlx.core as mx
+        qw = q_weight if do_q_norm else mx.zeros((1,), dtype=q.dtype)
+        kw = k_weight if do_k_norm else mx.zeros((1,), dtype=q.dtype)
+        out = _mlx().decode_cache_attention(
+            q, new_k, new_v, cos, sin, positions, context_lengths,
+            qw, kw, key_cache, value_cache, float(eps), do_q_norm,
+            do_k_norm, bool(gemma), scale)
+        return out[0], out[1], out[2]
+
+    # Preserve the equivalent functional framework composition as an explicit
+    # fallback for portability and future crossover measurements.
+    half = q.shape[-1] // 2
+    if _is_torch(q):
+        import torch
+        import torch.nn.functional as F
+        qf, kf = q.float(), new_k.float()
+        if do_q_norm:
+            qf = qf * torch.rsqrt(qf.square().mean(-1, keepdim=True) + float(eps))
+            qf = qf * (q_weight.float() + (1.0 if gemma else 0.0))
+        if do_k_norm:
+            kf = kf * torch.rsqrt(kf.square().mean(-1, keepdim=True) + float(eps))
+            kf = kf * (k_weight.float() + (1.0 if gemma else 0.0))
+        position = positions.long()
+        c = cos.index_select(0, position).float()
+        s = sin.index_select(0, position).float()
+        q_rotated = torch.cat((qf[..., :half] * c[:, None] - qf[..., half:] * s[:, None],
+                               qf[..., half:] * c[:, None] + qf[..., :half] * s[:, None]), -1)
+        k_rotated = torch.cat((kf[..., :half] * c[:, None] - kf[..., half:] * s[:, None],
+                               kf[..., half:] * c[:, None] + kf[..., :half] * s[:, None]), -1)
+        slots = torch.arange(key_cache.shape[2], device=q.device)[None, :] == context_lengths[:, None]
+        next_key = torch.where(slots[:, None, :, None],
+                               k_rotated.to(q.dtype)[:, :, None, :], key_cache)
+        next_value = torch.where(slots[:, None, :, None],
+                                 new_v[:, :, None, :], value_cache)
+        valid = torch.arange(key_cache.shape[2], device=q.device)[None, :] <= context_lengths[:, None]
+        mask = torch.where(valid, 0.0, -float("inf"))[:, None, None, :]
+        attention_scale = scale if scale > 0.0 else q.shape[-1] ** -0.5
+        output = F.scaled_dot_product_attention(
+            q_rotated.to(q.dtype)[:, :, None, :], next_key, next_value,
+            attn_mask=mask, scale=attention_scale, enable_gqa=True).squeeze(-2)
+        return output, next_key, next_value
+
+    import mlx.core as mx
+    qf, kf = q.astype(mx.float32), new_k.astype(mx.float32)
+    if do_q_norm:
+        qf = qf * mx.rsqrt(mx.mean(qf * qf, axis=-1, keepdims=True) + float(eps))
+        qf = qf * (q_weight.astype(mx.float32) + (1.0 if gemma else 0.0))
+    if do_k_norm:
+        kf = kf * mx.rsqrt(mx.mean(kf * kf, axis=-1, keepdims=True) + float(eps))
+        kf = kf * (k_weight.astype(mx.float32) + (1.0 if gemma else 0.0))
+    # Array indexing preserves the batch axis for B=1; mx.take squeezes it.
+    c = cos[positions.astype(mx.int32)].astype(mx.float32)
+    s = sin[positions.astype(mx.int32)].astype(mx.float32)
+    q_rotated = mx.concatenate((qf[..., :half] * c[:, None] - qf[..., half:] * s[:, None],
+                                qf[..., half:] * c[:, None] + qf[..., :half] * s[:, None]), -1)
+    k_rotated = mx.concatenate((kf[..., :half] * c[:, None] - kf[..., half:] * s[:, None],
+                                kf[..., half:] * c[:, None] + kf[..., :half] * s[:, None]), -1)
+    times = mx.arange(key_cache.shape[2])[None, :]
+    slots = times == context_lengths[:, None]
+    # MLX 0.21's broadcasted where path corrupts wide innermost dimensions on
+    # Metal. A zero/one selector preserves both the cache values and dtype.
+    selector = slots[:, None, :, None].astype(q.dtype)
+    next_key = (key_cache * (1 - selector) +
+                k_rotated.astype(q.dtype)[:, :, None, :] * selector)
+    next_value = value_cache * (1 - selector) + new_v[:, :, None, :] * selector
+    valid = times <= context_lengths[:, None]
+    mask = mx.where(valid, 0.0, -float("inf")).astype(q.dtype)[:, None, None, :]
+    attention_scale = scale if scale > 0.0 else q.shape[-1] ** -0.5
+    output = mx.fast.scaled_dot_product_attention(
+        q_rotated.astype(q.dtype)[:, :, None, :], next_key, next_value,
+        scale=attention_scale, mask=mask)[:, :, 0, :]
+    return output, next_key, next_value
+
+
 def swin_attn_d32(qkv, relative_bias, mask=None, windows_per_image=0, use_kernel=False):
     """Swin window attention over packed qkv (BW,N,3,H,32).
 
@@ -2680,6 +2827,83 @@ def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
     if _is_torch(x):
         return _torch().patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
     return _mlx().patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+
+
+def space_to_depth_norm_linear(x, norm_weight, projection_weight, height, width,
+                               norm_bias=None, projection_bias=None, block_size=2,
+                               eps=1e-5, use_kernel=None):
+    """Fuse row-major space-to-depth, LayerNorm, and a dense projection.
+
+    Input is (B,H*W,C); gathered features are ordered by (dy,dx,channel), with
+    zero-padding at odd spatial edges. ``block_size`` is 2 or 4, norm parameters
+    span block_size²*C, and projection_weight is (O,block_size²*C). Returns
+    (B,ceil(H/block)*ceil(W/block),O). Auto-routing uses the Metal kernel for
+    small workloads and the measured framework composition for larger ones;
+    pass ``use_kernel`` to select a path explicitly.
+    """
+    use_norm_bias = norm_bias is not None
+    use_projection_bias = projection_bias is not None
+    output_height = (int(height) + int(block_size) - 1) // int(block_size)
+    output_width = (int(width) + int(block_size) - 1) // int(block_size)
+    dimension = int(block_size) * int(block_size) * x.shape[-1]
+    work = x.shape[0] * output_height * output_width * projection_weight.shape[0] * dimension
+    if use_kernel is None:
+        use_kernel = work <= 1_000_000
+    if use_kernel and _is_torch(x):
+        import torch
+        nb = norm_bias if use_norm_bias else torch.zeros(1, dtype=x.dtype, device=x.device)
+        pb = (projection_bias if use_projection_bias else
+              torch.zeros(1, dtype=x.dtype, device=x.device))
+        return _torch().space_to_depth_norm_linear(
+            x, norm_weight, nb, projection_weight, pb, int(height), int(width),
+            int(block_size), float(eps), use_norm_bias, use_projection_bias)
+    if use_kernel:
+        import mlx.core as mx
+        nb = norm_bias if use_norm_bias else mx.zeros((1,), dtype=x.dtype)
+        pb = projection_bias if use_projection_bias else mx.zeros((1,), dtype=x.dtype)
+        return _mlx().space_to_depth_norm_linear(
+            x, norm_weight, nb, projection_weight, pb, int(height), int(width),
+            int(block_size), float(eps), use_norm_bias, use_projection_bias)
+
+    padded_height, padded_width = output_height * int(block_size), output_width * int(block_size)
+    if _is_torch(x):
+        import torch
+        import torch.nn.functional as F
+        image = x.reshape(x.shape[0], int(height), int(width), x.shape[-1])
+        image = F.pad(image, (0, 0, 0, padded_width - int(width),
+                              0, padded_height - int(height)))
+        merged = torch.cat(
+            [image[:, dy::int(block_size), dx::int(block_size)]
+             for dy in range(int(block_size)) for dx in range(int(block_size))], -1)
+        merged = merged.reshape(x.shape[0], -1, dimension).float()
+        mean = merged.mean(-1, keepdim=True)
+        variance = merged.square().mean(-1, keepdim=True) - mean.square()
+        normalized = (merged - mean) * torch.rsqrt(torch.clamp_min(variance, 0.0) + float(eps))
+        normalized = normalized * norm_weight.float()
+        if use_norm_bias:
+            normalized = normalized + norm_bias.float()
+        output = normalized @ projection_weight.float().T
+        if use_projection_bias:
+            output = output + projection_bias.float()
+        return output.to(x.dtype)
+    import mlx.core as mx
+    image = mx.reshape(x, (x.shape[0], int(height), int(width), x.shape[-1]))
+    image = mx.pad(image, ((0, 0), (0, padded_height - int(height)),
+                           (0, padded_width - int(width)), (0, 0)))
+    merged = mx.concatenate(
+        [image[:, dy::int(block_size), dx::int(block_size)]
+         for dy in range(int(block_size)) for dx in range(int(block_size))], -1)
+    merged = mx.reshape(merged, (x.shape[0], -1, dimension)).astype(mx.float32)
+    mean = mx.mean(merged, axis=-1, keepdims=True)
+    variance = mx.mean(merged * merged, axis=-1, keepdims=True) - mean * mean
+    normalized = (merged - mean) * mx.rsqrt(mx.maximum(variance, 0.0) + float(eps))
+    normalized = normalized * norm_weight.astype(mx.float32)
+    if use_norm_bias:
+        normalized = normalized + norm_bias.astype(mx.float32)
+    output = normalized @ mx.swapaxes(projection_weight.astype(mx.float32), 0, 1)
+    if use_projection_bias:
+        output = output + projection_bias.astype(mx.float32)
+    return output.astype(x.dtype)
 
 
 def edge_mlp_256x7(hidden, first_weight, first_bias, second_weight, second_bias,
@@ -2733,6 +2957,118 @@ def decode_linear_q8(x, weight, bias, residual=None, gelu=False):
             x, weight, bias, placeholder, bool(gelu), bool(use_residual))
     return _mlx().decode_linear_q8(
         x, weight, bias, placeholder, bool(gelu), bool(use_residual))
+
+
+def _decode_quantize_output(output, output_quant):
+    if output_quant is None:
+        return output
+    if output_quant == "fp8":
+        return quantize_per_token_fp8(output)
+    if output_quant == "int8":
+        return quantize_per_token_int8(output)
+    raise ValueError("output_quant must be None, 'fp8', or 'int8'")
+
+
+def decode_linear_epilogue(x, weight, bias=None, residual=None, activation="none",
+                           format=None, output_quant=None, use_kernel=None):
+    """Latency-oriented dense or packed decode linear with one fused epilogue.
+
+    Computes ``residual + activation(x @ weight.T + bias)`` in fp32 accumulation
+    and rounds once to x.dtype. ``activation`` is ``none``, ``gelu`` (erf), or
+    ``silu``; packed formats are q4_0/q8_0/q6_K. ``output_quant`` optionally
+    composes the established per-token dynamic FP8 or int8 quantizer and returns
+    its (codes, scale) pair. Packed weights always use Metal; dense weights are
+    auto-routed by workload size unless ``use_kernel`` is set explicitly.
+    """
+    activations = {"none": 0, None: 0, "gelu": 1, "silu": 2}
+    if activation not in activations:
+        raise ValueError("activation must be 'none', 'gelu', or 'silu'")
+    use_bias = bias is not None
+    use_residual = residual is not None
+    b = bias if use_bias else x
+    r = residual if use_residual else x
+    fmt = "" if format is None else str(format)
+    if use_kernel is None:
+        use_kernel = format is not None or x.shape[0] * x.shape[-1] * weight.shape[0] <= 1_000_000
+    if not use_kernel and format is not None:
+        raise ValueError("decode_linear_epilogue: use_kernel=False requires a dense weight")
+    if use_kernel and _is_torch(x):
+        output = _torch().decode_linear_epilogue(
+            x, weight, b, r, fmt, activations[activation], use_bias, use_residual)
+    elif use_kernel:
+        output = _mlx().decode_linear_epilogue(
+            x, weight, b, r, fmt, activations[activation], use_bias, use_residual)
+    elif _is_torch(x):
+        import torch
+        import torch.nn.functional as F
+        output = x.float() @ weight.float().T
+        if use_bias:
+            output = output + bias.float()
+        if activation == "gelu":
+            output = F.gelu(output, approximate="none")
+        elif activation == "silu":
+            output = F.silu(output)
+        if use_residual:
+            output = output + residual.float()
+        output = output.to(x.dtype)
+    else:
+        import mlx.core as mx
+        output = x.astype(mx.float32) @ mx.swapaxes(weight.astype(mx.float32), 0, 1)
+        if use_bias:
+            output = output + bias.astype(mx.float32)
+        if activation == "gelu":
+            output = 0.5 * output * (1.0 + mx.erf(output * (2.0 ** -0.5)))
+        elif activation == "silu":
+            output = output * mx.sigmoid(output)
+        if use_residual:
+            output = output + residual.astype(mx.float32)
+        output = output.astype(x.dtype)
+    return _decode_quantize_output(output, output_quant)
+
+
+def decode_swiglu(x, gate_weight, up_weight, gate_bias=None, up_bias=None,
+                  format=None, output_quant=None, use_kernel=None):
+    """Fuse two dense or packed decode projections with ``silu(gate) * up``.
+
+    Biases must either both be present or both be omitted. Packed q4_0, q8_0,
+    and q6_K weights are supported. Optional output quantization follows
+    ``decode_linear_epilogue``. Packed weights use Metal; the measured framework
+    composition is the dense default unless ``use_kernel`` is set explicitly.
+    """
+    if (gate_bias is None) != (up_bias is None):
+        raise ValueError("decode_swiglu: gate_bias and up_bias must both be present or omitted")
+    use_bias = gate_bias is not None
+    gb = gate_bias if use_bias else x
+    ub = up_bias if use_bias else x
+    fmt = "" if format is None else str(format)
+    if use_kernel is None:
+        use_kernel = format is not None
+    if not use_kernel and format is not None:
+        raise ValueError("decode_swiglu: use_kernel=False requires dense weights")
+    if use_kernel and _is_torch(x):
+        output = _torch().decode_swiglu(
+            x, gate_weight, up_weight, gb, ub, fmt, use_bias)
+    elif use_kernel:
+        output = _mlx().decode_swiglu(
+            x, gate_weight, up_weight, gb, ub, fmt, use_bias)
+    elif _is_torch(x):
+        import torch.nn.functional as F
+        gate = x.float() @ gate_weight.float().T
+        up = x.float() @ up_weight.float().T
+        if use_bias:
+            gate = gate + gate_bias.float()
+            up = up + up_bias.float()
+        output = (F.silu(gate) * up).to(x.dtype)
+    else:
+        import mlx.core as mx
+        xf = x.astype(mx.float32)
+        gate = xf @ mx.swapaxes(gate_weight.astype(mx.float32), 0, 1)
+        up = xf @ mx.swapaxes(up_weight.astype(mx.float32), 0, 1)
+        if use_bias:
+            gate = gate + gate_bias.astype(mx.float32)
+            up = up + up_bias.astype(mx.float32)
+        output = (gate * mx.sigmoid(gate) * up).astype(x.dtype)
+    return _decode_quantize_output(output, output_quant)
 
 
 def qgemm_actorder(wq, x, perm, w_format="kU4B8", fused=False):
@@ -2840,6 +3176,66 @@ def dequant_gather(table, ids, format, scale=1.0):
     if _is_torch(table):
         return _torch().dequant_gather(table, ids, format, float(scale))
     return _mlx().dequant_gather(table, ids, format, float(scale))
+
+
+def quantized_embedding_lookup(table, ids, format, scale=1.0, add=None,
+                               output_dtype="float16"):
+    """Gather packed embedding rows into fp16, bf16, or fp32 output.
+
+    Supports q4_0/q8_0, K-quants, IQ4, grouped U4/HQQ, FP8 E4M3, NVFP4,
+    and MXFP4 layouts. ``add`` is an optional output-shaped positional/residual
+    term. Invalid ids produce all-zero rows and intentionally ignore ``add``.
+    """
+    if output_dtype not in ("float16", "bfloat16", "float32"):
+        raise ValueError("output_dtype must be 'float16', 'bfloat16', or 'float32'")
+    use_add = add is not None
+    if _is_torch(table):
+        import torch
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                 "float32": torch.float32}[output_dtype]
+        additive = (add.to(dtype) if use_add else
+                    torch.zeros(1, dtype=dtype, device=table.device))
+        return _torch().quantized_embedding(
+            table, ids, additive, format, float(scale), use_add, output_dtype)
+    import mlx.core as mx
+    dtype = {"float16": mx.float16, "bfloat16": mx.bfloat16,
+             "float32": mx.float32}[output_dtype]
+    additive = add.astype(dtype) if use_add else mx.zeros((1,), dtype=dtype)
+    return _mlx().quantized_embedding(
+        table, ids, additive, format, float(scale), use_add, output_dtype)
+
+
+def quantized_embedding(table, ids, format, scale=1.0, add=None,
+                        output_dtype="float16"):
+    """Alias for :func:`quantized_embedding_lookup`."""
+    return quantized_embedding_lookup(
+        table, ids, format, scale=scale, add=add, output_dtype=output_dtype)
+
+
+def quantized_embedding_bag(table, ids, offsets, format, sample_weights=None,
+                            mode="sum", scale=1.0, output_dtype="float16"):
+    """CSR sum/mean embedding bag over a packed table.
+
+    Repeated ids contribute repeatedly. Invalid ids are skipped and do not count
+    toward ``mean``. Optional sample_weights has one fp32-convertible value per id.
+    """
+    if mode not in ("sum", "mean"):
+        raise ValueError("quantized_embedding_bag: mode must be 'sum' or 'mean'")
+    if output_dtype not in ("float16", "bfloat16", "float32"):
+        raise ValueError("output_dtype must be 'float16', 'bfloat16', or 'float32'")
+    use_weights = sample_weights is not None
+    if _is_torch(table):
+        import torch
+        weights = (sample_weights if use_weights else
+                   torch.zeros(1, dtype=torch.float32, device=table.device))
+        return _torch().quantized_embedding_bag(
+            table, ids, offsets, weights, format, float(scale), use_weights,
+            mode == "mean", output_dtype)
+    import mlx.core as mx
+    weights = sample_weights if use_weights else mx.zeros((1,), dtype=mx.float32)
+    return _mlx().quantized_embedding_bag(
+        table, ids, offsets, weights, format, float(scale), use_weights,
+        mode == "mean", output_dtype)
 
 
 def qflux_gelu(wq, x, bias, format="q8_0"):

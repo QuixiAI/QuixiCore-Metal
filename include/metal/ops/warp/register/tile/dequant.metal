@@ -651,6 +651,297 @@ METAL_FUNC void tk_dequant8(device const uchar* base, int col0, thread half* w) 
     for (int i = 0; i < 8; ++i) w[i] = FMT::dequant(base, col0 + i);
 }
 
+// FP32 companion used by kernels whose public contract requires dequantization
+// and all following scale/epilogue arithmetic to happen before the output dtype
+// is rounded.  The generic implementation widens the format's native decoder;
+// formats below specialize the path to avoid an intermediate half rounding.
+// Keep the final cast at the consuming kernel's store site.
+template<typename FMT>
+METAL_FUNC void tk_dequant8_f32(device const uchar* base, int col0,
+                                thread float* w) {
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) w[i] = float(FMT::dequant(base, col0 + i));
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q4_0>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    device const uchar* qs = base + 2;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int col = col0 + i;
+        const int nib = col < 16 ? (qs[col] & 0x0F) : (qs[col - 16] >> 4);
+        w[i] = d * float(nib - 8);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q8_0>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    device const char* qs = (device const char*)(base + 2);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) w[i] = d * float(qs[col0 + i]);
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q6_K>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    device const uchar* ql = base;
+    device const uchar* qh = base + 128;
+    device const char* sca = (device const char*)(base + 192);
+    const float d = float(((device const half*)(base + 208))[0]);
+    const int chunk = col0 >> 7;
+    const int pos = col0 & 127;
+    const int group = pos >> 5;
+    const int lane0 = pos & 31;
+    const float dsc = d * float(sca[chunk * 8 + (lane0 >> 4) + group * 2]);
+    device const uchar* q = ql + chunk * 64 + lane0 + 32 * (group & 1);
+    device const uchar* h = qh + chunk * 32 + lane0;
+    const int hshift = 2 * group;
+    const bool hi = (group & 2) != 0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int nib = hi ? (q[i] >> 4) : (q[i] & 0x0F);
+        const int qv = (nib | (((h[i] >> hshift) & 3) << 4)) - 32;
+        w[i] = dsc * float(qv);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q4_K>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    const float dmin = float(((device const half*)base)[1]);
+    device const uchar* scales = base + 4;
+    device const uchar* qs = base + 16;
+    const int chunk = col0 >> 6, pos = col0 & 63;
+    const bool hi = pos >= 32;
+    const int sub = chunk * 2 + (hi ? 1 : 0);
+    int sc, mn;
+    if (sub < 4) {
+        sc = scales[sub] & 63;
+        mn = scales[sub + 4] & 63;
+    } else {
+        sc = (scales[sub + 4] & 0x0F) | ((scales[sub - 4] >> 6) << 4);
+        mn = (scales[sub + 4] >> 4) | ((scales[sub] >> 6) << 4);
+    }
+    const float dl = d * float(sc), ml = dmin * float(mn);
+    device const uchar* q = qs + chunk * 32 + (hi ? pos - 32 : pos);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = dl * float(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - ml;
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q5_K>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    const float dmin = float(((device const half*)(base + 2))[0]);
+    device const uchar* scales = base + 4;
+    device const uchar* qh = base + 16;
+    device const uchar* qs = base + 48;
+    const int chunk = col0 >> 6, pos = col0 & 63;
+    const int sub = pos >> 5, lane0 = pos & 31;
+    const int scale_index = 2 * chunk + sub;
+    int sc, mn;
+    if (scale_index < 4) {
+        sc = scales[scale_index] & 63;
+        mn = scales[scale_index + 4] & 63;
+    } else {
+        sc = (scales[scale_index + 4] & 0x0F) |
+            ((scales[scale_index - 4] >> 6) << 4);
+        mn = (scales[scale_index + 4] >> 4) |
+            ((scales[scale_index] >> 6) << 4);
+    }
+    const float dl = d * float(sc), ml = dmin * float(mn);
+    const uchar high_mask = uchar(1u << scale_index);
+    device const uchar* q = qs + chunk * 32 + lane0;
+    device const uchar* h = qh + lane0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int q5 = (sub ? (q[i] >> 4) : (q[i] & 0x0F)) +
+            ((h[i] & high_mask) ? 16 : 0);
+        w[i] = dl * float(q5) - ml;
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q2_K>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    device const uchar* scales = base;
+    device const uchar* qs = base + 16;
+    const float d = float(((device const half*)(base + 80))[0]);
+    const float dmin = float(((device const half*)(base + 82))[0]);
+    const int chunk = col0 >> 7, pos = col0 & 127;
+    const int scale_index = pos >> 5, sub = (pos >> 4) & 1, lane0 = pos & 15;
+    const uchar scale_byte = scales[chunk * 8 + scale_index * 2 + sub];
+    const float dl = d * float(scale_byte & 0x0F);
+    const float ml = dmin * float(scale_byte >> 4);
+    device const uchar* q = qs + chunk * 32 + sub * 16 + lane0;
+    const int shift = 2 * scale_index;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = dl * float((q[i] >> shift) & 3) - ml;
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<q3_K>(device const uchar* base, int col0,
+                                     thread float* w) {
+    #pragma clang fp reassociate(off)
+    device const uchar* high_mask = base;
+    device const uchar* qs = base + 32;
+    device const uchar* scales = base + 96;
+    const float d = float(((device const half*)(base + 108))[0]);
+    const int chunk = col0 >> 7, pos = col0 & 127;
+    const int scale_index = pos >> 5, sub = (pos >> 4) & 1, lane0 = pos & 15;
+    const int index = chunk * 8 + scale_index * 2 + sub;
+    const int word = index >> 2, byte = index & 3;
+    int scale;
+    if (word == 0) {
+        scale = (scales[byte] & 0xF) | ((scales[8 + byte] & 3) << 4);
+    } else if (word == 1) {
+        scale = (scales[4 + byte] & 0xF) |
+            (((scales[8 + byte] >> 2) & 3) << 4);
+    } else if (word == 2) {
+        scale = ((scales[byte] >> 4) & 0xF) |
+            (((scales[8 + byte] >> 4) & 3) << 4);
+    } else {
+        scale = ((scales[4 + byte] >> 4) & 0xF) |
+            (((scales[8 + byte] >> 6) & 3) << 4);
+    }
+    const float dsc = d * float(scale - 32);
+    device const uchar* q = qs + chunk * 32 + sub * 16 + lane0;
+    device const uchar* h = high_mask + sub * 16 + lane0;
+    const int shift = 2 * scale_index;
+    const uchar high_bit = uchar(1u << (chunk * 4 + scale_index));
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        const int q3 = (((q[i] >> shift) & 3) |
+            (((h[i] & high_bit) ? 1 : 0) << 2)) - 4;
+        w[i] = dsc * float(q3);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<iq4_xs>(device const uchar* base, int col0,
+                                       thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    const ushort scales_h = ((device const ushort*)(base + 2))[0];
+    device const uchar* scales_l = base + 4;
+    device const uchar* qs = base + 8;
+    const int block = col0 >> 5, local = col0 & 31;
+    const int low = (scales_l[block >> 1] >> (4 * (block & 1))) & 0x0F;
+    const int high = (scales_h >> (2 * block)) & 0x3;
+    const float dl = d * float((low | (high << 4)) - 32);
+    const bool hi = local >= 16;
+    device const uchar* q = qs + 16 * block + (hi ? local - 16 : local);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = dl * float(kvalues_iq4nl[hi ? (q[i] >> 4) : (q[i] & 0x0F)]);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<iq4_nl>(device const uchar* base, int col0,
+                                       thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float d = float(((device const half*)base)[0]);
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 2 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = d * float(kvalues_iq4nl[hi ? (q[i] >> 4) : (q[i] & 0x0F)]);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<kU4B8>(device const uchar* base, int col0,
+                                      thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = float(((device const half*)base)[0]);
+    const bool hi = col0 >= 64;
+    device const uchar* q = base + 2 + (hi ? col0 - 64 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = scale * float(int(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - 8);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<kU4>(device const uchar* base, int col0,
+                                    thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = float(((device const half*)base)[0]);
+    const float zero = float(((device const half*)base)[1]);
+    const bool hi = col0 >= 64;
+    device const uchar* q = base + 4 + (hi ? col0 - 64 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = scale * (float(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - zero);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<hqq>(device const uchar* base, int col0,
+                                    thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = float(((device const half*)base)[0]);
+    const float zero = float(((device const half*)base)[1]);
+    const bool hi = col0 >= 32;
+    device const uchar* q = base + 4 + (hi ? col0 - 32 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = scale * (float(hi ? (q[i] >> 4) : (q[i] & 0x0F)) - zero);
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<fp8_e4m3>(device const uchar* base, int col0,
+                                         thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = float(((device const half*)base)[0]);
+    device const uchar* q = base + 2 + col0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) w[i] = scale * float(tk_e4m3_decode(q[i]));
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<nvfp4>(device const uchar* base, int col0,
+                                      thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = float(tk_e4m3_decode(base[0]));
+    const bool hi = col0 >= 8;
+    device const uchar* q = base + 1 + (hi ? col0 - 8 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = scale * float(tk_e2m1_decode(hi ? uint(q[i] >> 4) : uint(q[i] & 0x0F)));
+    }
+}
+
+template<>
+METAL_FUNC void tk_dequant8_f32<mxfp4>(device const uchar* base, int col0,
+                                      thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = metal::exp2(float(int(base[0]) - 127));
+    const bool hi = col0 >= 16;
+    device const uchar* q = base + 1 + (hi ? col0 - 16 : col0);
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) {
+        w[i] = scale * float(tk_e2m1_decode(hi ? uint(q[i] >> 4) : uint(q[i] & 0x0F)));
+    }
+}
+
 template<>
 METAL_FUNC void tk_dequant8<q4_K>(device const uchar* base, int col0, thread half* w) {
     const half d    = ((device const half*)base)[0];

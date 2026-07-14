@@ -118,4 +118,77 @@ families:
       - kernels/utils/add_rt
       - kernels/utils/dropout
       - kernels/utils/cross_entropy
-notes: Canonical family-level manifest. Operation-level metadata can now be added without legacy path translation.
+operations:
+  quantized_embedding:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/dequant_gather
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/dequant_gather
+    benchmark: quantized_embedding
+  quantized_embedding_bag:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/dequant_gather
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/dequant_gather
+    benchmark: quantized_embedding_bag
+  decode_linear_epilogue:
+    family: matmul
+    status: implemented
+    path: kernels/matmul/decode_linear
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/matmul/decode_linear
+    benchmark: decode_linear_epilogue
+  decode_swiglu:
+    family: matmul
+    status: implemented
+    path: kernels/matmul/decode_linear
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/matmul/decode_linear
+    benchmark: decode_swiglu
+  lm_head_masked:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/lm_head
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/lm_head
+    benchmark: lm_head_masked
+  lm_head_candidates:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/lm_head
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/lm_head
+    benchmark: lm_head_candidates
+  space_to_depth_norm_linear:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_merge
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_merge
+    benchmark: space_to_depth_norm_linear
+  decode_cache_attention:
+    family: attention
+    status: implemented
+    path: kernels/attention/attn_decode
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/attention/attn_decode
+    benchmark: decode_cache_attention
+notes: Canonical family manifest with operation-level metadata for specialized composed kernels.

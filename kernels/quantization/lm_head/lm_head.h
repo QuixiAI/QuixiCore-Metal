@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <string>
+#include <utility>
+
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 
@@ -56,6 +59,102 @@ std::vector<array> lm_head_constrained(
     int eos_id = -1,
     bool forbid_eos = false,
     StreamOrDevice s = {});
+
+/** Fused LM-head projection with a packed allow bitmask.  Returns top-k ids and
+ *  log-probabilities, both (T, topk).  `normalize_allowed=true` normalizes over
+ *  legal tokens; false normalizes over the full vocabulary before masking. */
+std::vector<array> lm_head_masked(
+    const array& h,
+    const array& W,
+    const array& bias,
+    const array& allow_mask,
+    const std::string& format = "",
+    int topk = 1,
+    bool normalize_allowed = true,
+    StreamOrDevice s = {});
+
+/** Sparse candidate LM head. `candidate_ids` is flat and `offsets` has T+1
+ *  entries. Candidate ids within each row must be unique. */
+std::vector<array> lm_head_candidates(
+    const array& h,
+    const array& W,
+    const array& bias,
+    const array& candidate_ids,
+    const array& offsets,
+    const std::string& format = "",
+    int topk = 1,
+    StreamOrDevice s = {});
+
+class LmHeadMaskedPartials : public Primitive {
+ public:
+  LmHeadMaskedPartials(Stream stream, std::string format, int vocab, int hidden,
+                       int tile_v, int topk, bool use_bias, bool normalize_allowed)
+      : Primitive(stream), format_(std::move(format)), vocab_(vocab), hidden_(hidden),
+        tile_v_(tile_v), topk_(topk), use_bias_(use_bias),
+        normalize_allowed_(normalize_allowed) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadMaskedPartials"; }
+  void print(std::ostream& os) override { os << "LmHeadMaskedPartials"; }
+  bool is_equivalent(const Primitive& other) const override;
+ private:
+  std::string format_;
+  int vocab_;
+  int hidden_;
+  int tile_v_;
+  int topk_;
+  bool use_bias_;
+  bool normalize_allowed_;
+};
+
+class LmHeadMaskedReduce : public Primitive {
+ public:
+  LmHeadMaskedReduce(Stream stream, int topk) : Primitive(stream), topk_(topk) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadMaskedReduce"; }
+  void print(std::ostream& os) override { os << "LmHeadMaskedReduce"; }
+  bool is_equivalent(const Primitive& other) const override;
+ private:
+  int topk_;
+};
+
+class LmHeadCandidates : public Primitive {
+ public:
+  LmHeadCandidates(Stream stream, std::string format, int vocab, int hidden,
+                   int topk, bool use_bias)
+      : Primitive(stream), format_(std::move(format)), vocab_(vocab), hidden_(hidden),
+        topk_(topk), use_bias_(use_bias) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadCandidates"; }
+  void print(std::ostream& os) override { os << "LmHeadCandidates"; }
+  bool is_equivalent(const Primitive& other) const override;
+ private:
+  std::string format_;
+  int vocab_;
+  int hidden_;
+  int topk_;
+  bool use_bias_;
+};
 
 class LmHeadConstrainedPartials : public Primitive {
  public:

@@ -205,6 +205,10 @@ def run_case(case, be, warmup, iters, check):
             b = time_thunk(thunk, be, warmup, iters)
             row["baselines"][name] = {
                 "ms": b["ms"],
+                "p20_ms": b["p20_ms"],
+                "p80_ms": b["p80_ms"],
+                "cv": round(b["cv"], 4),
+                "batch": b["batch"],
                 "speedup": (b["ms"] / t["ms"]) if t["ms"] > 0 else None,
             }
         except Exception as e:  # noqa: BLE001
@@ -2808,6 +2812,400 @@ def kernel_extension_cases(be, preset, formats):
                out_to_numpy=lambda out: be.to_numpy(out[0]),
                baselines={"matmul_logsoftmax_mask_argmax": constrained_base}, ref=ref,
                flops=float(2 * T * V * K))
+
+
+# --------------------------------------------------------------------------- composable decode kernels
+def _device_transpose(be, value):
+    return value.T if be.name == "torch" else be.mx.swapaxes(value, -1, -2)
+
+
+def _device_silu(be, value):
+    if be.name == "torch":
+        return be.torch.nn.functional.silu(value)
+    return value * be.mx.sigmoid(value)
+
+
+@register("quantized_embedding")
+def quantized_embedding_cases(be, preset, formats):
+    """Packed lookup candidate versus a materialized fp32 table gather."""
+    tk = be.tk()
+    rng = np.random.default_rng(301)
+    shapes = _pick(
+        preset, [(1024, 256, 32)],
+        [(8192, 1024, 1), (8192, 1024, 256)],
+        [(32768, 1536, 1), (32768, 1536, 256), (32768, 4096, 2048)])
+    fmt = "q4_0" if formats is None else next((f for f in formats if f in BLOCK_INFO), "q4_0")
+    for rows, dimension, tokens in shapes:
+        block_k = BLOCK_INFO[fmt][0]
+        dimension = ((dimension + block_k - 1) // block_k) * block_k
+        packed, dequantized = _packed_weight(fmt, rows, dimension, seed=301)
+        ids = rng.integers(0, rows, size=tokens, dtype=np.int32)
+        add = (0.02 * rng.standard_normal((tokens, dimension))).astype(np.float32)
+        packed_d, ids_d = be.raw_array(packed), be.int_array(ids)
+        table_d, add_d = be.array(dequantized), be.array(add)
+        if be.name == "mlx":
+            baseline = lambda: be.mx.take(table_d, ids_d, axis=0) + add_d
+        else:
+            baseline = lambda: table_d.index_select(0, ids_d.long()) + add_d
+        ref = dequantized[ids] + add
+        yield Case(
+            "quantized_embedding", f"{fmt}_R{rows}_D{dimension}_T{tokens}",
+            {"rows": rows, "D": dimension, "tokens": tokens}, "f32", fmt=fmt,
+            target=lambda packed_d=packed_d, ids_d=ids_d, add_d=add_d, fmt=fmt:
+                tk.quantized_embedding(
+                    packed_d, ids_d, fmt, add=add_d, output_dtype="float32"),
+            baselines={"predequantized_gather_add": baseline}, ref=ref,
+            bytes_moved=float(packed.nbytes + ids.nbytes + add.nbytes + ref.nbytes),
+            weight_bytes=float(packed.nbytes))
+
+
+@register("quantized_embedding_bag")
+def quantized_embedding_bag_cases(be, preset, formats):
+    """Packed CSR reduction candidate versus gather/materialize/reduce."""
+    tk = be.tk()
+    rng = np.random.default_rng(307)
+    shapes = _pick(
+        preset, [(1024, 256, 16, 4)],
+        [(8192, 1024, 128, 8), (8192, 1024, 32, 32)],
+        [(32768, 1536, 256, 8), (32768, 4096, 512, 16)])
+    fmt = "q4_0"
+    for rows, dimension, bags, bag_size in shapes:
+        packed, dequantized = _packed_weight(fmt, rows, dimension, seed=307)
+        ids = rng.integers(0, rows, size=bags * bag_size, dtype=np.int32)
+        offsets = np.arange(0, ids.size + 1, bag_size, dtype=np.int32)
+        sample_weights = (0.5 + rng.random(ids.size)).astype(np.float32)
+        packed_d, ids_d = be.raw_array(packed), be.int_array(ids)
+        offsets_d, weights_d = be.int_array(offsets), be.array(sample_weights)
+        table_d = be.array(dequantized)
+        if be.name == "mlx":
+            def baseline():
+                gathered = be.mx.take(table_d, ids_d, axis=0)
+                weighted = gathered * weights_d[:, None]
+                return be.mx.mean(be.mx.reshape(weighted, (bags, bag_size, dimension)), axis=1)
+        else:
+            def baseline():
+                gathered = table_d.index_select(0, ids_d.long())
+                weighted = gathered * weights_d[:, None]
+                return weighted.reshape(bags, bag_size, dimension).mean(1)
+        ref = (dequantized[ids] * sample_weights[:, None]).reshape(
+            bags, bag_size, dimension).mean(1)
+        yield Case(
+            "quantized_embedding_bag",
+            f"{fmt}_R{rows}_D{dimension}_B{bags}_L{bag_size}",
+            {"rows": rows, "D": dimension, "bags": bags, "bag_size": bag_size},
+            "f32", fmt=fmt,
+            target=lambda: tk.quantized_embedding_bag(
+                packed_d, ids_d, offsets_d, fmt, sample_weights=weights_d,
+                mode="mean", output_dtype="float32"),
+            baselines={"predequantized_gather_weight_mean": baseline}, ref=ref,
+            weight_bytes=float(packed.nbytes))
+
+
+@register("decode_linear_epilogue")
+def decode_linear_epilogue_cases(be, preset, formats):
+    """One-dispatch projection/SiLU/residual versus decomposed framework ops."""
+    tk = be.tk()
+    rng = np.random.default_rng(311)
+    shapes = _pick(preset, [(1, 256, 256)], [(1, 1536, 4096)],
+                   [(1, 4096, 4096), (4, 4096, 11008)])
+    for batch, hidden, output in shapes:
+        x = (0.08 * rng.standard_normal((batch, hidden))).astype(np.float32)
+        bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+        residual = (0.03 * rng.standard_normal((batch, output))).astype(np.float32)
+        x_d, bias_d, residual_d = be.array(x), be.array(bias), be.array(residual)
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K")
+                          if formats is None or f in formats]
+        for fmt in [None, *packed_formats]:
+            if fmt is None:
+                weight = (0.06 * rng.standard_normal((output, hidden))).astype(np.float32)
+                weight_d, weight_ref = be.array(weight), weight
+                weight_bytes = float(weight.nbytes)
+                variant = "dense"
+            else:
+                packed, weight_ref = _packed_weight(fmt, output, hidden, seed=313)
+                weight_d = be.raw_array(packed)
+                weight_bytes = float(packed.nbytes)
+                variant = fmt
+            weight_ref_d = be.array(weight_ref)
+            baseline = lambda weight_ref_d=weight_ref_d: (
+                _device_silu(be, x_d @ _device_transpose(be, weight_ref_d) + bias_d) + residual_d)
+            linear = x @ weight_ref.T + bias
+            ref = linear / (1.0 + np.exp(-linear)) + residual
+            yield Case(
+                "decode_linear_epilogue",
+                f"{variant}_B{batch}_K{hidden}_N{output}",
+                {"B": batch, "K": hidden, "N": output}, "f32", fmt=fmt,
+                target=lambda weight_d=weight_d, fmt=fmt: tk.decode_linear_epilogue(
+                    x_d, weight_d, bias_d, residual_d, activation="silu", format=fmt,
+                    use_kernel=True),
+                baselines={"matmul_bias_silu_residual": baseline}, ref=ref,
+                weight_bytes=weight_bytes, flops=float(2 * batch * hidden * output))
+
+
+@register("decode_swiglu")
+def decode_swiglu_cases(be, preset, formats):
+    """Fused dual projection versus two materialized matmuls."""
+    tk = be.tk()
+    rng = np.random.default_rng(317)
+    shapes = _pick(preset, [(1, 256, 256)], [(1, 1536, 4096)],
+                   [(1, 4096, 11008)])
+    for batch, hidden, output in shapes:
+        x = (0.07 * rng.standard_normal((batch, hidden))).astype(np.float32)
+        x_d = be.array(x)
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K")
+                          if formats is None or f in formats]
+        for fmt in [None, *packed_formats]:
+            if fmt is None:
+                gate = (0.05 * rng.standard_normal((output, hidden))).astype(np.float32)
+                up = (0.05 * rng.standard_normal((output, hidden))).astype(np.float32)
+                gate_d, up_d = be.array(gate), be.array(up)
+                weight_bytes = float(gate.nbytes + up.nbytes)
+                variant = "dense"
+            else:
+                gate_q, gate = _packed_weight(fmt, output, hidden, seed=319)
+                up_q, up = _packed_weight(fmt, output, hidden, seed=321)
+                gate_d, up_d = be.raw_array(gate_q), be.raw_array(up_q)
+                weight_bytes = float(gate_q.nbytes + up_q.nbytes)
+                variant = fmt
+            gate_ref_d, up_ref_d = be.array(gate), be.array(up)
+            baseline = lambda gate_ref_d=gate_ref_d, up_ref_d=up_ref_d: (
+                _device_silu(be, x_d @ _device_transpose(be, gate_ref_d)) *
+                (x_d @ _device_transpose(be, up_ref_d)))
+            gate_value = x @ gate.T
+            ref = gate_value / (1.0 + np.exp(-gate_value)) * (x @ up.T)
+            yield Case(
+                "decode_swiglu", f"{variant}_B{batch}_K{hidden}_N{output}",
+                {"B": batch, "K": hidden, "N": output}, "f32", fmt=fmt,
+                target=lambda gate_d=gate_d, up_d=up_d, fmt=fmt: tk.decode_swiglu(
+                    x_d, gate_d, up_d, format=fmt, use_kernel=True),
+                baselines={"two_matmuls_silu_mul": baseline}, ref=ref,
+                weight_bytes=weight_bytes, flops=float(4 * batch * hidden * output))
+
+
+def _allow_mask(rows, vocab):
+    packed = np.zeros((len(rows), (vocab + 31) // 32), dtype=np.uint32)
+    boolean = np.zeros((len(rows), vocab), dtype=bool)
+    for token, values in enumerate(rows):
+        boolean[token, values] = True
+        for value in values:
+            packed[token, value // 32] |= np.uint32(1 << (value % 32))
+    return packed.view(np.int32), boolean
+
+
+@register("lm_head_masked")
+def lm_head_masked_cases(be, preset, formats):
+    """Packed mask projection versus full logits plus mask/top-k/logsumexp."""
+    tk = be.tk()
+    rng = np.random.default_rng(331)
+    shapes = _pick(preset, [(1, 1025, 256, 32)],
+                   [(1, 8192, 1024, 256), (8, 8192, 1024, 64)],
+                   [(1, 32768, 1536, 512), (16, 32768, 1536, 128)])
+    topk, fmt = 4, "q4_0"
+    for tokens, vocab, hidden, legal in shapes:
+        packed, weight = _packed_weight(fmt, vocab, hidden, seed=331)
+        h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
+        bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
+        rows = [np.sort(rng.choice(vocab, size=legal, replace=False)).astype(np.int32)
+                for _ in range(tokens)]
+        allow_words, allow_bool = _allow_mask(rows, vocab)
+        h_d, packed_d, weight_d = be.array(h), be.raw_array(packed), be.array(weight)
+        bias_d = be.array(bias); allow_d = be.int_array(allow_words)
+        allow_bool_d = be.int_array(allow_bool)
+        if be.name == "mlx":
+            def baseline():
+                logits = h_d @ be.mx.swapaxes(weight_d, 0, 1) + bias_d
+                masked = be.mx.where(allow_bool_d, logits, -float("inf"))
+                ids = be.mx.argpartition(-masked, topk - 1, axis=-1)[:, :topk]
+                selected = be.mx.take_along_axis(masked, ids, axis=-1)
+                return ids, selected - be.mx.logsumexp(masked, axis=-1, keepdims=True)
+        else:
+            def baseline():
+                logits = h_d @ weight_d.T + bias_d
+                masked = be.torch.where(allow_bool_d.bool(), logits, -float("inf"))
+                selected, ids = be.torch.topk(masked, topk, dim=-1)
+                return ids.to(be.torch.int32), selected - be.torch.logsumexp(
+                    masked, dim=-1, keepdim=True)
+        logits = h @ weight.T + bias
+        ref = np.stack([values[np.lexsort((values, -logits[token, values]))[:topk]]
+                        for token, values in enumerate(rows)])
+        yield Case(
+            "lm_head_masked", f"{fmt}_T{tokens}_V{vocab}_K{hidden}_L{legal}",
+            {"T": tokens, "V": vocab, "K": hidden, "legal": legal}, "f32", fmt=fmt,
+            target=lambda: tk.lm_head_masked(
+                h_d, packed_d, allow_d, bias=bias_d, format=fmt, topk=topk),
+            out_to_numpy=lambda out: be.to_numpy(out[0]),
+            baselines={"full_matmul_mask_topk_logsoftmax": baseline}, ref=ref,
+            weight_bytes=float(packed.nbytes), flops=float(2 * tokens * vocab * hidden))
+
+
+@register("lm_head_candidates")
+def lm_head_candidates_cases(be, preset, formats):
+    """CSR candidate projection versus gathered dense candidate weights."""
+    tk = be.tk()
+    rng = np.random.default_rng(337)
+    shapes = _pick(preset, [(1, 1025, 256, 32)],
+                   [(1, 8192, 1024, 256), (8, 8192, 1024, 64)],
+                   [(16, 32768, 1536, 512)])
+    topk, fmt = 4, "q4_0"
+    for tokens, vocab, hidden, candidates in shapes:
+        packed, weight = _packed_weight(fmt, vocab, hidden, seed=337)
+        h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
+        bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
+        candidate_matrix = np.stack([
+            rng.choice(vocab, size=candidates, replace=False).astype(np.int32)
+            for _ in range(tokens)])
+        candidate_ids = candidate_matrix.reshape(-1)
+        offsets = np.arange(0, candidate_ids.size + 1, candidates, dtype=np.int32)
+        h_d, packed_d, weight_d = be.array(h), be.raw_array(packed), be.array(weight)
+        ids_d, offsets_d, bias_d = be.int_array(candidate_ids), be.int_array(offsets), be.array(bias)
+        matrix_d = be.int_array(candidate_matrix)
+        if be.name == "mlx":
+            def baseline():
+                rows = be.mx.take(weight_d, matrix_d, axis=0)
+                logits = be.mx.einsum("tk,tck->tc", h_d, rows) + be.mx.take(bias_d, matrix_d)
+                ids = be.mx.argpartition(-logits, topk - 1, axis=-1)[:, :topk]
+                selected = be.mx.take_along_axis(logits, ids, axis=-1)
+                return be.mx.take_along_axis(matrix_d, ids, axis=-1), (
+                    selected - be.mx.logsumexp(logits, axis=-1, keepdims=True))
+        else:
+            def baseline():
+                rows = weight_d.index_select(0, matrix_d.reshape(-1).long()).reshape(
+                    tokens, candidates, hidden)
+                logits = be.torch.einsum("tk,tck->tc", h_d, rows) + bias_d[matrix_d.long()]
+                selected, local = be.torch.topk(logits, topk, dim=-1)
+                return matrix_d.gather(1, local).to(be.torch.int32), (
+                    selected - be.torch.logsumexp(logits, dim=-1, keepdim=True))
+        logits = h @ weight.T + bias
+        ref = np.stack([
+            row[np.lexsort((row, -logits[token, row]))[:topk]]
+            for token, row in enumerate(candidate_matrix)])
+        yield Case(
+            "lm_head_candidates", f"{fmt}_T{tokens}_V{vocab}_K{hidden}_C{candidates}",
+            {"T": tokens, "V": vocab, "K": hidden, "candidates": candidates},
+            "f32", fmt=fmt,
+            target=lambda: tk.lm_head_candidates(
+                h_d, packed_d, ids_d, offsets_d, bias=bias_d, format=fmt, topk=topk),
+            out_to_numpy=lambda out: be.to_numpy(out[0]),
+            baselines={"gather_dense_rows_einsum_topk": baseline}, ref=ref,
+            weight_bytes=float(packed.nbytes),
+            flops=float(2 * tokens * candidates * hidden))
+
+
+@register("space_to_depth_norm_linear")
+def space_to_depth_norm_linear_cases(be, preset, formats):
+    """Fused gather/norm/projection versus a materialized framework chain."""
+    tk = be.tk()
+    rng = np.random.default_rng(347)
+    shapes = _pick(preset, [(1, 8, 8, 32, 64, 2)],
+                   [(1, 48, 48, 128, 512, 2), (1, 32, 32, 64, 256, 4)],
+                   [(4, 96, 96, 128, 512, 2), (2, 64, 64, 128, 1024, 4)])
+    for batch, height, width, channels, output, block in shapes:
+        dimension = block * block * channels
+        x = (0.1 * rng.standard_normal((batch, height * width, channels))).astype(np.float32)
+        norm_weight = (0.8 + 0.1 * rng.standard_normal(dimension)).astype(np.float32)
+        norm_bias = (0.02 * rng.standard_normal(dimension)).astype(np.float32)
+        projection = (0.04 * rng.standard_normal((output, dimension))).astype(np.float32)
+        projection_bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+        x_d, nw_d, nb_d, pw_d, pb_d = [be.array(value) for value in
+                                       (x, norm_weight, norm_bias, projection, projection_bias)]
+        if be.name == "mlx":
+            def baseline():
+                image = be.mx.reshape(x_d, (batch, height, width, channels))
+                merged = be.mx.concatenate(
+                    [image[:, dy::block, dx::block] for dy in range(block) for dx in range(block)],
+                    axis=-1)
+                merged = be.mx.reshape(merged, (batch, -1, dimension))
+                normalized = be.mx.fast.layer_norm(merged, nw_d, nb_d, 1e-5)
+                return normalized @ be.mx.swapaxes(pw_d, 0, 1) + pb_d
+        else:
+            def baseline():
+                image = x_d.reshape(batch, height, width, channels)
+                merged = be.torch.cat(
+                    [image[:, dy::block, dx::block] for dy in range(block) for dx in range(block)],
+                    dim=-1).reshape(batch, -1, dimension)
+                normalized = be.torch.nn.functional.layer_norm(
+                    merged, (dimension,), nw_d, nb_d, 1e-5)
+                return normalized @ pw_d.T + pb_d
+        image = x.reshape(batch, height, width, channels)
+        merged = np.concatenate(
+            [image[:, dy::block, dx::block] for dy in range(block) for dx in range(block)],
+            axis=-1).reshape(batch, -1, dimension)
+        mean = merged.mean(-1, keepdims=True)
+        variance = (merged * merged).mean(-1, keepdims=True) - mean * mean
+        normalized = (merged - mean) / np.sqrt(np.maximum(variance, 0) + 1e-5)
+        ref = (normalized * norm_weight + norm_bias) @ projection.T + projection_bias
+        yield Case(
+            "space_to_depth_norm_linear",
+            f"B{batch}_{height}x{width}_C{channels}_O{output}_S{block}",
+            {"B": batch, "H": height, "W": width, "C": channels,
+             "O": output, "block": block}, "f32",
+            target=lambda: tk.space_to_depth_norm_linear(
+                x_d, nw_d, pw_d, height, width, norm_bias=nb_d,
+                projection_bias=pb_d, block_size=block, use_kernel=True),
+            baselines={"space_to_depth_layernorm_matmul": baseline}, ref=ref,
+            flops=float(2 * batch * (height // block) * (width // block) * dimension * output))
+
+
+@register("decode_cache_attention")
+def decode_cache_attention_cases(be, preset, formats):
+    """Fused functional cache step versus pre-updated framework SDPA."""
+    tk = be.tk()
+    rng = np.random.default_rng(353)
+    shapes = _pick(preset, [(1, 4, 2, 64, 64)],
+                   [(4, 16, 4, 512, 128), (4, 16, 4, 1024, 128),
+                    (4, 16, 4, 2048, 128)],
+                   [(16, 32, 8, 4096, 128)])
+    for batch, heads_q, heads_kv, context, dimension in shapes:
+        cache_length = context + 16
+        q = (0.1 * rng.standard_normal((batch, heads_q, dimension))).astype(np.float32)
+        new_k = (0.1 * rng.standard_normal((batch, heads_kv, dimension))).astype(np.float32)
+        new_v = (0.1 * rng.standard_normal((batch, heads_kv, dimension))).astype(np.float32)
+        key_cache = (0.1 * rng.standard_normal(
+            (batch, heads_kv, cache_length, dimension))).astype(np.float32)
+        value_cache = (0.1 * rng.standard_normal(
+            (batch, heads_kv, cache_length, dimension))).astype(np.float32)
+        positions = np.full(batch, context, dtype=np.int32)
+        contexts = np.full(batch, context, dtype=np.int32)
+        angles = (np.arange(context + 1, dtype=np.float32)[:, None] + 1) * (
+            np.arange(dimension // 2, dtype=np.float32)[None, :] + 1) * 0.0001
+        cos, sin = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+        half = dimension // 2; c, s = cos[context], sin[context]
+        q_rotated = np.concatenate((q[..., :half] * c - q[..., half:] * s,
+                                    q[..., half:] * c + q[..., :half] * s), axis=-1)
+        k_rotated = np.concatenate((new_k[..., :half] * c - new_k[..., half:] * s,
+                                    new_k[..., half:] * c + new_k[..., :half] * s), axis=-1)
+        key_updated, value_updated = key_cache.copy(), value_cache.copy()
+        key_updated[:, :, context] = k_rotated; value_updated[:, :, context] = new_v
+        arrays = [be.array(value) for value in
+                  (q, new_k, new_v, cos, sin, key_cache, value_cache,
+                   q_rotated, key_updated, value_updated)]
+        q_d, nk_d, nv_d, cos_d, sin_d, kc_d, vc_d, qr_d, ku_d, vu_d = arrays
+        positions_d, contexts_d = be.int_array(positions), be.int_array(contexts)
+        baseline = lambda: tk.attn_decode_bh(
+            qr_d, ku_d, vu_d, context + 1, use_kernel=False)
+        equivalent = lambda: tk.decode_cache_attention(
+            q_d, nk_d, nv_d, cos_d, sin_d, positions_d, contexts_d, kc_d, vc_d,
+            use_kernel=False)
+        repetitions = heads_q // heads_kv
+        repeated_k = np.repeat(key_updated[:, :, :context + 1], repetitions, axis=1)
+        repeated_v = np.repeat(value_updated[:, :, :context + 1], repetitions, axis=1)
+        scores = np.einsum("bhd,bhtd->bht", q_rotated, repeated_k) / math.sqrt(dimension)
+        probabilities = np.exp(scores - scores.max(-1, keepdims=True))
+        probabilities /= probabilities.sum(-1, keepdims=True)
+        ref = np.einsum("bht,bhtd->bhd", probabilities, repeated_v)
+        yield Case(
+            "decode_cache_attention",
+            f"B{batch}_H{heads_q}_{heads_kv}_T{context}_D{dimension}",
+            {"B": batch, "Hq": heads_q, "Hkv": heads_kv, "T": context,
+             "D": dimension}, "f32",
+            target=lambda: tk.decode_cache_attention(
+                q_d, nk_d, nv_d, cos_d, sin_d, positions_d, contexts_d, kc_d, vc_d,
+                use_kernel=True),
+            out_to_numpy=lambda out: be.to_numpy(out[0]),
+            baselines={"framework_equivalent_functional_step": equivalent,
+                       "preupdated_framework_sdpa_output_only": baseline}, ref=ref,
+            bytes_moved=float(key_cache.nbytes + value_cache.nbytes +
+                              key_updated.nbytes + value_updated.nbytes))
 
 
 # --------------------------------------------------------------------------- runner

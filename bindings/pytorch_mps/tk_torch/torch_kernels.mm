@@ -4570,6 +4570,78 @@ static at::Tensor attn_decode_bh_mps(
   return out;
 }
 
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> decode_cache_attention_mps(
+    const at::Tensor& q_in, const at::Tensor& new_k_in,
+    const at::Tensor& new_v_in, const at::Tensor& cos_in,
+    const at::Tensor& sin_in, const at::Tensor& positions_in,
+    const at::Tensor& context_lengths_in, const at::Tensor& q_weight_in,
+    const at::Tensor& k_weight_in, const at::Tensor& key_cache_in,
+    const at::Tensor& value_cache_in, double eps, bool do_q_norm,
+    bool do_k_norm, bool gemma, double softmax_scale) {
+  TORCH_CHECK(q_in.device().is_mps() && tk_is_float_dtype(q_in) && q_in.dim() == 3 &&
+              q_in.size(0) > 0 && q_in.size(1) > 0 &&
+              (q_in.size(2) == 64 || q_in.size(2) == 128),
+              "decode_cache_attention: q must be (B,Hq,D) float with D=64 or 128");
+  const int B = q_in.size(0), Hq = q_in.size(1), D = q_in.size(2);
+  TORCH_CHECK(new_k_in.device().is_mps() && new_v_in.device().is_mps() &&
+              new_k_in.scalar_type() == q_in.scalar_type() &&
+              new_v_in.scalar_type() == q_in.scalar_type() && new_k_in.dim() == 3 &&
+              new_v_in.sizes() == new_k_in.sizes() && new_k_in.size(0) == B &&
+              new_k_in.size(1) > 0 && new_k_in.size(2) == D &&
+              Hq % new_k_in.size(1) == 0,
+              "decode_cache_attention: new_k/new_v must be (B,Hkv,D), Hq%Hkv=0");
+  const int Hkv = new_k_in.size(1);
+  TORCH_CHECK(key_cache_in.device().is_mps() && value_cache_in.device().is_mps() &&
+              key_cache_in.scalar_type() == q_in.scalar_type() &&
+              value_cache_in.scalar_type() == q_in.scalar_type() &&
+              key_cache_in.dim() == 4 && value_cache_in.sizes() == key_cache_in.sizes() &&
+              key_cache_in.size(0) == B && key_cache_in.size(1) == Hkv &&
+              key_cache_in.size(2) > 0 && key_cache_in.size(3) == D,
+              "decode_cache_attention: caches must be (B,Hkv,cache_T,D)");
+  TORCH_CHECK(cos_in.device().is_mps() && sin_in.device().is_mps() &&
+              cos_in.scalar_type() == q_in.scalar_type() &&
+              sin_in.scalar_type() == q_in.scalar_type() && cos_in.dim() == 2 &&
+              sin_in.sizes() == cos_in.sizes() && cos_in.size(0) > 0 &&
+              cos_in.size(1) == D / 2,
+              "decode_cache_attention: cos/sin must be (P,D/2) with q dtype");
+  TORCH_CHECK(positions_in.device().is_mps() && context_lengths_in.device().is_mps() &&
+              positions_in.dim() == 1 && positions_in.size(0) == B &&
+              context_lengths_in.dim() == 1 && context_lengths_in.size(0) == B,
+              "decode_cache_attention: positions/context_lengths must be (B,)");
+  TORCH_CHECK(!do_q_norm ||
+              (q_weight_in.device().is_mps() && q_weight_in.scalar_type() == q_in.scalar_type() &&
+               q_weight_in.dim() == 1 && q_weight_in.size(0) == D),
+              "decode_cache_attention: q_weight must be (D,)");
+  TORCH_CHECK(!do_k_norm ||
+              (k_weight_in.device().is_mps() && k_weight_in.scalar_type() == q_in.scalar_type() &&
+               k_weight_in.dim() == 1 && k_weight_in.size(0) == D),
+              "decode_cache_attention: k_weight must be (D,)");
+  TORCH_CHECK(eps > 0.0 && softmax_scale >= 0.0,
+              "decode_cache_attention: eps positive and softmax_scale non-negative required");
+  auto q = q_in.contiguous(), new_k = new_k_in.contiguous(), new_v = new_v_in.contiguous();
+  auto cos = cos_in.contiguous(), sin = sin_in.contiguous();
+  auto positions = positions_in.to(at::kInt).contiguous();
+  auto context_lengths = context_lengths_in.to(at::kInt).contiguous();
+  auto q_weight = q_weight_in.to(q.scalar_type()).contiguous();
+  auto k_weight = k_weight_in.to(q.scalar_type()).contiguous();
+  auto key_cache_input = key_cache_in.contiguous();
+  auto value_cache_input = value_cache_in.contiguous();
+  auto output = at::empty_like(q), key_cache = at::empty_like(key_cache_input);
+  auto value_cache = at::empty_like(value_cache_input);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_kv_cache_clone(
+        e, key_cache_input, value_cache_input, key_cache, value_cache,
+        static_cast<uint64_t>(key_cache_input.numel()), tk_type_name(q));
+    tk::launch_decode_cache_attention(
+        e, q, new_k, new_v, cos, sin, positions, context_lengths,
+        q_weight, k_weight, key_cache, value_cache, output,
+        B, Hq, Hkv, key_cache.size(2), D, static_cast<float>(eps),
+        do_q_norm, do_k_norm, gemma, static_cast<float>(softmax_scale),
+        tk_type_name(q));
+  });
+  return {output, key_cache, value_cache};
+}
+
 static at::Tensor swin_attn_d32_mps(
     const at::Tensor& qkv_in, const at::Tensor& relative_bias_in,
     const at::Tensor& mask_in, int64_t windows_per_image) {
@@ -4623,6 +4695,56 @@ static at::Tensor patch_merge_layernorm_mps(
     tk::launch_patch_merge_layernorm(e, input, weight, bias, output, B,
                                      static_cast<int>(height), static_cast<int>(width), C,
                                      static_cast<float>(eps));
+  });
+  return output;
+}
+
+static at::Tensor space_to_depth_norm_linear_mps(
+    const at::Tensor& input_in, const at::Tensor& norm_weight_in,
+    const at::Tensor& norm_bias_in, const at::Tensor& projection_weight_in,
+    const at::Tensor& projection_bias_in, int64_t height, int64_t width,
+    int64_t block_size, double eps, bool use_norm_bias,
+    bool use_projection_bias) {
+  TORCH_CHECK(input_in.device().is_mps() && tk_is_float_dtype(input_in) &&
+              input_in.dim() == 3 && input_in.size(0) > 0 && input_in.size(2) > 0 &&
+              height > 0 && width > 0 && input_in.size(1) == height * width &&
+              (block_size == 2 || block_size == 4),
+              "space_to_depth_norm_linear: input must be (B,H*W,C) float; block is 2 or 4");
+  const int B = input_in.size(0), C = input_in.size(2);
+  const int dimension = block_size * block_size * C;
+  TORCH_CHECK(dimension <= 4096 && norm_weight_in.device().is_mps() &&
+              norm_weight_in.scalar_type() == input_in.scalar_type() &&
+              norm_weight_in.dim() == 1 && norm_weight_in.size(0) == dimension,
+              "space_to_depth_norm_linear: norm_weight mismatch or dimension > 4096");
+  TORCH_CHECK(!use_norm_bias ||
+              (norm_bias_in.device().is_mps() &&
+               norm_bias_in.scalar_type() == input_in.scalar_type() &&
+               norm_bias_in.dim() == 1 && norm_bias_in.size(0) == dimension),
+              "space_to_depth_norm_linear: norm_bias must be (block^2*C,)");
+  TORCH_CHECK(projection_weight_in.device().is_mps() &&
+              projection_weight_in.scalar_type() == input_in.scalar_type() &&
+              projection_weight_in.dim() == 2 && projection_weight_in.size(0) > 0 &&
+              projection_weight_in.size(1) == dimension,
+              "space_to_depth_norm_linear: projection_weight must be (O,block^2*C)");
+  const int O = projection_weight_in.size(0);
+  TORCH_CHECK(!use_projection_bias ||
+              (projection_bias_in.device().is_mps() &&
+               projection_bias_in.scalar_type() == input_in.scalar_type() &&
+               projection_bias_in.dim() == 1 && projection_bias_in.size(0) == O),
+              "space_to_depth_norm_linear: projection_bias must be (O,)");
+  auto input = input_in.contiguous(), norm_weight = norm_weight_in.contiguous();
+  auto norm_bias = norm_bias_in.to(input.scalar_type()).contiguous();
+  auto projection_weight = projection_weight_in.contiguous();
+  auto projection_bias = projection_bias_in.to(input.scalar_type()).contiguous();
+  const int patches = ((static_cast<int>(height) + block_size - 1) / block_size) *
+                      ((static_cast<int>(width) + block_size - 1) / block_size);
+  auto output = at::empty({B, patches, O}, input.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_space_to_depth_norm_linear(
+        e, input, norm_weight, norm_bias, projection_weight, projection_bias,
+        output, B, static_cast<int>(height), static_cast<int>(width), C, O,
+        static_cast<int>(block_size), static_cast<float>(eps), use_norm_bias,
+        use_projection_bias, tk_type_name(input));
   });
   return output;
 }
@@ -4733,6 +4855,95 @@ static at::Tensor decode_linear_q8_mps(
   return output;
 }
 
+static int check_decode_epilogue_weight(
+    const at::Tensor& x, const at::Tensor& weight,
+    const std::string& format, const char* name) {
+  TORCH_CHECK(x.device().is_mps() && weight.device().is_mps() &&
+              tk_is_float_dtype(x) && x.dim() == 2 && x.size(0) > 0 && x.size(1) > 0,
+              name, ": x must be non-empty (B,K) fp32/fp16/bf16");
+  const int K = x.size(1);
+  if (format.empty()) {
+    TORCH_CHECK(weight.scalar_type() == x.scalar_type() && weight.dim() == 2 &&
+                weight.size(0) > 0 && weight.size(1) == K,
+                name, ": dense weight must be (N,K) with x dtype");
+    return weight.size(0);
+  }
+  int block_k = 0, block_bytes = 0;
+  if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else {
+    TORCH_CHECK(false,
+                name, ": format must be empty/dense, q4_0, q8_0, or q6_K");
+  }
+  TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
+              weight.size(0) > 0 && K % block_k == 0 &&
+              weight.size(1) == K / block_k && weight.size(2) == block_bytes,
+              name, ": packed weight must be uint8 (N,K/block_k,block_bytes)");
+  return weight.size(0);
+}
+
+static at::Tensor decode_linear_epilogue_mps(
+    const at::Tensor& x_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, const at::Tensor& residual_in,
+    const std::string& format, int64_t activation,
+    bool use_bias, bool use_residual) {
+  TORCH_CHECK(activation >= 0 && activation <= 2,
+              "decode_linear_epilogue: activation must be 0, 1, or 2");
+  const int N = check_decode_epilogue_weight(
+      x_in, weight_in, format, "decode_linear_epilogue");
+  const int B = x_in.size(0), K = x_in.size(1);
+  TORCH_CHECK(!use_bias || (bias_in.device().is_mps() && bias_in.dim() == 1 &&
+              bias_in.size(0) == N && bias_in.scalar_type() == x_in.scalar_type()),
+              "decode_linear_epilogue: bias must be (N,) with x dtype");
+  TORCH_CHECK(!use_residual || (residual_in.device().is_mps() && residual_in.dim() == 2 &&
+              residual_in.size(0) == B && residual_in.size(1) == N &&
+              residual_in.scalar_type() == x_in.scalar_type()),
+              "decode_linear_epilogue: residual must be (B,N) with x dtype");
+  auto x = x_in.contiguous(), weight = weight_in.contiguous();
+  auto bias = bias_in.to(x.scalar_type()).contiguous();
+  auto residual = residual_in.to(x.scalar_type()).contiguous();
+  auto output = at::empty({B, N}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_linear_epilogue(
+        e, x, weight, bias, residual, output, B, K, N,
+        static_cast<int>(activation), use_bias, use_residual, format,
+        tk_type_name(x));
+  });
+  return output;
+}
+
+static at::Tensor decode_swiglu_mps(
+    const at::Tensor& x_in, const at::Tensor& gate_weight_in,
+    const at::Tensor& up_weight_in, const at::Tensor& gate_bias_in,
+    const at::Tensor& up_bias_in, const std::string& format, bool use_bias) {
+  const int N = check_decode_epilogue_weight(
+      x_in, gate_weight_in, format, "decode_swiglu");
+  const int up_N = check_decode_epilogue_weight(
+      x_in, up_weight_in, format, "decode_swiglu");
+  TORCH_CHECK(up_N == N && up_weight_in.sizes() == gate_weight_in.sizes(),
+              "decode_swiglu: gate and up weights must have identical shapes");
+  TORCH_CHECK(!use_bias ||
+              (gate_bias_in.device().is_mps() && up_bias_in.device().is_mps() &&
+               gate_bias_in.scalar_type() == x_in.scalar_type() &&
+               up_bias_in.scalar_type() == x_in.scalar_type() &&
+               gate_bias_in.dim() == 1 && up_bias_in.dim() == 1 &&
+               gate_bias_in.size(0) == N && up_bias_in.size(0) == N),
+              "decode_swiglu: both biases must be (N,) with x dtype");
+  auto x = x_in.contiguous(), gate_weight = gate_weight_in.contiguous();
+  auto up_weight = up_weight_in.contiguous();
+  auto gate_bias = gate_bias_in.to(x.scalar_type()).contiguous();
+  auto up_bias = up_bias_in.to(x.scalar_type()).contiguous();
+  const int B = x.size(0), K = x.size(1);
+  auto output = at::empty({B, N}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_decode_swiglu(
+        e, x, gate_weight, up_weight, gate_bias, up_bias, output,
+        B, K, N, use_bias, format, tk_type_name(x));
+  });
+  return output;
+}
+
 static at::Tensor dequant_gather_mps(
     const at::Tensor& table_in, const at::Tensor& ids_in,
     const std::string& format, double scale) {
@@ -4754,6 +4965,92 @@ static at::Tensor dequant_gather_mps(
   tk_encode([&](TorchEncoder& e) {
     tk::launch_dequant_gather(e, table, ids, output, rows, columns, ids.numel(),
                               static_cast<float>(scale), format);
+  });
+  return output;
+}
+
+static std::tuple<int, int> quantized_embedding_layout(const std::string& format) {
+  if (format == "q4_0") return {32, 18};
+  if (format == "q8_0") return {32, 34};
+  if (format == "q4_K") return {256, 144};
+  if (format == "q5_K") return {256, 176};
+  if (format == "q6_K") return {256, 210};
+  if (format == "q2_K") return {256, 84};
+  if (format == "q3_K") return {256, 110};
+  if (format == "iq4_nl") return {32, 18};
+  if (format == "iq4_xs") return {256, 136};
+  if (format == "kU4B8") return {128, 66};
+  if (format == "kU4") return {128, 68};
+  if (format == "hqq") return {64, 36};
+  if (format == "fp8_e4m3") return {32, 34};
+  if (format == "nvfp4") return {16, 9};
+  if (format == "mxfp4") return {32, 17};
+  TORCH_CHECK(false, "quantized_embedding: unsupported packed format '", format, "'");
+}
+
+static at::ScalarType quantized_embedding_dtype(const std::string& name) {
+  if (name == "float16") return at::kHalf;
+  if (name == "bfloat16") return at::kBFloat16;
+  if (name == "float32") return at::kFloat;
+  TORCH_CHECK(false,
+              "quantized_embedding: output_dtype must be float16, bfloat16, or float32");
+}
+
+static at::Tensor quantized_embedding_mps(
+    const at::Tensor& table_in, const at::Tensor& ids_in,
+    const at::Tensor& add_in, const std::string& format, double scale,
+    bool use_add, const std::string& output_dtype) {
+  auto [block_k, block_bytes] = quantized_embedding_layout(format);
+  TORCH_CHECK(table_in.device().is_mps() && ids_in.device().is_mps() &&
+              add_in.device().is_mps() && table_in.scalar_type() == at::kByte &&
+              table_in.dim() == 3 && table_in.size(0) > 0 && table_in.size(1) > 0 &&
+              table_in.size(2) == block_bytes && ids_in.numel() > 0,
+              "quantized_embedding: table must be packed uint8 (rows,blocks,block_bytes)");
+  const auto dtype = quantized_embedding_dtype(output_dtype);
+  const int rows = table_in.size(0), columns = table_in.size(1) * block_k;
+  auto shape = ids_in.sizes().vec();
+  shape.push_back(columns);
+  TORCH_CHECK(!use_add || (add_in.scalar_type() == dtype && add_in.sizes() == shape),
+              "quantized_embedding: add must match output shape and output_dtype");
+  auto table = table_in.contiguous(), ids = ids_in.to(at::kInt).contiguous();
+  auto add = add_in.to(dtype).contiguous();
+  auto output = at::empty(shape, table.options().dtype(dtype));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantized_embedding(
+        e, table, ids, add, output, rows, columns, ids.numel(),
+        static_cast<float>(scale), use_add, format, tk_type_name(output));
+  });
+  return output;
+}
+
+static at::Tensor quantized_embedding_bag_mps(
+    const at::Tensor& table_in, const at::Tensor& ids_in,
+    const at::Tensor& offsets_in, const at::Tensor& sample_weights_in,
+    const std::string& format, double scale, bool use_weights,
+    bool mean_mode, const std::string& output_dtype) {
+  auto [block_k, block_bytes] = quantized_embedding_layout(format);
+  TORCH_CHECK(table_in.device().is_mps() && ids_in.device().is_mps() &&
+              offsets_in.device().is_mps() && sample_weights_in.device().is_mps() &&
+              table_in.scalar_type() == at::kByte && table_in.dim() == 3 &&
+              table_in.size(0) > 0 && table_in.size(1) > 0 &&
+              table_in.size(2) == block_bytes && ids_in.dim() == 1 &&
+              offsets_in.dim() == 1 && offsets_in.size(0) >= 2,
+              "quantized_embedding_bag: expected packed table, flat ids, and offsets");
+  TORCH_CHECK(!use_weights ||
+              (sample_weights_in.dim() == 1 && sample_weights_in.numel() == ids_in.numel()),
+              "quantized_embedding_bag: sample_weights must have one value per id");
+  const auto dtype = quantized_embedding_dtype(output_dtype);
+  const int rows = table_in.size(0), columns = table_in.size(1) * block_k;
+  const int bags = offsets_in.size(0) - 1;
+  auto table = table_in.contiguous(), ids = ids_in.to(at::kInt).contiguous();
+  auto offsets = offsets_in.to(at::kInt).contiguous();
+  auto weights = sample_weights_in.to(at::kFloat).contiguous();
+  auto output = at::empty({bags, columns}, table.options().dtype(dtype));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_quantized_embedding_bag(
+        e, table, ids, offsets, weights, output, rows, columns, ids.numel(), bags,
+        static_cast<float>(scale), use_weights, mean_mode, format,
+        tk_type_name(output));
   });
   return output;
 }
@@ -4800,6 +5097,105 @@ static std::tuple<at::Tensor, at::Tensor> lm_head_constrained_mps(
         e, part_max, part_sum, part_best, part_id, token, logprob, num_vtiles, T);
   });
   return {token, logprob};
+}
+
+static int check_masked_lm_weight(
+    const at::Tensor& h, const at::Tensor& weight,
+    const std::string& format, const char* name) {
+  TORCH_CHECK(h.device().is_mps() && weight.device().is_mps() &&
+              tk_is_float_dtype(h) && h.dim() == 2 &&
+              h.size(0) > 0 && h.size(1) > 0,
+              name, ": h must be non-empty (T,K) fp32/fp16/bf16");
+  const int K = h.size(1);
+  if (format.empty()) {
+    TORCH_CHECK(weight.scalar_type() == h.scalar_type() && weight.dim() == 2 &&
+                weight.size(0) > 0 && weight.size(1) == K,
+                name, ": dense weight must be (V,K) with h dtype");
+    return weight.size(0);
+  }
+  int block_k = 0, block_bytes = 0;
+  if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else {
+    TORCH_CHECK(false,
+                name, ": format must be empty/dense, q4_0, q8_0, or q6_K");
+  }
+  TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
+              weight.size(0) > 0 && K % block_k == 0 &&
+              weight.size(1) == K / block_k && weight.size(2) == block_bytes,
+              name, ": invalid packed weight shape");
+  return weight.size(0);
+}
+
+static std::tuple<at::Tensor, at::Tensor> lm_head_masked_mps(
+    const at::Tensor& h_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, const at::Tensor& allow_mask_in,
+    const std::string& format, int64_t topk, bool normalize_allowed) {
+  const int V = check_masked_lm_weight(
+      h_in, weight_in, format, "lm_head_masked");
+  const int T = h_in.size(0), K = h_in.size(1), words = (V + 31) / 32;
+  TORCH_CHECK(topk >= 1 && topk <= 8 && topk <= V,
+              "lm_head_masked: topk must be in [1,min(8,V)]");
+  TORCH_CHECK(allow_mask_in.device().is_mps() && allow_mask_in.dim() == 2 &&
+              allow_mask_in.size(0) == T && allow_mask_in.size(1) == words,
+              "lm_head_masked: allow_mask must be (T,ceil(V/32))");
+  const bool use_bias = bias_in.numel() > 1;
+  TORCH_CHECK(!use_bias || (bias_in.dim() == 1 && bias_in.size(0) == V),
+              "lm_head_masked: bias must be (V,) or scalar placeholder");
+  constexpr int MASKED_TILE_V = 128;
+  const int num_vtiles = (V + MASKED_TILE_V - 1) / MASKED_TILE_V;
+  auto h = h_in.contiguous(), weight = weight_in.contiguous();
+  auto bias = use_bias ? bias_in.to(at::kFloat).contiguous()
+                       : at::zeros({1}, h.options().dtype(at::kFloat));
+  auto allow_mask = allow_mask_in.to(at::kInt).contiguous();
+  auto f32 = h.options().dtype(at::kFloat), i32 = h.options().dtype(at::kInt);
+  auto part_val = at::empty({T, num_vtiles, topk}, f32);
+  auto part_id = at::empty({T, num_vtiles, topk}, i32);
+  auto part_max = at::empty({T, num_vtiles}, f32);
+  auto part_sum = at::empty({T, num_vtiles}, f32);
+  auto ids = at::empty({T, topk}, i32), logprobs = at::empty({T, topk}, f32);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_masked_partials(
+        e, h, weight, bias, allow_mask, part_val, part_id, part_max, part_sum,
+        V, K, MASKED_TILE_V, num_vtiles, static_cast<int>(topk), use_bias,
+        normalize_allowed, words, T, format, tk_type_name(h));
+    tk::launch_lm_head_masked_reduce(
+        e, part_val, part_id, part_max, part_sum, ids, logprobs,
+        num_vtiles, static_cast<int>(topk), T);
+  });
+  return {ids, logprobs};
+}
+
+static std::tuple<at::Tensor, at::Tensor> lm_head_candidates_mps(
+    const at::Tensor& h_in, const at::Tensor& weight_in,
+    const at::Tensor& bias_in, const at::Tensor& candidate_ids_in,
+    const at::Tensor& offsets_in, const std::string& format, int64_t topk) {
+  const int V = check_masked_lm_weight(
+      h_in, weight_in, format, "lm_head_candidates");
+  const int T = h_in.size(0), K = h_in.size(1);
+  TORCH_CHECK(topk >= 1 && topk <= 8 && topk <= V,
+              "lm_head_candidates: topk must be in [1,min(8,V)]");
+  TORCH_CHECK(candidate_ids_in.device().is_mps() && offsets_in.device().is_mps() &&
+              candidate_ids_in.dim() == 1 && offsets_in.dim() == 1 &&
+              offsets_in.size(0) == T + 1,
+              "lm_head_candidates: flat candidate_ids and T+1 offsets required");
+  const bool use_bias = bias_in.numel() > 1;
+  TORCH_CHECK(!use_bias || (bias_in.dim() == 1 && bias_in.size(0) == V),
+              "lm_head_candidates: bias must be (V,) or scalar placeholder");
+  auto h = h_in.contiguous(), weight = weight_in.contiguous();
+  auto candidate_ids = candidate_ids_in.to(at::kInt).contiguous();
+  auto offsets = offsets_in.to(at::kInt).contiguous();
+  auto bias = use_bias ? bias_in.to(at::kFloat).contiguous()
+                       : at::zeros({1}, h.options().dtype(at::kFloat));
+  auto ids = at::empty({T, topk}, h.options().dtype(at::kInt));
+  auto logprobs = at::empty({T, topk}, h.options().dtype(at::kFloat));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_candidates(
+        e, h, weight, candidate_ids, offsets, bias, ids, logprobs,
+        V, K, static_cast<int>(topk), use_bias, T, format, tk_type_name(h));
+  });
+  return {ids, logprobs};
 }
 
 static at::Tensor flux_gelu_erf_mps(
@@ -5190,10 +5586,27 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "decode-compatible residual-add + LayerNorm (MPS)");
   m.def("attn_decode_bh", &attn_decode_bh_mps,
         "batched head-major GQA attention decode (MPS)");
+  m.def("decode_cache_attention", &decode_cache_attention_mps,
+        "fused norm + RoPE + cache append + decode attention (MPS)",
+        pybind11::arg("q"), pybind11::arg("new_k"), pybind11::arg("new_v"),
+        pybind11::arg("cos"), pybind11::arg("sin"), pybind11::arg("positions"),
+        pybind11::arg("context_lengths"), pybind11::arg("q_weight"),
+        pybind11::arg("k_weight"), pybind11::arg("key_cache"),
+        pybind11::arg("value_cache"), pybind11::arg("eps") = 1e-6,
+        pybind11::arg("do_q_norm") = false, pybind11::arg("do_k_norm") = false,
+        pybind11::arg("gemma") = false, pybind11::arg("softmax_scale") = 0.0);
   m.def("swin_attn_d32", &swin_attn_d32_mps,
         "Swin packed-QKV window attention, D=32 (MPS)");
   m.def("patch_merge_layernorm", &patch_merge_layernorm_mps,
         "fused Swin patch merge + LayerNorm (MPS)");
+  m.def("space_to_depth_norm_linear", &space_to_depth_norm_linear_mps,
+        "fused space-to-depth + norm + projection (MPS)",
+        pybind11::arg("input"), pybind11::arg("norm_weight"),
+        pybind11::arg("norm_bias"), pybind11::arg("projection_weight"),
+        pybind11::arg("projection_bias"), pybind11::arg("height"),
+        pybind11::arg("width"), pybind11::arg("block_size") = 2,
+        pybind11::arg("eps") = 1e-5, pybind11::arg("use_norm_bias") = true,
+        pybind11::arg("use_projection_bias") = false);
   m.def("edge_mlp_256x7", &edge_mlp_256x7_mps,
         "fixed pairwise 512-to-256-to-7 edge MLP (MPS)");
   m.def("decode_linear", &decode_linear_mps,
@@ -5202,10 +5615,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "decode linear + materialized-order residual (MPS)");
   m.def("decode_linear_q8", &decode_linear_q8_mps,
         "q8_0 decode linear with optional GELU/residual (MPS)");
+  m.def("decode_linear_epilogue", &decode_linear_epilogue_mps,
+        "dense/packed decode linear epilogue (MPS)",
+        pybind11::arg("x"), pybind11::arg("weight"), pybind11::arg("bias"),
+        pybind11::arg("residual"), pybind11::arg("format") = "",
+        pybind11::arg("activation") = 0, pybind11::arg("use_bias") = false,
+        pybind11::arg("use_residual") = false);
+  m.def("decode_swiglu", &decode_swiglu_mps,
+        "dense/packed decode pair with SwiGLU (MPS)",
+        pybind11::arg("x"), pybind11::arg("gate_weight"),
+        pybind11::arg("up_weight"), pybind11::arg("gate_bias"),
+        pybind11::arg("up_bias"), pybind11::arg("format") = "",
+        pybind11::arg("use_bias") = false);
   m.def("dequant_gather", &dequant_gather_mps,
         "packed GGUF gather + direct fp16 dequantization (MPS)");
+  m.def("quantized_embedding", &quantized_embedding_mps,
+        "packed embedding lookup with optional additive epilogue (MPS)",
+        pybind11::arg("table"), pybind11::arg("ids"), pybind11::arg("add"),
+        pybind11::arg("format"), pybind11::arg("scale") = 1.0,
+        pybind11::arg("use_add") = false,
+        pybind11::arg("output_dtype") = "float16");
+  m.def("quantized_embedding_bag", &quantized_embedding_bag_mps,
+        "CSR embedding bag over packed rows (MPS)",
+        pybind11::arg("table"), pybind11::arg("ids"), pybind11::arg("offsets"),
+        pybind11::arg("sample_weights"), pybind11::arg("format"),
+        pybind11::arg("scale") = 1.0, pybind11::arg("use_weights") = false,
+        pybind11::arg("mean_mode") = false,
+        pybind11::arg("output_dtype") = "float16");
   m.def("lm_head_constrained", &lm_head_constrained_mps,
         "dense constrained LM head returning token and logprob (MPS)");
+  m.def("lm_head_masked", &lm_head_masked_mps,
+        "masked dense/packed LM head returning top-k and logprobs (MPS)",
+        pybind11::arg("h"), pybind11::arg("weight"), pybind11::arg("bias"),
+        pybind11::arg("allow_mask"), pybind11::arg("format") = "",
+        pybind11::arg("topk") = 1, pybind11::arg("normalize_allowed") = true);
+  m.def("lm_head_candidates", &lm_head_candidates_mps,
+        "CSR candidate dense/packed LM head returning top-k and logprobs (MPS)",
+        pybind11::arg("h"), pybind11::arg("weight"), pybind11::arg("bias"),
+        pybind11::arg("candidate_ids"), pybind11::arg("offsets"),
+        pybind11::arg("format") = "", pybind11::arg("topk") = 1);
   m.def("flux_gelu_erf", &flux_gelu_erf_mps,
         "fused GEMM + erf GELU (MPS)");
 }

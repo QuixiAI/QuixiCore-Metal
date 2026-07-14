@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 import tk
+from tk.quant import QUANT_FORMATS
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -361,3 +362,118 @@ if __name__ == "__main__":
     test_categorical("float32", 4, 32000, 2048)
     test_topk("float32", 8)
     print("ok")
+
+
+def _packed_allow_mask(rows, vocab):
+    mask = np.zeros((len(rows), (vocab + 31) // 32), dtype=np.uint32)
+    for token, allowed in enumerate(rows):
+        for value in allowed:
+            mask[token, value // 32] |= np.uint32(1 << (value % 32))
+    return mask
+
+
+def _topk_logprobs(logits, candidates, topk, normalizer_ids=None):
+    valid = np.array([v for v in candidates if 0 <= v < logits.shape[0]], dtype=np.int32)
+    if valid.size == 0:
+        return np.full(topk, -1, np.int32), np.full(topk, -np.inf, np.float32)
+    order = np.lexsort((valid, -logits[valid]))[:topk]
+    selected = valid[order]
+    normalizer = valid if normalizer_ids is None else np.asarray(normalizer_ids, dtype=np.int32)
+    values = logits[normalizer]
+    maximum = values.max()
+    lse = maximum + np.log(np.exp(values - maximum).sum())
+    out_ids = np.full(topk, -1, np.int32)
+    out_lp = np.full(topk, -np.inf, np.float32)
+    out_ids[:selected.size] = selected
+    out_lp[:selected.size] = logits[selected] - lse
+    return out_ids, out_lp
+
+
+@pytest.mark.parametrize("normalize", ["allowed", "full"])
+def test_lm_head_masked_dense_topk_logprobs_and_empty_row(normalize):
+    rng = np.random.default_rng(401 + (normalize == "full"))
+    T, V, K, topk = 3, 333, 71, 4
+    h = (0.12 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.11 * rng.standard_normal((V, K))).astype(np.float32)
+    bias = (0.03 * rng.standard_normal(V)).astype(np.float32)
+    allowed = [[1, 5, 17, 241, 260, 332], [0, 7, 22, 128, 299], []]
+    mask = _packed_allow_mask(allowed, V)
+    ids, logprobs = tk.lm_head_masked(
+        mx.array(h), mx.array(W), mx.array(mask), bias=mx.array(bias),
+        topk=topk, normalize=normalize)
+    mx.eval(ids, logprobs)
+
+    logits = h @ W.T + bias
+    ref_ids, ref_logprobs = [], []
+    for token in range(T):
+        normalizer = np.arange(V) if normalize == "full" else None
+        row_ids, row_lp = _topk_logprobs(
+            logits[token], allowed[token], topk, normalizer_ids=normalizer)
+        ref_ids.append(row_ids)
+        ref_logprobs.append(row_lp)
+    np.testing.assert_array_equal(np.array(ids), np.stack(ref_ids))
+    np.testing.assert_allclose(
+        np.array(logprobs)[:2], np.stack(ref_logprobs)[:2], rtol=5e-5, atol=5e-5)
+    assert np.isneginf(np.array(logprobs)[2]).all()
+
+
+def test_lm_head_masked_ties_choose_lower_token_id():
+    h = mx.ones((1, 32), dtype=mx.float32)
+    W = mx.zeros((40, 32), dtype=mx.float32)
+    mask = _packed_allow_mask([[31, 7, 19, 3]], 40)
+    ids, logprobs = tk.lm_head_masked(h, W, mx.array(mask), topk=4)
+    mx.eval(ids, logprobs)
+    np.testing.assert_array_equal(np.array(ids), np.array([[3, 7, 19, 31]], np.int32))
+    np.testing.assert_allclose(np.array(logprobs), -np.log(4.0), atol=1e-6)
+
+
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "q6_K"])
+def test_lm_head_masked_and_candidates_packed(fmt):
+    quantize, dequantize = QUANT_FORMATS[fmt]
+    rng = np.random.default_rng(433 + len(fmt))
+    T, V, K, topk = 2, 291, 256, 3
+    h = (0.08 * rng.standard_normal((T, K))).astype(np.float32)
+    packed = quantize((0.1 * rng.standard_normal((V, K))).astype(np.float32))
+    bias = (0.02 * rng.standard_normal(V)).astype(np.float32)
+    rows = [[2, 9, 36, 117, 257, 290], [0, 5, 32, 88, 180, 233]]
+    flat = np.array(rows[0] + rows[1], dtype=np.int32)
+    offsets = np.array([0, len(rows[0]), flat.size], dtype=np.int32)
+
+    masked_ids, masked_lp = tk.lm_head_masked(
+        mx.array(h), mx.array(packed), mx.array(_packed_allow_mask(rows, V)),
+        bias=mx.array(bias), format=fmt, topk=topk)
+    candidate_ids, candidate_lp = tk.lm_head_candidates(
+        mx.array(h), mx.array(packed), mx.array(flat), mx.array(offsets),
+        bias=mx.array(bias), format=fmt, topk=topk)
+    mx.eval(masked_ids, masked_lp, candidate_ids, candidate_lp)
+
+    logits = h @ dequantize(packed).astype(np.float32).T + bias
+    expected_ids, expected_lp = zip(*[
+        _topk_logprobs(logits[token], rows[token], topk) for token in range(T)
+    ])
+    expected_ids, expected_lp = np.stack(expected_ids), np.stack(expected_lp)
+    np.testing.assert_array_equal(np.array(masked_ids), expected_ids)
+    np.testing.assert_array_equal(np.array(candidate_ids), expected_ids)
+    np.testing.assert_allclose(np.array(masked_lp), expected_lp, rtol=8e-5, atol=8e-5)
+    np.testing.assert_allclose(np.array(candidate_lp), expected_lp, rtol=8e-5, atol=8e-5)
+
+
+def test_lm_head_candidates_skips_invalid_and_pads_short_rows():
+    rng = np.random.default_rng(457)
+    T, V, K, topk = 2, 43, 37, 4
+    h = (0.1 * rng.standard_normal((T, K))).astype(np.float32)
+    W = (0.1 * rng.standard_normal((V, K))).astype(np.float32)
+    candidate_ids = np.array([4, -1, V, 2, 17], dtype=np.int32)
+    offsets = np.array([0, 3, 5], dtype=np.int32)
+    ids, logprobs = tk.lm_head_candidates(
+        mx.array(h), mx.array(W), mx.array(candidate_ids), mx.array(offsets),
+        topk=topk)
+    mx.eval(ids, logprobs)
+    logits = h @ W.T
+    ref0 = _topk_logprobs(logits[0], [4, -1, V], topk)
+    ref1 = _topk_logprobs(logits[1], [2, 17], topk)
+    np.testing.assert_array_equal(np.array(ids), np.stack([ref0[0], ref1[0]]))
+    np.testing.assert_allclose(
+        np.array(logprobs)[:, :2], np.stack([ref0[1], ref1[1]])[:, :2],
+        rtol=5e-5, atol=5e-5)
+    assert np.isneginf(np.array(logprobs)[1, 2:]).all()

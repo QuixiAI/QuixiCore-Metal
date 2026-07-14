@@ -312,3 +312,191 @@ def test_bfloat16_kernel_variants_mps():
     flux = tk_torch.flux_gelu_erf(flux_x, flux_weight, flux_bias)
     flux_ref = F.gelu(flux_x @ flux_weight + flux_bias, approximate="none")
     assert torch.allclose(flux, flux_ref, atol=0.06, rtol=0.06)
+
+
+def test_quantized_embedding_lookup_and_bag_mps():
+    import tk
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(901)
+    rows, columns = 7, 96
+    source = (0.2 * rng.standard_normal((rows, columns))).astype(np.float32)
+    packed = QUANT_FORMATS["q4_0"][0](source)
+    table = QUANT_FORMATS["q4_0"][1](packed).astype(np.float32)
+    ids = np.array([[3, -1], [1, rows]], np.int32)
+    add = (0.03 * rng.standard_normal((*ids.shape, columns))).astype(np.float32)
+    got = tk.quantized_embedding(
+        torch.from_numpy(packed).to("mps"), torch.from_numpy(ids).to("mps"),
+        "q4_0", scale=1.25, add=torch.from_numpy(add).to("mps"),
+        output_dtype="float32")
+    reference = np.zeros((*ids.shape, columns), np.float32)
+    reference[0, 0] = table[3] * 1.25 + add[0, 0]
+    reference[1, 0] = table[1] * 1.25 + add[1, 0]
+    np.testing.assert_allclose(got.cpu().numpy(), reference, rtol=3e-6, atol=3e-6)
+
+    bag_ids = np.array([1, 1, -1, 4, 2], np.int32)
+    offsets = np.array([0, 3, 5, 5], np.int32)
+    weights = np.array([0.5, 1.25, 9.0, -0.75, 2.0], np.float32)
+    bag = tk_torch.quantized_embedding_bag(
+        torch.from_numpy(packed).to("mps"), torch.from_numpy(bag_ids).to("mps"),
+        torch.from_numpy(offsets).to("mps"), torch.from_numpy(weights).to("mps"),
+        "q4_0", 0.75, True, True, "float32")
+    bag_ref = np.zeros((3, columns), np.float32)
+    bag_ref[0] = (table[1] * 0.5 + table[1] * 1.25) * 0.75 / 2
+    bag_ref[1] = (table[4] * -0.75 + table[2] * 2.0) * 0.75 / 2
+    np.testing.assert_allclose(bag.cpu().numpy(), bag_ref, rtol=3e-6, atol=3e-6)
+
+
+def test_decode_epilogue_and_swiglu_mps():
+    import tk
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(907)
+    batch, hidden, output = 2, 256, 37
+    x = (0.08 * rng.standard_normal((batch, hidden))).astype(np.float32)
+    gate = (0.1 * rng.standard_normal((output, hidden))).astype(np.float32)
+    up = (0.09 * rng.standard_normal((output, hidden))).astype(np.float32)
+    bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+    residual = (0.03 * rng.standard_normal((batch, output))).astype(np.float32)
+    xt, gt, ut, bt, rt = [torch.from_numpy(value).to("mps")
+                           for value in (x, gate, up, bias, residual)]
+    got = tk.decode_linear_epilogue(xt, gt, bt, rt, activation="silu")
+    linear = x @ gate.T + bias
+    reference = linear / (1.0 + np.exp(-linear)) + residual
+    np.testing.assert_allclose(got.cpu().numpy(), reference, rtol=5e-4, atol=5e-4)
+
+    dense_swiglu = tk.decode_swiglu(xt, gt, ut, bt, bt)
+    dense_gate = x @ gate.T + bias
+    dense_reference = dense_gate / (1.0 + np.exp(-dense_gate)) * (x @ up.T + bias)
+    np.testing.assert_allclose(
+        dense_swiglu.cpu().numpy(), dense_reference, rtol=5e-4, atol=5e-4)
+
+    quantize, dequantize = QUANT_FORMATS["q4_0"]
+    gate_q, up_q = quantize(gate), quantize(up)
+    swiglu = tk_torch.decode_swiglu(
+        xt, torch.from_numpy(gate_q).to("mps"), torch.from_numpy(up_q).to("mps"),
+        bt, bt, "q4_0", True)
+    gate_value = x @ dequantize(gate_q).T + bias
+    up_value = x @ dequantize(up_q).T + bias
+    swiglu_ref = gate_value / (1.0 + np.exp(-gate_value)) * up_value
+    np.testing.assert_allclose(swiglu.cpu().numpy(), swiglu_ref, rtol=7e-4, atol=7e-4)
+
+
+def test_masked_and_candidate_lm_head_mps():
+    rng = np.random.default_rng(911)
+    tokens, vocab, hidden, topk = 2, 73, 61, 3
+    h = (0.1 * rng.standard_normal((tokens, hidden))).astype(np.float32)
+    weight = (0.1 * rng.standard_normal((vocab, hidden))).astype(np.float32)
+    bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
+    rows = [[2, 7, 36, 65], [0, 11, 42, 70]]
+    mask = np.zeros((tokens, (vocab + 31) // 32), np.int32)
+    for row, values in enumerate(rows):
+        for value in values:
+            mask[row, value // 32] |= np.int32(1 << (value % 32))
+    args = [torch.from_numpy(value).to("mps") for value in (h, weight, bias, mask)]
+    ids, logprobs = tk_torch.lm_head_masked(*args, "", topk, True)
+    flat = np.array(rows[0] + rows[1], np.int32)
+    offsets = np.array([0, len(rows[0]), len(flat)], np.int32)
+    cids, clogprobs = tk_torch.lm_head_candidates(
+        args[0], args[1], args[2], torch.from_numpy(flat).to("mps"),
+        torch.from_numpy(offsets).to("mps"), "", topk)
+
+    logits = h @ weight.T + bias
+    ref_ids, ref_lp = [], []
+    for row, candidates in enumerate(rows):
+        candidates = np.array(candidates, np.int32)
+        order = np.lexsort((candidates, -logits[row, candidates]))[:topk]
+        selected = candidates[order]
+        values = logits[row, candidates]
+        maximum = values.max()
+        log_z = maximum + np.log(np.exp(values - maximum).sum())
+        ref_ids.append(selected)
+        ref_lp.append(logits[row, selected] - log_z)
+    np.testing.assert_array_equal(ids.cpu().numpy(), np.stack(ref_ids))
+    np.testing.assert_array_equal(cids.cpu().numpy(), np.stack(ref_ids))
+    np.testing.assert_allclose(logprobs.cpu().numpy(), np.stack(ref_lp), rtol=5e-5, atol=5e-5)
+    np.testing.assert_allclose(clogprobs.cpu().numpy(), np.stack(ref_lp), rtol=5e-5, atol=5e-5)
+
+
+@pytest.mark.parametrize("use_kernel", [None, False, True], ids=["auto", "routed", "kernel"])
+def test_space_to_depth_norm_linear_mps(use_kernel):
+    import tk
+
+    rng = np.random.default_rng(919)
+    batch, height, width, channels, output, block = 2, 5, 7, 11, 29, 4
+    dimension = block * block * channels
+    x = (0.15 * rng.standard_normal((batch, height * width, channels))).astype(np.float32)
+    norm_weight = (0.8 + 0.1 * rng.standard_normal(dimension)).astype(np.float32)
+    norm_bias = (0.02 * rng.standard_normal(dimension)).astype(np.float32)
+    projection = (0.06 * rng.standard_normal((output, dimension))).astype(np.float32)
+    projection_bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+    tensors = [torch.from_numpy(value).to("mps") for value in
+               (x, norm_weight, norm_bias, projection, projection_bias)]
+    got = tk.space_to_depth_norm_linear(
+        tensors[0], tensors[1], tensors[3], height, width,
+        norm_bias=tensors[2], projection_bias=tensors[4], block_size=block,
+        use_kernel=use_kernel)
+
+    image = x.reshape(batch, height, width, channels)
+    merged = []
+    for oy in range((height + block - 1) // block):
+        for ox in range((width + block - 1) // block):
+            values = []
+            for dy in range(block):
+                for dx in range(block):
+                    sy, sx = oy * block + dy, ox * block + dx
+                    values.append(image[:, sy, sx] if sy < height and sx < width
+                                  else np.zeros((batch, channels), np.float32))
+            merged.append(np.concatenate(values, -1))
+    merged = np.stack(merged, 1)
+    mean = merged.mean(-1, keepdims=True)
+    variance = (merged * merged).mean(-1, keepdims=True) - mean * mean
+    normalized = (merged - mean) / np.sqrt(np.maximum(variance, 0) + 1e-5)
+    reference = (normalized * norm_weight + norm_bias) @ projection.T + projection_bias
+    np.testing.assert_allclose(got.cpu().numpy(), reference, rtol=7e-4, atol=7e-4)
+
+
+@pytest.mark.parametrize("use_kernel", [None, False, True], ids=["auto", "routed", "kernel"])
+def test_decode_cache_attention_mps(use_kernel):
+    import tk
+
+    rng = np.random.default_rng(929)
+    batch, heads_q, heads_kv, dimension, cache_length = 2, 4, 2, 64, 8
+    contexts = np.array([0, 5], np.int32)
+    positions = np.array([2, 6], np.int32)
+    shapes = ((batch, heads_q, dimension), (batch, heads_kv, dimension),
+              (batch, heads_kv, dimension),
+              (batch, heads_kv, cache_length, dimension),
+              (batch, heads_kv, cache_length, dimension))
+    q, new_k, new_v, key_cache, value_cache = [
+        (0.12 * rng.standard_normal(shape)).astype(np.float32) for shape in shapes]
+    angles = (np.arange(9)[:, None] + 1) * (np.arange(dimension // 2)[None, :] + 1) * 0.002
+    cos, sin = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+    arrays = [torch.from_numpy(value).to("mps") for value in
+              (q, new_k, new_v, cos, sin, positions, contexts, key_cache, value_cache)]
+    output, next_k, next_v = tk.decode_cache_attention(
+        arrays[0], arrays[1], arrays[2], arrays[3], arrays[4], arrays[5], arrays[6],
+        arrays[7], arrays[8], use_kernel=use_kernel)
+
+    half = dimension // 2
+    q_rotated, k_rotated = np.empty_like(q), np.empty_like(new_k)
+    for row in range(batch):
+        c, s = cos[positions[row]], sin[positions[row]]
+        q_rotated[row, :, :half] = q[row, :, :half] * c - q[row, :, half:] * s
+        q_rotated[row, :, half:] = q[row, :, half:] * c + q[row, :, :half] * s
+        k_rotated[row, :, :half] = new_k[row, :, :half] * c - new_k[row, :, half:] * s
+        k_rotated[row, :, half:] = new_k[row, :, half:] * c + new_k[row, :, :half] * s
+    ref_k, ref_v = key_cache.copy(), value_cache.copy()
+    reference = np.empty_like(q)
+    for row in range(batch):
+        ref_k[row, :, contexts[row]] = k_rotated[row]
+        ref_v[row, :, contexts[row]] = new_v[row]
+        for head in range(heads_q):
+            kv_head = head // (heads_q // heads_kv)
+            score = (ref_k[row, kv_head, :contexts[row] + 1] @ q_rotated[row, head]
+                     / math.sqrt(dimension))
+            probability = np.exp(score - score.max()); probability /= probability.sum()
+            reference[row, head] = probability @ ref_v[row, kv_head, :contexts[row] + 1]
+    np.testing.assert_allclose(output.cpu().numpy(), reference, rtol=7e-5, atol=7e-5)
+    np.testing.assert_allclose(next_k.cpu().numpy(), ref_k, rtol=2e-6, atol=2e-6)
+    np.testing.assert_array_equal(next_v.cpu().numpy(), ref_v)

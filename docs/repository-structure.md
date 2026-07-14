@@ -183,15 +183,18 @@ groups or framework buckets:
 - `norms/`: RMSNorm, LayerNorm, add-norm, norm-to-quant, QK norm.
 - `activations/`: GELU, GLU, SiLU/SwiGLU helpers, standalone softmax.
 - `attention/`: flash attention, causal/non-causal/varlen attention, backward,
-  paged attention, MLA, rotary, quantized-KV attention, state merging.
+  paged attention, MLA, rotary, quantized-KV attention, functional cache decode,
+  state merging.
 - `linear_attention/`: Based, Hedgehog, linear attention, causal/decay linear
   attention, GDN, complex linear attention primitives.
 - `ssm/`: Mamba, SSD, selective scan, FFT convolution.
-- `matmul/`: dense GEMM, staged GEMM, complex matmul, Flux.
+- `matmul/`: dense/staged/complex GEMM, Flux, decode epilogues, and packed
+  decode SwiGLU.
 - `quantization/`: act quant, runtime quant, qgemm, qgemv, quantized LM head,
+  packed embedding lookup/reduction, sparse candidate projection,
   fp8/int8/fp4 packing, TurboQuant.
-- `vision/`: window-attention support operations, patch merging, and fixed
-  vision-model projection heads such as the pairwise edge MLP.
+- `vision/`: window-attention support operations, patch merging,
+  space-to-depth/norm/projection, and fixed-shape projection heads.
 - `moe/`: routing, expert alignment, gather/scatter, grouped GEMM, quantized
   MoE GEMM, LoRA alignment, finalize.
 - `sampling/`: sampling, logit transforms, penalties, rejection sampling, beam

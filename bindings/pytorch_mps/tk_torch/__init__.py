@@ -630,6 +630,17 @@ def attn_decode_bh(q, key_cache, value_cache, context_length):
     return _ext.attn_decode_bh(q, key_cache, value_cache, int(context_length))
 
 
+def decode_cache_attention(q, new_k, new_v, cos, sin, positions, context_lengths,
+                           q_weight, k_weight, key_cache, value_cache, eps=1e-6,
+                           do_q_norm=False, do_k_norm=False, gemma=False,
+                           softmax_scale=0.0):
+    """Fused norm, RoPE, cache append, and multi-simdgroup decode attention."""
+    return tuple(_ext.decode_cache_attention(
+        q, new_k, new_v, cos, sin, positions, context_lengths,
+        q_weight, k_weight, key_cache, value_cache, float(eps),
+        bool(do_q_norm), bool(do_k_norm), bool(gemma), float(softmax_scale)))
+
+
 def swin_attn_d32(qkv, relative_bias, mask, windows_per_image=0):
     """Swin packed-QKV window attention for head dimension 32."""
     return _ext.swin_attn_d32(qkv, relative_bias, mask, int(windows_per_image))
@@ -638,6 +649,17 @@ def swin_attn_d32(qkv, relative_bias, mask, windows_per_image=0):
 def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
     """Fused Swin 2x2 patch gather + LayerNorm."""
     return _ext.patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+
+
+def space_to_depth_norm_linear(x, norm_weight, norm_bias, projection_weight,
+                               projection_bias, height, width, block_size=2,
+                               eps=1e-5, use_norm_bias=True,
+                               use_projection_bias=False):
+    """Fused space-to-depth, LayerNorm, and dense projection."""
+    return _ext.space_to_depth_norm_linear(
+        x, norm_weight, norm_bias, projection_weight, projection_bias,
+        int(height), int(width), int(block_size), float(eps),
+        bool(use_norm_bias), bool(use_projection_bias))
 
 
 def edge_mlp_256x7(hidden, first_weight, first_bias, second_weight, second_bias):
@@ -662,6 +684,22 @@ def decode_linear_q8(x, weight, bias, residual, gelu=False, use_residual=False):
         x, weight, bias, residual, bool(gelu), bool(use_residual))
 
 
+def decode_linear_epilogue(x, weight, bias, residual, format="", activation=0,
+                           use_bias=False, use_residual=False):
+    """Dense/packed decode linear with fused bias, activation, and residual."""
+    return _ext.decode_linear_epilogue(
+        x, weight, bias, residual, str(format), int(activation),
+        bool(use_bias), bool(use_residual))
+
+
+def decode_swiglu(x, gate_weight, up_weight, gate_bias, up_bias,
+                  format="", use_bias=False):
+    """Dense/packed decode projections with fused SwiGLU."""
+    return _ext.decode_swiglu(
+        x, gate_weight, up_weight, gate_bias, up_bias,
+        str(format), bool(use_bias))
+
+
 def lm_head_sample(h, W, bias, mode, k, temperature, seed):
     """Fused LM-head + sampling: token id per row of h without materializing (T,V) logits.
     mode 0=argmax, 1=categorical, 2=top-k. bias (V,) or a 1-elem dummy. Returns (T,) int32. MPS."""
@@ -679,6 +717,19 @@ def lm_head_constrained(h, W, bias, forbidden, previous, eos_id=-1, forbid_eos=F
     """Dense grammar-constrained LM head; returns (token ids, selected log-probabilities)."""
     return tuple(_ext.lm_head_constrained(
         h, W, bias, forbidden, previous, int(eos_id), bool(forbid_eos)))
+
+
+def lm_head_masked(h, W, bias, allow_mask, format="", topk=1,
+                   normalize_allowed=True):
+    """Masked dense/packed LM head returning top-k ids and log-probabilities."""
+    return tuple(_ext.lm_head_masked(
+        h, W, bias, allow_mask, str(format), int(topk), bool(normalize_allowed)))
+
+
+def lm_head_candidates(h, W, bias, candidate_ids, offsets, format="", topk=1):
+    """CSR candidate dense/packed LM head returning top-k ids and log-probabilities."""
+    return tuple(_ext.lm_head_candidates(
+        h, W, bias, candidate_ids, offsets, str(format), int(topk)))
 
 
 def cross_entropy_fwd(logits, targets, ignore_index, label_smoothing, z_loss, softcap=0.0):
@@ -1443,6 +1494,22 @@ def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
 def dequant_gather(table, ids, format, scale=1.0):
     """Gather packed q4_0/q8_0/q6_K rows directly to fp16."""
     return _ext.dequant_gather(table, ids, str(format), float(scale))
+
+
+def quantized_embedding(table, ids, add, format, scale=1.0, use_add=False,
+                        output_dtype="float16"):
+    """Packed embedding lookup with optional additive epilogue."""
+    return _ext.quantized_embedding(
+        table, ids, add, str(format), float(scale), bool(use_add), str(output_dtype))
+
+
+def quantized_embedding_bag(table, ids, offsets, sample_weights, format,
+                            scale=1.0, use_weights=False, mean_mode=False,
+                            output_dtype="float16"):
+    """CSR sum/mean embedding bag over packed rows."""
+    return _ext.quantized_embedding_bag(
+        table, ids, offsets, sample_weights, str(format), float(scale),
+        bool(use_weights), bool(mean_mode), str(output_dtype))
 
 
 def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: str = "q8_0"):

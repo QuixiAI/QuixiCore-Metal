@@ -706,3 +706,418 @@ kernel void lm_head_constrained_reduce(
 instantiate_lm_head_constrained(float32, float)
 instantiate_lm_head_constrained(float16, half)
 instantiate_lm_head_constrained(bfloat16, bf16)
+
+// ---------------------------------------------------------------------------
+// Generic masked and sparse-candidate LM heads.
+// ---------------------------------------------------------------------------
+constant int LMH_MASKED_MAX_K = 8;
+
+template <typename T>
+METAL_FUNC float lmh_dense_dot_f32(
+    device const T *hrow, device const T *wrow, int K) {
+    const int nk4 = K % 4 == 0 ? K / 4 : 0;
+    device const metal::vec<T, 4> *h4 =
+        (device const metal::vec<T, 4> *)hrow;
+    device const metal::vec<T, 4> *w4 =
+        (device const metal::vec<T, 4> *)wrow;
+    float result = 0.0f;
+    for (int j = 0; j < nk4; ++j) result += dot(float4(w4[j]), float4(h4[j]));
+    for (int j = nk4 * 4; j < K; ++j) result += float(wrow[j]) * float(hrow[j]);
+    return result;
+}
+
+template <typename FMT, typename T>
+METAL_FUNC float lmh_quant_dot_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / FMT::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * FMT::block_bytes;
+        for (int col0 = 0; col0 < FMT::block_k; col0 += 8) {
+            float values[8];
+            tk_dequant8_f32<FMT>(base, col0, values);
+            const int input_base = block * FMT::block_k + col0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) {
+                result += values[i] * float(hrow[input_base + i]);
+            }
+        }
+    }
+    return result;
+}
+
+// q4_0 packs both 16-value halves behind one fp16 scale. Decode the complete
+// block here so the sequential LM-head row dot loads that scale and each packed
+// byte once, instead of re-entering the generic 8-value decoder four times.
+template <typename T>
+METAL_FUNC float lmh_quant_dot_q4_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / 32;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * 18;
+        const float scale = float(((device const half *)base)[0]);
+        device const uchar *codes = base + 2;
+        const int input_base = block * 32;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            result += scale * float(int(packed & 0x0f) - 8) *
+                float(hrow[input_base + i]);
+            result += scale * float(int(packed >> 4) - 8) *
+                float(hrow[input_base + i + 16]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_quant_dot_q4(T)                                      \
+  template <> METAL_FUNC float lmh_quant_dot_f32<q4_0, T>(                  \
+    device const T *hrow, device const uchar *wrow, int K) {                \
+    return lmh_quant_dot_q4_f32<T>(hrow, wrow, K);                           \
+  }
+
+specialize_lmh_quant_dot_q4(float)
+specialize_lmh_quant_dot_q4(half)
+specialize_lmh_quant_dot_q4(bf16)
+
+METAL_FUNC void lmh_lse_update(float value, thread float &maximum,
+                               thread float &sum) {
+    if (value > maximum) {
+        sum = maximum == LMH_NEG_INF ? 1.0f : sum * exp(maximum - value) + 1.0f;
+        maximum = value;
+    } else {
+        sum += exp(value - maximum);
+    }
+}
+
+template <typename T>
+kernel void lm_head_masked_partials(
+    device const T *h [[buffer(0)]],
+    device const T *W [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device const uint *allow_mask [[buffer(3)]],
+    device float *part_val [[buffer(4)]],
+    device int *part_id [[buffer(5)]],
+    device float *part_max [[buffer(6)]],
+    device float *part_sum [[buffer(7)]],
+    constant int &V [[buffer(8)]],
+    constant int &K [[buffer(9)]],
+    constant int &tile_v [[buffer(10)]],
+    constant int &num_vtiles [[buffer(11)]],
+    constant int &topk [[buffer(12)]],
+    constant int &use_bias [[buffer(13)]],
+    constant int &normalize_allowed [[buffer(14)]],
+    constant int &mask_words [[buffer(15)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int vtile = int(tgid.x), token = int(tgid.y);
+    const int v0 = vtile * tile_v, v1 = min(v0 + tile_v, V);
+    device const T *hrow = h + (long)token * K;
+    float mine_val[8];
+    int mine_id[8];
+    bool used[8];
+    int nmine = 0;
+    float local_max = LMH_NEG_INF, local_sum = 0.0f;
+    for (int vocab = v0 + int(lane); vocab < v1; vocab += 32) {
+        const bool allowed =
+            (allow_mask[(long)token * mask_words + (vocab >> 5)] &
+             (1u << (vocab & 31))) != 0;
+        if (normalize_allowed && !allowed) continue;
+        float logit = lmh_dense_dot_f32(hrow, W + (long)vocab * K, K);
+        if (use_bias != 0) logit += bias[vocab];
+        if (!normalize_allowed || allowed) lmh_lse_update(logit, local_max, local_sum);
+        if (allowed) {
+            mine_val[nmine] = logit;
+            mine_id[nmine] = vocab;
+            ++nmine;
+        }
+    }
+    const float tile_max = simd_max(local_max);
+    const float tile_sum = simd_sum(
+        local_max == LMH_NEG_INF ? 0.0f : local_sum * exp(local_max - tile_max));
+    if (lane == 0) {
+        const long tile_offset = (long)token * num_vtiles + vtile;
+        part_max[tile_offset] = tile_max;
+        part_sum[tile_offset] = tile_sum;
+    }
+    const long base = ((long)token * num_vtiles + vtile) * topk;
+    lmh_part_emit emit{part_val, part_id, base, lane};
+    masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF, emit);
+}
+
+template <typename FMT, typename T>
+kernel void lm_head_masked_partials_q(
+    device const T *h [[buffer(0)]],
+    device const uchar *W [[buffer(1)]],
+    device const float *bias [[buffer(2)]],
+    device const uint *allow_mask [[buffer(3)]],
+    device float *part_val [[buffer(4)]],
+    device int *part_id [[buffer(5)]],
+    device float *part_max [[buffer(6)]],
+    device float *part_sum [[buffer(7)]],
+    constant int &V [[buffer(8)]],
+    constant int &K [[buffer(9)]],
+    constant int &tile_v [[buffer(10)]],
+    constant int &num_vtiles [[buffer(11)]],
+    constant int &topk [[buffer(12)]],
+    constant int &use_bias [[buffer(13)]],
+    constant int &normalize_allowed [[buffer(14)]],
+    constant int &mask_words [[buffer(15)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int vtile = int(tgid.x), token = int(tgid.y);
+    const int v0 = vtile * tile_v, v1 = min(v0 + tile_v, V);
+    const int row_bytes = (K / FMT::block_k) * FMT::block_bytes;
+    device const T *hrow = h + (long)token * K;
+    float mine_val[8];
+    int mine_id[8];
+    bool used[8];
+    int nmine = 0;
+    float local_max = LMH_NEG_INF, local_sum = 0.0f;
+    for (int vocab = v0 + int(lane); vocab < v1; vocab += 32) {
+        const bool allowed =
+            (allow_mask[(long)token * mask_words + (vocab >> 5)] &
+             (1u << (vocab & 31))) != 0;
+        if (normalize_allowed && !allowed) continue;
+        float logit = lmh_quant_dot_f32<FMT>(
+            hrow, W + (long)vocab * row_bytes, K);
+        if (use_bias != 0) logit += bias[vocab];
+        if (!normalize_allowed || allowed) lmh_lse_update(logit, local_max, local_sum);
+        if (allowed) {
+            mine_val[nmine] = logit;
+            mine_id[nmine] = vocab;
+            ++nmine;
+        }
+    }
+    const float tile_max = simd_max(local_max);
+    const float tile_sum = simd_sum(
+        local_max == LMH_NEG_INF ? 0.0f : local_sum * exp(local_max - tile_max));
+    if (lane == 0) {
+        const long tile_offset = (long)token * num_vtiles + vtile;
+        part_max[tile_offset] = tile_max;
+        part_sum[tile_offset] = tile_sum;
+    }
+    const long base = ((long)token * num_vtiles + vtile) * topk;
+    lmh_part_emit emit{part_val, part_id, base, lane};
+    masked_topk_local(mine_val, mine_id, used, nmine, topk, LMH_NEG_INF, emit);
+}
+
+kernel void lm_head_masked_reduce(
+    device const float *part_val [[buffer(0)]],
+    device const int *part_id [[buffer(1)]],
+    device const float *part_max [[buffer(2)]],
+    device const float *part_sum [[buffer(3)]],
+    device int *out_id [[buffer(4)]],
+    device float *out_logprob [[buffer(5)]],
+    constant int &num_vtiles [[buffer(6)]],
+    constant int &topk [[buffer(7)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int candidates = num_vtiles * topk;
+    const long candidate_base = (long)token * candidates;
+    int chosen[LMH_MASKED_MAX_K];
+    float chosen_val[LMH_MASKED_MAX_K];
+    stored_cand candidate{part_val, part_id, candidate_base};
+    masked_topk(candidate, candidates, topk, lane, LMH_NEG_INF, chosen, chosen_val);
+    const long tile_base = (long)token * num_vtiles;
+    float maximum = LMH_NEG_INF;
+    for (int tile = int(lane); tile < num_vtiles; tile += 32) {
+        maximum = max(maximum, part_max[tile_base + tile]);
+    }
+    maximum = simd_max(maximum);
+    float sum = 0.0f;
+    for (int tile = int(lane); tile < num_vtiles; tile += 32) {
+        const float tile_max = part_max[tile_base + tile];
+        if (tile_max != LMH_NEG_INF) {
+            sum += part_sum[tile_base + tile] * exp(tile_max - maximum);
+        }
+    }
+    sum = simd_sum(sum);
+    const float lse = sum > 0.0f ? maximum + log(sum) : INFINITY;
+    if (lane == 0) {
+        const long output_base = (long)token * topk;
+        for (int i = 0; i < topk; ++i) {
+            out_id[output_base + i] = chosen[i];
+            out_logprob[output_base + i] =
+                chosen[i] >= 0 ? chosen_val[i] - lse : -INFINITY;
+        }
+    }
+}
+
+METAL_FUNC void lmh_insert_candidate(
+    float value, int id, int topk, thread float *values, thread int *ids) {
+    int position = topk;
+    for (int i = 0; i < topk; ++i) {
+        if (value > values[i] || (value == values[i] && id < ids[i])) {
+            position = i;
+            break;
+        }
+    }
+    if (position == topk) return;
+    for (int i = topk - 1; i > position; --i) {
+        values[i] = values[i - 1];
+        ids[i] = ids[i - 1];
+    }
+    values[position] = value;
+    ids[position] = id;
+}
+
+struct lmh_candidate_emit {
+    device int *out_id;
+    device float *out_logprob;
+    long base;
+    float lse;
+    uint lane;
+    METAL_FUNC void operator()(int k, float value, int id) {
+        if (lane == 0) {
+            const bool valid = value != LMH_NEG_INF && id != 0x7fffffff;
+            out_id[base + k] = valid ? id : -1;
+            out_logprob[base + k] = valid ? value - lse : -INFINITY;
+        }
+    }
+};
+
+template <typename T>
+kernel void lm_head_candidates(
+    device const T *h [[buffer(0)]],
+    device const T *W [[buffer(1)]],
+    device const int *candidate_ids [[buffer(2)]],
+    device const int *offsets [[buffer(3)]],
+    device const float *bias [[buffer(4)]],
+    device int *out_id [[buffer(5)]],
+    device float *out_logprob [[buffer(6)]],
+    constant int &V [[buffer(7)]],
+    constant int &K [[buffer(8)]],
+    constant int &topk [[buffer(9)]],
+    constant int &use_bias [[buffer(10)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    device const T *hrow = h + (long)token * K;
+    float mine_val[LMH_MASKED_MAX_K];
+    int mine_id[LMH_MASKED_MAX_K];
+    bool used[LMH_MASKED_MAX_K];
+    for (int i = 0; i < topk; ++i) {
+        mine_val[i] = LMH_NEG_INF;
+        mine_id[i] = 0x7fffffff;
+    }
+    float local_max = LMH_NEG_INF, local_sum = 0.0f;
+    const int begin = offsets[token], end = offsets[token + 1];
+    for (int index = begin + int(lane); index < end; index += 32) {
+        const int vocab = candidate_ids[index];
+        if (vocab < 0 || vocab >= V) continue;
+        float logit = lmh_dense_dot_f32(hrow, W + (long)vocab * K, K);
+        if (use_bias != 0) logit += bias[vocab];
+        lmh_lse_update(logit, local_max, local_sum);
+        lmh_insert_candidate(logit, vocab, topk, mine_val, mine_id);
+    }
+    const float maximum = simd_max(local_max);
+    const float sum = simd_sum(
+        local_max == LMH_NEG_INF ? 0.0f : local_sum * exp(local_max - maximum));
+    const float lse = sum > 0.0f ? maximum + log(sum) : INFINITY;
+    lmh_candidate_emit emit{
+        out_id, out_logprob, (long)token * topk, lse, lane};
+    masked_topk_local(
+        mine_val, mine_id, used, topk, topk, LMH_NEG_INF, emit);
+}
+
+template <typename FMT, typename T>
+kernel void lm_head_candidates_q(
+    device const T *h [[buffer(0)]],
+    device const uchar *W [[buffer(1)]],
+    device const int *candidate_ids [[buffer(2)]],
+    device const int *offsets [[buffer(3)]],
+    device const float *bias [[buffer(4)]],
+    device int *out_id [[buffer(5)]],
+    device float *out_logprob [[buffer(6)]],
+    constant int &V [[buffer(7)]],
+    constant int &K [[buffer(8)]],
+    constant int &topk [[buffer(9)]],
+    constant int &use_bias [[buffer(10)]],
+    uint token [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    device const T *hrow = h + (long)token * K;
+    const int row_bytes = (K / FMT::block_k) * FMT::block_bytes;
+    float mine_val[LMH_MASKED_MAX_K];
+    int mine_id[LMH_MASKED_MAX_K];
+    bool used[LMH_MASKED_MAX_K];
+    for (int i = 0; i < topk; ++i) {
+        mine_val[i] = LMH_NEG_INF;
+        mine_id[i] = 0x7fffffff;
+    }
+    float local_max = LMH_NEG_INF, local_sum = 0.0f;
+    const int begin = offsets[token], end = offsets[token + 1];
+    for (int index = begin + int(lane); index < end; index += 32) {
+        const int vocab = candidate_ids[index];
+        if (vocab < 0 || vocab >= V) continue;
+        float logit = lmh_quant_dot_f32<FMT>(
+            hrow, W + (long)vocab * row_bytes, K);
+        if (use_bias != 0) logit += bias[vocab];
+        lmh_lse_update(logit, local_max, local_sum);
+        lmh_insert_candidate(logit, vocab, topk, mine_val, mine_id);
+    }
+    const float maximum = simd_max(local_max);
+    const float sum = simd_sum(
+        local_max == LMH_NEG_INF ? 0.0f : local_sum * exp(local_max - maximum));
+    const float lse = sum > 0.0f ? maximum + log(sum) : INFINITY;
+    lmh_candidate_emit emit{
+        out_id, out_logprob, (long)token * topk, lse, lane};
+    masked_topk_local(
+        mine_val, mine_id, used, topk, topk, LMH_NEG_INF, emit);
+}
+
+#define instantiate_lm_head_masked_dense(type_name, T)                       \
+  template [[host_name("lm_head_masked_partials_dense_" #type_name)]]       \
+  [[kernel]] void lm_head_masked_partials<T>(                                \
+    device const T *h [[buffer(0)]], device const T *W [[buffer(1)]],        \
+    device const float *bias [[buffer(2)]], device const uint *mask [[buffer(3)]], \
+    device float *part_val [[buffer(4)]], device int *part_id [[buffer(5)]], \
+    device float *part_max [[buffer(6)]], device float *part_sum [[buffer(7)]], \
+    constant int &V [[buffer(8)]], constant int &K [[buffer(9)]],            \
+    constant int &tile_v [[buffer(10)]], constant int &num_vtiles [[buffer(11)]], \
+    constant int &topk [[buffer(12)]], constant int &use_bias [[buffer(13)]], \
+    constant int &normalize_allowed [[buffer(14)]],                          \
+    constant int &mask_words [[buffer(15)]],                                 \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("lm_head_candidates_dense_" #type_name)]] [[kernel]] \
+  void lm_head_candidates<T>(                                                \
+    device const T *h [[buffer(0)]], device const T *W [[buffer(1)]],        \
+    device const int *candidate_ids [[buffer(2)]], device const int *offsets [[buffer(3)]], \
+    device const float *bias [[buffer(4)]], device int *out_id [[buffer(5)]], \
+    device float *out_logprob [[buffer(6)]], constant int &V [[buffer(7)]],  \
+    constant int &K [[buffer(8)]], constant int &topk [[buffer(9)]],         \
+    constant int &use_bias [[buffer(10)]],                                   \
+    uint token [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_lm_head_masked_q(fmt_name, FMT, type_name, T)            \
+  template [[host_name("lm_head_masked_partials_" fmt_name "_" #type_name)]] \
+  [[kernel]] void lm_head_masked_partials_q<FMT, T>(                         \
+    device const T *h [[buffer(0)]], device const uchar *W [[buffer(1)]],    \
+    device const float *bias [[buffer(2)]], device const uint *mask [[buffer(3)]], \
+    device float *part_val [[buffer(4)]], device int *part_id [[buffer(5)]], \
+    device float *part_max [[buffer(6)]], device float *part_sum [[buffer(7)]], \
+    constant int &V [[buffer(8)]], constant int &K [[buffer(9)]],            \
+    constant int &tile_v [[buffer(10)]], constant int &num_vtiles [[buffer(11)]], \
+    constant int &topk [[buffer(12)]], constant int &use_bias [[buffer(13)]], \
+    constant int &normalize_allowed [[buffer(14)]],                          \
+    constant int &mask_words [[buffer(15)]],                                 \
+    uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]); \
+  template [[host_name("lm_head_candidates_" fmt_name "_" #type_name)]]    \
+  [[kernel]] void lm_head_candidates_q<FMT, T>(                              \
+    device const T *h [[buffer(0)]], device const uchar *W [[buffer(1)]],    \
+    device const int *candidate_ids [[buffer(2)]], device const int *offsets [[buffer(3)]], \
+    device const float *bias [[buffer(4)]], device int *out_id [[buffer(5)]], \
+    device float *out_logprob [[buffer(6)]], constant int &V [[buffer(7)]],  \
+    constant int &K [[buffer(8)]], constant int &topk [[buffer(9)]],         \
+    constant int &use_bias [[buffer(10)]],                                   \
+    uint token [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_lm_head_masked_type(type_name, T)                        \
+  instantiate_lm_head_masked_dense(type_name, T)                             \
+  instantiate_lm_head_masked_q("q4_0", q4_0, type_name, T)                  \
+  instantiate_lm_head_masked_q("q8_0", q8_0, type_name, T)                  \
+  instantiate_lm_head_masked_q("q6_K", q6_K, type_name, T)
+
+instantiate_lm_head_masked_type(float32, float)
+instantiate_lm_head_masked_type(float16, half)
+instantiate_lm_head_masked_type(bfloat16, bf16)

@@ -1698,6 +1698,20 @@ NB_MODULE(_ext, m) {
       R"(dense projection + row-conditioned grammar mask + greedy token and log-probability.)");
 
     m.def(
+      "lm_head_masked", &lm_head_masked,
+      "h"_a, "w"_a, "bias"_a, "allow_mask"_a,
+      "format"_a = "", "topk"_a = 1, "normalize_allowed"_a = true,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(masked dense/packed LM head returning top-k ids and log-probabilities.)");
+
+    m.def(
+      "lm_head_candidates", &lm_head_candidates,
+      "h"_a, "w"_a, "bias"_a, "candidate_ids"_a, "offsets"_a,
+      "format"_a = "", "topk"_a = 1,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(CSR candidate dense/packed LM head returning top-k ids and log-probabilities.)");
+
+    m.def(
       "cross_entropy_fwd",
       &cross_entropy_fwd,
       "logits"_a,
@@ -2119,6 +2133,22 @@ NB_MODULE(_ext, m) {
       R"(gather packed GGUF rows and dequantize directly to fp16.)");
 
     m.def(
+      "quantized_embedding", &quantized_embedding,
+      "table"_a, "ids"_a, "add"_a, "format"_a,
+      "scale"_a = 1.0f, "use_add"_a = false,
+      "output_dtype"_a = "float16",
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(packed embedding lookup with optional additive epilogue and selectable output dtype.)");
+
+    m.def(
+      "quantized_embedding_bag", &quantized_embedding_bag,
+      "table"_a, "ids"_a, "offsets"_a, "sample_weights"_a, "format"_a,
+      "scale"_a = 1.0f, "use_weights"_a = false, "mean_mode"_a = false,
+      "output_dtype"_a = "float16",
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(CSR embedding bag over packed rows; sum or valid-id mean.)");
+
+    m.def(
       "qflux_gelu",
       &qflux_gelu,
       "wq"_a,
@@ -2171,6 +2201,16 @@ NB_MODULE(_ext, m) {
       R"(batched head-major GQA decode over a preallocated dense KV cache.)");
 
     m.def(
+      "decode_cache_attention", &decode_cache_attention,
+      "q"_a, "new_k"_a, "new_v"_a, "cos"_a, "sin"_a,
+      "positions"_a, "context_lengths"_a, "q_weight"_a, "k_weight"_a,
+      "key_cache"_a, "value_cache"_a, "eps"_a = 1e-6f,
+      "do_q_norm"_a = false, "do_k_norm"_a = false, "gemma"_a = false,
+      "softmax_scale"_a = 0.0f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused Q/K norm, RoPE, dense-cache append, and multi-simdgroup decode attention.)");
+
+    m.def(
       "swin_attn_d32", &swin_attn_d32,
       "qkv"_a, "relative_bias"_a, "mask"_a, "windows_per_image"_a = 0,
       nb::kw_only(), "stream"_a = nb::none(),
@@ -2181,6 +2221,15 @@ NB_MODULE(_ext, m) {
       "input"_a, "weight"_a, "bias"_a, "height"_a, "width"_a,
       "eps"_a = 1e-5f, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused Swin 2x2 patch gather and LayerNorm.)");
+
+    m.def(
+      "space_to_depth_norm_linear", &space_to_depth_norm_linear,
+      "input"_a, "norm_weight"_a, "norm_bias"_a,
+      "projection_weight"_a, "projection_bias"_a,
+      "height"_a, "width"_a, "block_size"_a = 2, "eps"_a = 1e-5f,
+      "use_norm_bias"_a = true, "use_projection_bias"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused space-to-depth, LayerNorm, and dense projection.)");
 
     m.def(
       "edge_mlp_256x7", &edge_mlp_256x7,
@@ -2207,6 +2256,22 @@ NB_MODULE(_ext, m) {
       "gelu"_a = false, "use_residual"_a = false,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(q8_0 decode linear with optional erf GELU and residual.)");
+
+    m.def(
+      "decode_linear_epilogue", &decode_linear_epilogue,
+      "x"_a, "weight"_a, "bias"_a, "residual"_a,
+      "format"_a = "", "activation"_a = 0,
+      "use_bias"_a = false, "use_residual"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(dense/packed decode linear with fused bias, activation, and residual.)");
+
+    m.def(
+      "decode_swiglu", &decode_swiglu,
+      "x"_a, "gate_weight"_a, "up_weight"_a,
+      "gate_bias"_a, "up_bias"_a,
+      "format"_a = "", "use_bias"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(dense/packed pair of decode projections with fused SwiGLU.)");
 
     m.def(
       "qgemv_w2a8",

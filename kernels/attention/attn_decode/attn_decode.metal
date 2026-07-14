@@ -5,11 +5,8 @@ using namespace metal;
 using namespace mittens;
 
 // ---------------------------------------------------------------------------
-// Batch-1 attention DECODE (built on request past train_plan §11.7's "custom
-// attention: never built" line — the training path keeps SDPA; this serves the
-// rollout-generate customer): one new-token query against a dense KV cache,
-// GQA, online softmax. The Metal analogue of the CPU engine's
-// bn_attn_decode_kv8, minus the int8 cache (rollout caches are bf16).
+// Batch-1 GQA decode: one new-token query against a dense floating-point KV
+// cache, using online softmax.
 //
 //   q (Hq, D) · kc/vc (Tk, Hkv, D) -> out (Hq, D);  head h reads kv head h/rep.
 //
@@ -163,3 +160,212 @@ kernel void attn_decode_bh(device const T *q [[buffer(0)]],
 instantiate_attn_decode_bh(float32, float)
 instantiate_attn_decode_bh(float16, half)
 instantiate_attn_decode_bh(bfloat16, bf16)
+
+// Functional decode step over a head-major cache.  The host clones the input
+// cache first; this dispatch optionally RMS-normalizes Q/K, applies split-half
+// RoPE, appends the rotated K and raw V, and attends through the appended token.
+// SIMD groups partition each context and merge online-softmax state.
+template <typename T>
+kernel void decode_cache_attention(
+    device const T *q [[buffer(0)]],
+    device const T *new_k [[buffer(1)]],
+    device const T *new_v [[buffer(2)]],
+    device const T *cos_table [[buffer(3)]],
+    device const T *sin_table [[buffer(4)]],
+    device const int *positions [[buffer(5)]],
+    device const int *context_lengths [[buffer(6)]],
+    device const T *q_weight [[buffer(7)]],
+    device const T *k_weight [[buffer(8)]],
+    device T *key_cache [[buffer(9)]],
+    device T *value_cache [[buffer(10)]],
+    device T *output [[buffer(11)]],
+    constant int &batch_size [[buffer(12)]],
+    constant int &heads_q [[buffer(13)]],
+    constant int &heads_kv [[buffer(14)]],
+    constant int &cache_length [[buffer(15)]],
+    constant int &dimension [[buffer(16)]],
+    constant float &epsilon [[buffer(17)]],
+    constant int &do_q_norm [[buffer(18)]],
+    constant int &do_k_norm [[buffer(19)]],
+    constant int &gemma [[buffer(20)]],
+    constant float &softmax_scale [[buffer(21)]],
+    uint3 group [[threadgroup_position_in_grid]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint3 threads [[threads_per_threadgroup]]) {
+    threadgroup float warp_maximum[32];
+    threadgroup float warp_denominator[32];
+    threadgroup float warp_output[32 * 128];
+
+    const int head = int(group.x);
+    const int batch = int(group.y);
+    if (batch >= batch_size || head >= heads_q) return;
+    const int repetitions = heads_q / heads_kv;
+    const int kv_head = head / repetitions;
+    const int context = context_lengths[batch];
+    const int position = positions[batch];
+    const int half_dimension = dimension / 2;
+    const int values_per_lane = dimension / 32;
+    const int active_simdgroups = int(threads.x / 32);
+    const long q_base = ((long)batch * heads_q + head) * dimension;
+    const long new_k_base = ((long)batch * heads_kv + kv_head) * dimension;
+    const long rope_base = (long)position * half_dimension;
+
+    float q_sumsq = 0.0f, k_sumsq = 0.0f;
+    for (int j = 0; j < values_per_lane; ++j) {
+        const int d = j * 32 + int(lane);
+        const float qv = float(q[q_base + d]);
+        const float kv = float(new_k[new_k_base + d]);
+        q_sumsq += qv * qv;
+        k_sumsq += kv * kv;
+    }
+    q_sumsq = metal::simd_sum(q_sumsq);
+    k_sumsq = metal::simd_sum(k_sumsq);
+    const float q_inverse = do_q_norm != 0
+        ? metal::rsqrt(q_sumsq / float(dimension) + epsilon) : 1.0f;
+    const float k_inverse = do_k_norm != 0
+        ? metal::rsqrt(k_sumsq / float(dimension) + epsilon) : 1.0f;
+
+    float q_rotated[4], k_rotated[4], v_values[4], output_accumulator[4];
+    #pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j) {
+        q_rotated[j] = 0.0f;
+        k_rotated[j] = 0.0f;
+        v_values[j] = 0.0f;
+        output_accumulator[j] = 0.0f;
+    }
+    for (int j = 0; j < values_per_lane; ++j) {
+        const int d = j * 32 + int(lane);
+        const int pair_d = d < half_dimension ? d + half_dimension : d - half_dimension;
+        const int rope_d = d < half_dimension ? d : d - half_dimension;
+        float qv = float(q[q_base + d]);
+        float qp = float(q[q_base + pair_d]);
+        float kv = float(new_k[new_k_base + d]);
+        float kp = float(new_k[new_k_base + pair_d]);
+        if (do_q_norm != 0) {
+            const float qw = float(q_weight[d]) + (gemma != 0 ? 1.0f : 0.0f);
+            const float qpw = float(q_weight[pair_d]) + (gemma != 0 ? 1.0f : 0.0f);
+            qv *= q_inverse * qw;
+            qp *= q_inverse * qpw;
+        }
+        if (do_k_norm != 0) {
+            const float kw = float(k_weight[d]) + (gemma != 0 ? 1.0f : 0.0f);
+            const float kpw = float(k_weight[pair_d]) + (gemma != 0 ? 1.0f : 0.0f);
+            kv *= k_inverse * kw;
+            kp *= k_inverse * kpw;
+        }
+        const float cosine = float(cos_table[rope_base + rope_d]);
+        const float sine = float(sin_table[rope_base + rope_d]);
+        q_rotated[j] = d < half_dimension
+            ? qv * cosine - qp * sine : qv * cosine + qp * sine;
+        k_rotated[j] = d < half_dimension
+            ? kv * cosine - kp * sine : kv * cosine + kp * sine;
+        v_values[j] = float(new_v[new_k_base + d]);
+    }
+
+    // Exactly one query group writes each (batch, kv_head) append row. Other
+    // query heads consume their register copy of the same new K/V, avoiding a
+    // cross-threadgroup ordering dependency.
+    if (simd_index == 0 && head % repetitions == 0 &&
+        context >= 0 && context < cache_length) {
+        const long cache_base =
+            (((long)batch * heads_kv + kv_head) * cache_length + context) * dimension;
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = j * 32 + int(lane);
+            key_cache[cache_base + d] = T(k_rotated[j]);
+            value_cache[cache_base + d] = T(v_values[j]);
+        }
+    }
+
+    const float scale = softmax_scale > 0.0f
+        ? softmax_scale : metal::rsqrt(float(dimension));
+    float maximum = ATTN_NEG_INF;
+    float denominator = 0.0f;
+    for (int token = int(simd_index); token <= context;
+         token += active_simdgroups) {
+        float score = 0.0f;
+        const bool appended = token == context;
+        const long cache_base =
+            (((long)batch * heads_kv + kv_head) * cache_length + token) * dimension;
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = j * 32 + int(lane);
+            const float key_value = appended
+                ? k_rotated[j] : float(key_cache[cache_base + d]);
+            score += q_rotated[j] * key_value;
+        }
+        score = metal::simd_sum(score) * scale;
+        const float next_maximum = max(maximum, score);
+        const float correction = exp(maximum - next_maximum);
+        const float probability = exp(score - next_maximum);
+        denominator = denominator * correction + probability;
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = j * 32 + int(lane);
+            const float value = appended
+                ? v_values[j] : float(value_cache[cache_base + d]);
+            output_accumulator[j] =
+                output_accumulator[j] * correction + probability * value;
+        }
+        maximum = next_maximum;
+    }
+    if (lane == 0) {
+        warp_maximum[simd_index] = maximum;
+        warp_denominator[simd_index] = denominator;
+    }
+    for (int j = 0; j < values_per_lane; ++j) {
+        const int d = j * 32 + int(lane);
+        warp_output[simd_index * 128 + d] = output_accumulator[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_index == 0) {
+        float global_maximum = ATTN_NEG_INF;
+        for (int warp = 0; warp < active_simdgroups; ++warp) {
+            if (warp_denominator[warp] > 0.0f) {
+                global_maximum = max(global_maximum, warp_maximum[warp]);
+            }
+        }
+        float global_denominator = 0.0f;
+        for (int warp = 0; warp < active_simdgroups; ++warp) {
+            if (warp_denominator[warp] > 0.0f) {
+                global_denominator += warp_denominator[warp] *
+                    exp(warp_maximum[warp] - global_maximum);
+            }
+        }
+        const long output_base = ((long)batch * heads_q + head) * dimension;
+        for (int j = 0; j < values_per_lane; ++j) {
+            const int d = j * 32 + int(lane);
+            float numerator = 0.0f;
+            for (int warp = 0; warp < active_simdgroups; ++warp) {
+                if (warp_denominator[warp] > 0.0f) {
+                    numerator += warp_output[warp * 128 + d] *
+                        exp(warp_maximum[warp] - global_maximum);
+                }
+            }
+            output[output_base + d] = T(numerator / global_denominator);
+        }
+    }
+}
+
+#define instantiate_decode_cache_attention(type_name, T)                     \
+  template [[host_name("decode_cache_attention_" #type_name)]] [[kernel]]   \
+  void decode_cache_attention<T>(                                            \
+    device const T *q [[buffer(0)]], device const T *new_k [[buffer(1)]],    \
+    device const T *new_v [[buffer(2)]], device const T *cos_table [[buffer(3)]], \
+    device const T *sin_table [[buffer(4)]], device const int *positions [[buffer(5)]], \
+    device const int *context_lengths [[buffer(6)]],                         \
+    device const T *q_weight [[buffer(7)]], device const T *k_weight [[buffer(8)]], \
+    device T *key_cache [[buffer(9)]], device T *value_cache [[buffer(10)]], \
+    device T *output [[buffer(11)]], constant int &batch_size [[buffer(12)]], \
+    constant int &heads_q [[buffer(13)]], constant int &heads_kv [[buffer(14)]], \
+    constant int &cache_length [[buffer(15)]], constant int &dimension [[buffer(16)]], \
+    constant float &epsilon [[buffer(17)]], constant int &do_q_norm [[buffer(18)]], \
+    constant int &do_k_norm [[buffer(19)]], constant int &gemma [[buffer(20)]], \
+    constant float &softmax_scale [[buffer(21)]],                            \
+    uint3 group [[threadgroup_position_in_grid]],                            \
+    uint simd_index [[simdgroup_index_in_threadgroup]],                      \
+    uint lane [[thread_index_in_simdgroup]],                                 \
+    uint3 threads [[threads_per_threadgroup]]);
+
+instantiate_decode_cache_attention(float32, float)
+instantiate_decode_cache_attention(float16, half)
+instantiate_decode_cache_attention(bfloat16, bf16)

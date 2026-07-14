@@ -1210,3 +1210,333 @@ gather with one final FP16 cast or pre-dequantized matmul for packed formats,
 and packed qgemv+argmax for the Q6_K LM-head routing comparison. No speed claim
 is made for the five retained non-default kernels. The implementations and
 benchmark routing are accepted with the keep/reject decisions above.
+
+## 2026-07-13: Packed embedding, decode, sparse projection, spatial, and cache-attention pass
+
+Status: candidate; correctness and focused performance work complete.
+
+Current implementation: added packed quantized embedding lookup and CSR
+embedding-bag reduction; dense/q4_0/q8_0/q6_K decode projection with fused
+epilogue and SwiGLU; packed-mask and CSR-candidate output projection; block-2/4
+space-to-depth + LayerNorm + projection; and a functional decode-cache attention
+step with optional Q/K RMSNorm, split-half RoPE, cache append, and GQA. The
+shared fp32 packed decoder now covers all embedding formats without widening a
+half-precision intermediate.
+
+Current public route:
+
+- Packed embedding, packed decode, and sparse output projection use their Metal
+  kernels directly.
+- Dense `decode_linear_epilogue` uses Metal below 1,000,000 multiply terms and
+  framework matmul above that measured crossover. Dense `decode_swiglu` uses
+  the framework composition by default; packed weights use Metal.
+- `space_to_depth_norm_linear` uses Metal below 1,000,000 projection multiply
+  terms and the framework composition above it.
+- `decode_cache_attention` uses Metal below 512 allocated cache slots and the
+  equivalent functional framework composition from 512 slots onward. Explicit
+  `use_kernel=True/False` remains available on routed operations.
+
+References inspected: existing QuixiCore Metal dequant, qgemv, LayerNorm,
+embedding, and SDPA implementations. No application runtime or application
+contract is part of these APIs.
+
+Correctness:
+
+- `scripts/build kernels` passed for the native MLX extension and Metal library.
+- `PYTHONPATH=bindings/python .venv/bin/python -m pytest -q
+  tests/correctness/quantization/dequant_gather/test_dequant_gather.py
+  tests/correctness/matmul/decode_linear/test_decode_linear.py
+  tests/correctness/quantization/lm_head/test_lm_head.py
+  tests/correctness/vision/patch_merge/test_patch_merge.py
+  tests/correctness/attention/attn_decode/test_attn_decode.py` passed: 187.
+- `PYTHON=.venv/bin/python scripts/test mps -q -k 'quantized_embedding or
+  decode_linear or lm_head_masked or lm_head_candidates or
+  space_to_depth_norm_linear or decode_cache_attention'` passed: 9 focused
+  cases (463 deselected).
+- `PYTHON=.venv/bin/python scripts/test correctness -q` passed: 2025.
+- `PYTHON=.venv/bin/python scripts/test mps -q` passed: 472.
+- `PYTHON=.venv/bin/python scripts/test parity -q` passed: 401, including
+  direct cross-backend parity for every new operation family.
+- The final quick benchmark ran 21 oracle-checked cases. Maximum relative error
+  was 1.64e-6; embedding lookup and both sparse projection paths were exact.
+  Tests cover fp32/fp16/bfloat16 output, every supported packed embedding
+  decoder, dense and q4_0/q8_0/q6_K projection, invalid ids, empty/weighted
+  bags, odd spatial padding, variable cache lengths, normalization modes, and
+  both routed and direct-kernel paths.
+
+Focused performance run:
+
+- Integration path: MLX Python extension, explicit direct-kernel targets versus
+  equivalent MLX/decomposed baselines.
+- Hardware/toolchain: Apple M4 Max (128 GB), macOS 26.5.1 (25F80), Xcode 26.6
+  (17F113), Apple Metal 32023.883 / Metal toolchain 17.6.109.0, Python 3.12.9,
+  MLX 0.21.1.
+- Working-tree label: `294f8bd-dirty`.
+- Initial/candidate command: `.venv/bin/python perf/bench_kernels.py --backend
+  mlx --preset quick --kernel quantized_embedding,quantized_embedding_bag,
+  decode_linear_epilogue,decode_swiglu,lm_head_masked,lm_head_candidates,
+  space_to_depth_norm_linear,decode_cache_attention --warmup 5 --iters 20`.
+- Final command: `PYTHONPATH=bindings/python .venv/bin/python
+  perf/bench_kernels.py --backend mlx --preset quick --kernel
+  quantized_embedding,quantized_embedding_bag,decode_linear_epilogue,
+  decode_swiglu,lm_head_masked,lm_head_candidates,
+  space_to_depth_norm_linear,decode_cache_attention --warmup 10 --iters 30
+  --out-dir perf/results/2026-07-13/new-kernels-final-quick`.
+- `time_thunk` warms for at least 50 ms, adaptively batches short calls to at
+  least 2 ms per sample, synchronizes every sample, and reports per-call median,
+  p20/p80, and CV. Small throughput-style calls showed OS/queue outliers (CV up
+  to 0.60), so decisions use central bands and the independent initial,
+  candidate, and final runs rather than a single minimum.
+
+Baseline: packed operations compare against a resident pre-dequantized table or
+weight plus the equivalent framework operations. Sparse output projection
+compares against full/gathered dense logits, masking, top-k, and logsumexp.
+Spatial projection compares against materialized space-to-depth, framework
+LayerNorm, and matmul. Cache attention's equivalent baseline includes RoPE,
+functional cache construction, and SDPA; its much smaller pre-updated,
+output-only SDPA number is recorded in raw results but is not used for the
+decision.
+
+Experiments (one launch/decode factor changed at a time):
+
+| Family / priority shape | Initial ms | Candidate ms | Decision |
+|---|---:|---:|---|
+| embedding lookup, q4_0 T256 D1024, 256 -> 128 threads | 0.0234 | 0.0110 | Keep; 2.14x faster. |
+| embedding bag, q4_0 B128 L8 D1024, 256 -> 128 threads | 0.0331 | 0.0131 | Keep; 2.53x faster. |
+| embedding bag, q4_0 B32 L32 D1024, 256 -> 128 threads | 0.0288 | 0.0155 | Keep; 1.86x faster. |
+| q4_0 decode epilogue B1 K1536 N4096, scalar -> paired nibbles | 0.1051 | 0.0488 | Keep; 2.15x faster. |
+| q4_0 SwiGLU B1 K1536 N4096, scalar -> paired nibbles | 0.0823 | 0.0279 | Keep; 2.95x faster. |
+| masked output projection T1/T8, vocabulary tile 256 -> 128 | 0.0909 / 0.1635 | 0.0338 / 0.1234 | Keep; 2.69x / 1.32x. |
+| space-to-depth block2/block4, 256 -> 128 threads | 0.7146 / 0.0894 | 0.7499 / 0.1325 | Reject and restore 256 threads. |
+| cache attention T512/T2048, four -> two simdgroups | 0.3203 / 1.4659 | 0.6117 / 2.7687 | Reject and restore four simdgroups. |
+
+The CSR candidate projection does not use the masked-LM vocabulary tile. Its
+one-simdgroup CSR scan was retained without attributing run-to-run timing
+movement to that unrelated experiment; the final direct-versus-equivalent
+measurements below are the decision basis for this kernel.
+
+Final priority-shape results are milliseconds. Each timing cell is `median
+[p20,p80], CV`; speedup is equivalent-baseline/target.
+
+| kernel | variant | target median [p20,p80], CV | equivalent baseline median [p20,p80], CV | speedup | rel err |
+|---|---|---:|---:|---:|---:|
+| quantized_embedding | q4_0 R8192 D1024 T1 | 0.0144 [0.0127,0.0232], 0.527 | 0.0158 [0.0115,0.0241], 0.393 | 1.09x | 0.00e+00 |
+| quantized_embedding | q4_0 R8192 D1024 T256 | 0.0143 [0.0128,0.0171], 0.603 | 0.0344 [0.0298,0.0415], 0.277 | 2.40x | 0.00e+00 |
+| quantized_embedding_bag | q4_0 R8192 D1024 B128 L8 | 0.0163 [0.0141,0.0191], 0.354 | 0.0674 [0.0636,0.0834], 0.393 | 4.14x | 1.14e-07 |
+| quantized_embedding_bag | q4_0 R8192 D1024 B32 L32 | 0.0182 [0.0161,0.0201], 0.199 | 0.0658 [0.0604,0.0753], 0.371 | 3.62x | 1.66e-07 |
+| decode_linear_epilogue | dense B1 K1536 N4096 | 0.0431 [0.0402,0.0518], 0.364 | 0.0431 [0.0414,0.0602], 0.281 | 1.00x | 2.29e-07 |
+| decode_linear_epilogue | q4_0 B1 K1536 N4096 | 0.0439 [0.0404,0.0495], 0.370 | 0.0433 [0.0413,0.0522], 0.282 | 0.99x | 2.40e-07 |
+| decode_linear_epilogue | q8_0 B1 K1536 N4096 | 0.0193 [0.0173,0.0252], 0.364 | 0.0429 [0.0408,0.0539], 0.342 | 2.22x | 2.36e-07 |
+| decode_linear_epilogue | q6_K B1 K1536 N4096 | 0.0395 [0.0355,0.0440], 0.123 | 0.0417 [0.0387,0.0490], 0.376 | 1.06x | 2.35e-07 |
+| decode_swiglu | dense B1 K1536 N4096 | 0.1244 [0.1137,0.1400], 0.174 | 0.0896 [0.0778,0.1026], 0.336 | 0.72x | 1.48e-07 |
+| decode_swiglu | q4_0 B1 K1536 N4096 | 0.0343 [0.0329,0.0423], 0.396 | 0.0733 [0.0679,0.0864], 0.243 | 2.14x | 1.83e-07 |
+| decode_swiglu | q8_0 B1 K1536 N4096 | 0.0493 [0.0448,0.0605], 0.235 | 0.1102 [0.1000,0.1227], 0.220 | 2.24x | 2.71e-07 |
+| decode_swiglu | q6_K B1 K1536 N4096 | 0.0484 [0.0462,0.0544], 0.309 | 0.0705 [0.0684,0.0781], 0.312 | 1.46x | 1.98e-07 |
+| lm_head_masked | q4_0 T1 V8192 K1024 L256 | 0.0495 [0.0446,0.0590], 0.133 | 0.1384 [0.1333,0.1668], 0.293 | 2.80x | 0.00e+00 |
+| lm_head_masked | q4_0 T8 V8192 K1024 L64 | 0.1348 [0.1301,0.1518], 0.253 | 0.1712 [0.1586,0.1998], 0.216 | 1.27x | 0.00e+00 |
+| lm_head_candidates | q4_0 T1 V8192 K1024 C256 | 0.0371 [0.0324,0.0417], 0.128 | 0.1702 [0.1545,0.1878], 0.122 | 4.59x | 0.00e+00 |
+| lm_head_candidates | q4_0 T8 V8192 K1024 C64 | 0.0210 [0.0173,0.0298], 0.326 | 0.1775 [0.1612,0.2106], 0.160 | 8.45x | 0.00e+00 |
+| space_to_depth_norm_linear | B1 48x48 C128 O512 S2 | 0.5965 [0.5726,0.6466], 0.112 | 0.0721 [0.0666,0.0821], 0.208 | 0.12x | 3.84e-07 |
+| space_to_depth_norm_linear | B1 32x32 C64 O256 S4 | 0.0912 [0.0852,0.0977], 0.113 | 0.0872 [0.0808,0.1085], 0.181 | 0.96x | 3.07e-07 |
+| decode_cache_attention | B4 H16/4 T512 D128 | 0.3789 [0.3621,0.4298], 0.109 | 0.3387 [0.2981,0.4148], 0.154 | 0.89x | 1.02e-06 |
+| decode_cache_attention | B4 H16/4 T1024 D128 | 0.7808 [0.7538,0.8745], 0.086 | 0.4398 [0.4025,0.5846], 0.175 | 0.56x | 1.30e-06 |
+| decode_cache_attention | B4 H16/4 T2048 D128 | 1.5635 [1.5090,1.7283], 0.094 | 0.8210 [0.7767,0.9536], 0.160 | 0.53x | 1.64e-06 |
+
+Decision:
+
+- Keep the 128-thread embedding launch, 128-token masked-LM vocabulary tile,
+  and q4_0 paired-nibble decoder. Restore the 256-thread spatial launch and
+  four-simdgroup attention launch after measured regressions.
+- Keep packed embedding/bag and both sparse output projection kernels as direct
+  defaults. They avoid expanded intermediates and win on priority shapes.
+- Keep packed decode paths. q8_0 and packed SwiGLU are clear wins; q4_0 decode
+  epilogue is parity with a resident expanded-weight baseline in the final run,
+  but is substantially faster than its initial decoder and preserves packed
+  storage. Do not claim a q4_0 epilogue speedup over resident dense weights.
+- Route dense SwiGLU to the framework composition. Auto-route dense decode
+  epilogue by size: the direct kernel wins at B1,K256,N256 (0.0108 vs 0.0235
+  ms) and is tied at B1,K1536,N4096.
+- Auto-route spatial projection: Metal wins the edge shape B1,8x8,C32,O64,S2
+  (0.0139 vs 0.0563 ms), while the framework path is 8.27x faster on the
+  realistic block-2 priority shape.
+- Auto-route functional cache attention: Metal wins B1,H4/2,T64,D64 against
+  the equivalent functional composition (0.0809 vs 0.2974 ms); the framework
+  composition is 1.12x, 1.78x, and 1.90x faster at T512/1024/2048. The
+  exclusive 512-slot allocation threshold keeps the measured sides of the
+  crossover.
+
+Open questions: re-evaluate a tiled/multi-query cache-attention algorithm that
+parallelizes the context dimension, and a matrix-tiled spatial projection that
+reuses each normalized patch across output channels. Revisit the q4_0/q6_K
+decode crossover only with isolated long runs because sub-0.05 ms cases remain
+sensitive to queue scheduling.
+
+Raw results:
+
+- `perf/results/2026-07-13/new-kernels-baseline-quick/`
+- `perf/results/2026-07-13/new-kernels-candidate-quick/`
+- `perf/results/2026-07-13/new-kernels-final-smoke/`
+- `perf/results/2026-07-13/new-kernels-final-quick/`
+
+## 2026-07-13: New-kernel second optimization pass
+
+Status: complete. This pass supersedes the launch/decode conclusions in the
+preceding entry where explicitly noted; the earlier measurements remain above
+as the historical starting point.
+
+Hypotheses:
+
+- Embedding had reached a launch/occupancy balance at 128 threads; a smaller
+  group might help T=1 but could starve batched lookup and bag reduction.
+- The q4_0 decode paths still decoded one packed block across two lanes. A
+  whole-block-per-lane mapping could load its scale/address once. The same
+  whole-block idea needed an independent q8_0 test rather than being assumed.
+- Allowed-only masked projection should inspect the bitmask before touching a
+  packed weight row. Masked and CSR-candidate projections could also decode a
+  complete q4_0 row block with one scale and 16 packed-byte reads.
+- Spatial projection was weight-traffic bound on the block-2 direct path. A
+  threadgroup could reuse each projection weight across several patches.
+- Cache attention was context-serial within four SIMD groups; increasing
+  context partitions could trade a small merge for much more parallelism.
+
+Environment: Apple M4 Max MacBook Pro (16 CPU cores, 128 GB), macOS 26.5.1
+(25F80), Xcode 26.6 (17F113), Apple Metal 32023.883 / Metal toolchain
+17.6.109.0, Python 3.12.9, MLX 0.21.1, and PyTorch 2.12.1 MPS. Working-tree
+label: `294f8bd-dirty`.
+
+Measurement method: `perf/bench_kernels.py` with its one-second clock ramp,
+at least 50 ms per-thunk warmup, adaptive batching to at least 2 ms/sample,
+and a synchronization per sample. The fresh baseline used 10 requested
+warmups and 30 samples; isolated candidates used 10/40; the final unified MLX
+run used 15/50. Comprehensive MLX and MPS cache runs used 10/30. Every timing
+below is a per-call median; p20/p80 and CV are retained in the raw JSONL.
+
+Commands:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel quantized_embedding,quantized_embedding_bag,decode_linear_epilogue,decode_swiglu,lm_head_masked,lm_head_candidates,space_to_depth_norm_linear,decode_cache_attention \
+  --warmup 15 --iters 50 \
+  --out-dir perf/results/2026-07-13/new-kernels-second-pass-final-quick
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset comprehensive --kernel decode_cache_attention \
+  --warmup 10 --iters 30 \
+  --out-dir perf/results/2026-07-13/new-kernels-second-pass-cache-comprehensive
+PYTHONPATH=bindings/python:bindings/pytorch_mps .venv/bin/python perf/bench_kernels.py \
+  --backend torch --preset quick --kernel decode_cache_attention \
+  --warmup 10 --iters 30 \
+  --out-dir perf/results/2026-07-13/new-kernels-second-pass-cache-mps-quick
+```
+
+Controlled experiments (one meaningful factor at a time):
+
+| Family / priority shape | Control ms | Candidate ms | Decision |
+|---|---:|---:|---|
+| q4_0 embedding T1 / T256, 128 -> 64 threads | 0.0104 / 0.0120 | 0.0097 / 0.0140 | Reject: T256 regressed 16%. |
+| q4_0 bag B128xL8 / B32xL32, 128 -> 64 threads | 0.0130 / 0.0157 | 0.0172 / 0.0156 | Reject: priority B128 regressed 32%. |
+| q4_0 decode epilogue / SwiGLU, paired lanes -> one block per lane | 0.0241 / 0.0285 | 0.0207 / 0.0256 | Keep: 14% / 10% faster. |
+| q8_0 decode epilogue / SwiGLU, generic -> one block per lane | 0.0169 / 0.0265 | 0.0187 / 0.0372 | Reject against back-to-back generic control. |
+| masked LM T1 L256 / T8 L64, project then mask -> mask first | 0.0332 / 0.1264 | 0.0296 / 0.0376 | Keep: 11% / 70% faster. Full-normalization mode still projects every row. |
+| masked LM T1 / T8, generic q4_0 chunks -> whole-block decoder | 0.0296 / 0.0376 | 0.0279 / 0.0330 | Keep: 6% / 12% faster. |
+| candidate LM T1 C256 / T8 C64, generic q4_0 chunks -> whole-block decoder | 0.0360 / 0.0164 | 0.0228 / 0.0154 | Keep: 37% / 6% faster. |
+| masked LM T1 / T8, fixed tile 128 -> fixed tile 256 | 0.0279 / 0.0330 | 0.0287 / 0.0315 | Mixed; reject the global change. |
+| masked LM T1 / T8, fixed tile 128 -> 128 below T4, otherwise 256 | 0.0279 / 0.0330 | 0.0272 / 0.0324 | Keep the routed tile; both branches pass the full LM suite. |
+| spatial S2 / S4, reread input -> stage raw input in threadgroup memory | 0.7339 / 0.0848 | 0.7171 / 0.0840 | Reject: <=2.3%, not material or robust. |
+| spatial S2, one patch -> four patches per threadgroup | 0.7339 | 0.3211 | Keep for dimension <=1024 and at least 256 patches; 56% faster. |
+| spatial S2, four -> eight patches per threadgroup | 0.3211 | 0.3833 | Reject: 19% regression from lost parallelism. |
+| cache T512 / T1024 / T2048, 4 -> 8 SIMD groups | 0.3210 / 0.6916 / 1.4389 | 0.2158 / 0.4099 / 0.8237 | Keep and continue sweep. |
+| cache T512 / T1024 / T2048, 8 -> 16 SIMD groups | 0.2158 / 0.4099 / 0.8237 | 0.1507 / 0.3188 / 0.7466 | Keep and continue sweep. |
+| cache T512 / T1024 / T2048, 16 -> 32 SIMD groups | 0.1507 / 0.3188 / 0.7466 | 0.1365 / 0.2484 / 0.4987 | Keep; hardware-limit 1024-thread group is best at every priority shape. |
+
+Final MLX quick results are milliseconds. The baseline is the equivalent
+framework/decomposed operation, not cache attention's separately recorded
+pre-updated output-only SDPA. Each timing cell is `median [p20,p80], CV`.
+
+| kernel | variant | target median [p20,p80], CV | equivalent baseline median | speedup | rel err |
+|---|---|---:|---:|---:|---:|
+| quantized_embedding | q4_0 R8192 D1024 T1 | 0.0105 [0.0102,0.0111], 0.168 | 0.0092 | 0.88x | 0.00e+00 |
+| quantized_embedding | q4_0 R8192 D1024 T256 | 0.0123 [0.0116,0.0127], 0.216 | 0.0276 | 2.25x | 0.00e+00 |
+| quantized_embedding_bag | q4_0 B128 L8 D1024 | 0.0137 [0.0134,0.0141], 0.138 | 0.0591 | 4.31x | 1.14e-07 |
+| quantized_embedding_bag | q4_0 B32 L32 D1024 | 0.0190 [0.0186,0.0196], 0.121 | 0.0944 | 4.96x | 1.66e-07 |
+| decode_linear_epilogue | dense B1 K1536 N4096 | 0.0599 [0.0543,0.0724], 0.121 | 0.0389 | 0.65x | 2.29e-07 |
+| decode_linear_epilogue | q4_0 B1 K1536 N4096 | 0.0201 [0.0196,0.0211], 0.092 | 0.0440 | 2.19x | 2.40e-07 |
+| decode_linear_epilogue | q8_0 B1 K1536 N4096 | 0.0309 [0.0306,0.0452], 0.213 | 0.0567 | 1.84x | 2.36e-07 |
+| decode_linear_epilogue | q6_K B1 K1536 N4096 | 0.0407 [0.0374,0.0415], 0.069 | 0.0416 | 1.02x | 2.35e-07 |
+| decode_swiglu | dense B1 K1536 N4096 | 0.1035 [0.0976,0.1114], 0.112 | 0.0659 | 0.64x | 1.48e-07 |
+| decode_swiglu | q4_0 B1 K1536 N4096 | 0.0260 [0.0256,0.0266], 0.051 | 0.0692 | 2.66x | 2.74e-07 |
+| decode_swiglu | q8_0 B1 K1536 N4096 | 0.0268 [0.0262,0.0275], 0.059 | 0.0661 | 2.46x | 2.71e-07 |
+| decode_swiglu | q6_K B1 K1536 N4096 | 0.0452 [0.0449,0.0457], 0.019 | 0.0662 | 1.46x | 1.98e-07 |
+| lm_head_masked | q4_0 T1 V8192 K1024 L256 | 0.0260 [0.0249,0.0273], 0.090 | 0.1302 | 5.00x | 0.00e+00 |
+| lm_head_masked | q4_0 T8 V8192 K1024 L64 | 0.0328 [0.0322,0.0339], 0.081 | 0.1486 | 4.53x | 0.00e+00 |
+| lm_head_candidates | q4_0 T1 V8192 K1024 C256 | 0.0231 [0.0227,0.0236], 0.112 | 0.1410 | 6.11x | 0.00e+00 |
+| lm_head_candidates | q4_0 T8 V8192 K1024 C64 | 0.0144 [0.0140,0.0150], 0.094 | 0.1480 | 10.28x | 0.00e+00 |
+| space_to_depth_norm_linear | B1 48x48 C128 O512 S2 | 0.2913 [0.2904,0.2925], 0.019 | 0.0637 | 0.22x | 3.84e-07 |
+| space_to_depth_norm_linear | B1 32x32 C64 O256 S4 | 0.0916 [0.0894,0.0948], 0.037 | 0.0770 | 0.84x | 3.07e-07 |
+| decode_cache_attention | B4 H16/4 T512 D128 | 0.1352 [0.1322,0.1380], 0.086 | 0.2727 | 2.02x | 9.52e-07 |
+| decode_cache_attention | B4 H16/4 T1024 D128 | 0.2508 [0.2459,0.2609], 0.080 | 0.3673 | 1.46x | 1.25e-06 |
+| decode_cache_attention | B4 H16/4 T2048 D128 | 0.4960 [0.4929,0.5022], 0.106 | 0.7048 | 1.42x | 1.68e-06 |
+
+The comprehensive MLX cache case B16,H32/Hkv8,T4096,D128 measured 7.1676
+[7.1217,7.2459] ms (CV 0.009) versus 8.7295 ms for the equivalent functional
+step, a 1.22x win with 2.68e-6 relative error. MPS measured 0.1592/0.2598/
+0.5247 ms at T512/1024/2048 versus equivalent 0.6482/1.1121/2.0271 ms, and
+7.1023 ms at the comprehensive T4096 case versus 27.9344 ms. The public
+`decode_cache_attention` default therefore returns to the Metal path for all
+measured sizes; `use_kernel=False` preserves the framework fallback.
+The smoke B1,H4/Hkv2,T64,D64 case measured 0.0449 ms versus 0.2254 ms on MLX
+and 0.0963 ms versus 0.5391 ms on MPS, closing the small-context side of that
+routing decision.
+
+Correctness and validation:
+
+- `scripts/build kernels` passed with the retained q4_0 decoder, group-of-four
+  spatial kernel, and 32-SIMD-group cache kernel.
+- The five focused test modules passed 187 tests.
+- `scripts/test correctness -q` passed 2025 tests.
+- `scripts/test parity -q` passed 401 tests.
+- `scripts/test mps -q` passed 472 tests.
+- All benchmark cases passed their in-run oracle. The maximum relative error
+  was 2.75e-6 across the final quick/comprehensive MLX and MPS runs; embedding
+  lookup and both sparse projection families were exact.
+
+Final decisions:
+
+- Retain 128-thread embedding and bag launches; reject 64 threads.
+- Keep whole-q4_0-block decode in fused decode and sparse LM-head dots. Keep
+  the existing generic q8_0 decoder.
+- Keep mask-first allowed normalization and route masked vocabulary tiles to
+  128 rows below four tokens, 256 otherwise.
+- Keep four-patch spatial weight reuse only for dimensions <=1024 with at
+  least 256 patches. The public high-work framework crossover remains because
+  the direct priority shapes are still slower than framework composition.
+- Keep 32 SIMD groups for functional cache decode and make Metal the automatic
+  public route across the measured 64-through-4096-slot range.
+- Dense fused decode and untouched q6_K/q8_0 paths retain their existing public
+  routing. No speedup is attributed to unchanged or rejected variants.
+
+Raw results:
+
+- Baseline and final: `perf/results/2026-07-13/new-kernels-second-pass-baseline-quick/`,
+  `perf/results/2026-07-13/new-kernels-second-pass-final-quick/`.
+- Embedding/decode: `new-kernels-second-pass-embedding-64/`,
+  `new-kernels-second-pass-decode-q4-full-block/`,
+  `new-kernels-second-pass-decode-q8-full-block/`, and
+  `new-kernels-second-pass-decode-q8-control-generic/` under the same date.
+- Sparse projection: `new-kernels-second-pass-lm-mask-first/`,
+  `new-kernels-second-pass-lm-q4-block-decode/`,
+  `new-kernels-second-pass-lm-mask-tile256/`, and
+  `new-kernels-second-pass-lm-mask-dynamic-tile/`.
+- Spatial: `new-kernels-second-pass-space-stage-input/`,
+  `new-kernels-second-pass-space-stage-control/`,
+  `new-kernels-second-pass-space-group4/`, and
+  `new-kernels-second-pass-space-group8/`.
+- Cache: `new-kernels-second-pass-cache-4simd-control/`,
+  `new-kernels-second-pass-cache-8simd/`,
+  `new-kernels-second-pass-cache-16simd/`,
+  `new-kernels-second-pass-cache-32simd/`,
+  `new-kernels-second-pass-cache-smoke/`,
+  `new-kernels-second-pass-cache-comprehensive/`,
+  `new-kernels-second-pass-cache-mps-smoke/`,
+  `new-kernels-second-pass-cache-mps-quick/`, and
+  `new-kernels-second-pass-cache-mps-comprehensive/`.

@@ -6,7 +6,7 @@ into `perf/optimization_status.md`.
 
 ## Environment
 
-Date: 2026-07-06.
+Date: 2026-07-13.
 
 Each real baseline entry should record:
 
@@ -26,7 +26,30 @@ Each real baseline entry should record:
 | GEMM timing | `perf/harness/time_gemm.py` | Focused timing for GEMM kernels |
 | LayerNorm timing | `perf/harness/time_layernorm.py` | Focused timing for row-reduction kernels |
 | General timing helpers | `perf/harness/time_perf.py` | Shared harness utilities |
+| Shared kernel harness | `perf/bench_kernels.py` | Schema-v1 correctness and timing cases for every active family, including specialized composed operations |
 | Kernel notebook | `perf/optimization_status.md` | Detailed historical optimization entries |
+
+## 2026-07-13 Specialized Operation Baseline
+
+The focused MLX baseline and final optimized runs for packed embeddings, decode
+epilogues/SwiGLU, masked and candidate output projection, spatial projection,
+and functional cache attention are indexed below. Exact per-case p20/p80, CV,
+correctness error, and framework baseline statistics are in the JSONL files;
+durable decisions are in `perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Initial geometry | `294f8bd-dirty` | MLX / quick | 5 / 20 | `perf/results/2026-07-13/new-kernels-baseline-quick/` |
+| Candidate geometry | `294f8bd-dirty` | MLX / quick | 5 / 20 | `perf/results/2026-07-13/new-kernels-candidate-quick/` |
+| Final edge shapes | `294f8bd-dirty` | MLX / smoke | 3 / 5 | `perf/results/2026-07-13/new-kernels-final-smoke/` |
+| Final priority shapes | `294f8bd-dirty` | MLX / quick | 10 / 30 | `perf/results/2026-07-13/new-kernels-final-quick/` |
+| Second-pass baseline | `294f8bd-dirty` | MLX / quick | 10 / 30 | `perf/results/2026-07-13/new-kernels-second-pass-baseline-quick/` |
+| Second-pass final | `294f8bd-dirty` | MLX / quick | 15 / 50 | `perf/results/2026-07-13/new-kernels-second-pass-final-quick/` |
+| Cache edge | `294f8bd-dirty` | MLX / smoke | 10 / 40 | `perf/results/2026-07-13/new-kernels-second-pass-cache-smoke/` |
+| Cache comprehensive | `294f8bd-dirty` | MLX / comprehensive | 10 / 30 | `perf/results/2026-07-13/new-kernels-second-pass-cache-comprehensive/` |
+| Cache MPS edge | `294f8bd-dirty` | PyTorch MPS / smoke | 10 / 40 | `perf/results/2026-07-13/new-kernels-second-pass-cache-mps-smoke/` |
+| Cache MPS priority | `294f8bd-dirty` | PyTorch MPS / quick | 10 / 30 | `perf/results/2026-07-13/new-kernels-second-pass-cache-mps-quick/` |
+| Cache MPS comprehensive | `294f8bd-dirty` | PyTorch MPS / comprehensive | 10 / 30 | `perf/results/2026-07-13/new-kernels-second-pass-cache-mps-comprehensive/` |
 
 ## Migration Tasks
 

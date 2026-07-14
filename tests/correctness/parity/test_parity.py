@@ -2314,3 +2314,164 @@ def test_norm_backward_parity():
     gm = tk.gelu_backward(_mk(x, "mlx", "f32"), _mk(dy, "mlx", "f32"))
     gt = tk.gelu_backward(_mk(x, "torch", "f32"), _mk(dy, "torch", "f32"))
     _assert_parity(gm, gt, atol=1e-5)
+
+
+def _packed_on(packed, framework):
+    if framework == "mlx":
+        return mx.array(packed)
+    return torch.from_numpy(np.ascontiguousarray(packed)).to("mps")
+
+
+def _int_on(values, framework):
+    values = np.ascontiguousarray(values)
+    if framework == "mlx":
+        return mx.array(values)
+    return torch.from_numpy(values).to("mps")
+
+
+def test_quantized_embedding_lookup_and_bag_parity():
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(2001)
+    rows, dimension = 37, 256
+    quantize, _ = QUANT_FORMATS["q4_0"]
+    packed = quantize((0.2 * rng.standard_normal((rows, dimension))).astype(np.float32))
+    ids = np.array([0, 36, -1, 11, 11], dtype=np.int32)
+    offsets = np.array([0, 3, 5], dtype=np.int32)
+    weights = (0.5 + rng.random(ids.size)).astype(np.float32)
+
+    lookup_m = tk.quantized_embedding(
+        _packed_on(packed, "mlx"), _int_on(ids, "mlx"), "q4_0",
+        output_dtype="float32")
+    lookup_t = tk.quantized_embedding(
+        _packed_on(packed, "torch"), _int_on(ids, "torch"), "q4_0",
+        output_dtype="float32")
+    _assert_parity(lookup_m, lookup_t, atol=1e-6)
+
+    bag_m = tk.quantized_embedding_bag(
+        _packed_on(packed, "mlx"), _int_on(ids, "mlx"), _int_on(offsets, "mlx"),
+        "q4_0", sample_weights=_mk(weights, "mlx", "f32"), mode="mean",
+        output_dtype="float32")
+    bag_t = tk.quantized_embedding_bag(
+        _packed_on(packed, "torch"), _int_on(ids, "torch"), _int_on(offsets, "torch"),
+        "q4_0", sample_weights=_mk(weights, "torch", "f32"), mode="mean",
+        output_dtype="float32")
+    _assert_parity(bag_m, bag_t, atol=2e-6)
+
+
+def test_packed_decode_epilogue_and_swiglu_parity():
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(2003)
+    batch, hidden, output = 2, 256, 39
+    quantize, _ = QUANT_FORMATS["q4_0"]
+    x = (0.08 * rng.standard_normal((batch, hidden))).astype(np.float32)
+    gate = quantize((0.09 * rng.standard_normal((output, hidden))).astype(np.float32))
+    up = quantize((0.08 * rng.standard_normal((output, hidden))).astype(np.float32))
+    bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+    residual = (0.03 * rng.standard_normal((batch, output))).astype(np.float32)
+
+    epilogue_m = tk.decode_linear_epilogue(
+        _mk(x, "mlx", "f32"), _packed_on(gate, "mlx"), _mk(bias, "mlx", "f32"),
+        _mk(residual, "mlx", "f32"), activation="silu", format="q4_0")
+    epilogue_t = tk.decode_linear_epilogue(
+        _mk(x, "torch", "f32"), _packed_on(gate, "torch"), _mk(bias, "torch", "f32"),
+        _mk(residual, "torch", "f32"), activation="silu", format="q4_0")
+    _assert_parity(epilogue_m, epilogue_t, atol=2e-6)
+
+    swiglu_m = tk.decode_swiglu(
+        _mk(x, "mlx", "f32"), _packed_on(gate, "mlx"), _packed_on(up, "mlx"),
+        format="q4_0")
+    swiglu_t = tk.decode_swiglu(
+        _mk(x, "torch", "f32"), _packed_on(gate, "torch"), _packed_on(up, "torch"),
+        format="q4_0")
+    _assert_parity(swiglu_m, swiglu_t, atol=2e-6)
+
+
+def test_masked_and_candidate_output_projection_parity():
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(2007)
+    tokens, vocab, hidden, topk = 2, 73, 256, 3
+    quantize, _ = QUANT_FORMATS["q4_0"]
+    h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
+    packed = quantize((0.1 * rng.standard_normal((vocab, hidden))).astype(np.float32))
+    bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
+    rows = (np.array([2, 7, 36, 65], np.int32),
+            np.array([0, 11, 42, 70], np.int32))
+    allow = np.zeros((tokens, (vocab + 31) // 32), dtype=np.uint32)
+    for row, values in enumerate(rows):
+        for value in values:
+            allow[row, value // 32] |= np.uint32(1) << np.uint32(value % 32)
+    allow = allow.view(np.int32)
+    candidates = np.concatenate(rows)
+    offsets = np.array([0, len(rows[0]), len(candidates)], np.int32)
+
+    masked_m = tk.lm_head_masked(
+        _mk(h, "mlx", "f32"), _packed_on(packed, "mlx"), _int_on(allow, "mlx"),
+        bias=_mk(bias, "mlx", "f32"), format="q4_0", topk=topk)
+    masked_t = tk.lm_head_masked(
+        _mk(h, "torch", "f32"), _packed_on(packed, "torch"), _int_on(allow, "torch"),
+        bias=_mk(bias, "torch", "f32"), format="q4_0", topk=topk)
+    _assert_parity(masked_m[0], masked_t[0], atol=0)
+    _assert_parity(masked_m[1], masked_t[1], atol=2e-5)
+
+    candidate_m = tk.lm_head_candidates(
+        _mk(h, "mlx", "f32"), _packed_on(packed, "mlx"),
+        _int_on(candidates, "mlx"), _int_on(offsets, "mlx"),
+        bias=_mk(bias, "mlx", "f32"), format="q4_0", topk=topk)
+    candidate_t = tk.lm_head_candidates(
+        _mk(h, "torch", "f32"), _packed_on(packed, "torch"),
+        _int_on(candidates, "torch"), _int_on(offsets, "torch"),
+        bias=_mk(bias, "torch", "f32"), format="q4_0", topk=topk)
+    _assert_parity(candidate_m[0], candidate_t[0], atol=0)
+    _assert_parity(candidate_m[1], candidate_t[1], atol=2e-5)
+
+
+def test_space_to_depth_norm_linear_parity():
+    rng = np.random.default_rng(2011)
+    batch, height, width, channels, output, block = 1, 5, 7, 11, 29, 4
+    dimension = block * block * channels
+    x = (0.12 * rng.standard_normal((batch, height * width, channels))).astype(np.float32)
+    norm_weight = (0.8 + 0.1 * rng.standard_normal(dimension)).astype(np.float32)
+    norm_bias = (0.02 * rng.standard_normal(dimension)).astype(np.float32)
+    projection = (0.06 * rng.standard_normal((output, dimension))).astype(np.float32)
+    projection_bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
+    args_m = [_mk(value, "mlx", "f32") for value in
+              (x, norm_weight, projection, norm_bias, projection_bias)]
+    args_t = [_mk(value, "torch", "f32") for value in
+              (x, norm_weight, projection, norm_bias, projection_bias)]
+    output_m = tk.space_to_depth_norm_linear(
+        args_m[0], args_m[1], args_m[2], height, width,
+        norm_bias=args_m[3], projection_bias=args_m[4], block_size=block,
+        use_kernel=True)
+    output_t = tk.space_to_depth_norm_linear(
+        args_t[0], args_t[1], args_t[2], height, width,
+        norm_bias=args_t[3], projection_bias=args_t[4], block_size=block,
+        use_kernel=True)
+    _assert_parity(output_m, output_t, atol=2e-5)
+
+
+def test_decode_cache_attention_parity():
+    rng = np.random.default_rng(2017)
+    batch, heads_q, heads_kv, dimension, cache_length = 2, 4, 2, 64, 8
+    contexts = np.array([0, 5], np.int32)
+    positions = np.array([2, 6], np.int32)
+    shapes = ((batch, heads_q, dimension), (batch, heads_kv, dimension),
+              (batch, heads_kv, dimension),
+              (batch, heads_kv, cache_length, dimension),
+              (batch, heads_kv, cache_length, dimension))
+    q, new_k, new_v, key_cache, value_cache = [
+        (0.12 * rng.standard_normal(shape)).astype(np.float32) for shape in shapes]
+    angles = ((np.arange(9, dtype=np.float32)[:, None] + 1) *
+              (np.arange(dimension // 2, dtype=np.float32)[None, :] + 1) * 0.002)
+    cos, sin = np.cos(angles).astype(np.float32), np.sin(angles).astype(np.float32)
+    arrays = (q, new_k, new_v, cos, sin, positions, contexts, key_cache, value_cache)
+    mlx_args = [(_int_on(value, "mlx") if value.dtype == np.int32 else
+                 _mk(value, "mlx", "f32")) for value in arrays]
+    torch_args = [(_int_on(value, "torch") if value.dtype == np.int32 else
+                   _mk(value, "torch", "f32")) for value in arrays]
+    output_m = tk.decode_cache_attention(*mlx_args, use_kernel=True)
+    output_t = tk.decode_cache_attention(*torch_args, use_kernel=True)
+    for mlx_value, torch_value in zip(output_m, output_t):
+        _assert_parity(mlx_value, torch_value, atol=2e-5)

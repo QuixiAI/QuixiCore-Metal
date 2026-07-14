@@ -20,6 +20,59 @@
 namespace mlx::core {
 
 static constexpr int LMH_TILE_V = 256;
+static constexpr int LMH_MASKED_TILE_V_SMALL = 128;
+static constexpr int LMH_MASKED_TILE_V_BATCHED = 256;
+
+namespace {
+bool lmh_float(Dtype dtype) {
+  return dtype == float32 || dtype == float16 || dtype == bfloat16;
+}
+
+int check_masked_weight(
+    const array& h, const array& W, const std::string& format,
+    const char* name) {
+  if (h.ndim() != 2 || h.shape(0) <= 0 || h.shape(1) <= 0 ||
+      !lmh_float(h.dtype())) {
+    throw std::invalid_argument(std::string(name) +
+        ": h must be non-empty (T,K) fp32/fp16/bf16");
+  }
+  const int K = h.shape(1);
+  if (format.empty()) {
+    if (W.ndim() != 2 || W.shape(0) <= 0 || W.shape(1) != K ||
+        W.dtype() != h.dtype()) {
+      throw std::invalid_argument(std::string(name) +
+          ": dense W must be (V,K) with h dtype");
+    }
+    return W.shape(0);
+  }
+  int block_k = 0, block_bytes = 0;
+  if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else {
+    throw std::invalid_argument(std::string(name) +
+        ": format must be empty/dense, q4_0, q8_0, or q6_K");
+  }
+  if (W.dtype() != uint8 || W.ndim() != 3 || W.shape(0) <= 0 ||
+      K % block_k != 0 || W.shape(1) != K / block_k ||
+      W.shape(2) != block_bytes) {
+    throw std::invalid_argument(std::string(name) +
+        ": packed W must be uint8 (V,K/block_k,block_bytes)");
+  }
+  return W.shape(0);
+}
+
+array lmh_bias(
+    const array& bias, int vocab, bool use_bias, StreamOrDevice s,
+    const char* name) {
+  if (use_bias && (bias.ndim() != 1 || bias.shape(0) != vocab)) {
+    throw std::invalid_argument(std::string(name) +
+        ": bias must be (V,) or a scalar placeholder");
+  }
+  return use_bias ? contiguous(astype(bias, float32, s), false, s)
+                  : zeros({1}, float32, s);
+}
+}
 
 array lm_head_sample(
     const array& h,
@@ -222,6 +275,137 @@ std::vector<array> lm_head_constrained(
   return array::make_arrays(
       {{tokens}, {tokens}}, {int32, float32},
       std::make_shared<LmHeadConstrainedReduce>(to_stream(s)), partials);
+}
+
+std::vector<array> lm_head_masked(
+    const array& h, const array& W, const array& bias,
+    const array& allow_mask, const std::string& format, int topk,
+    bool normalize_allowed, StreamOrDevice s) {
+  const int vocab = check_masked_weight(h, W, format, "lm_head_masked");
+  const int tokens = h.shape(0), hidden = h.shape(1);
+  if (topk < 1 || topk > 8 || topk > vocab) {
+    throw std::invalid_argument("lm_head_masked: topk must be in [1, min(8,V)]");
+  }
+  const int mask_words = (vocab + 31) / 32;
+  if (allow_mask.ndim() != 2 || allow_mask.shape(0) != tokens ||
+      allow_mask.shape(1) != mask_words) {
+    throw std::invalid_argument(
+        "lm_head_masked: allow_mask must be (T,ceil(V/32)) packed words");
+  }
+  const bool use_bias = bias.size() > 1;
+  auto bias_c = lmh_bias(bias, vocab, use_bias, s, "lm_head_masked");
+  const int tile_v = tokens >= 4
+      ? LMH_MASKED_TILE_V_BATCHED
+      : LMH_MASKED_TILE_V_SMALL;
+  const int num_vtiles = (vocab + tile_v - 1) / tile_v;
+  auto partials = array::make_arrays(
+      {{tokens, num_vtiles, topk}, {tokens, num_vtiles, topk},
+       {tokens, num_vtiles}, {tokens, num_vtiles}},
+      {float32, int32, float32, float32},
+      std::make_shared<LmHeadMaskedPartials>(
+          to_stream(s), format, vocab, hidden, tile_v, topk, use_bias,
+          normalize_allowed),
+      {contiguous(h, false, s), contiguous(W, false, s), bias_c,
+       contiguous(astype(allow_mask, uint32, s), false, s)});
+  return array::make_arrays(
+      {{tokens, topk}, {tokens, topk}}, {int32, float32},
+      std::make_shared<LmHeadMaskedReduce>(to_stream(s), topk), partials);
+}
+
+std::vector<array> lm_head_candidates(
+    const array& h, const array& W, const array& bias,
+    const array& candidate_ids, const array& offsets,
+    const std::string& format, int topk, StreamOrDevice s) {
+  const int vocab = check_masked_weight(h, W, format, "lm_head_candidates");
+  const int tokens = h.shape(0), hidden = h.shape(1);
+  if (topk < 1 || topk > 8 || topk > vocab) {
+    throw std::invalid_argument("lm_head_candidates: topk must be in [1, min(8,V)]");
+  }
+  if (candidate_ids.ndim() != 1 || offsets.ndim() != 1 ||
+      offsets.shape(0) != tokens + 1) {
+    throw std::invalid_argument(
+        "lm_head_candidates: candidate_ids must be flat and offsets must have T+1 entries");
+  }
+  const bool use_bias = bias.size() > 1;
+  auto bias_c = lmh_bias(bias, vocab, use_bias, s, "lm_head_candidates");
+  return array::make_arrays(
+      {{tokens, topk}, {tokens, topk}}, {int32, float32},
+      std::make_shared<LmHeadCandidates>(
+          to_stream(s), format, vocab, hidden, topk, use_bias),
+      {contiguous(h, false, s), contiguous(W, false, s),
+       contiguous(astype(candidate_ids, int32, s), false, s),
+       contiguous(astype(offsets, int32, s), false, s), bias_c});
+}
+
+void LmHeadMaskedPartials::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadMaskedPartials has no CPU implementation.");
+}
+void LmHeadMaskedPartials::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream(); auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index); MLXEncoder enc(d, ce);
+  const int tokens = inputs[0].shape(0);
+  const int num_vtiles = outputs[2].shape(1);
+  tk::launch_lm_head_masked_partials(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3],
+      outputs[0], outputs[1], outputs[2], outputs[3],
+      vocab_, hidden_, tile_v_, num_vtiles, topk_, use_bias_,
+      normalize_allowed_, inputs[3].shape(1), tokens, format_,
+      type_to_name(inputs[0]));
+}
+bool LmHeadMaskedPartials::is_equivalent(const Primitive& other) const {
+  if (typeid(*this) != typeid(other)) return false;
+  auto& o = static_cast<const LmHeadMaskedPartials&>(other);
+  return format_ == o.format_ && vocab_ == o.vocab_ && hidden_ == o.hidden_ &&
+      tile_v_ == o.tile_v_ && topk_ == o.topk_ && use_bias_ == o.use_bias_ &&
+      normalize_allowed_ == o.normalize_allowed_;
+}
+
+void LmHeadMaskedReduce::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadMaskedReduce has no CPU implementation.");
+}
+void LmHeadMaskedReduce::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream(); auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index); MLXEncoder enc(d, ce);
+  tk::launch_lm_head_masked_reduce(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1],
+      inputs[2].shape(1), topk_, inputs[2].shape(0));
+}
+bool LmHeadMaskedReduce::is_equivalent(const Primitive& other) const {
+  return typeid(*this) == typeid(other) &&
+      topk_ == static_cast<const LmHeadMaskedReduce&>(other).topk_;
+}
+
+void LmHeadCandidates::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadCandidates has no CPU implementation.");
+}
+void LmHeadCandidates::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream(); auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index); MLXEncoder enc(d, ce);
+  tk::launch_lm_head_candidates(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4],
+      outputs[0], outputs[1], vocab_, hidden_, topk_, use_bias_,
+      inputs[0].shape(0), format_, type_to_name(inputs[0]));
+}
+bool LmHeadCandidates::is_equivalent(const Primitive& other) const {
+  if (typeid(*this) != typeid(other)) return false;
+  auto& o = static_cast<const LmHeadCandidates&>(other);
+  return format_ == o.format_ && vocab_ == o.vocab_ && hidden_ == o.hidden_ &&
+      topk_ == o.topk_ && use_bias_ == o.use_bias_;
 }
 
 void LmHeadConstrainedPartials::eval_cpu(
@@ -481,5 +665,8 @@ TK_LMH_NO_AUTODIFF(LmHeadTopkReduce, "LmHeadTopkReduce")
 TK_LMH_NO_AUTODIFF(LmHeadToppReduce, "LmHeadToppReduce")
 TK_LMH_NO_AUTODIFF(LmHeadConstrainedPartials, "LmHeadConstrainedPartials")
 TK_LMH_NO_AUTODIFF(LmHeadConstrainedReduce, "LmHeadConstrainedReduce")
+TK_LMH_NO_AUTODIFF(LmHeadMaskedPartials, "LmHeadMaskedPartials")
+TK_LMH_NO_AUTODIFF(LmHeadMaskedReduce, "LmHeadMaskedReduce")
+TK_LMH_NO_AUTODIFF(LmHeadCandidates, "LmHeadCandidates")
 
 } // namespace mlx::core

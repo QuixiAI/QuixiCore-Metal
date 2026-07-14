@@ -273,6 +273,27 @@ void launch_attn_decode_bh(E& e, typename E::in_t q, typename E::in_t kc,
   e.dispatch(Hq, B, 1, 32, 1, 1);
 }
 
+template <class E>
+void launch_decode_cache_attention(
+    E& e, typename E::in_t q, typename E::in_t new_k, typename E::in_t new_v,
+    typename E::in_t cos, typename E::in_t sin, typename E::in_t positions,
+    typename E::in_t context_lengths, typename E::in_t q_weight,
+    typename E::in_t k_weight, typename E::out_t key_cache,
+    typename E::out_t value_cache, typename E::out_t output,
+    int B, int Hq, int Hkv, int cache_T, int D, float eps,
+    bool do_q_norm, bool do_k_norm, bool gemma, float softmax_scale,
+    const std::string& type_name) {
+  e.pipeline("decode_cache_attention_" + type_name);
+  e.in(q, 0); e.in(new_k, 1); e.in(new_v, 2); e.in(cos, 3); e.in(sin, 4);
+  e.in(positions, 5); e.in(context_lengths, 6); e.in(q_weight, 7); e.in(k_weight, 8);
+  e.out(key_cache, 9); e.out(value_cache, 10); e.out(output, 11);
+  e.bytes(B, 12); e.bytes(Hq, 13); e.bytes(Hkv, 14); e.bytes(cache_T, 15);
+  e.bytes(D, 16); e.bytes(eps, 17); e.bytes(do_q_norm ? 1 : 0, 18);
+  e.bytes(do_k_norm ? 1 : 0, 19); e.bytes(gemma ? 1 : 0, 20);
+  e.bytes(softmax_scale, 21);
+  e.dispatch(Hq, B, 1, 1024, 1, 1);
+}
+
 // Swin window attention over packed qkv (BW,N,3,H,32).
 template <class E>
 void launch_swin_attn_d32(E& e, typename E::in_t qkv, typename E::in_t relative_bias,
@@ -295,6 +316,29 @@ void launch_patch_merge_layernorm(E& e, typename E::in_t input, typename E::in_t
   e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.out(output, 3);
   e.bytes(B, 4); e.bytes(H, 5); e.bytes(W, 6); e.bytes(C, 7); e.bytes(eps, 8);
   e.dispatch(B * ((H + 1) / 2) * ((W + 1) / 2), 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_space_to_depth_norm_linear(
+    E& e, typename E::in_t input, typename E::in_t norm_weight,
+    typename E::in_t norm_bias, typename E::in_t projection_weight,
+    typename E::in_t projection_bias, typename E::out_t output,
+    int B, int H, int W, int C, int O, int block_size, float eps,
+    bool use_norm_bias, bool use_projection_bias,
+    const std::string& type_name) {
+  const int dimension = block_size * block_size * C;
+  const int patches = B * ((H + block_size - 1) / block_size) *
+      ((W + block_size - 1) / block_size);
+  const bool use_group4 = dimension <= 1024 && patches >= 256;
+  e.pipeline("space_to_depth_norm_linear_" +
+             std::string(use_group4 ? "group4_" : "") + type_name);
+  e.in(input, 0); e.in(norm_weight, 1); e.in(norm_bias, 2);
+  e.in(projection_weight, 3); e.in(projection_bias, 4); e.out(output, 5);
+  e.bytes(B, 6); e.bytes(H, 7); e.bytes(W, 8); e.bytes(C, 9); e.bytes(O, 10);
+  e.bytes(block_size, 11); e.bytes(eps, 12); e.bytes(use_norm_bias ? 1 : 0, 13);
+  e.bytes(use_projection_bias ? 1 : 0, 14);
+  e.dispatch(use_group4 ? (patches + 3) / 4 : patches,
+             1, 1, 256, 1, 1);
 }
 
 template <class E>
@@ -328,6 +372,35 @@ void launch_decode_linear_q8(
   e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.in(residual, 3); e.out(output, 4);
   e.bytes(B, 5); e.bytes(K, 6); e.bytes(N, 7);
   e.bytes(gelu ? 1 : 0, 8); e.bytes(use_residual ? 1 : 0, 9);
+  e.dispatch(N, B, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_linear_epilogue(
+    E& e, typename E::in_t input, typename E::in_t weight,
+    typename E::in_t bias, typename E::in_t residual, typename E::out_t output,
+    int B, int K, int N, int activation, bool use_bias, bool use_residual,
+    const std::string& format, const std::string& type_name) {
+  const std::string layout = format.empty() ? "dense" : format;
+  e.pipeline("decode_linear_epilogue_" + layout + "_" + type_name);
+  e.in(input, 0); e.in(weight, 1); e.in(bias, 2); e.in(residual, 3); e.out(output, 4);
+  e.bytes(B, 5); e.bytes(K, 6); e.bytes(N, 7); e.bytes(activation, 8);
+  e.bytes(use_bias ? 1 : 0, 9); e.bytes(use_residual ? 1 : 0, 10);
+  e.dispatch(N, B, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_decode_swiglu(
+    E& e, typename E::in_t input, typename E::in_t gate_weight,
+    typename E::in_t up_weight, typename E::in_t gate_bias,
+    typename E::in_t up_bias, typename E::out_t output,
+    int B, int K, int N, bool use_bias, const std::string& format,
+    const std::string& type_name) {
+  const std::string layout = format.empty() ? "dense" : format;
+  e.pipeline("decode_swiglu_" + layout + "_" + type_name);
+  e.in(input, 0); e.in(gate_weight, 1); e.in(up_weight, 2);
+  e.in(gate_bias, 3); e.in(up_bias, 4); e.out(output, 5);
+  e.bytes(B, 6); e.bytes(K, 7); e.bytes(N, 8); e.bytes(use_bias ? 1 : 0, 9);
   e.dispatch(N, B, 1, 32, 1, 1);
 }
 
@@ -2285,6 +2358,54 @@ void launch_lm_head_constrained_reduce(
   e.dispatch(T, 1, 1, 32, 1, 1);
 }
 
+template <class E>
+void launch_lm_head_masked_partials(
+    E& e, typename E::in_t h, typename E::in_t weight,
+    typename E::in_t bias, typename E::in_t allow_mask,
+    typename E::out_t part_val, typename E::out_t part_id,
+    typename E::out_t part_max, typename E::out_t part_sum,
+    int V, int K, int tile_v, int num_vtiles, int topk, bool use_bias,
+    bool normalize_allowed, int mask_words, int T,
+    const std::string& format, const std::string& type_name) {
+  const std::string layout = format.empty() ? "dense" : format;
+  e.pipeline("lm_head_masked_partials_" + layout + "_" + type_name);
+  e.in(h, 0); e.in(weight, 1); e.in(bias, 2); e.in(allow_mask, 3);
+  e.out(part_val, 4); e.out(part_id, 5); e.out(part_max, 6); e.out(part_sum, 7);
+  e.bytes(V, 8); e.bytes(K, 9); e.bytes(tile_v, 10); e.bytes(num_vtiles, 11);
+  e.bytes(topk, 12); e.bytes(use_bias ? 1 : 0, 13);
+  e.bytes(normalize_allowed ? 1 : 0, 14); e.bytes(mask_words, 15);
+  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_lm_head_masked_reduce(
+    E& e, typename E::in_t part_val, typename E::in_t part_id,
+    typename E::in_t part_max, typename E::in_t part_sum,
+    typename E::out_t out_id, typename E::out_t out_logprob,
+    int num_vtiles, int topk, int T) {
+  e.pipeline("lm_head_masked_reduce");
+  e.in(part_val, 0); e.in(part_id, 1); e.in(part_max, 2); e.in(part_sum, 3);
+  e.out(out_id, 4); e.out(out_logprob, 5);
+  e.bytes(num_vtiles, 6); e.bytes(topk, 7);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_lm_head_candidates(
+    E& e, typename E::in_t h, typename E::in_t weight,
+    typename E::in_t candidate_ids, typename E::in_t offsets,
+    typename E::in_t bias, typename E::out_t out_id,
+    typename E::out_t out_logprob, int V, int K, int topk,
+    bool use_bias, int T, const std::string& format,
+    const std::string& type_name) {
+  const std::string layout = format.empty() ? "dense" : format;
+  e.pipeline("lm_head_candidates_" + layout + "_" + type_name);
+  e.in(h, 0); e.in(weight, 1); e.in(candidate_ids, 2); e.in(offsets, 3);
+  e.in(bias, 4); e.out(out_id, 5); e.out(out_logprob, 6);
+  e.bytes(V, 7); e.bytes(K, 8); e.bytes(topk, 9); e.bytes(use_bias ? 1 : 0, 10);
+  e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
 // topk partials: h@0 W@1 -> part_val@2 part_id@3 ; bias@4 ; V@5 K@6 TILE_V@7 num_vtiles@8 topk@9
 //   use_bias@10 (i32) ; grid (num_vtiles, T) × 32.
 template <class E>
@@ -2814,6 +2935,37 @@ void launch_dequant_gather(E& e, typename E::in_t table, typename E::in_t ids,
   e.bytes(rows, 3); e.bytes(columns, 4); e.bytes(tokens, 5); e.bytes(scale, 6);
   const long spans = (long)tokens * (columns / 8);
   e.dispatch(static_cast<int>((spans + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// General packed embedding lookup with output dtype and optional additive
+// epilogue.  One thread owns an aligned eight-column span.
+template <class E>
+void launch_quantized_embedding(
+    E& e, typename E::in_t table, typename E::in_t ids, typename E::in_t add,
+    typename E::out_t output, int rows, int columns, int tokens, float scale,
+    bool use_add, const std::string& fmt, const std::string& type_name) {
+  e.pipeline("quantized_embedding_" + fmt + "_" + type_name);
+  e.in(table, 0); e.in(ids, 1); e.in(add, 2); e.out(output, 3);
+  e.bytes(rows, 4); e.bytes(columns, 5); e.bytes(tokens, 6); e.bytes(scale, 7);
+  e.bytes(use_add ? 1 : 0, 8);
+  const long spans = static_cast<long>(tokens) * (columns / 8);
+  e.dispatch(static_cast<int>((spans + 127) / 128), 1, 1, 128, 1, 1);
+}
+
+template <class E>
+void launch_quantized_embedding_bag(
+    E& e, typename E::in_t table, typename E::in_t ids,
+    typename E::in_t offsets, typename E::in_t sample_weights,
+    typename E::out_t output, int rows, int columns, int id_count, int bags,
+    float scale, bool use_weights, bool mean_mode, const std::string& fmt,
+    const std::string& type_name) {
+  e.pipeline("quantized_embedding_bag_" + fmt + "_" + type_name);
+  e.in(table, 0); e.in(ids, 1); e.in(offsets, 2); e.in(sample_weights, 3);
+  e.out(output, 4); e.bytes(rows, 5); e.bytes(columns, 6);
+  e.bytes(id_count, 7); e.bytes(bags, 8); e.bytes(scale, 9);
+  e.bytes(use_weights ? 1 : 0, 10); e.bytes(mean_mode ? 1 : 0, 11);
+  const long spans = static_cast<long>(bags) * (columns / 8);
+  e.dispatch(static_cast<int>((spans + 127) / 128), 1, 1, 128, 1, 1);
 }
 
 // ----- qgemv_w8a8 (W8A8 int8xint8 decode): D@0 Wq@1(int8) Xq@2(int8) w_scale@3 a_scale@4 ;

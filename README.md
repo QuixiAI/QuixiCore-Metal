@@ -95,6 +95,25 @@ y = tk_torch.layernorm(x, w, b)
 torch.mps.synchronize()
 ```
 
+### Specialized composed operations
+
+The public `tk` module also exposes pure tensor operations that combine common
+decode, sparse-projection, embedding, and vision stages without introducing an
+application-level runtime:
+
+| Operation | Public API and contract |
+| --- | --- |
+| Packed embeddings | `quantized_embedding` and `quantized_embedding_bag` gather or reduce GGUF/MX/FP rows directly from packed tables. |
+| Decode projections | `decode_linear_epilogue` and `decode_swiglu` support dense, q4_0, q8_0, and q6_K weights, fused activations/bias/residuals, and optional output quantization. |
+| Sparse output projection | `lm_head_masked` consumes packed allow masks; `lm_head_candidates` consumes CSR candidate lists. Both return deterministic top-k ids and log-probabilities without materializing full logits. |
+| Spatial projection | `space_to_depth_norm_linear` composes block-2/block-4 space-to-depth, LayerNorm, and projection with odd-edge padding. |
+| Functional cache decode | `decode_cache_attention` composes optional Q/K RMSNorm, split-half RoPE, functional cache append, and GQA attention. |
+
+MLX arrays and PyTorch MPS tensors use the same top-level functions. Operations
+with measured crossover points auto-route between direct Metal and framework
+composition; `use_kernel=True` or `False` selects a path explicitly where the
+API exposes that option.
+
 ## Test
 
 ```bash
