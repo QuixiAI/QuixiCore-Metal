@@ -267,10 +267,13 @@ void launch_attn_decode_bh(E& e, typename E::in_t q, typename E::in_t kc,
                            typename E::in_t vc, typename E::out_t out,
                            int B, int Tk, int cache_T, int Hq, int Hkv, int D,
                            const std::string& type_name) {
-  e.pipeline("attn_decode_bh_" + type_name);
+  const int partitions = Tk >= 2048 ? 32 : (Tk >= 512 ? 8 : 1);
+  e.pipeline(partitions == 1
+      ? "attn_decode_bh_" + type_name
+      : "attn_decode_bh_partitioned_" + std::to_string(partitions) + "_" + type_name);
   e.in(q, 0); e.in(kc, 1); e.in(vc, 2); e.out(out, 3);
   e.bytes(Tk, 4); e.bytes(Hq, 5); e.bytes(Hkv, 6); e.bytes(D, 7); e.bytes(cache_T, 8);
-  e.dispatch(Hq, B, 1, 32, 1, 1);
+  e.dispatch(Hq, B, 1, partitions * 32, 1, 1);
 }
 
 template <class E>
@@ -329,16 +332,24 @@ void launch_space_to_depth_norm_linear(
   const int dimension = block_size * block_size * C;
   const int patches = B * ((H + block_size - 1) / block_size) *
       ((W + block_size - 1) / block_size);
-  const bool use_group4 = dimension <= 1024 && patches >= 256;
+  const bool use_tiled = type_name == "float32" && H % block_size == 0 &&
+      W % block_size == 0 && dimension % 8 == 0 && O % 32 == 0 &&
+      patches % 8 == 0;
+  const bool use_group4 = !use_tiled && dimension <= 1024 && patches >= 256;
   e.pipeline("space_to_depth_norm_linear_" +
-             std::string(use_group4 ? "group4_" : "") + type_name);
+             std::string(use_tiled ? "tiled_" : (use_group4 ? "group4_" : "")) +
+             type_name);
   e.in(input, 0); e.in(norm_weight, 1); e.in(norm_bias, 2);
   e.in(projection_weight, 3); e.in(projection_bias, 4); e.out(output, 5);
   e.bytes(B, 6); e.bytes(H, 7); e.bytes(W, 8); e.bytes(C, 9); e.bytes(O, 10);
   e.bytes(block_size, 11); e.bytes(eps, 12); e.bytes(use_norm_bias ? 1 : 0, 13);
   e.bytes(use_projection_bias ? 1 : 0, 14);
-  e.dispatch(use_group4 ? (patches + 3) / 4 : patches,
-             1, 1, 256, 1, 1);
+  if (use_tiled) {
+    e.dispatch(O / 32, patches / 8, 1, 128, 1, 1);
+  } else {
+    e.dispatch(use_group4 ? (patches + 3) / 4 : patches,
+               1, 1, 256, 1, 1);
+  }
 }
 
 template <class E>
@@ -405,15 +416,27 @@ void launch_decode_swiglu(
 }
 
 template <class E>
-void launch_edge_mlp_256x7(
+void launch_edge_mlp_project_256(
     E& e, typename E::in_t hidden, typename E::in_t first_weight,
-    typename E::in_t first_bias, typename E::in_t second_weight,
-    typename E::in_t second_bias, typename E::out_t output,
+    typename E::in_t first_bias, typename E::out_t left_output,
+    typename E::out_t right_output,
     int B, int L, const std::string& type_name) {
-  e.pipeline("edge_mlp_256x7_" + type_name);
+  e.pipeline("edge_mlp_project_256_" + type_name);
   e.in(hidden, 0); e.in(first_weight, 1); e.in(first_bias, 2);
-  e.in(second_weight, 3); e.in(second_bias, 4); e.out(output, 5);
-  e.bytes(B, 6); e.bytes(L, 7);
+  e.out(left_output, 3); e.out(right_output, 4);
+  e.bytes(B, 5); e.bytes(L, 6);
+  e.dispatch(B * L, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_edge_mlp_combine_256x7(
+    E& e, typename E::in_t left_partial, typename E::in_t right_partial,
+    typename E::in_t second_weight, typename E::in_t second_bias,
+    typename E::out_t output, int B, int L, const std::string& type_name) {
+  e.pipeline("edge_mlp_combine_256x7_" + type_name);
+  e.in(left_partial, 0); e.in(right_partial, 1);
+  e.in(second_weight, 2); e.in(second_bias, 3); e.out(output, 4);
+  e.bytes(B, 5); e.bytes(L, 6);
   e.dispatch(L * L, B, 1, 256, 1, 1);
 }
 
@@ -2439,12 +2462,14 @@ void launch_lm_head_topp_partials_q(E& e, typename E::in_t h, typename E::in_t W
                                     typename E::in_t bias, int V, int K, int TILE_V, int num_vtiles,
                                     int topk, int use_bias, float invtemp,
                                     typename E::out_t part_lse, int T, const std::string& fmt,
-                                    const std::string& htype) {
+                                    const std::string& htype, int rows_per_tg = 1) {
   e.pipeline("lm_head_topp_partials_q_" + fmt + "_" + htype);
   e.in(h, 0); e.in(Wq, 1); e.out(part_val, 2); e.out(part_id, 3); e.in(bias, 4);
   e.bytes(V, 5); e.bytes(K, 6); e.bytes(TILE_V, 7); e.bytes(num_vtiles, 8);
   e.bytes(topk, 9); e.bytes(use_bias, 10); e.bytes(invtemp, 11); e.out(part_lse, 12);
-  e.dispatch(num_vtiles, T, 1, 32, 1, 1);
+  e.bytes(rows_per_tg, 13); e.bytes(T, 14);
+  e.dispatch(num_vtiles, (T + rows_per_tg - 1) / rows_per_tg, 1,
+             32 * rows_per_tg, 1, 1);
 }
 
 // topk reduce: part_val@0 part_id@1 -> out_idx@2 ; num_vtiles@3 topk@4 (i32) seed@5 (u32)
@@ -2467,6 +2492,21 @@ void launch_lm_head_topp_reduce(E& e, typename E::in_t part_val, typename E::in_
   e.bytes(num_vtiles, 3); e.bytes(topk, 4); e.bytes(p, 5); e.bytes(seed, 6); e.bytes(invtemp, 7);
   e.in(part_lse, 8);
   e.dispatch(T, 1, 1, 32, 1, 1);
+}
+
+// Quantized LM-head beam merge: tile top candidates + tile lse + cumulative
+// score -> exact per-row top-2BM child scores, grid (B*BM,) x 32.
+template <class E>
+void launch_lm_head_beam_reduce(
+    E& e, typename E::in_t part_val, typename E::in_t part_id,
+    typename E::in_t part_lse, typename E::in_t cum,
+    typename E::out_t cand_score, typename E::out_t cand_token,
+    int num_vtiles, int two_bm, int rows) {
+  e.pipeline("lm_head_beam_reduce");
+  e.in(part_val, 0); e.in(part_id, 1); e.in(part_lse, 2); e.in(cum, 3);
+  e.out(cand_score, 4); e.out(cand_token, 5);
+  e.bytes(num_vtiles, 6); e.bytes(two_bm, 7);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- cross_entropy fwd: logits@0 targets@1 -> loss@2 lse@3 ; V@4 ignore_index@5 (i32)

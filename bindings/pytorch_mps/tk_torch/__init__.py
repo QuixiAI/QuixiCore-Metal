@@ -713,6 +713,12 @@ def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed, top_
                                  float(temperature), int(seed), float(top_p))
 
 
+def lm_head_beam_advance(h, Wq, bias, cum_log_probs, beam_width, fmt="q4_0"):
+    """Quantized LM-head + exact beam-search advance without full logits. MPS."""
+    return _ext.lm_head_beam_advance(
+        h, Wq, bias, cum_log_probs, int(beam_width), str(fmt))
+
+
 def lm_head_constrained(h, W, bias, forbidden, previous, eos_id=-1, forbid_eos=False):
     """Dense grammar-constrained LM head; returns (token ids, selected log-probabilities)."""
     return tuple(_ext.lm_head_constrained(

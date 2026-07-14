@@ -10,6 +10,7 @@
 #include "mlx/utils.h"
 
 #include "lm_head/lm_head.h"
+#include "sampling/sampling.h"
 
 #ifdef _METAL_
 #include "mlx/backend/metal/device.h"
@@ -226,6 +227,82 @@ array lm_head_sample_q(
       {h_c, Wq_c, bias_c});
   return array({T}, int32, std::make_shared<LmHeadArgcatReduce>(to_stream(s)),
                {parts[0], parts[1]});
+}
+
+std::vector<array> lm_head_beam_advance(
+    const array& h,
+    const array& Wq,
+    const array& bias,
+    const array& cum_log_probs,
+    int beam_width,
+    const std::string& format,
+    StreamOrDevice s) {
+  if (h.ndim() != 2 || h.shape(0) <= 0 || h.shape(1) <= 0 ||
+      !lmh_float(h.dtype())) {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: h must be non-empty (B*BM,K) fp32/fp16/bf16");
+  }
+  int block_bytes = 0;
+  if (format == "q4_0") block_bytes = 18;
+  else if (format == "q8_0") block_bytes = 34;
+  else {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: format must be q4_0 or q8_0");
+  }
+  const int rows = h.shape(0);
+  const int hidden = h.shape(1);
+  if (hidden % 32 != 0 || Wq.dtype() != uint8 || Wq.ndim() != 3 ||
+      Wq.shape(0) <= 0 || Wq.shape(1) != hidden / 32 ||
+      Wq.shape(2) != block_bytes) {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: packed W must be uint8 (V,K/32,block_bytes)");
+  }
+  if (beam_width < 1 || beam_width > 16) {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: beam_width must be in [1,16]");
+  }
+  if (cum_log_probs.ndim() != 2 ||
+      cum_log_probs.shape(1) != beam_width ||
+      rows != cum_log_probs.shape(0) * beam_width) {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: cum_log_probs must be (B,BM) and h rows B*BM");
+  }
+  const int vocab = Wq.shape(0);
+  const int two_bm = 2 * beam_width;
+  if (vocab < two_bm) {
+    throw std::invalid_argument(
+        "lm_head_beam_advance: vocab size must be >= 2*beam_width");
+  }
+  const bool use_bias = bias.size() > 1;
+  auto bias_c = lmh_bias(bias, vocab, use_bias, s, "lm_head_beam_advance");
+  auto h_c = contiguous(h, false, s);
+  auto Wq_c = contiguous(astype(Wq, uint8, s), false, s);
+  auto cum_c = contiguous(
+      astype(reshape(cum_log_probs, {rows}, s), float32, s), false, s);
+  const int num_vtiles = (vocab + LMH_TILE_V - 1) / LMH_TILE_V;
+
+  // The quantized tile pass emits both top-2BM candidates and the exact tile
+  // logsumexp. The first reduce merges those into per-beam cumulative scores;
+  // the established BeamSelect then finds the global BM children per batch.
+  auto partials = array::make_arrays(
+      {{rows, num_vtiles, two_bm}, {rows, num_vtiles, two_bm},
+       {rows, num_vtiles}},
+      {float32, int32, float32},
+      std::make_shared<LmHeadToppPartialsQ>(
+          to_stream(s), two_bm, use_bias, LMH_TILE_V, vocab, hidden, 1.0f,
+          format, 4),
+      {h_c, Wq_c, bias_c});
+  auto candidates = array::make_arrays(
+      {{rows, two_bm}, {rows, two_bm}}, {float32, int32},
+      std::make_shared<LmHeadBeamReduce>(to_stream(s), two_bm),
+      {partials[0], partials[1], partials[2], cum_c});
+  const int batches = cum_log_probs.shape(0);
+  return array::make_arrays(
+      {{batches, beam_width}, {batches, beam_width},
+       {batches, beam_width}},
+      {int32, int32, float32},
+      std::make_shared<BeamSelect>(to_stream(s), beam_width, two_bm),
+      {candidates[0], candidates[1]});
 }
 
 std::vector<array> lm_head_constrained(
@@ -595,7 +672,7 @@ void LmHeadToppPartialsQ::eval_gpu(const std::vector<array>& inputs, std::vector
   MLXEncoder enc(d, ce);
   tk::launch_lm_head_topp_partials_q(enc, h, Wq, part_val, part_id, bias, V_, K_, tile_v_,
                                      num_vtiles, topk_, use_bias_, invtemp_, part_lse, T, fmt_,
-                                     type_to_name(h));
+                                     type_to_name(h), rows_per_tg_);
 }
 
 // ---------------- topk reduce ----------------
@@ -639,6 +716,25 @@ void LmHeadToppReduce::eval_gpu(const std::vector<array>& inputs, std::vector<ar
                                  invtemp_, part_lse, T);
 }
 
+// ---------------- quantized LM-head beam reduce ----------------
+void LmHeadBeamReduce::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("LmHeadBeamReduce has no CPU implementation.");
+}
+void LmHeadBeamReduce::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_lm_head_beam_reduce(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1],
+      inputs[2].shape(1), two_bm_, inputs[2].shape(0));
+}
+
 #define TK_LMH_NO_AUTODIFF(CLASS, LABEL)                                     \
   std::vector<array> CLASS::jvp(                                             \
       const std::vector<array>&, const std::vector<array>&,                  \
@@ -663,6 +759,7 @@ TK_LMH_NO_AUTODIFF(LmHeadTopkPartialsQ, "LmHeadTopkPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadToppPartialsQ, "LmHeadToppPartialsQ")
 TK_LMH_NO_AUTODIFF(LmHeadTopkReduce, "LmHeadTopkReduce")
 TK_LMH_NO_AUTODIFF(LmHeadToppReduce, "LmHeadToppReduce")
+TK_LMH_NO_AUTODIFF(LmHeadBeamReduce, "LmHeadBeamReduce")
 TK_LMH_NO_AUTODIFF(LmHeadConstrainedPartials, "LmHeadConstrainedPartials")
 TK_LMH_NO_AUTODIFF(LmHeadConstrainedReduce, "LmHeadConstrainedReduce")
 TK_LMH_NO_AUTODIFF(LmHeadMaskedPartials, "LmHeadMaskedPartials")

@@ -2428,9 +2428,39 @@ def test_masked_and_candidate_output_projection_parity():
     _assert_parity(candidate_m[1], candidate_t[1], atol=2e-5)
 
 
-def test_space_to_depth_norm_linear_parity():
-    rng = np.random.default_rng(2011)
-    batch, height, width, channels, output, block = 1, 5, 7, 11, 29, 4
+def test_quantized_lm_head_beam_advance_parity():
+    from tk.quant import QUANT_FORMATS
+
+    rng = np.random.default_rng(2009)
+    batch, beam_width, vocab, hidden = 1, 4, 1027, 256
+    quantize, _ = QUANT_FORMATS["q4_0"]
+    hidden_states = (0.08 * rng.standard_normal(
+        (batch * beam_width, hidden))).astype(np.float32)
+    packed = quantize((0.09 * rng.standard_normal(
+        (vocab, hidden))).astype(np.float32))
+    bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
+    cumulative = np.array([[0.0, -0.2, -0.7, -1.1]], dtype=np.float32)
+    output_m = tk.lm_head_beam_advance(
+        _mk(hidden_states, "mlx", "f32"), _packed_on(packed, "mlx"),
+        _mk(cumulative, "mlx", "f32"), beam_width,
+        bias=_mk(bias, "mlx", "f32"), format="q4_0")
+    output_t = tk.lm_head_beam_advance(
+        _mk(hidden_states, "torch", "f32"), _packed_on(packed, "torch"),
+        _mk(cumulative, "torch", "f32"), beam_width,
+        bias=_mk(bias, "torch", "f32"), format="q4_0")
+    _assert_parity(output_m[0], output_t[0], atol=0)
+    _assert_parity(output_m[1], output_t[1], atol=0)
+    _assert_parity(output_m[2], output_t[2], atol=2e-5)
+
+
+@pytest.mark.parametrize(
+    "height,width,channels,output,block",
+    [(5, 7, 11, 29, 4), (8, 8, 16, 64, 2)],
+)
+def test_space_to_depth_norm_linear_parity(
+        height, width, channels, output, block):
+    rng = np.random.default_rng(2011 + height + channels)
+    batch = 1
     dimension = block * block * channels
     x = (0.12 * rng.standard_normal((batch, height * width, channels))).astype(np.float32)
     norm_weight = (0.8 + 0.1 * rng.standard_normal(dimension)).astype(np.float32)
@@ -2449,6 +2479,39 @@ def test_space_to_depth_norm_linear_parity():
         args_t[0], args_t[1], args_t[2], height, width,
         norm_bias=args_t[3], projection_bias=args_t[4], block_size=block,
         use_kernel=True)
+    _assert_parity(output_m, output_t, atol=2e-5)
+
+
+def test_edge_mlp_256x7_parity():
+    rng = np.random.default_rng(2013)
+    batch, length = 1, 8
+    arrays = [
+        (0.05 * rng.standard_normal(shape)).astype(np.float32)
+        for shape in ((batch, length, 256), (256, 512), (256,), (7, 256), (7,))
+    ]
+    output_m = tk.edge_mlp_256x7(
+        *(_mk(value, "mlx", "f32") for value in arrays), use_kernel=True)
+    output_t = tk.edge_mlp_256x7(
+        *(_mk(value, "torch", "f32") for value in arrays), use_kernel=True)
+    _assert_parity(output_m, output_t, atol=2e-5)
+
+
+@pytest.mark.parametrize("context_length", [512, 2048])
+def test_attn_decode_bh_partitioned_parity(context_length):
+    rng = np.random.default_rng(2015 + context_length)
+    batch, heads_q, heads_kv, dimension = 1, 4, 2, 64
+    arrays = [
+        (0.12 * rng.standard_normal(shape)).astype(np.float32)
+        for shape in ((batch, heads_q, dimension),
+                      (batch, heads_kv, context_length, dimension),
+                      (batch, heads_kv, context_length, dimension))
+    ]
+    output_m = tk.attn_decode_bh(
+        *(_mk(value, "mlx", "f32") for value in arrays),
+        context_length, use_kernel=True)
+    output_t = tk.attn_decode_bh(
+        *(_mk(value, "torch", "f32") for value in arrays),
+        context_length, use_kernel=True)
     _assert_parity(output_m, output_t, atol=2e-5)
 
 

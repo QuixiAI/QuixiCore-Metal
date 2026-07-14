@@ -477,3 +477,38 @@ def test_lm_head_candidates_skips_invalid_and_pads_short_rows():
         np.array(logprobs)[:, :2], np.stack([ref0[1], ref1[1]])[:, :2],
         rtol=5e-5, atol=5e-5)
     assert np.isneginf(np.array(logprobs)[1, 2:]).all()
+
+
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0"])
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+@pytest.mark.parametrize("V", [1024, 1027])
+def test_quantized_lm_head_beam_advance(fmt, dtype, V):
+    """Both quantized projection routes match dequantize + full beam search."""
+    quantize, dequantize = QUANT_FORMATS[fmt]
+    rng = np.random.default_rng(503 + len(fmt) + len(dtype) + V)
+    B, beam_width, K = 2, 4, 256
+    h = (0.18 * rng.standard_normal((B * beam_width, K))).astype(np.float32)
+    packed = quantize((0.14 * rng.standard_normal((V, K))).astype(np.float32))
+    bias = (0.025 * rng.standard_normal(V)).astype(np.float32)
+    cum = (0.1 * rng.standard_normal((B, beam_width))).astype(np.float32)
+    hm = mx.array(h).astype(_MX[dtype])
+
+    token, parent, score = tk.lm_head_beam_advance(
+        hm, mx.array(packed), mx.array(cum), beam_width,
+        bias=mx.array(bias), format=fmt)
+    mx.eval(token, parent, score)
+
+    h_seen = np.array(hm.astype(mx.float32))
+    logits = h_seen @ dequantize(packed).astype(np.float32).T + bias
+    maximum = logits.max(axis=1, keepdims=True)
+    log_z = maximum + np.log(np.exp(logits - maximum).sum(axis=1, keepdims=True))
+    flat_score = (logits - log_z).reshape(B, beam_width, V)
+    flat_score = (flat_score + cum[:, :, None]).reshape(B, beam_width * V)
+    selected = np.argsort(-flat_score, axis=1, kind="stable")[:, :beam_width]
+    expected_token = (selected % V).astype(np.int32)
+    expected_parent = (selected // V).astype(np.int32)
+    expected_score = np.take_along_axis(flat_score, selected, axis=1)
+
+    np.testing.assert_array_equal(np.array(token), expected_token)
+    np.testing.assert_array_equal(np.array(parent), expected_parent)
+    np.testing.assert_allclose(np.array(score), expected_score, rtol=8e-4, atol=2e-3)

@@ -106,7 +106,10 @@ application-level runtime:
 | Packed embeddings | `quantized_embedding` and `quantized_embedding_bag` gather or reduce GGUF/MX/FP rows directly from packed tables. |
 | Decode projections | `decode_linear_epilogue` and `decode_swiglu` support dense, q4_0, q8_0, and q6_K weights, fused activations/bias/residuals, and optional output quantization. |
 | Sparse output projection | `lm_head_masked` consumes packed allow masks; `lm_head_candidates` consumes CSR candidate lists. Both return deterministic top-k ids and log-probabilities without materializing full logits. |
+| Quantized beam advance | `lm_head_beam_advance` combines q4_0/q8_0 output projection, exact full-vocabulary normalization, cumulative beam scores, and deterministic parent/token selection. |
 | Spatial projection | `space_to_depth_norm_linear` composes block-2/block-4 space-to-depth, LayerNorm, and projection with odd-edge padding. |
+| Pairwise edge MLP | `edge_mlp_256x7` factorizes a fixed 512→256→7 pairwise MLP so the first projection scales with sequence length rather than pair count. |
+| Head-major GQA decode | `attn_decode_bh` consumes preallocated `(B,Hkv,cache_T,D)` caches and partitions long contexts across SIMD groups. |
 | Functional cache decode | `decode_cache_attention` composes optional Q/K RMSNorm, split-half RoPE, functional cache append, and GQA attention. |
 
 MLX arrays and PyTorch MPS tensors use the same top-level functions. Operations

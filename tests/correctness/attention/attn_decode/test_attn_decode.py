@@ -28,7 +28,7 @@ def test_attn_decode_matches_numpy(Hq, Hkv, D, Tk):
     np.testing.assert_allclose(np.array(got), ref, rtol=3e-5, atol=3e-5)
 
 
-@pytest.mark.parametrize("use_kernel", [False, True])
+@pytest.mark.parametrize("use_kernel", [None, False, True])
 @pytest.mark.parametrize("dtype,atol", [(mx.float32, 4e-5), (mx.bfloat16, 4e-2)])
 def test_attn_decode_bh_matches_preallocated_cache_layout(use_kernel, dtype, atol):
     rng = np.random.default_rng(311)
@@ -50,6 +50,29 @@ def test_attn_decode_bh_matches_preallocated_cache_layout(use_kernel, dtype, ato
             ref[batch, head] = probs @ v[batch, kv_head, :Tk]
     np.testing.assert_allclose(
         np.array(got.astype(mx.float32)), ref, rtol=atol, atol=atol)
+
+
+@pytest.mark.parametrize("context_length", [512, 2048])
+def test_attn_decode_bh_partitioned_long_context(context_length):
+    rng = np.random.default_rng(419 + context_length)
+    batch, heads_q, heads_kv, dimension = 1, 2, 1, 64
+    q = (0.15 * rng.standard_normal(
+        (batch, heads_q, dimension))).astype(np.float32)
+    k = (0.15 * rng.standard_normal(
+        (batch, heads_kv, context_length + 3, dimension))).astype(np.float32)
+    v = (0.15 * rng.standard_normal(
+        (batch, heads_kv, context_length + 3, dimension))).astype(np.float32)
+    got = attn_decode_bh(
+        mx.array(q), mx.array(k), mx.array(v), context_length, use_kernel=True)
+    mx.eval(got)
+
+    reference = np.empty_like(q)
+    for head in range(heads_q):
+        scores = k[0, 0, :context_length] @ q[0, head] / np.sqrt(dimension)
+        probabilities = np.exp(scores - scores.max())
+        probabilities /= probabilities.sum()
+        reference[0, head] = probabilities @ v[0, 0, :context_length]
+    np.testing.assert_allclose(np.array(got), reference, rtol=5e-5, atol=5e-5)
 
 
 def _rms_norm(x, weight, eps, gemma):

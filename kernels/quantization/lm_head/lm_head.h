@@ -47,6 +47,19 @@ array lm_head_sample_q(
     float top_p = 0.0f,   // mode 3 (topp): nucleus threshold; k = over-selected candidate cap
     StreamOrDevice s = {});
 
+/** Quantized LM-head + exact beam-search advance without materializing (B*BM,V)
+ *  logits. Wq is q4_0/q8_0 packed (V,K/32,block_bytes); h is (B*BM,K),
+ *  cum_log_probs is (B,BM), and BM <= 16. Returns next token, parent beam,
+ *  and updated cumulative log-probability, each (B,BM). */
+std::vector<array> lm_head_beam_advance(
+    const array& h,
+    const array& Wq,
+    const array& bias,
+    const array& cum_log_probs,
+    int beam_width,
+    const std::string& format = "q4_0",
+    StreamOrDevice s = {});
+
 /** Dense LM head with a row-conditioned grammar mask. Returns
  *  [selected_token (T,) int32, selected_logprob (T,) fp32]. `forbidden` is a
  *  uint8 (V,V) matrix indexed by (previous_token, candidate_token). */
@@ -269,9 +282,9 @@ class LmHeadTopkPartialsQ : public Primitive {
 class LmHeadToppPartialsQ : public Primitive {
  public:
   LmHeadToppPartialsQ(Stream stream, int topk, int use_bias, int tile_v, int V, int K, float invtemp,
-                      const std::string& fmt)
+                      const std::string& fmt, int rows_per_tg = 1)
       : Primitive(stream), topk_(topk), use_bias_(use_bias), tile_v_(tile_v), V_(V), K_(K),
-        invtemp_(invtemp), fmt_(fmt) {}
+        invtemp_(invtemp), fmt_(fmt), rows_per_tg_(rows_per_tg) {}
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
   void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
   std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
@@ -285,7 +298,8 @@ class LmHeadToppPartialsQ : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     auto& o = static_cast<const LmHeadToppPartialsQ&>(other);
     return topk_ == o.topk_ && use_bias_ == o.use_bias_ && tile_v_ == o.tile_v_ && V_ == o.V_ &&
-           K_ == o.K_ && invtemp_ == o.invtemp_ && fmt_ == o.fmt_;
+           K_ == o.K_ && invtemp_ == o.invtemp_ && fmt_ == o.fmt_ &&
+           rows_per_tg_ == o.rows_per_tg_;
   }
 
  private:
@@ -296,6 +310,7 @@ class LmHeadToppPartialsQ : public Primitive {
   int K_;
   float invtemp_;
   std::string fmt_;
+  int rows_per_tg_;
 };
 
 class LmHeadArgcatPartials : public Primitive {
@@ -418,6 +433,29 @@ class LmHeadToppReduce : public Primitive {
   int topk_;
   float p_, invtemp_;
   uint32_t seed_;
+};
+
+class LmHeadBeamReduce : public Primitive {
+ public:
+  LmHeadBeamReduce(Stream stream, int two_bm)
+      : Primitive(stream), two_bm_(two_bm) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "LmHeadBeamReduce"; }
+  void print(std::ostream& os) override { os << "LmHeadBeamReduce"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return typeid(*this) == typeid(other) &&
+        two_bm_ == static_cast<const LmHeadBeamReduce&>(other).two_bm_;
+  }
+
+ private:
+  int two_bm_;
 };
 
 } // namespace mlx::core

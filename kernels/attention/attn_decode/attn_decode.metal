@@ -143,7 +143,7 @@ kernel void attn_decode_bh(device const T *q [[buffer(0)]],
     }
 }
 
-#define instantiate_attn_decode_bh(type_name, T)                               \
+#define instantiate_attn_decode_bh_single(type_name, T)                       \
   template [[host_name("attn_decode_bh_" #type_name)]] [[kernel]] void       \
   attn_decode_bh<T>(device const T *q [[buffer(0)]],                          \
                     device const T *kc [[buffer(1)]],                         \
@@ -157,9 +157,131 @@ kernel void attn_decode_bh(device const T *q [[buffer(0)]],
                     uint2 pos [[threadgroup_position_in_grid]],               \
                     uint lane [[thread_index_in_simdgroup]]);
 
-instantiate_attn_decode_bh(float32, float)
-instantiate_attn_decode_bh(float16, half)
-instantiate_attn_decode_bh(bfloat16, bf16)
+instantiate_attn_decode_bh_single(float32, float)
+instantiate_attn_decode_bh_single(float16, half)
+instantiate_attn_decode_bh_single(bfloat16, bf16)
+
+// Long contexts are split across a compile-time number of simdgroups. Their
+// online-softmax states are merged once in threadgroup memory.
+template <typename T, int PARTITIONS>
+kernel void attn_decode_bh_partitioned(device const T *q [[buffer(0)]],
+                           device const T *kc [[buffer(1)]],
+                           device const T *vc [[buffer(2)]],
+                           device T *out [[buffer(3)]],
+                           constant int &Tk [[buffer(4)]],
+                           constant int &Hq [[buffer(5)]],
+                           constant int &Hkv [[buffer(6)]],
+                           constant int &D [[buffer(7)]],
+                           constant int &cache_T [[buffer(8)]],
+                           uint3 pos [[threadgroup_position_in_grid]],
+                           uint simd_index [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float warp_maximum[PARTITIONS];
+    threadgroup float warp_denominator[PARTITIONS];
+    threadgroup float warp_output[PARTITIONS * 128];
+
+    const int head = int(pos.x);
+    const int batch = int(pos.y);
+    const int rep = Hq / Hkv;
+    const int hk = head / rep;
+    const float scale = metal::rsqrt(float(D));
+    const int per = (D + 31) / 32;
+    const long qbase = ((long)batch * Hq + head) * D;
+
+    float qreg[4], oacc[4];
+    #pragma clang loop unroll(full)
+    for (int j = 0; j < 4; ++j) {
+        const int d = j * 32 + int(lane);
+        qreg[j] = (j < per && d < D) ? float(q[qbase + d]) : 0.0f;
+        oacc[j] = 0.0f;
+    }
+
+    float maximum = ATTN_NEG_INF, denominator = 0.0f;
+    for (int token = int(simd_index); token < Tk; token += PARTITIONS) {
+        const long kvbase = (((long)batch * Hkv + hk) * cache_T + token) * D;
+        float score = 0.0f;
+        for (int j = 0; j < per; ++j) {
+            const int d = j * 32 + int(lane);
+            if (d < D) score += qreg[j] * float(kc[kvbase + d]);
+        }
+        score = metal::simd_sum(score) * scale;
+        const float next_maximum = max(maximum, score);
+        const float correction = exp(maximum - next_maximum);
+        const float probability = exp(score - next_maximum);
+        denominator = denominator * correction + probability;
+        for (int j = 0; j < per; ++j) {
+            const int d = j * 32 + int(lane);
+            if (d < D) {
+                oacc[j] = oacc[j] * correction + probability * float(vc[kvbase + d]);
+            }
+        }
+        maximum = next_maximum;
+    }
+
+    if (lane == 0) {
+        warp_maximum[simd_index] = maximum;
+        warp_denominator[simd_index] = denominator;
+    }
+    for (int j = 0; j < per; ++j) {
+        const int d = j * 32 + int(lane);
+        if (d < D) warp_output[simd_index * 128 + d] = oacc[j];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_index == 0) {
+        float global_maximum = ATTN_NEG_INF;
+        for (int warp = 0; warp < PARTITIONS; ++warp) {
+            if (warp_denominator[warp] > 0.0f) {
+                global_maximum = max(global_maximum, warp_maximum[warp]);
+            }
+        }
+        float global_denominator = 0.0f;
+        for (int warp = 0; warp < PARTITIONS; ++warp) {
+            if (warp_denominator[warp] > 0.0f) {
+                global_denominator += warp_denominator[warp] *
+                    exp(warp_maximum[warp] - global_maximum);
+            }
+        }
+        for (int j = 0; j < per; ++j) {
+            const int d = j * 32 + int(lane);
+            if (d < D) {
+                float numerator = 0.0f;
+                for (int warp = 0; warp < PARTITIONS; ++warp) {
+                    if (warp_denominator[warp] > 0.0f) {
+                        numerator += warp_output[warp * 128 + d] *
+                            exp(warp_maximum[warp] - global_maximum);
+                    }
+                }
+                out[qbase + d] = T(numerator / global_denominator);
+            }
+        }
+    }
+}
+
+#define instantiate_attn_decode_bh_partitioned(type_name, T, partitions)       \
+  template [[host_name("attn_decode_bh_partitioned_" #partitions "_"        \
+                       #type_name)]] [[kernel]] void                          \
+  attn_decode_bh_partitioned<T, partitions>(                                  \
+                    device const T *q [[buffer(0)]],                          \
+                    device const T *kc [[buffer(1)]],                         \
+                    device const T *vc [[buffer(2)]],                         \
+                    device T *out [[buffer(3)]],                              \
+                    constant int &Tk [[buffer(4)]],                           \
+                    constant int &Hq [[buffer(5)]],                           \
+                    constant int &Hkv [[buffer(6)]],                          \
+                    constant int &D [[buffer(7)]],                            \
+                    constant int &cache_T [[buffer(8)]],                      \
+                    uint3 pos [[threadgroup_position_in_grid]],               \
+                    uint simd_index [[simdgroup_index_in_threadgroup]],       \
+                    uint lane [[thread_index_in_simdgroup]]);
+
+#define instantiate_attn_decode_bh_partitions(type_name, T)                   \
+  instantiate_attn_decode_bh_partitioned(type_name, T, 8)                    \
+  instantiate_attn_decode_bh_partitioned(type_name, T, 32)
+
+instantiate_attn_decode_bh_partitions(float32, float)
+instantiate_attn_decode_bh_partitions(float16, half)
+instantiate_attn_decode_bh_partitions(bfloat16, bf16)
 
 // Functional decode step over a head-major cache.  The host clones the input
 // cache first; this dispatch optionally RMS-normalizes Q/K, applies split-half

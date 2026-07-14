@@ -58,10 +58,12 @@ def _space_to_depth_reference(x, height, width, block_size):
 
 @pytest.mark.parametrize(
     "height,width,channels,out_channels,block_size",
-    [(4, 6, 13, 29, 2), (3, 5, 17, 31, 2), (5, 7, 20, 43, 4)],
+    [(4, 6, 13, 29, 2), (3, 5, 17, 31, 2), (5, 7, 20, 43, 4),
+     (8, 8, 16, 64, 2), (8, 8, 8, 64, 4)],
 )
 @pytest.mark.parametrize("use_biases", [False, True])
-@pytest.mark.parametrize("use_kernel", [False, True], ids=["routed", "kernel"])
+@pytest.mark.parametrize(
+    "use_kernel", [None, False, True], ids=["auto", "framework", "kernel"])
 def test_space_to_depth_norm_linear_matches_reference(
         height, width, channels, out_channels, block_size, use_biases, use_kernel):
     rng = np.random.default_rng(height * 1000 + width * 100 + channels)
@@ -94,7 +96,8 @@ def test_space_to_depth_norm_linear_matches_reference(
     np.testing.assert_allclose(np.array(got), ref, rtol=6e-4, atol=6e-4)
 
 
-@pytest.mark.parametrize("use_kernel", [False, True], ids=["routed", "kernel"])
+@pytest.mark.parametrize(
+    "use_kernel", [None, False, True], ids=["auto", "framework", "kernel"])
 def test_space_to_depth_norm_linear_bfloat16_rounding(use_kernel):
     rng = np.random.default_rng(599)
     batch, height, width, channels, out_channels = 1, 3, 5, 12, 19

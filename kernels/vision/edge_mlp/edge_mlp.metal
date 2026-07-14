@@ -5,19 +5,56 @@ using namespace metal;
 
 namespace mittens {
 
-// Fixed 512->256->7 pairwise edge MLP. One 256-thread
-// threadgroup owns a pair, computes the hidden activation once, then seven
-// simdgroups produce the edge logits without a BxLxLx256 intermediate.
+// Fixed 512->256->7 pairwise MLP, factorized as
+//   left[b,i]  = hidden[b,i] @ W[:,:256]^T
+//   right[b,j] = hidden[b,j] @ W[:,256:]^T + bias
+//   out[b,:,i,j] = W2 @ GELU(left[b,i] + right[b,j]) + bias2.
+// The first projection is linear in the two pair inputs, so computing each
+// side once reduces that stage from O(L^2) matrix-vector products to O(L).
+// Both partials use the public dtype so the combine kernel retains the legacy
+// separate left/right rounding points.
 template <typename T>
-kernel void edge_mlp_256x7(
+kernel void edge_mlp_project_256(
     device const T *hidden [[buffer(0)]],
     device const T *first_weight [[buffer(1)]],
     device const T *first_bias [[buffer(2)]],
-    device const T *second_weight [[buffer(3)]],
-    device const T *second_bias [[buffer(4)]],
-    device T *output [[buffer(5)]],
-    constant int &batch [[buffer(6)]],
-    constant int &length [[buffer(7)]],
+    device T *left_output [[buffer(3)]],
+    device T *right_output [[buffer(4)]],
+    constant int &batch [[buffer(5)]],
+    constant int &length [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]]) {
+    if (row >= uint(batch * length)) return;
+    const int feature = int(thread_id);
+    const long hidden_base = (long)row * 256;
+    const long weight_base = (long)feature * 512;
+    device const metal::vec<T, 4> *hidden4 =
+        (device const metal::vec<T, 4> *)(hidden + hidden_base);
+    device const metal::vec<T, 4> *left_weight4 =
+        (device const metal::vec<T, 4> *)(first_weight + weight_base);
+    device const metal::vec<T, 4> *right_weight4 =
+        (device const metal::vec<T, 4> *)(first_weight + weight_base + 256);
+    float left = 0.0f;
+    float right = float(first_bias[feature]);
+    #pragma clang loop unroll(full)
+    for (int dimension4 = 0; dimension4 < 64; ++dimension4) {
+        const float4 input = float4(hidden4[dimension4]);
+        left += dot(input, float4(left_weight4[dimension4]));
+        right += dot(input, float4(right_weight4[dimension4]));
+    }
+    left_output[hidden_base + feature] = T(left);
+    right_output[hidden_base + feature] = T(right);
+}
+
+template <typename T>
+kernel void edge_mlp_combine_256x7(
+    device const T *left_partial [[buffer(0)]],
+    device const T *right_partial [[buffer(1)]],
+    device const T *second_weight [[buffer(2)]],
+    device const T *second_bias [[buffer(3)]],
+    device T *output [[buffer(4)]],
+    constant int &batch [[buffer(5)]],
+    constant int &length [[buffer(6)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint thread_id [[thread_index_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
@@ -28,22 +65,11 @@ kernel void edge_mlp_256x7(
     const int left_index = pair / length;
     const int right_index = pair - left_index * length;
     const int feature = int(thread_id);
-    threadgroup float activation[256];
-
     const long left_base = ((long)batch_index * length + left_index) * 256;
     const long right_base = ((long)batch_index * length + right_index) * 256;
-    const long weight_base = (long)feature * 512;
-    float left = 0.0f;
-    float right = float(first_bias[feature]);
-    for (int dimension = 0; dimension < 256; ++dimension) {
-        left += float(hidden[left_base + dimension]) *
-                float(first_weight[weight_base + dimension]);
-        right += float(hidden[right_base + dimension]) *
-                 float(first_weight[weight_base + 256 + dimension]);
-    }
-    const T left_rounded = T(left);
-    const T right_rounded = T(right);
-    const T joined = T(float(left_rounded) + float(right_rounded));
+    threadgroup float activation[256];
+    const T joined = T(float(left_partial[left_base + feature]) +
+                       float(right_partial[right_base + feature]));
     activation[feature] = float(T(glu_gelu_erf(float(joined))));
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -63,20 +89,28 @@ kernel void edge_mlp_256x7(
     }
 }
 
-#define instantiate_edge_mlp(type_name, T)                                    \
-  template [[host_name("edge_mlp_256x7_" #type_name)]] [[kernel]]           \
-  void edge_mlp_256x7<T>(device const T *hidden [[buffer(0)]],                \
+#define instantiate_edge_mlp_project(type_name, T)                            \
+  template [[host_name("edge_mlp_project_256_" #type_name)]] [[kernel]]     \
+  void edge_mlp_project_256<T>(device const T *hidden [[buffer(0)]],          \
     device const T *first_weight [[buffer(1)]],                               \
     device const T *first_bias [[buffer(2)]],                                 \
-    device const T *second_weight [[buffer(3)]],                              \
-    device const T *second_bias [[buffer(4)]], device T *output [[buffer(5)]], \
-    constant int &batch [[buffer(6)]], constant int &length [[buffer(7)]],    \
+    device T *left_output [[buffer(3)]], device T *right_output [[buffer(4)]], \
+    constant int &batch [[buffer(5)]], constant int &length [[buffer(6)]],    \
+    uint row [[threadgroup_position_in_grid]],                                \
+    uint thread_id [[thread_index_in_threadgroup]]);                          \
+                                                                               \
+  template [[host_name("edge_mlp_combine_256x7_" #type_name)]] [[kernel]]  \
+  void edge_mlp_combine_256x7<T>(device const T *left_partial [[buffer(0)]],  \
+    device const T *right_partial [[buffer(1)]],                              \
+    device const T *second_weight [[buffer(2)]],                              \
+    device const T *second_bias [[buffer(3)]], device T *output [[buffer(4)]], \
+    constant int &batch [[buffer(5)]], constant int &length [[buffer(6)]],    \
     uint2 group [[threadgroup_position_in_grid]],                             \
     uint thread_id [[thread_index_in_threadgroup]],                           \
     uint lane [[thread_index_in_simdgroup]],                                  \
     uint simdgroup_id [[simdgroup_index_in_threadgroup]]);
 
-instantiate_edge_mlp(float32, float)
-instantiate_edge_mlp(bfloat16, bf16)
+instantiate_edge_mlp_project(float32, float)
+instantiate_edge_mlp_project(bfloat16, bf16)
 
 } // namespace mittens

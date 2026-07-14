@@ -2035,6 +2035,56 @@ def beam_advance(logits, cum_log_probs, beam_width):
     return out[0], out[1], out[2]
 
 
+def lm_head_beam_advance(h, W, cum_log_probs, beam_width, bias=None,
+                         format="q4_0"):
+    """Quantized LM-head plus exact beam-search advance. ``W`` is q4_0/q8_0
+    packed ``(V,K/32,bytes)`` and ``h`` is ``(B*beam_width,K)``. Q4_0 with up
+    to four beam rows uses the no-logits fused kernel; q8_0 and larger row
+    batches use the packed matrix path so the head weights are shared across
+    rows. Returns next token, parent beam, and updated cumulative log-probability,
+    each ``(B,beam_width)``.
+    """
+    if format not in ("q4_0", "q8_0"):
+        raise ValueError("lm_head_beam_advance: format must be q4_0 or q8_0")
+    rows = int(h.shape[0])
+    # Q4 row-wise fusion saves a logits allocation and wins at decode-scale
+    # row counts. Q8 and larger row batches favor a 32-column packed GEMM that
+    # amortizes each weight read; pad only its small activation side.
+    use_matrix = (format == "q8_0" or rows > 4) and int(W.shape[0]) % 32 == 0
+    if _is_torch(h):
+        import torch
+        if use_matrix:
+            padded_rows = ((rows + 31) // 32) * 32
+            h_cols = h.to(torch.float16).transpose(0, 1).contiguous()
+            if padded_rows != rows:
+                h_cols = torch.cat((h_cols, torch.zeros(
+                    (h_cols.shape[0], padded_rows - rows), dtype=h_cols.dtype,
+                    device=h_cols.device)), dim=1)
+            logits = qgemm(W, h_cols, format).transpose(0, 1)[:rows]
+            if bias is not None:
+                logits = logits + bias.to(logits.dtype)
+            return beam_advance(logits, cum_log_probs, int(beam_width))
+        b = bias if bias is not None else torch.zeros(
+            1, dtype=torch.float32, device=h.device)
+        return _torch().lm_head_beam_advance(
+            h, W, b, cum_log_probs, int(beam_width), str(format))
+    import mlx.core as mx
+    if use_matrix:
+        padded_rows = ((rows + 31) // 32) * 32
+        h_cols = mx.swapaxes(h.astype(mx.float16), 0, 1)
+        if padded_rows != rows:
+            h_cols = mx.concatenate((h_cols, mx.zeros(
+                (h_cols.shape[0], padded_rows - rows), dtype=h_cols.dtype)), axis=1)
+        logits = mx.swapaxes(qgemm(W, h_cols, format), 0, 1)[:rows]
+        if bias is not None:
+            logits = logits + bias.astype(logits.dtype)
+        return beam_advance(logits, cum_log_probs, int(beam_width))
+    b = bias if bias is not None else mx.zeros((1,), dtype=mx.float32)
+    out = _mlx().lm_head_beam_advance(
+        h, W, b, cum_log_probs, int(beam_width), str(format))
+    return out[0], out[1], out[2]
+
+
 def beam_build_copy_pairs(parent_beam, block_table, seq_lens, block_size):
     """Build the (src,dst) block-copy pairs for a beam KV reorder ON-DEVICE — no host readback.
     Returns a fixed (B*BM*max_blocks, 2) int64 buffer of pairs (sentinel (-1,-1) for empty slots),
@@ -2663,12 +2713,15 @@ def attn_decode(q, k, v):
     return _mlx().attn_decode(q, k, v)
 
 
-def attn_decode_bh(q, k, v, context_length, use_kernel=False):
+def attn_decode_bh(q, k, v, context_length, use_kernel=None):
     """Batched head-major GQA decode: q (B,Hq,D), k/v (B,Hkv,cache_T,D).
 
-    Framework SDPA is the measured default. ``use_kernel=True`` retains the
-    head-major Metal kernel as an explicit parity/optimization path.
+    Auto-routing uses Metal for MPS tensors and for MLX contexts below 512;
+    longer MLX contexts use framework SDPA. Pass ``use_kernel`` to select a
+    path explicitly.
     """
+    if use_kernel is None:
+        use_kernel = _is_torch(q) or int(context_length) < 512
     if use_kernel:
         if _is_torch(q):
             return _torch().attn_decode_bh(q, k, v, int(context_length))
@@ -2846,9 +2899,21 @@ def space_to_depth_norm_linear(x, norm_weight, projection_weight, height, width,
     output_height = (int(height) + int(block_size) - 1) // int(block_size)
     output_width = (int(width) + int(block_size) - 1) // int(block_size)
     dimension = int(block_size) * int(block_size) * x.shape[-1]
-    work = x.shape[0] * output_height * output_width * projection_weight.shape[0] * dimension
+    patches = x.shape[0] * output_height * output_width
+    work = patches * projection_weight.shape[0] * dimension
     if use_kernel is None:
-        use_kernel = work <= 1_000_000
+        if _is_torch(x):
+            import torch
+            is_float32 = x.dtype == torch.float32
+        else:
+            import mlx.core as mx
+            is_float32 = x.dtype == mx.float32
+        use_tiled_block4 = (
+            is_float32 and int(block_size) == 4 and
+            int(height) % 4 == 0 and int(width) % 4 == 0 and
+            dimension % 8 == 0 and projection_weight.shape[0] % 32 == 0 and
+            patches % 8 == 0)
+        use_kernel = work <= 1_000_000 or use_tiled_block4
     if use_kernel and _is_torch(x):
         import torch
         nb = norm_bias if use_norm_bias else torch.zeros(1, dtype=x.dtype, device=x.device)
@@ -2907,12 +2972,14 @@ def space_to_depth_norm_linear(x, norm_weight, projection_weight, height, width,
 
 
 def edge_mlp_256x7(hidden, first_weight, first_bias, second_weight, second_bias,
-                   use_kernel=False):
+                   use_kernel=None):
     """Fixed pairwise 512->256->7 edge MLP. Returns (B,7,L,L).
 
-    The framework composition is the measured default. ``use_kernel=True``
-    runs the fixed-shape Metal kernel.
+    The factorized Metal path is the measured default. ``use_kernel=False``
+    selects the materialized framework composition.
     """
+    if use_kernel is None:
+        use_kernel = True
     if use_kernel:
         if _is_torch(hidden):
             return _torch().edge_mlp_256x7(

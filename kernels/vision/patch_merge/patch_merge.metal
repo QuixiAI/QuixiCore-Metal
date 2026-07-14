@@ -337,6 +337,134 @@ kernel void space_to_depth_norm_linear_group4(
     }
 }
 
+// Matrix-tiled fp32 specialization. A 4-simdgroup threadgroup computes an
+// 8-patch x 32-output tile using 8x8 simdgroup matrix operations. Normalized
+// features are produced one K tile at a time in shared memory, so the fused
+// gather/norm contract is retained without materializing the merged matrix.
+// The launch route guarantees full spatial blocks and dimensions divisible by
+// the tile sizes; irregular shapes continue through the generic kernel.
+[[host_name("space_to_depth_norm_linear_tiled_float32")]]
+kernel void space_to_depth_norm_linear_tiled_float32(
+    device const float *input [[buffer(0)]],
+    device const float *norm_weight [[buffer(1)]],
+    device const float *norm_bias [[buffer(2)]],
+    device const float *projection_weight [[buffer(3)]],
+    device const float *projection_bias [[buffer(4)]],
+    device float *output [[buffer(5)]],
+    constant int &batch [[buffer(6)]],
+    constant int &height [[buffer(7)]],
+    constant int &width [[buffer(8)]],
+    constant int &channels [[buffer(9)]],
+    constant int &out_channels [[buffer(10)]],
+    constant int &block_size [[buffer(11)]],
+    constant float &epsilon [[buffer(12)]],
+    constant int &use_norm_bias [[buffer(13)]],
+    constant int &use_projection_bias [[buffer(14)]],
+    uint2 tile [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint simd_index [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int PATCH_TILE = 8;
+    constexpr int OUTPUT_TILE = 32;
+    constexpr int K_TILE = 8;
+    threadgroup st<float, PATCH_TILE, K_TILE> normalized_tile;
+    threadgroup float stats[PATCH_TILE * 2];
+    threadgroup long source_origins[PATCH_TILE];
+
+    const int output_height = height / block_size;
+    const int output_width = width / block_size;
+    const int patches_per_batch = output_height * output_width;
+    const int patch_base = int(tile.y) * PATCH_TILE;
+    const int dimension = block_size * block_size * channels;
+
+    if (thread_index < PATCH_TILE) {
+        const int output_index = patch_base + int(thread_index);
+        const int batch_index = output_index / patches_per_batch;
+        const int patch_index = output_index - batch_index * patches_per_batch;
+        const int output_y = patch_index / output_width;
+        const int output_x = patch_index - output_y * output_width;
+        source_origins[thread_index] =
+            ((long)batch_index * height * width +
+             (long)output_y * block_size * width + output_x * block_size) *
+            channels;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Each simdgroup owns two patch statistics. The projection's output tiles
+    // deliberately recompute this small reduction to keep the normalized
+    // matrix on chip and avoid an intermediate allocation.
+    for (int patch = int(simd_index); patch < PATCH_TILE; patch += 4) {
+        float sum = 0.0f, sumsq = 0.0f;
+        const long origin = source_origins[patch];
+        for (int feature = int(lane); feature < dimension; feature += 32) {
+            const int spatial = feature / channels;
+            const int channel = feature - spatial * channels;
+            const int dy = spatial / block_size;
+            const int dx = spatial - dy * block_size;
+            const float value = input[origin + (long)(dy * width + dx) * channels + channel];
+            sum += value;
+            sumsq += value * value;
+        }
+        sum = simd_sum(sum);
+        sumsq = simd_sum(sumsq);
+        if (lane == 0) {
+            const float mean = sum / float(dimension);
+            const float variance = metal::max(
+                sumsq / float(dimension) - mean * mean, 0.0f);
+            stats[patch * 2] = mean;
+            stats[patch * 2 + 1] = metal::rsqrt(variance + epsilon);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    using global_layout = gl<float, 1, 1, -1, -1>;
+    global_layout gl_weight(
+        (device float *)projection_weight, nullptr, nullptr,
+        out_channels, dimension);
+    global_layout gl_output(
+        output, nullptr, nullptr, batch * patches_per_batch, out_channels);
+    rt<float, PATCH_TILE, K_TILE> a_reg;
+    rt<float, 8, K_TILE, ducks::rt_layout::col> weight_reg;
+    rt<float, PATCH_TILE, 8> accumulator;
+    zero(accumulator);
+
+    for (int k_tile = 0; k_tile < dimension / K_TILE; ++k_tile) {
+        if (thread_index < PATCH_TILE * K_TILE) {
+            const int patch = int(thread_index) / K_TILE;
+            const int k = int(thread_index) - patch * K_TILE;
+            const int feature = k_tile * K_TILE + k;
+            const int spatial = feature / channels;
+            const int channel = feature - spatial * channels;
+            const int dy = spatial / block_size;
+            const int dx = spatial - dy * block_size;
+            float value = input[source_origins[patch] +
+                (long)(dy * width + dx) * channels + channel];
+            value = (value - stats[patch * 2]) * stats[patch * 2 + 1] *
+                norm_weight[feature];
+            if (use_norm_bias != 0) value += norm_bias[feature];
+            normalized_tile[int2(patch, k)] = value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        load(a_reg, normalized_tile, lane);
+        const int output_subtile = int(tile.x) * 4 + int(simd_index);
+        load(weight_reg, gl_weight, {0, 0, output_subtile, k_tile}, lane);
+        mma_ABt(accumulator, a_reg, weight_reg, accumulator);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (use_projection_bias != 0) {
+        const int qid = int(lane) / 4;
+        const int sx = (qid & 2) * 2 + (int(lane) % 2) * 2;
+        const int output_base = int(tile.x) * OUTPUT_TILE + int(simd_index) * 8;
+        accumulator.tiles[0][0].data.thread_elements()[0] +=
+            projection_bias[output_base + sx];
+        accumulator.tiles[0][0].data.thread_elements()[1] +=
+            projection_bias[output_base + sx + 1];
+    }
+    store(gl_output, accumulator,
+          {0, 0, int(tile.y), int(tile.x) * 4 + int(simd_index)}, lane);
+}
+
 #define instantiate_space_to_depth_norm_linear(type_name, T)                 \
   template [[host_name("space_to_depth_norm_linear_" #type_name)]]          \
   [[kernel]] void space_to_depth_norm_linear<T>(                             \

@@ -1540,3 +1540,168 @@ Raw results:
   `new-kernels-second-pass-cache-mps-smoke/`,
   `new-kernels-second-pass-cache-mps-quick/`, and
   `new-kernels-second-pass-cache-mps-comprehensive/`.
+
+## 2026-07-13: Cross-kernel follow-ups and optimization pass
+
+Status: complete. This entry implements the follow-ups identified after the
+new-kernel passes: whole-block q4_0 LM-head decode, factorized pairwise MLP,
+quantized LM-head beam advance, matrix-tiled spatial projection, and
+context-partitioned head-major decode attention.
+
+Hypotheses:
+
+- The LM-head sampler's sequential q4_0 dot paid generic dequant helper and
+  scale-address overhead four times per block; decoding all 32 weights after
+  one scale load should remove most of that cost.
+- A pairwise 512->256 first layer is separable into one left and one right
+  sequence projection. Projecting each sequence once should replace an
+  O(L^2*512*256) stage with O(L*256*256), leaving only the small pairwise GELU
+  and 256->7 combine at O(L^2).
+- Beam advance needs only exact row log-sum-exp and top-2*beam-width candidates,
+  not a resident full-logits tensor. A staged quantized projection/reduce can
+  preserve exact beam scores; larger row batches should instead reuse weights
+  through the existing packed 32-column GEMM.
+- Spatial projection is a matrix multiply hidden inside gather and LayerNorm.
+  An 8-patch matrix tile should reuse normalized features and engage SIMD-group
+  matrix operations without materializing the merged tensor.
+- Generic head-major decode is context-serial. Compile-time 8- and 32-SIMD-group
+  partitions can expose long-context parallelism, then merge online-softmax
+  state in threadgroup memory.
+
+Environment: MacBook Pro Mac16,5, Apple M4 Max, 128 GB; macOS 26.5.1 (25F80);
+Xcode 26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0;
+Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1 MPS. Working-tree label:
+`bc90717-dirty`.
+
+Measurement method: `perf/bench_kernels.py` with its clock ramp, adaptive
+per-sample batching, and synchronization per sample. The initial baseline and
+final unified runs requested 10 warmups and 30 measured samples. Isolated q4_0
+LM-head and edge candidates used 10/40; all other controlled variants used
+10/30. Tables report per-call median, p20/p80, and coefficient of variation
+(CV); raw JSONL retains the complete result records.
+
+Final commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel lm_head_q,lm_head_beam,edge_mlp,space_to_depth_norm_linear,attn_decode_bh \
+  --formats q4_0,q8_0 --warmup 10 --iters 30 \
+  --out-dir perf/results/2026-07-13/cross-kernel-final-mlx
+PYTHONPATH=bindings/python:bindings/pytorch_mps .venv/bin/python \
+  perf/bench_kernels.py --backend torch --preset quick \
+  --kernel lm_head_q,lm_head_beam,edge_mlp,space_to_depth_norm_linear,attn_decode_bh \
+  --formats q4_0,q8_0 --warmup 10 --iters 30 \
+  --out-dir perf/results/2026-07-13/cross-kernel-final-mps
+scripts/test correctness -q
+scripts/test parity -q
+scripts/test mps -q
+```
+
+Controlled experiments, one meaningful factor at a time:
+
+| Family / priority shape | Control ms | Candidate ms | Decision |
+|---|---:|---:|---|
+| LM-head q4_0 top-k T1/T8, generic 8-value helper -> whole 32-value block | 2.9924 / 5.5223 | 0.2758 / 1.2047 | Keep; 10.85x / 4.58x. The final unified sample is 0.2786 / 1.2737 ms. |
+| qgemv f32 q4_0 N6144 K1536, paired-block mapping -> whole block per lane | 0.0189 | 0.0271 | Reject and revert; 43% regression. The LM-head result does not generalize to parallel qgemv. |
+| Pairwise edge MLP B1 L64, direct pair kernel -> factorized project/combine | 1.3031 | 0.1353 | Keep; 9.63x over the old kernel and 1.38x over the materialized framework composition. |
+| Quantized beam q8_0 smoke, scalar block decode -> four-block vector attempt | 0.2340 | 1.8109 | Reject and revert. |
+| Quantized beam tile rows, one -> four rows per threadgroup | 0.2340 q8 smoke | 0.1168 | Keep in the no-logits partials launch. |
+| Quantized beam full shape, row-wise fusion -> routed q4 fusion / packed GEMM | q4/q8 B4 2.4258 / 3.6890 | 1.0053 / 1.0080 | Keep matrix route for rows >4 and regular vocab widths; 2.41x / 3.66x. |
+| Spatial S2/S4, group-of-four scalar projection -> 8x32 matrix tile | 0.3152 / 0.0978 | 0.1821 / 0.0404 | Keep; 1.73x / 2.42x over the prior direct kernel. |
+| Spatial matrix tile, 32 -> 64 output columns | 0.1700 / 0.0407 | 0.1815 / 0.0328 | Mixed; reject globally because S2 regressed. |
+| Spatial tile width selected at runtime instead of compile time | 0.1700 / 0.0407 | 0.2443 / 0.0436 | Reject; dynamic geometry inhibited Metal specialization. |
+| Attention T512/T2048, one context SIMD group -> eight | 0.5451 / 5.2582 | 0.0664 / 0.5826 | Keep eight groups for T512-2047; 8.21x / 9.03x over serial. |
+| Attention T512/T2048, eight -> four groups | 0.0664 / 0.5826 | 0.1035 / 0.7054 | Reject. |
+| Attention T512/T1024/T2048, routed 8/8/32 -> sixteen groups | 0.0665 / 0.1401 / 0.3441 | 0.0718 / 0.2177 / 0.4837 | Reject at every priority context. |
+| Attention T2048, eight -> 32 groups | 0.5826 | 0.3526 | Keep from T2048; 1.65x over eight groups and 14.91x over serial. |
+| Attention shared allocation, 8-slot -> 32-slot while launching eight groups | 0.0664 | 0.1062 | Reject shared generic state; retain separate compile-time 8/32 specializations. |
+
+Final MLX quick results:
+
+| Kernel / shape | Target median [p20,p80], CV ms | Best baseline ms | Speedup | Error |
+|---|---:|---:|---:|---:|
+| LM-head q4_0 T1 V32000 K4096 | 0.2786 [0.2725,0.3099], 0.130 | 5.7441 dense top-k | 20.62x | exact ids in tests |
+| LM-head q4_0 T8 V32000 K4096 | 1.2737 [1.1930,1.3664], 0.061 | 5.8540 dense top-k | 4.60x | exact ids in tests |
+| Beam q4_0 B1 BM4 V32000 K4096 | 0.7464 [0.7305,0.9175], 0.111 | 0.9799 resident fp16 | 1.31x | exact token/parent in tests |
+| Beam q8_0 B1 BM4 V32000 K4096 | 1.0183 [0.9681,1.1375], 0.074 | 1.0039 resident fp16 | 0.99x | exact token/parent in tests |
+| Beam q4_0 B4 BM4 V32000 K4096 | 1.0053 [0.9675,1.1331], 0.082 | 1.2019 packed GEMM | 1.20x | exact token/parent in tests |
+| Beam q8_0 B4 BM4 V32000 K4096 | 1.0080 [0.9727,1.1527], 0.108 | 1.1805 packed GEMM | 1.17x | exact token/parent in tests |
+| Edge MLP B1 L64 | 0.1399 [0.1237,0.2271], 0.284 | 0.1877 framework | 1.34x | 3.10e-7 rel |
+| Spatial B1 48x48 C128 O512 S2 | 0.1769 [0.1664,0.2273], 0.181 | 0.0688 framework | 0.39x | 3.49e-7 rel |
+| Spatial B1 32x32 C64 O256 S4 | 0.0445 [0.0427,0.0496], 0.127 | 0.0833 framework | 1.87x | 3.07e-7 rel |
+| Attention B4 H16/4 T512 D128 | 0.0703 [0.0645,0.0747], 0.229 | 0.0326 MLX SDPA | 0.46x | 8.53e-7 rel |
+| Attention B4 H16/4 T1024 D128 | 0.1586 [0.1422,0.2022], 0.251 | 0.0567 MLX SDPA | 0.36x | 1.42e-6 rel |
+| Attention B4 H16/4 T2048 D128 | 0.3545 [0.3389,0.3933], 0.085 | 0.1326 MLX SDPA | 0.37x | 1.47e-6 rel |
+
+Final MPS quick results:
+
+| Kernel / shape | Target median [p20,p80], CV ms | Framework baseline ms | Speedup | Error |
+|---|---:|---:|---:|---:|
+| Beam q4_0 B1 BM4 | 0.9125 [0.8907,1.0647], 0.086 | 1.2525 | 1.37x | parity exact/2e-5 score |
+| Beam q8_0 B1 BM4 | 1.2240 [1.1630,1.4088], 0.106 | 1.2144 | 0.99x | parity covered through matrix route |
+| Beam q4_0 B4 BM4 | 1.2101 [1.1829,1.4594], 0.106 | 1.3945 | 1.15x | parity exact/2e-5 score |
+| Beam q8_0 B4 BM4 | 1.2241 [1.1627,1.4572], 0.112 | 1.3466 | 1.10x | parity covered through matrix route |
+| Edge MLP B1 L64 | 0.0943 [0.0924,0.1023], 0.299 | 0.1603 | 1.70x | 3.10e-7 rel |
+| Spatial B1 48x48 C128 O512 S2 | 0.1961 [0.1895,0.2252], 0.176 | 0.1237 | 0.63x | 3.49e-7 rel |
+| Spatial B1 32x32 C64 O256 S4 | 0.0972 [0.0958,0.1056], 0.198 | 0.1451 | 1.49x | 2.79e-7 rel |
+| Attention B4 H16/4 T512 D128 | 0.1212 [0.1176,0.1323], 0.276 | 0.4256 | 3.51x | 8.53e-7 rel |
+| Attention B4 H16/4 T1024 D128 | 0.2824 [0.2745,0.3609], 0.127 | 0.9509 | 3.37x | 1.42e-6 rel |
+| Attention B4 H16/4 T2048 D128 | 0.3799 [0.3687,0.4407], 0.109 | 1.7871 | 4.70x | 1.33e-6 rel |
+
+Correctness and validation:
+
+- Final Python/MLX and PyTorch MPS builds completed with the retained kernels.
+- Focused suites passed 81 LM-head, 4 edge-MLP, 35 spatial, and 32 attention
+  tests. These include irregular vocabularies, fp32/bf16, tiled block-2/block-4
+  spatial shapes, and the 8-/32-partition attention thresholds.
+- `scripts/test correctness -q`: 2062 passed.
+- `scripts/test parity -q`: 406 passed, including q4_0 beam advance, factorized
+  edge MLP, matrix-tiled spatial projection, and both long attention routes.
+- `scripts/test mps -q`: 472 passed.
+- Every numeric final benchmark case passed its oracle; maximum recorded
+  relative error was 1.47e-6. Structured LM-head/beam outputs are validated by
+  exact-id tests rather than the benchmark's scalar error field.
+
+Final decisions and routing:
+
+- Keep whole-block q4_0 decode only in sequential LM-head sampler dots. The
+  qgemv experiment regressed and was fully reverted; q8_0 decoding is unchanged.
+- Keep factorized edge project/combine and make it the public default. It wins
+  at both L8 (0.0260 vs 0.1008 ms) and L64; `use_kernel=False` retains the
+  materialized framework composition.
+- Keep exact staged quantized beam advance. Q4_0 with at most four rows uses the
+  no-logits path. Q8_0 and larger row batches use packed 32-column GEMM when the
+  vocab permits it; irregular widths retain the exact staged fallback. Do not
+  claim a q8_0 B1 win over resident fp16 weights.
+- Keep the compile-time 8x32 spatial tile. Auto-route qualifying fp32 block-4
+  shapes to Metal and keep the realistic block-2 priority shape on framework;
+  small direct workloads retain the existing Metal route.
+- Keep barrier-free single-warp attention below T512, eight partitions for
+  T512-2047, and 32 from T2048. Auto-route MPS to Metal at all measured shapes;
+  on MLX use Metal below T512 and framework SDPA for longer contexts.
+
+Raw results:
+
+- Baseline: `perf/results/2026-07-13/cross-kernel-followups-baseline/`.
+- Final: `cross-kernel-final-mlx/`, `cross-kernel-final-mps/`, and
+  `cross-kernel-edge-smoke/` under the same date.
+- LM-head/qgemv: `cross-kernel-lm-head-q4-whole-block/`,
+  `cross-kernel-qgemv-f32-paired-control/`,
+  `cross-kernel-qgemv-f32-q4-full-block/`, and
+  `cross-kernel-qgemv-q4-full-block/`.
+- Beam: `cross-kernel-lm-head-beam-smoke/`,
+  `cross-kernel-lm-head-beam-rows4/`,
+  `cross-kernel-lm-head-beam-rows4-quick/`,
+  `cross-kernel-lm-head-beam-q8-vec4/`, and
+  `cross-kernel-lm-head-beam-final-routing/`.
+- Spatial: `cross-kernel-spatial-tiled/`,
+  `cross-kernel-spatial-tiled64-fixed/`,
+  `cross-kernel-spatial-tiled-adaptive/`, and
+  `cross-kernel-spatial-tiled-final/`.
+- Attention: `cross-kernel-attn-decode-baseline/`,
+  `cross-kernel-attn-decode-partition4/`,
+  `cross-kernel-attn-decode-partition8/`,
+  `cross-kernel-attn-decode-partition16/`,
+  `cross-kernel-attn-decode-partition32/`,
+  `cross-kernel-attn-decode-shared32-launch8/`, and
+  `cross-kernel-attn-decode-final-route-repeat/`.

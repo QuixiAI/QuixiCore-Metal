@@ -3866,6 +3866,73 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   return out;
 }
 
+// Quantized LM-head + exact beam-search advance. The staged path emits only
+// O(B*BM*num_tiles*BM) candidates, never the full logits tensor.
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> lm_head_beam_advance_mps(
+    const at::Tensor& h_in, const at::Tensor& Wq_in, const at::Tensor& bias_in,
+    const at::Tensor& cum_in, int64_t beam_width, const std::string& fmt) {
+  TORCH_CHECK(h_in.device().is_mps() && Wq_in.device().is_mps() &&
+                  bias_in.device().is_mps() && cum_in.device().is_mps() &&
+                  tk_is_float_dtype(h_in),
+              "lm_head_beam_advance: inputs must be MPS and h floating point");
+  TORCH_CHECK(h_in.dim() == 2 && h_in.size(0) > 0 && h_in.size(1) > 0,
+              "lm_head_beam_advance: h must be non-empty (B*BM,K)");
+  int block_bytes = 0;
+  if (fmt == "q4_0") block_bytes = 18;
+  else if (fmt == "q8_0") block_bytes = 34;
+  else TORCH_CHECK(false, "lm_head_beam_advance: format must be q4_0 or q8_0");
+  TORCH_CHECK(beam_width >= 1 && beam_width <= 16,
+              "lm_head_beam_advance: beam_width must be in [1,16]");
+  const int rows = static_cast<int>(h_in.size(0));
+  const int hidden = static_cast<int>(h_in.size(1));
+  TORCH_CHECK(hidden % 32 == 0 && Wq_in.scalar_type() == at::kByte &&
+                  Wq_in.dim() == 3 && Wq_in.size(0) > 0 &&
+                  Wq_in.size(1) == hidden / 32 && Wq_in.size(2) == block_bytes,
+              "lm_head_beam_advance: packed W must be uint8 (V,K/32,block_bytes)");
+  TORCH_CHECK(cum_in.dim() == 2 && cum_in.size(1) == beam_width &&
+                  rows == cum_in.size(0) * beam_width,
+              "lm_head_beam_advance: cum_log_probs must be (B,BM), h rows B*BM");
+  const int batches = static_cast<int>(cum_in.size(0));
+  const int vocab = static_cast<int>(Wq_in.size(0));
+  const int two_bm = 2 * static_cast<int>(beam_width);
+  TORCH_CHECK(vocab >= two_bm,
+              "lm_head_beam_advance: vocab must be >= 2*beam_width");
+  TORCH_CHECK(bias_in.numel() <= 1 ||
+                  (bias_in.dim() == 1 && bias_in.size(0) == vocab),
+              "lm_head_beam_advance: bias must be (V,) or a scalar placeholder");
+
+  constexpr int TILE_V = 256;
+  const int num_vtiles = (vocab + TILE_V - 1) / TILE_V;
+  const int use_bias = bias_in.numel() > 1 ? 1 : 0;
+  auto h = h_in.contiguous();
+  auto Wq = Wq_in.to(at::kByte).contiguous();
+  auto bias = bias_in.to(at::kFloat).contiguous();
+  auto cum = cum_in.to(at::kFloat).contiguous().reshape({rows});
+  auto f32 = h.options().dtype(at::kFloat);
+  auto i32 = h.options().dtype(at::kInt);
+  auto part_val = at::empty({rows, num_vtiles, two_bm}, f32);
+  auto part_id = at::empty({rows, num_vtiles, two_bm}, i32);
+  auto part_lse = at::empty({rows, num_vtiles}, f32);
+  auto cand_score = at::empty({rows, two_bm}, f32);
+  auto cand_token = at::empty({rows, two_bm}, i32);
+  auto next_token = at::empty({batches, beam_width}, i32);
+  auto parent_beam = at::empty({batches, beam_width}, i32);
+  auto new_cum = at::empty({batches, beam_width}, f32);
+  const std::string tn = tk_type_name(h);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_lm_head_topp_partials_q(
+        e, h, Wq, part_val, part_id, bias, vocab, hidden, TILE_V,
+        num_vtiles, two_bm, use_bias, 1.0f, part_lse, rows, fmt, tn, 4);
+    tk::launch_lm_head_beam_reduce(
+        e, part_val, part_id, part_lse, cum, cand_score, cand_token,
+        num_vtiles, two_bm, rows);
+    tk::launch_beam_select(
+        e, cand_score, cand_token, next_token, parent_beam, new_cum,
+        batches, static_cast<int>(beam_width), two_bm);
+  });
+  return {next_token, parent_beam, new_cum};
+}
+
 // Fused cross-entropy forward: per-row [loss, lse] without storing (T, V) probabilities.
 static std::tuple<at::Tensor, at::Tensor> cross_entropy_fwd_mps(
     const at::Tensor& logits_in, const at::Tensor& targets_in, int64_t ignore_index,
@@ -4773,10 +4840,17 @@ static at::Tensor edge_mlp_256x7_mps(
   auto first_bias = first_bias_in.contiguous(), second_weight = second_weight_in.contiguous();
   auto second_bias = second_bias_in.contiguous();
   const int B = hidden.size(0), L = hidden.size(1);
+  auto left_partial = at::empty({B, L, 256}, hidden.options());
+  auto right_partial = at::empty({B, L, 256}, hidden.options());
   auto output = at::empty({B, 7, L, L}, hidden.options());
   tk_encode([&](TorchEncoder& e) {
-    tk::launch_edge_mlp_256x7(e, hidden, first_weight, first_bias, second_weight,
-                              second_bias, output, B, L, tk_type_name(hidden));
+    const std::string type_name = tk_type_name(hidden);
+    tk::launch_edge_mlp_project_256(
+        e, hidden, first_weight, first_bias, left_partial, right_partial,
+        B, L, type_name);
+    tk::launch_edge_mlp_combine_256x7(
+        e, left_partial, right_partial, second_weight, second_bias,
+        output, B, L, type_name);
   });
   return output;
 }
@@ -5518,6 +5592,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("lm_head_sample", &lm_head_sample_mps, "ThunderMittens fused LM-head + sampling (MPS)");
   m.def("lm_head_sample_q", &lm_head_sample_q_mps,
         "ThunderMittens fused LM-head + sampling over quantized weights (MPS)");
+  m.def("lm_head_beam_advance", &lm_head_beam_advance_mps,
+        "ThunderMittens quantized LM-head + beam-search advance (MPS)");
   m.def("cross_entropy_fwd", &cross_entropy_fwd_mps, "ThunderMittens fused cross-entropy fwd (MPS)");
   m.def("cross_entropy_bwd", &cross_entropy_bwd_mps, "ThunderMittens fused cross-entropy bwd (MPS)");
   m.def("kd_kl_topk_fwd", &kd_kl_topk_fwd_mps, "BitNet sparse-teacher KD-KL fwd (MPS)",

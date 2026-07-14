@@ -24,6 +24,62 @@ using namespace mittens;
 constant float LMH_NEG_INF = -3.4028234663852886e38f;
 constant int LMH_MAX_K = 64;
 
+// Sequential fused-sampler rows benefit from decoding an entire q4_0 block at
+// once. Keep the legacy half-rounded weight contract here: the scale/code
+// product is rounded to half before the fp32 dot accumulation, exactly as in
+// q4_0::dequant and tk_dequant8<q4_0>.
+template <typename FMT, typename T>
+METAL_FUNC float lmh_sampler_quant_dot(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / FMT::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * FMT::block_bytes;
+        for (int col0 = 0; col0 < FMT::block_k; col0 += 8) {
+            half values[8];
+            tk_dequant8<FMT>(base, col0, values);
+            const int input_base = block * FMT::block_k + col0;
+            #pragma clang loop unroll(full)
+            for (int i = 0; i < 8; ++i) {
+                result += float(values[i]) * float(hrow[input_base + i]);
+            }
+        }
+    }
+    return result;
+}
+
+template <typename T>
+METAL_FUNC float lmh_sampler_quant_dot_q4(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / q4_0::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * q4_0::block_bytes;
+        const half scale = ((device const half *)base)[0];
+        device const uchar *codes = base + 2;
+        const int input_base = block * q4_0::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            const half low = scale * half(int(packed & 0x0f) - 8);
+            const half high = scale * half(int(packed >> 4) - 8);
+            result += float(low) * float(hrow[input_base + i]);
+            result += float(high) * float(hrow[input_base + i + 16]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_sampler_q4(T)                                      \
+  template <> METAL_FUNC float lmh_sampler_quant_dot<q4_0, T>(            \
+    device const T *hrow, device const uchar *wrow, int K) {              \
+    return lmh_sampler_quant_dot_q4<T>(hrow, wrow, K);                     \
+  }
+
+specialize_lmh_sampler_q4(float)
+specialize_lmh_sampler_q4(half)
+specialize_lmh_sampler_q4(bf16)
+
 // emit functor for the Family-B masked_topk_local merge in the top-k/top-p partials kernels: writes
 // each round's winner into the per-tile (part_val, part_id) partials on lane 0 (-1 id for an empty
 // round). Shared by lm_head_topk_partials / lm_head_topk_partials_q / lm_head_topp_partials_q.
@@ -137,16 +193,7 @@ kernel void lm_head_argcat_partials_q(device const T     *h          [[buffer(0)
     int   bi   = (v0 + (int)lane < v1) ? v0 + (int)lane : v0;
     for (int v = v0 + (int)lane; v < v1; v += 32) {
         device const uchar *wq_row = Wq + (long)v * bpr * FMT::block_bytes;
-        float dot_acc = 0.0f;
-        for (int b = 0; b < bpr; ++b) {
-            device const uchar *base = wq_row + (long)b * FMT::block_bytes;
-            for (int cib = 0; cib < FMT::block_k; cib += 8) {
-                half w8[8];
-                tk_dequant8<FMT>(base, cib, w8);
-                const int koff = b * FMT::block_k + cib;
-                for (int kk = 0; kk < 8; ++kk) dot_acc += float(w8[kk]) * float(hrow[koff + kk]);
-            }
-        }
+        const float dot_acc = lmh_sampler_quant_dot<FMT>(hrow, wq_row, K);
         float ls = dot_acc * invtemp;
         if (use_bias) ls += bias[v];
         if (use_gumbel) ls += rng_gumbel(seed, (uint)t, (uint)v);
@@ -401,6 +448,50 @@ kernel void lm_head_topp_reduce(device const float *part_val [[buffer(0)]],   //
     if (lane == 0) { out_idx[t] = (gbest == LMH_NEG_INF) ? -1 : gid; }
 }
 
+// Merge quantized LM-head tile candidates into exact per-beam log-probability
+// candidates. Each tile supplied its full logsumexp and top-2BM tokens, so the
+// merged pool contains the row's true top-2BM while the normalizer covers V.
+kernel void lm_head_beam_reduce(
+    device const float *part_val   [[buffer(0)]], // (BR,num_vtiles,2BM)
+    device const int   *part_id    [[buffer(1)]],
+    device const float *part_lse   [[buffer(2)]], // (BR,num_vtiles)
+    device const float *cum        [[buffer(3)]], // (BR,)
+    device float       *cand_score [[buffer(4)]], // (BR,2BM)
+    device int         *cand_token [[buffer(5)]],
+    constant int &num_vtiles       [[buffer(6)]],
+    constant int &two_bm           [[buffer(7)]],
+    uint row  [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int ncand = num_vtiles * two_bm;
+    const long base = (long)row * ncand;
+    int chosen_id[LMH_MAX_K];
+    float chosen_val[LMH_MAX_K];
+    stored_cand candidates{part_val, part_id, base};
+    masked_topk(candidates, ncand, two_bm, lane, LMH_NEG_INF,
+                chosen_id, chosen_val);
+
+    const long lbase = (long)row * num_vtiles;
+    float lmax = LMH_NEG_INF;
+    for (int tile = (int)lane; tile < num_vtiles; tile += 32) {
+        lmax = max(lmax, part_lse[lbase + tile]);
+    }
+    const float gmax = simd_max(lmax);
+    float lsum = 0.0f;
+    for (int tile = (int)lane; tile < num_vtiles; tile += 32) {
+        const float tile_lse = part_lse[lbase + tile];
+        if (tile_lse > LMH_NEG_INF) lsum += exp(tile_lse - gmax);
+    }
+    const float lse = gmax + log(simd_sum(lsum));
+    if (lane == 0) {
+        const long obase = (long)row * two_bm;
+        const float cumr = cum[row];
+        for (int k = 0; k < two_bm; ++k) {
+            cand_token[obase + k] = chosen_id[k];
+            cand_score[obase + k] = cumr + chosen_val[k] - lse;
+        }
+    }
+}
+
 // Quantized top-k partials: same per-lane top-k as lm_head_topk_partials, but W is packed
 // (V, K/block_k, block_bytes) uchar dequantized on the fly via tk_dequant8<FMT>. Feeds the SAME
 // lm_head_topk_reduce (global merge + Gumbel-max), so the fused quant top-k path avoids ever
@@ -432,16 +523,7 @@ kernel void lm_head_topk_partials_q(device const T     *h          [[buffer(0)]]
     int   nmine = 0;
     for (int v = v0 + (int)lane; v < v1; v += 32) {
         device const uchar *wq_row = Wq + (long)v * bpr * FMT::block_bytes;
-        float dot_acc = 0.0f;
-        for (int b = 0; b < bpr; ++b) {
-            device const uchar *base = wq_row + (long)b * FMT::block_bytes;
-            for (int cib = 0; cib < FMT::block_k; cib += 8) {
-                half w8[8];
-                tk_dequant8<FMT>(base, cib, w8);
-                const int koff = b * FMT::block_k + cib;
-                for (int kk = 0; kk < 8; ++kk) dot_acc += float(w8[kk]) * float(hrow[koff + kk]);
-            }
-        }
+        const float dot_acc = lmh_sampler_quant_dot<FMT>(hrow, wq_row, K);
         float ls = dot_acc;
         if (use_bias) ls += bias[v];
         mine_val[nmine] = ls;
@@ -489,10 +571,14 @@ kernel void lm_head_topp_partials_q(device const T     *h          [[buffer(0)]]
                                     constant int   &use_bias   [[buffer(10)]],
                                     constant float &invtemp    [[buffer(11)]],
                                     device float       *part_lse   [[buffer(12)]],  // (T, num_vtiles)
+                                    constant int   &rows_per_tg [[buffer(13)]],
+                                    constant int   &total_rows  [[buffer(14)]],
                                     uint2 tgid [[threadgroup_position_in_grid]],
+                                    uint  simdgroup [[simdgroup_index_in_threadgroup]],
                                     uint  lane [[thread_index_in_simdgroup]]) {
     const int vtile = (int)tgid.x;
-    const int t     = (int)tgid.y;
+    const int t     = (int)tgid.y * rows_per_tg + (int)simdgroup;
+    if (t >= total_rows) return;
     device const T *hrow = h + (long)t * K;
     const int v0 = vtile * TILE_V;
     const int v1 = min(v0 + TILE_V, V);
@@ -505,16 +591,7 @@ kernel void lm_head_topp_partials_q(device const T     *h          [[buffer(0)]]
     float lmax = LMH_NEG_INF, lsum = 0.0f;    // streaming tempered logsumexp over this lane's logits
     for (int v = v0 + (int)lane; v < v1; v += 32) {
         device const uchar *wq_row = Wq + (long)v * bpr * FMT::block_bytes;
-        float dot_acc = 0.0f;
-        for (int b = 0; b < bpr; ++b) {
-            device const uchar *base = wq_row + (long)b * FMT::block_bytes;
-            for (int cib = 0; cib < FMT::block_k; cib += 8) {
-                half w8[8];
-                tk_dequant8<FMT>(base, cib, w8);
-                const int koff = b * FMT::block_k + cib;
-                for (int kk = 0; kk < 8; ++kk) dot_acc += float(w8[kk]) * float(hrow[koff + kk]);
-            }
-        }
+        const float dot_acc = lmh_sampler_quant_dot<FMT>(hrow, wq_row, K);
         float ls = dot_acc;
         if (use_bias) ls += bias[v];
         const float tl = ls * invtemp;                    // tempered logit
@@ -544,7 +621,10 @@ kernel void lm_head_topp_partials_q(device const T     *h          [[buffer(0)]]
     constant int &TILE_V [[buffer(7)]], constant int &num_vtiles [[buffer(8)]],     \
     constant int &topk [[buffer(9)]], constant int &use_bias [[buffer(10)]],        \
     constant float &invtemp [[buffer(11)]], device float *part_lse [[buffer(12)]],  \
-    uint2 tgid [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]]);
+    constant int &rows_per_tg [[buffer(13)]], constant int &total_rows [[buffer(14)]], \
+    uint2 tgid [[threadgroup_position_in_grid]],                                    \
+    uint simdgroup [[simdgroup_index_in_threadgroup]],                              \
+    uint lane [[thread_index_in_simdgroup]]);
 
 instantiate_lm_head_topp_q("q8_0_float32", q8_0, float)
 instantiate_lm_head_topp_q("q8_0_float16", q8_0, half)

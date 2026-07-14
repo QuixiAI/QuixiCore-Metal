@@ -2086,6 +2086,66 @@ def lm_head_q_cases(be, preset, formats):
                        baselines=baselines, ref=None, weight_bytes=float(V * (K // bk) * bb))
 
 
+@register("lm_head_beam")
+def lm_head_beam_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(225)
+    fmts = formats or ["q4_0", "q8_0"]
+    # Beam decode is dominated by the projection. The baseline keeps an fp16
+    # dequantized head resident, materializes logits, then uses the fused dense
+    # beam primitive; the target reads packed weights and never creates logits.
+    shapes = _pick(preset, [(1, 4, 8192, 1024)],
+                   [(1, 4, 32000, 4096), (4, 4, 32000, 4096)],
+                   [(1, 4, 32000, 4096), (4, 4, 32000, 4096),
+                    (1, 8, 128256, 4096)])
+    for B, BM, V, K in shapes:
+        h = (0.25 * rng.standard_normal((B * BM, K))).astype(np.float32)
+        cum = (0.1 * rng.standard_normal((B, BM))).astype(np.float32)
+        h_d = be.array(h, "f16")
+        cum_d = be.array(cum, "f32")
+        for fmt in fmts:
+            if fmt not in ("q4_0", "q8_0"):
+                continue
+            bk, bb = BLOCK_INFO[fmt]
+            wq, wdq = _packed_weight(fmt, V, K, seed=225)
+            wq_d = be.raw_array(wq)
+            w_half = be.array(wdq, "f16")
+            del wdq
+            if be.name == "mlx":
+                mx = be.mx
+                dense = lambda h_d=h_d, w_half=w_half: mx.matmul(h_d, w_half.T)
+                padded_rows = ((B * BM + 31) // 32) * 32
+                h_cols = mx.swapaxes(h_d, 0, 1)
+                if padded_rows != B * BM:
+                    h_cols = mx.concatenate(
+                        (h_cols, mx.zeros((K, padded_rows - B * BM), dtype=h_d.dtype)),
+                        axis=1)
+                mx.eval(h_cols)
+
+                def packed_matmul_beam(wq_d=wq_d, h_cols=h_cols, cum_d=cum_d,
+                                       BM=BM, rows=B * BM, fmt=fmt):
+                    logits = mx.swapaxes(tk.qgemm(wq_d, h_cols, format=fmt), 0, 1)[:rows]
+                    return tk.beam_advance(logits, cum_d, BM)
+            else:
+                dense = lambda h_d=h_d, w_half=w_half: h_d @ w_half.T
+
+            def dense_beam(dense=dense, cum_d=cum_d, BM=BM):
+                return tk.beam_advance(dense(), cum_d, BM)
+
+            yield Case(
+                "lm_head_beam", f"{fmt}_B{B}_BM{BM}_V{V}_K{K}",
+                {"B": B, "BM": BM, "V": V, "K": K}, "f16", fmt=fmt,
+                target=lambda h_d=h_d, wq_d=wq_d, cum_d=cum_d, BM=BM, fmt=fmt:
+                    tk.lm_head_beam_advance(h_d, wq_d, cum_d, BM, format=fmt),
+                baselines={
+                    "resident_fp16_matmul+beam": dense_beam,
+                    **({"packed_qgemm32+beam": packed_matmul_beam}
+                       if be.name == "mlx" else {}),
+                }, ref=None,
+                weight_bytes=float(V * (K // bk) * bb),
+                flops=2.0 * B * BM * V * K)
+
+
 # Embedding / multimodal.
 @register("embedding_lookup")
 def embedding_lookup_cases(be, preset, formats):
@@ -2514,6 +2574,80 @@ def _gelu_erf_device(be, x):
     return be.torch.nn.functional.gelu(x, approximate="none")
 
 
+@register("attn_decode_bh")
+def attn_decode_bh_cases(be, preset, formats):
+    """Batched head-major GQA decode, including long-context priority shapes."""
+    tk = be.tk()
+    rng = np.random.default_rng(260)
+    shapes = _pick(
+        preset,
+        [(1, 4, 2, 17, 32)],
+        [(4, 8, 2, 256, 32), (4, 16, 4, 512, 128),
+         (4, 16, 4, 1024, 128), (4, 16, 4, 2048, 128)],
+        [(16, 32, 8, 4096, 128)])
+    for B, Hq, Hkv, T, D in shapes:
+        q = (0.2 * rng.standard_normal((B, Hq, D))).astype(np.float32)
+        k = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
+        v = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
+        q_d, k_d, v_d = be.array(q), be.array(k), be.array(v)
+        group = Hq // Hkv
+
+        def attn_base(q_d=q_d, k_d=k_d, v_d=v_d, T=T):
+            return tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=False)
+
+        score = np.einsum(
+            "bhd,bhtd->bht", q, np.repeat(k, group, axis=1)) / math.sqrt(D)
+        prob = np.exp(score - score.max(-1, keepdims=True))
+        prob /= prob.sum(-1, keepdims=True)
+        ref = np.einsum("bht,bhtd->bhd", prob, np.repeat(v, group, axis=1))
+        yield Case(
+            "attn_decode_bh", f"B{B}_H{Hq}_{Hkv}_T{T}_D{D}",
+            {"B": B, "Hq": Hq, "Hkv": Hkv, "T": T, "D": D}, "f32",
+            target=lambda q_d=q_d, k_d=k_d, v_d=v_d, T=T:
+                tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=True),
+            baselines={"framework_sdpa": attn_base}, ref=ref,
+            bytes_moved=float((q.size + k.size + v.size + q.size) * 4))
+
+
+@register("edge_mlp")
+def edge_mlp_cases(be, preset, formats):
+    """Fixed factorized 512-to-256-to-7 pairwise edge MLP."""
+    tk = be.tk()
+    rng = np.random.default_rng(263)
+    B, L = _pick(preset, (1, 8), (1, 64), (4, 128))
+    hidden = (0.05 * rng.standard_normal((B, L, 256))).astype(np.float32)
+    first_w = (0.04 * rng.standard_normal((256, 512))).astype(np.float32)
+    first_b = (0.03 * rng.standard_normal(256)).astype(np.float32)
+    second_w = (0.04 * rng.standard_normal((7, 256))).astype(np.float32)
+    second_b = (0.03 * rng.standard_normal(7)).astype(np.float32)
+    h_d, fw_d, fb_d = be.array(hidden), be.array(first_w), be.array(first_b)
+    sw_d, sb_d = be.array(second_w), be.array(second_b)
+    if be.name == "mlx":
+        def edge_base():
+            left = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, :256], 0, 1))
+            right = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, 256:], 0, 1)) + fb_d
+            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
+            return be.mx.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
+    else:
+        def edge_base():
+            left = h_d @ fw_d[:, :256].T
+            right = h_d @ fw_d[:, 256:].T + fb_d
+            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
+            return be.torch.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
+    left = hidden @ first_w[:, :256].T
+    right = hidden @ first_w[:, 256:].T + first_b
+    ref = np.einsum(
+        "bijh,ch->bcij", _gelu_erf_np(left[:, :, None] + right[:, None]), second_w)
+    ref += second_b[None, :, None, None]
+    yield Case(
+        "edge_mlp", f"B{B}_L{L}",
+        {"B": B, "L": L, "hidden": 256, "classes": 7}, "f32",
+        target=lambda: tk.edge_mlp_256x7(
+            h_d, fw_d, fb_d, sw_d, sb_d, use_kernel=True),
+        baselines={"materialized_pairwise_mlp": edge_base}, ref=ref,
+        flops=float(B * L * L * 2 * 256 * 7))
+
+
 @register("kernel_extensions")
 def kernel_extension_cases(be, preset, formats):
     """Focused A/B suite for fused and specialized kernel paths.
@@ -2572,25 +2706,6 @@ def kernel_extension_cases(be, preset, formats):
                baselines={"add_then_framework_layer_norm": decode_norm_base}, ref=ref,
                bytes_moved=float(4 * R * D * 2))
 
-    # Batched head-major GQA decode with a D=32 specialization.
-    B, Hq, Hkv, T, D = _pick(preset, (1, 4, 2, 17, 32),
-                             (4, 8, 2, 256, 32), (16, 8, 1, 480, 32))
-    q = (0.2 * rng.standard_normal((B, Hq, D))).astype(np.float32)
-    k = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
-    v = (0.2 * rng.standard_normal((B, Hkv, T, D))).astype(np.float32)
-    q_d, k_d, v_d = be.array(q), be.array(k), be.array(v)
-    group = Hq // Hkv
-    def attn_base():
-        return tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=False)
-    score = np.einsum("bhd,bhtd->bht", q, np.repeat(k, group, axis=1)) / math.sqrt(D)
-    prob = np.exp(score - score.max(-1, keepdims=True)); prob /= prob.sum(-1, keepdims=True)
-    ref = np.einsum("bht,bhtd->bhd", prob, np.repeat(v, group, axis=1))
-    yield Case("attn_decode_bh", f"B{B}_H{Hq}_{Hkv}_T{T}_D{D}",
-               {"B": B, "Hq": Hq, "Hkv": Hkv, "T": T, "D": D}, "f32",
-               target=lambda: tk.attn_decode_bh(q_d, k_d, v_d, T, use_kernel=True),
-               baselines={"framework_sdpa": attn_base}, ref=ref,
-               bytes_moved=float((q.size + k.size + v.size + q.size) * 4))
-
     # Swin's priority window is 12x12 (N=144) with D=32.
     BW, N, H = _pick(preset, (2, 16, 2), (8, 144, 4), (64, 144, 4))
     qkv = (0.12 * rng.standard_normal((BW, N, 3, H, 32))).astype(np.float32)
@@ -2645,37 +2760,6 @@ def kernel_extension_cases(be, preset, formats):
                target=lambda: tk.patch_merge_layernorm(x_d, w_d, b_d, height, width),
                baselines={"gather_concat_layer_norm": patch_base}, ref=ref,
                bytes_moved=float(2 * B * height * width * C * 2))
-
-    # Fixed 512-to-256-to-7 pairwise edge head.
-    B, L = _pick(preset, (1, 8), (1, 64), (4, 128))
-    hidden = (0.05 * rng.standard_normal((B, L, 256))).astype(np.float32)
-    first_w = (0.04 * rng.standard_normal((256, 512))).astype(np.float32)
-    first_b = (0.03 * rng.standard_normal(256)).astype(np.float32)
-    second_w = (0.04 * rng.standard_normal((7, 256))).astype(np.float32)
-    second_b = (0.03 * rng.standard_normal(7)).astype(np.float32)
-    h_d, fw_d, fb_d = be.array(hidden), be.array(first_w), be.array(first_b)
-    sw_d, sb_d = be.array(second_w), be.array(second_b)
-    if be.name == "mlx":
-        def edge_base():
-            left = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, :256], 0, 1))
-            right = be.mx.matmul(h_d, be.mx.swapaxes(fw_d[:, 256:], 0, 1)) + fb_d
-            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
-            return be.mx.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
-    else:
-        def edge_base():
-            left = h_d @ fw_d[:, :256].T
-            right = h_d @ fw_d[:, 256:].T + fb_d
-            act = _gelu_erf_device(be, left[:, :, None, :] + right[:, None, :, :])
-            return be.torch.einsum("bijh,ch->bcij", act, sw_d) + sb_d[None, :, None, None]
-    left = hidden @ first_w[:, :256].T
-    right = hidden @ first_w[:, 256:].T + first_b
-    ref = np.einsum("bijh,ch->bcij", _gelu_erf_np(left[:, :, None] + right[:, None]), second_w)
-    ref += second_b[None, :, None, None]
-    yield Case("edge_mlp", f"B{B}_L{L}", {"B": B, "L": L, "hidden": 256, "classes": 7}, "f32",
-               target=lambda: tk.edge_mlp_256x7(
-                   h_d, fw_d, fb_d, sw_d, sb_d, use_kernel=True),
-               baselines={"materialized_pairwise_mlp": edge_base}, ref=ref,
-               flops=float(B * L * L * 2 * 256 * 7))
 
     # Decode linear (dense + q8_0) and tiled Flux erf-GELU.
     B, K, N = _pick(preset, (1, 65, 37), (1, 256, 256), (16, 256, 256))

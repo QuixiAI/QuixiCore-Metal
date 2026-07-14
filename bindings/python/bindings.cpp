@@ -1691,6 +1691,22 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "lm_head_beam_advance",
+      &lm_head_beam_advance,
+      "h"_a,
+      "wq"_a,
+      "bias"_a,
+      "cum_log_probs"_a,
+      "beam_width"_a,
+      "format"_a = "q4_0",
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        quantized LM-head + exact beam-search advance without materializing full logits.
+        Returns [next_token, parent_beam, updated cumulative log-probability].
+      )");
+
+    m.def(
       "lm_head_constrained", &lm_head_constrained,
       "h"_a, "w"_a, "bias"_a, "forbidden"_a, "previous"_a,
       "eos_id"_a = -1, "forbid_eos"_a = false,

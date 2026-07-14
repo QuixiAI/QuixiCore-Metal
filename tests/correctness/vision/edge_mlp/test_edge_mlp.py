@@ -12,7 +12,7 @@ def _gelu_erf(x):
     return 0.5 * x * (1.0 + np.vectorize(math.erf)(x / np.sqrt(2.0)))
 
 
-@pytest.mark.parametrize("use_kernel", [False, True])
+@pytest.mark.parametrize("use_kernel", [None, False, True])
 def test_edge_mlp_matches_materialized_pairwise_reference(use_kernel):
     rng = np.random.default_rng(73)
     B, L = 1, 3
