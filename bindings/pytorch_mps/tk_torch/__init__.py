@@ -707,7 +707,7 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
 
 
 def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed, top_p=0.0):
-    """Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/nvfp4 weights. mode 0=argmax, 1=categorical,
+    """Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/mxfp8/nvfp4/mxfp4 weights. mode 0=argmax, 1=categorical,
     2=topk, 3=topp (nucleus over the top-k candidate pool, top_p in (0,1]). Returns (T,) int32. MPS."""
     return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode), int(topk),
                                  float(temperature), int(seed), float(top_p))
@@ -1524,7 +1524,7 @@ def qflux_gelu(wq: torch.Tensor, x: torch.Tensor, bias: torch.Tensor, format: st
 
 
 def attn_q(q, kq, vq, format="q8_0", causal=False, multiwarp=False):
-    """Quantized-KV flash attention: softmax(QK^T)V, K/V from blocks. q bf16 (B,H,N,D); kq/vq uint8. MPS."""
+    """Quantized-KV flash attention over q8_0/q4_0/fp8_e4m3/mxfp8 K/V blocks. MPS."""
     return _ext.attn_q(q, kq, vq, format, causal, multiwarp)
 
 

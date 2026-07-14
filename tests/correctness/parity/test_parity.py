@@ -93,7 +93,7 @@ def test_attn_fwd_parity(shape):
     _assert_parity(om, ot, atol=1e-2)
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"])
 def test_attn_q_parity(fmt):
     from tk.quant import quantize_kv
     B, H, N, D = 1, 2, 64, 64
@@ -150,7 +150,7 @@ def test_lm_head_sample_parity(mode, k):
     _assert_parity(om, ot, atol=0)   # integer token ids: exact
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "mxfp8", "nvfp4", "mxfp4"])
 @pytest.mark.parametrize("mode,k", [("argmax", 0), ("topk", 8)])
 def test_lm_head_sample_quant_parity(fmt, mode, k):
     from tk.quant import QUANT_FORMATS
@@ -166,7 +166,7 @@ def test_lm_head_sample_quant_parity(fmt, mode, k):
     _assert_parity(om, ot, atol=0)   # same dequant + reduce metallib -> exact token ids
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "mxfp8", "nvfp4", "mxfp4"])
 @pytest.mark.parametrize("p", [0.5, 0.9])
 def test_lm_head_sample_quant_topp_parity(fmt, p):
     from tk.quant import QUANT_FORMATS
@@ -635,7 +635,7 @@ def test_moe_grouped_gemm_swiglu_parity(H, inter):
     _assert_parity(om, ot, atol=6e-2)
 
 
-@pytest.mark.parametrize("fmt", ["mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
+@pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
 def test_moe_grouped_gemm_rect_q_parity(fmt):
     # same packed expert stack + same bf16 activations through both backends' metallibs
     from tk.quant import quantize_expert_stack
@@ -656,8 +656,9 @@ def test_moe_grouped_gemm_rect_q_parity(fmt):
     _assert_parity(om, ot, atol=6e-2)
 
 
+@pytest.mark.parametrize("fmt", ["mxfp4", "mxfp8"])
 @pytest.mark.parametrize("act", ["swiglu", "swiglu_oai"])
-def test_moe_grouped_gemm_swiglu_q_parity(act):
+def test_moe_grouped_gemm_swiglu_q_parity(fmt, act):
     from tk.quant import quantize_expert_stack
     rng = np.random.default_rng(54)
     E, H, inter = 4, 256, 64
@@ -665,13 +666,13 @@ def test_moe_grouped_gemm_swiglu_q_parity(act):
     A = (0.1 * rng.standard_normal((total, H))).astype(np.float32)
     W1 = (0.1 * rng.standard_normal((E, H, 2 * inter))).astype(np.float32)
     bias = (0.1 * rng.standard_normal((E, 2 * inter))).astype(np.float32)
-    W1q = quantize_expert_stack(W1, "mxfp4")
+    W1q = quantize_expert_stack(W1, fmt)
     om = tk.moe_grouped_gemm_swiglu_q(
-        mx.array(A).astype(mx.bfloat16), mx.array(W1q), mx.array(eot), format="mxfp4",
+        mx.array(A).astype(mx.bfloat16), mx.array(W1q), mx.array(eot), format=fmt,
         bias=mx.array(bias).astype(mx.bfloat16), act=act)
     ot = tk.moe_grouped_gemm_swiglu_q(
         torch.from_numpy(A).to(torch.bfloat16).to("mps"), torch.from_numpy(W1q).to("mps"),
-        torch.from_numpy(eot).to("mps"), format="mxfp4",
+        torch.from_numpy(eot).to("mps"), format=fmt,
         bias=torch.from_numpy(bias).to(torch.bfloat16).to("mps"), act=act)
     _assert_parity(om, ot, atol=6e-2)
 
@@ -2329,42 +2330,44 @@ def _int_on(values, framework):
     return torch.from_numpy(values).to("mps")
 
 
-def test_quantized_embedding_lookup_and_bag_parity():
+@pytest.mark.parametrize("fmt", ["q4_0", "mxfp8"])
+def test_quantized_embedding_lookup_and_bag_parity(fmt):
     from tk.quant import QUANT_FORMATS
 
     rng = np.random.default_rng(2001)
     rows, dimension = 37, 256
-    quantize, _ = QUANT_FORMATS["q4_0"]
+    quantize, _ = QUANT_FORMATS[fmt]
     packed = quantize((0.2 * rng.standard_normal((rows, dimension))).astype(np.float32))
     ids = np.array([0, 36, -1, 11, 11], dtype=np.int32)
     offsets = np.array([0, 3, 5], dtype=np.int32)
     weights = (0.5 + rng.random(ids.size)).astype(np.float32)
 
     lookup_m = tk.quantized_embedding(
-        _packed_on(packed, "mlx"), _int_on(ids, "mlx"), "q4_0",
+        _packed_on(packed, "mlx"), _int_on(ids, "mlx"), fmt,
         output_dtype="float32")
     lookup_t = tk.quantized_embedding(
-        _packed_on(packed, "torch"), _int_on(ids, "torch"), "q4_0",
+        _packed_on(packed, "torch"), _int_on(ids, "torch"), fmt,
         output_dtype="float32")
     _assert_parity(lookup_m, lookup_t, atol=1e-6)
 
     bag_m = tk.quantized_embedding_bag(
         _packed_on(packed, "mlx"), _int_on(ids, "mlx"), _int_on(offsets, "mlx"),
-        "q4_0", sample_weights=_mk(weights, "mlx", "f32"), mode="mean",
+        fmt, sample_weights=_mk(weights, "mlx", "f32"), mode="mean",
         output_dtype="float32")
     bag_t = tk.quantized_embedding_bag(
         _packed_on(packed, "torch"), _int_on(ids, "torch"), _int_on(offsets, "torch"),
-        "q4_0", sample_weights=_mk(weights, "torch", "f32"), mode="mean",
+        fmt, sample_weights=_mk(weights, "torch", "f32"), mode="mean",
         output_dtype="float32")
     _assert_parity(bag_m, bag_t, atol=2e-6)
 
 
-def test_packed_decode_epilogue_and_swiglu_parity():
+@pytest.mark.parametrize("fmt", ["q4_0", "mxfp8", "nvfp4", "mxfp4"])
+def test_packed_decode_epilogue_and_swiglu_parity(fmt):
     from tk.quant import QUANT_FORMATS
 
-    rng = np.random.default_rng(2003)
+    rng = np.random.default_rng(2003 + len(fmt))
     batch, hidden, output = 2, 256, 39
-    quantize, _ = QUANT_FORMATS["q4_0"]
+    quantize, _ = QUANT_FORMATS[fmt]
     x = (0.08 * rng.standard_normal((batch, hidden))).astype(np.float32)
     gate = quantize((0.09 * rng.standard_normal((output, hidden))).astype(np.float32))
     up = quantize((0.08 * rng.standard_normal((output, hidden))).astype(np.float32))
@@ -2373,22 +2376,22 @@ def test_packed_decode_epilogue_and_swiglu_parity():
 
     epilogue_m = tk.decode_linear_epilogue(
         _mk(x, "mlx", "f32"), _packed_on(gate, "mlx"), _mk(bias, "mlx", "f32"),
-        _mk(residual, "mlx", "f32"), activation="silu", format="q4_0")
+        _mk(residual, "mlx", "f32"), activation="silu", format=fmt)
     epilogue_t = tk.decode_linear_epilogue(
         _mk(x, "torch", "f32"), _packed_on(gate, "torch"), _mk(bias, "torch", "f32"),
-        _mk(residual, "torch", "f32"), activation="silu", format="q4_0")
+        _mk(residual, "torch", "f32"), activation="silu", format=fmt)
     _assert_parity(epilogue_m, epilogue_t, atol=2e-6)
 
     swiglu_m = tk.decode_swiglu(
         _mk(x, "mlx", "f32"), _packed_on(gate, "mlx"), _packed_on(up, "mlx"),
-        format="q4_0")
+        format=fmt)
     swiglu_t = tk.decode_swiglu(
         _mk(x, "torch", "f32"), _packed_on(gate, "torch"), _packed_on(up, "torch"),
-        format="q4_0")
+        format=fmt)
     _assert_parity(swiglu_m, swiglu_t, atol=2e-6)
 
 
-@pytest.mark.parametrize("fmt", ["q4_0", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["q4_0", "mxfp8", "nvfp4", "mxfp4"])
 def test_masked_and_candidate_output_projection_parity(fmt):
     from tk.quant import QUANT_FORMATS
 
@@ -2429,7 +2432,7 @@ def test_masked_and_candidate_output_projection_parity(fmt):
     _assert_parity(candidate_m[1], candidate_t[1], atol=2e-5)
 
 
-@pytest.mark.parametrize("fmt", ["q4_0", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["q4_0", "mxfp8", "nvfp4", "mxfp4"])
 def test_quantized_lm_head_beam_advance_parity(fmt):
     from tk.quant import QUANT_FORMATS
 

@@ -27,6 +27,144 @@ Xcode/Metal toolchain version, integration path, command, git commit or
 working-tree label, dtype, shape, quant format, warmups, iterations, median,
 variance, correctness tolerance, and observed error.
 
+## 2026-07-13: MXFP4 inference coverage and hot-path pass
+
+Status: candidate; retained implementations have passed focused benchmarks,
+repository-wide correctness/parity validation, both backend builds, and the
+Xcode test build.
+
+Current implementation:
+
+- MXFP4 is available in fused decode epilogue/SwiGLU, LM-head
+  argmax/categorical/top-k/top-p sampling, packed-mask and CSR-candidate output
+  projection, and exact beam advance on MLX and PyTorch MPS.
+- QGEMV has an MXFP4 whole-block kernel: one lane consumes the 32 weights behind
+  one E8M0 scale instead of invoking four 8-value span decoders per block.
+- Decode/SwiGLU and LM-head sequential dots likewise consume complete 32-value
+  blocks. Decode and sparse projection keep scale/code products in fp32 where
+  their public contract requires one final rounding; the sampler preserves its
+  established half-rounded dequant contract.
+- `tk_e8m0_decode_f32` reconstructs E8M0 powers of two directly from IEEE-754
+  exponent bits, including the code-zero subnormal and code-255 infinity cases.
+  The float 8-value decoder used by packed embedding lookup and the retained
+  complete-block paths use it instead of a transcendental `exp2`.
+- Generic half fragment decode remains unchanged for QGEMM/QFlux. The
+  four-column MoE decoder also retains native half `exp2`; controlled variants
+  did not improve their full priority shape sets.
+
+Current public route:
+
+- Packed decode and LM-head operations dispatch directly to their MXFP4 Metal
+  instantiations. Beam advance uses row-wise no-logits fusion for at most four
+  rows and the existing packed QGEMM route above four rows when the vocabulary
+  is matrix-tile aligned.
+- MXFP4 QGEMV dispatches to the complete-block kernel. QGEMM, QFlux, and
+  quantized MoE retain their previous launch geometry and generic decoders.
+
+References inspected: the repository's existing MXFP4
+`{E8M0 scale, 16 packed E2M1 bytes}` contract, q4_0 complete-block kernels, and
+the preceding NVFP4 inference pass. No external implementation code was
+imported.
+
+Environment and method:
+
+- Hardware/toolchain: MacBook Pro Mac16,5, Apple M4 Max, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Metal 32023.883 / Metal toolchain 17.6.109.0;
+  Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1 MPS.
+- Working-tree label: `3cab797-dirty`.
+- Performance integration path: MLX Python extension, format `mxfp4`, fp16
+  QGEMV/QGEMM/QFlux/MoE and embedding inputs, and fp32 fused decode/LM-head
+  inputs. The harness performs its clock ramp and at least 50 ms of per-thunk
+  warmup, adaptively batches calls to at least 2 ms per sample, synchronizes
+  each sample, and reports per-call median, p20/p80, and CV.
+- All focused runs requested 10 warmups and 40 measured samples. The initial
+  and final commands were:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemv,qgemm,qflux,moe_q --formats mxfp4 \
+  --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/mxfp4-inference-baseline
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemv,qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam,quantized_embedding \
+  --formats mxfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/mxfp4-inference-final
+```
+
+Correctness and validation:
+
+- `scripts/build kernels` and `scripts/build pytorch_mps` passed.
+- `scripts/test correctness -q`: 2110 passed.
+- `scripts/test parity -q`: 420 passed, including MXFP4 decode, sampling,
+  top-p, sparse projection, and beam parity.
+- `scripts/test mps -q`: 472 passed.
+- `scripts/test xcode`: test build succeeded for the shared primitive target.
+- The final benchmark observed relative errors of `8.23e-7` and `8.94e-5`
+  for QGEMV, `2.32e-7` for decode epilogue, `2.07e-7` for SwiGLU, and zero
+  selected-id error for masked/candidate projection. Structured sampling and
+  beam outputs are covered by exact-id tests.
+
+Retained QGEMV results compare the original generic 8-value-span kernel with
+the final whole-block route. Times are milliseconds; brackets contain p20/p80,
+followed by CV.
+
+| Shape | Original | Final | Change | Final packed-weight GB/s |
+|---|---:|---:|---:|---:|
+| N4096 K4096 | 0.0331 [0.0325/0.0340], .0621 | 0.0269 [0.0261/0.0284], .0777 | -18.7% | 331 |
+| N11008 K4096 | 0.0786 [0.0775/0.0857], .0567 | 0.0539 [0.0515/0.0570], .0831 | -31.4% | 444 |
+
+The new fused-operation controls used the simplest correct generic MXFP4
+integration before complete-block specialization. Final values include the
+retained complete-block and E8M0 bit-reconstruction changes.
+
+| Path / shape | Generic control ms | Final ms [p20/p80], CV | Change | Error / check |
+|---|---:|---:|---:|---:|
+| Decode epilogue B1 K1536 N4096 | 0.0240 | 0.0191 [0.0187/0.0195], .0736 | -20.4% | 2.32e-7 rel |
+| Decode SwiGLU B1 K1536 N4096 | 0.0373 | 0.0292 [0.0279/0.0341], .1261 | -21.9% | 2.07e-7 rel |
+| LM-head top-k T1 V32000 K4096 | 0.5141 | 0.2754 [0.2722/0.2807], .0348 | -46.4% | exact selected ids |
+| LM-head top-k T8 V32000 K4096 | 2.1984 | 1.2691 [1.2586/1.2952], .0198 | -42.3% | exact selected ids |
+| Masked T1 V8192 K1024 legal256 | 0.0834 | 0.0313 [0.0303/0.0340], .0969 | -62.4% | exact ids/log-probs |
+| Masked T8 V8192 K1024 legal64 | 0.0564 | 0.0429 [0.0398/0.0462], .0946 | -24.0% | exact ids/log-probs |
+| Candidates T1 V8192 K1024 C256 | 0.0574 | 0.0366 [0.0356/0.0379], .0901 | -36.3% | exact ids/log-probs |
+| Candidates T8 V8192 K1024 C64 | 0.0185 | 0.0162 [0.0160/0.0169], .1085 | -12.3% | exact ids/log-probs |
+| Beam B1 BM4 V32000 K4096 | 1.2039 | 0.7713 [0.7674/0.7852], .0215 | -35.9% | exact token/parent |
+| Beam B4 BM4 V32000 K4096 | 0.9835 | 0.9739 [0.9655/0.9906], .0162 | flat | exact token/parent |
+
+Controlled experiments and decisions:
+
+| Factor | Priority control | Candidate / repeat | Decision |
+|---|---:|---:|---|
+| Packed embedding E8M0 `exp2` -> bit reconstruction, T1/T256 R8192 D1024 | 0.01169 / 0.02205 ms | 0.00959 / 0.02182 ms | Keep; T1 improves 17.9%, T256 is flat, outputs exact. Candidate p20/p80 were 0.00934/0.01032 and 0.02112/0.02263 ms. |
+| LM-head generic spans -> whole 32-value block, top-k T1/T8 | 0.5141 / 2.1984 ms | 0.3558 / 1.2619 ms | Keep; 30.8% / 42.6%. |
+| E8M0 bit reconstruction after whole-block LM-head, top-k T1/T8 | 0.3558 / 1.2619 ms | 0.2618 / 1.2811 ms | Keep for decode-priority T1 and shared paths; T8 movement is within the central bands. |
+| MXFP4 row-fragment specialization, QGEMM M32/M128/M512 | 0.0998 / 0.3611 / 1.3302 ms | first 0.1058 / 0.3524 / 1.3102; repeat 0.1207 / 0.3588 / 1.3193 ms | Reject; M32 regressed and larger shapes were below the 3% keep threshold. Generic compiler CSE already amortizes the scale. |
+| Same row fragment, QFlux M128 | 0.3540 ms | 0.3557; repeat 0.3680 ms | Reject and restore generic decoder. |
+| Bit reconstruction in generic MMA decoder, QGEMM M32/M128/M512 | 0.0999 / 0.3527 / 1.2935 ms | 0.0976 / 0.3531 / 1.3034 ms | Reject; mixed/noisy and M512 regressed. Restore native half `exp2`. |
+| Bit reconstruction in four-column MoE decoder, rect rows32 / SwiGLU rows512 | 0.1089 / 1.9034 ms | repeat 0.1433 / 1.7532 ms | Reject global change: the 7.9% large-SwiGLU win does not justify the repeatable 31.6% decode-shape regression. Restore native half `exp2`. |
+
+Decision: keep the new MXFP4 inference coverage, complete-block QGEMV and
+sequential fused decoders, and exact E8M0 reconstruction in fp32 span/complete-
+block paths. Reject row-fragment specialization and generic MMA/MoE E8M0 bit
+reconstruction. Matrix and MoE paths remain intentionally unchanged.
+
+Open questions: a future matrix-path pass needs a genuinely different MXFP4
+execution strategy rather than more fragment temporaries. The large-row MoE
+SwiGLU bit-decoder result may justify a separately routed prefill kernel only
+if a shape-aware implementation can preserve the small-row decode path.
+
+Raw results:
+
+- Baseline/control/final: `mxfp4-inference-baseline`,
+  `mxfp4-coverage-generic`, and `mxfp4-inference-final` under
+  `perf/results/2026-07-13/`.
+- Retained variants: `mxfp4-coverage-whole-block`,
+  `mxfp4-decode-whole-block-repeat`, `mxfp4-coverage-e8m0-bits`,
+  `mxfp4-e8m0-bits`, `mxfp4-e8m0-bits-repeat`,
+  `mxfp4-embedding-e8m0-bits`, and `mxfp4-embedding-exp2`.
+- Rejected variants: `mxfp4-hotpaths-candidate`,
+  `mxfp4-row-fragment-repeat`, `mxfp4-pre-e8m0-bits`, and
+  `mxfp4-moe-column-exp2-restored`.
+
 ## 2026-07-13: NVFP4 inference decode and output-projection pass
 
 Status: landed; retained implementations have passed focused performance and
@@ -1863,3 +2001,101 @@ Raw results:
   `cross-kernel-attn-decode-partition32/`,
   `cross-kernel-attn-decode-shared32-launch8/`, and
   `cross-kernel-attn-decode-final-route-repeat/`.
+
+## 2026-07-14: MXFP8 inference coverage completion
+
+Status: complete for coverage. This pass instantiates the existing MXFP8
+decoders across packed embedding lookup/bag, decode linear epilogues and
+SwiGLU, LM-head sampling/sparse projection/beam advance, quantized MoE, and
+D64/D128 quantized-KV attention. It is a compatibility and baseline pass, not
+a speedup claim for every newly covered path.
+
+Hypotheses:
+
+- A shared float32 MXFP8 span decoder can preserve the host dequantization
+  oracle for sequential embedding, decode, and sparse LM-head consumers while
+  leaving the existing half-accumulation QGEMV fast path unchanged.
+- LM-head filtering should benefit most because masked and candidate
+  projection avoid materializing the full vocabulary even when MXFP8 decode is
+  added to the fused kernel.
+- The existing MXFP8 MoE column decoder should make the format immediately
+  usable once the Metal template and host layout are instantiated, although
+  its current schedule may not beat resident bf16 weights.
+- MXFP8 quantized-KV attention should reuse the existing single- and
+  multi-warp format abstraction for D64/D128. Its storage saving over the
+  existing FP8-E4M3 layout is only one byte per 32 values, so compatibility is
+  the primary objective.
+
+Environment: MacBook Pro Mac16,5, Apple M4 Max, 40 GPU cores, 128 GB, Metal 4;
+macOS 26.5.1 (25F80); Xcode 26.6 (17F113); Apple Metal 32023.883 / Metal
+toolchain 17.6.109.0; Python 3.12.9; MLX 0.21.1; power mode 0. Working-tree
+label: `3cab797-dirty`.
+
+Measurement method: `perf/bench_kernels.py` with its clock ramp, adaptive
+per-sample batching, and synchronization per sample. The focused MLX quick run
+used 10 warmups and 40 measured samples. The table reports per-call median,
+p20/p80, and coefficient of variation (CV). Each baseline is the fastest
+equivalent resident, predequantized, or existing-kernel control recorded in the
+same result row.
+
+Command:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel quantized_embedding,quantized_embedding_bag,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam,moe_q,attn_q \
+  --formats mxfp8 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-14/mxfp8-coverage-generic
+```
+
+Focused coverage results:
+
+| Kernel / priority shape | Target median [p20,p80], CV ms | Best control ms | Relative | Error / oracle |
+|---|---:|---:|---:|---:|
+| Embedding T1 R8192 D1024 | 0.0118 [0.0107,0.0156], 0.188 | 0.0113 predequantized | 0.96x | exact |
+| Embedding T256 R8192 D1024 | 0.0216 [0.0211,0.0228], 0.150 | 0.0500 predequantized | 2.31x | exact |
+| Embedding bag B128 L8 D1024 | 0.0233 [0.0229,0.0256], 0.097 | 0.1365 predequantized | 5.85x | 1.13e-7 rel |
+| Embedding bag B32 L32 D1024 | 0.0168 [0.0164,0.0214], 0.185 | 0.0894 predequantized | 5.32x | 1.99e-7 rel |
+| Decode epilogue B1 K1536 N4096 | 0.0661 [0.0452,0.0712], 0.218 | 0.0465 expanded matmul | 0.70x | 2.37e-7 rel |
+| Decode SwiGLU B1 K1536 N4096 | 0.0770 [0.0735,0.1205], 0.246 | 0.0723 expanded matmuls | 0.94x | 1.99e-7 rel |
+| LM top-k T1 V32000 K4096 | 0.5073 [0.5008,0.5160], 0.031 | 5.0474 dense top-k | 9.95x | exact ids in tests |
+| LM top-k T8 V32000 K4096 | 2.0743 [2.0415,2.1159], 0.019 | 5.1279 dense top-k | 2.47x | exact ids in tests |
+| LM masked T1 V8192 K1024 L256 | 0.0783 [0.0740,0.1119], 0.196 | 0.1633 full projection | 2.09x | exact |
+| LM masked T8 V8192 K1024 L64 | 0.0548 [0.0534,0.0578], 0.078 | 0.1626 full projection | 2.97x | exact |
+| LM candidates T1 V8192 K1024 C256 | 0.0867 [0.0849,0.0917], 0.074 | 0.1392 gathered dense rows | 1.61x | exact |
+| LM candidates T8 V8192 K1024 C64 | 0.0158 [0.0155,0.0176], 0.157 | 0.1425 gathered dense rows | 9.00x | exact |
+| LM beam B1 BM4 V32000 K4096 | 1.1437 [1.1290,1.1629], 0.016 | 0.9419 resident fp16 | 0.82x | exact token/parent in tests |
+| LM beam B4 BM4 V32000 K4096 | 1.0007 [0.9899,1.0200], 0.017 | 1.1820 packed GEMM + beam | 1.18x | exact token/parent in tests |
+| MoE rect K/N2880, 32 routed rows | 0.1199 [0.1064,0.1457], 0.275 | 0.0590 resident bf16 | 0.49x | benchmark oracle passed |
+| MoE rect K/N2880, 512 routed rows | 0.7135 [0.7051,0.7292], 0.028 | 0.6292 resident bf16 | 0.88x | benchmark oracle passed |
+| MoE SwiGLU H/I2880, 32 routed rows | 0.3045 [0.2651,0.3887], 0.279 | 0.1325 resident bf16 | 0.44x | benchmark oracle passed |
+| MoE SwiGLU H/I2880, 512 routed rows | 3.1456 [3.0944,3.2304], 0.022 | 1.2875 resident bf16 | 0.41x | benchmark oracle passed |
+| Attention B1 H8 N1024 D128 | 0.4811 [0.4743,0.4945], 0.029 | 0.4186 dequantized attention | 0.87x | benchmark oracle passed |
+| Attention multi-warp B1 H8 N1024 D128 | 0.4794 [0.4756,0.5012], 0.036 | 0.4770 single-warp | 0.99x | benchmark oracle passed |
+
+Correctness and validation:
+
+- All 22 numeric and structured rows in the focused performance run completed
+  with status `ok`; the largest reported scalar relative error was 2.37e-7.
+- The affected MLX correctness modules passed 252 tests, including MXFP8
+  lookup/bag, both decode epilogues, LM-head routes, rectangular and SwiGLU
+  MoE, and single-/multi-warp causal and noncausal attention at D64/D128.
+- `scripts/test correctness -q`: 2155 passed.
+- `scripts/test parity -q`: 432 passed.
+- `scripts/test mps -q`: 472 passed.
+- `scripts/test xcode`: test build succeeded.
+
+Decisions and follow-ups:
+
+- Keep every instantiation and host-format addition: the coverage paths are
+  correct, public validation is explicit, and format compatibility is now
+  complete for the requested surfaces.
+- The embedding bag and filtered LM-head paths are already useful wins. Keep
+  the existing row-count routing for beam advance: B4 reaches the packed GEMM
+  path, while the B1 fused MXFP8 route remains an optimization target.
+- Do not claim a speedup for MXFP8 decode, MoE, or quantized-KV attention. The
+  generic float32 decoder, current MoE scheduling, and attention decode/layout
+  are the next hot-path candidates. Multi-warp MXFP8 attention did not improve
+  N1024 D128 and should not be preferred on this evidence alone.
+
+Raw results: `perf/results/2026-07-14/mxfp8-coverage-generic/`.

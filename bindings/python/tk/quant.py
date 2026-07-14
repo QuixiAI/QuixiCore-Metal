@@ -1357,8 +1357,11 @@ def dequantize_kv(packed, format="q8_0"):
 # contraction axis K (matching every upstream weight-quant format), then packed row-wise with
 # the standard QUANT_FORMATS packer. The kernels contract out = A @ dequant(Wq[e])^T via a
 # col-layout register fill + mma_ABt. Formats limited to the instantiated kernel variants.
-MOE_Q_FORMATS = ("mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K")
-_MOE_Q_BLOCK_K = {"mxfp4": 32, "kU4": 128, "fp8_e4m3": 32, "q8_0": 32, "nvfp4": 16, "q4_K": 256}
+MOE_Q_FORMATS = ("mxfp4", "mxfp8", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K")
+_MOE_Q_BLOCK_K = {
+    "mxfp4": 32, "mxfp8": 32, "kU4": 128, "fp8_e4m3": 32,
+    "q8_0": 32, "nvfp4": 16, "q4_K": 256,
+}
 
 
 def quantize_expert_stack(W, format="mxfp4"):
@@ -1366,7 +1369,8 @@ def quantize_expert_stack(W, format="mxfp4"):
 
     Works for both MoE weights: W1 (E, H, 2*inter) -> (E, 2*inter, row_bytes over K=H) and
     W2 (E, inter, H) -> (E, H, row_bytes over K=inter). row_bytes = K/block_k * block_bytes.
-    Requires K % block_k == 0 (mxfp4/fp8_e4m3/q8_0: 32, nvfp4: 16, kU4: 128, q4_K: 256).
+    Requires K % block_k == 0 (mxfp4/mxfp8/fp8_e4m3/q8_0: 32, nvfp4: 16,
+    kU4: 128, q4_K: 256).
     """
     if format not in MOE_Q_FORMATS:
         raise ValueError(f"quantize_expert_stack: format must be one of {MOE_Q_FORMATS}")

@@ -194,6 +194,7 @@ instantiate_quantized_embedding("kU4B8", kU4B8)
 instantiate_quantized_embedding("kU4", kU4)
 instantiate_quantized_embedding("hqq", hqq)
 instantiate_quantized_embedding("fp8_e4m3", fp8_e4m3)
+instantiate_quantized_embedding("mxfp8", mxfp8)
 instantiate_quantized_embedding("nvfp4", nvfp4)
 instantiate_quantized_embedding("mxfp4", mxfp4)
 

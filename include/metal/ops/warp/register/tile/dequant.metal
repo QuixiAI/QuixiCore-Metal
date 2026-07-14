@@ -279,6 +279,20 @@ METAL_FUNC half tk_e2m1_decode(uint nib) {
     const half mag = (nib & 0x6) ? as_type<half>(h) * 16384.0h : ((nib & 1) ? 0.5h : 0.0h);
     return (nib & 0x8) ? -mag : mag;
 }
+
+// E8M0 stores the biased IEEE exponent directly. For codes 1..254, placing
+// the byte in a float exponent field reconstructs 2^(code-127) exactly; code
+// zero is the one subnormal exception (2^-127). Code 255 maps to infinity,
+// matching exp2(128). The half helper preserves the prior half-rounded scale
+// contract without issuing a transcendental exp2 instruction.
+METAL_FUNC float tk_e8m0_decode_f32(uint code) {
+    const uint bits = code == 0 ? 0x00400000u : (code << 23);
+    return as_type<float>(bits);
+}
+
+METAL_FUNC half tk_e8m0_decode(uint code) {
+    return half(tk_e8m0_decode_f32(code));
+}
 // fp8 e5m2 (1-5-2, bias 15): e5m2 IS truncated fp16 — value = as_half(code << 8), a pure bitcast
 // (e5m2 subnormals are genuine fp16 subnormals; constructing the bits directly involves no
 // arithmetic, so FTZ cannot flush the decode itself).
@@ -917,6 +931,16 @@ METAL_FUNC void tk_dequant8_f32<fp8_e4m3>(device const uchar* base, int col0,
 }
 
 template<>
+METAL_FUNC void tk_dequant8_f32<mxfp8>(device const uchar* base, int col0,
+                                      thread float* w) {
+    #pragma clang fp reassociate(off)
+    const float scale = tk_e8m0_decode_f32(base[0]);
+    device const uchar* q = base + 1 + col0;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < 8; ++i) w[i] = scale * float(tk_e4m3_decode(q[i]));
+}
+
+template<>
 METAL_FUNC void tk_dequant8_f32<nvfp4>(device const uchar* base, int col0,
                                       thread float* w) {
     #pragma clang fp reassociate(off)
@@ -933,7 +957,7 @@ template<>
 METAL_FUNC void tk_dequant8_f32<mxfp4>(device const uchar* base, int col0,
                                       thread float* w) {
     #pragma clang fp reassociate(off)
-    const float scale = metal::exp2(float(int(base[0]) - 127));
+    const float scale = tk_e8m0_decode_f32(base[0]);
     const bool hi = col0 >= 16;
     device const uchar* q = base + 1 + (hi ? col0 - 16 : col0);
     #pragma clang loop unroll(full)
@@ -1194,9 +1218,9 @@ METAL_FUNC void dequant_into_shared(threadgroup st<half, BN, BK>& dst,
 }
 
 // A row-layout fragment lane owns adjacent pairs at columns
-// {c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}.  Most formats use the scalar fallback below, but
-// nvfp4's 16-value block maps this pattern onto exactly two scales and four packed bytes.
-// Keep the helper format-gated so another future block_k=16 layout cannot silently inherit it.
+// {c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}. Most formats use the scalar fallback below, but
+// NVFP4 maps the span onto two 16-value blocks. Keep the helper format-gated so another
+// layout cannot silently inherit that mapping.
 template<typename FMT>
 struct tk_dequant_row8_s8 {
     constant static constexpr const bool enabled = false;
@@ -1320,6 +1344,9 @@ template<> struct tk_dequant_cols4_s8<mxfp4> {
     static METAL_FUNC void run(device const uchar* base, int c, thread half* w) {
         // c <= 6, so cols {c, c+8} are low nibbles and {c+16, c+24} the high nibbles of the
         // SAME two bytes qs[c], qs[c+8] — two byte loads + one exp2 cover all four weights.
+        // This span already amortizes scale expansion 4x. The native half exp2
+        // remains faster than float-bit reconstruction plus half conversion at
+        // the priority 32-row MoE decode shape.
         const half d = metal::exp2(half((int)base[0] - 127));
         const uchar b0 = (base + 1)[c], b1 = (base + 1)[c + 8];
         w[0] = d * tk_e2m1_decode(b0 & 0x0F); w[1] = d * tk_e2m1_decode(b1 & 0x0F);

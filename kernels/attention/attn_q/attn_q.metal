@@ -99,6 +99,8 @@ instantiate_attn_q_fmt(q4_0, q4_0, 64)
 instantiate_attn_q_fmt(q4_0, q4_0, 128)
 instantiate_attn_q_fmt(fp8_e4m3, fp8_e4m3, 64)
 instantiate_attn_q_fmt(fp8_e4m3, fp8_e4m3, 128)
+instantiate_attn_q_fmt(mxfp8, mxfp8, 64)
+instantiate_attn_q_fmt(mxfp8, mxfp8, 128)
 
 // ---- multi-warp variant (non-causal): NUM_WARPS simdgroups share each dequantized K/V block.
 // Both K and V are cooperatively dequantized into threadgroup memory (multiwarp already stages
@@ -185,5 +187,7 @@ instantiate_attn_q_mw("attn_q_mw_q4_0_64", q4_0, 64);
 instantiate_attn_q_mw("attn_q_mw_q4_0_128", q4_0, 128);
 instantiate_attn_q_mw("attn_q_mw_fp8_e4m3_64", fp8_e4m3, 64);
 instantiate_attn_q_mw("attn_q_mw_fp8_e4m3_128", fp8_e4m3, 128);
+instantiate_attn_q_mw("attn_q_mw_mxfp8_64", mxfp8, 64);
+instantiate_attn_q_mw("attn_q_mw_mxfp8_128", mxfp8, 128);
 
 }

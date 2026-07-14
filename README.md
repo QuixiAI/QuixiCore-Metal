@@ -104,10 +104,10 @@ application-level runtime:
 | Operation | Public API and contract |
 | --- | --- |
 | Packed embeddings | `quantized_embedding` and `quantized_embedding_bag` gather or reduce GGUF/MX/FP rows directly from packed tables. |
-| Decode projections | `decode_linear_epilogue` and `decode_swiglu` support dense, q4_0, q8_0, q6_K, and NVFP4 weights, fused activations/bias/residuals, and optional output quantization. |
-| Fused output sampling | `lm_head_sample` supports q4_0/q8_0/NVFP4 projection with argmax, categorical, top-k, and top-p modes without materializing logits; q6_K supports fused argmax and categorical modes. |
-| Sparse output projection | `lm_head_masked` consumes packed allow masks; `lm_head_candidates` consumes CSR candidate lists. Both support dense, q4_0, q8_0, q6_K, and NVFP4 weights and return deterministic top-k ids and log-probabilities without materializing full logits. |
-| Quantized beam advance | `lm_head_beam_advance` combines q4_0/q8_0/NVFP4 output projection, exact full-vocabulary normalization, cumulative beam scores, and deterministic parent/token selection. |
+| Decode projections | `decode_linear_epilogue` and `decode_swiglu` support dense, q4_0, q8_0, q6_K, MXFP8, NVFP4, and MXFP4 weights, fused activations/bias/residuals, and optional output quantization. |
+| Fused output sampling | `lm_head_sample` supports q4_0/q8_0/MXFP8/NVFP4/MXFP4 projection with argmax, categorical, top-k, and top-p modes without materializing logits; q6_K supports fused argmax and categorical modes. |
+| Sparse output projection | `lm_head_masked` consumes packed allow masks; `lm_head_candidates` consumes CSR candidate lists. Both support dense, q4_0, q8_0, q6_K, MXFP8, NVFP4, and MXFP4 weights and return deterministic top-k ids and log-probabilities without materializing full logits. |
+| Quantized beam advance | `lm_head_beam_advance` combines q4_0/q8_0/MXFP8/NVFP4/MXFP4 output projection, exact full-vocabulary normalization, cumulative beam scores, and deterministic parent/token selection. |
 | Spatial projection | `space_to_depth_norm_linear` composes block-2/block-4 space-to-depth, LayerNorm, and projection with odd-edge padding. |
 | Pairwise edge MLP | `edge_mlp_256x7` factorizes a fixed 512→256→7 pairwise MLP so the first projection scales with sequence length rather than pair count. |
 | Head-major GQA decode | `attn_decode_bh` consumes preallocated `(B,Hkv,cache_T,D)` caches and partitions long contexts across SIMD groups. |

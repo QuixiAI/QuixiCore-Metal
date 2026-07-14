@@ -976,6 +976,7 @@ kernel void moe_grouped_gemm_swiglu_q(device bf16 *out                 [[buffer(
 instantiate_moe_gemm_q(mxfp4, mxfp4)
 instantiate_moe_gemm_q(kU4, kU4)
 instantiate_moe_gemm_q(fp8_e4m3, fp8_e4m3)
+instantiate_moe_gemm_q(mxfp8, mxfp8)
 instantiate_moe_gemm_q(tq2_0, tq2_0)
 instantiate_moe_gemm_q(q8_0, q8_0)
 instantiate_moe_gemm_q(nvfp4, nvfp4)

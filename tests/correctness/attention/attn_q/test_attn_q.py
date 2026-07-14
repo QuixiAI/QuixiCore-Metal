@@ -1,6 +1,6 @@
 """Quantized-KV attention: softmax(QK^T)·V with K,V dequantized from blocks. Validated against a
 reference attention computed on the *dequantized* K/V (so quant error is isolated from the kernel),
-across q8_0 / q4_0 / fp8_e4m3 and D in {64,128}. Run from kernels/:
+across q8_0 / q4_0 / fp8_e4m3 / mxfp8 and D in {64,128}. Run from kernels/:
     python -m pytest attn_q/correctness/test_attn_q.py -v
 """
 
@@ -19,7 +19,7 @@ def _ref_attn(q, k, v):                                       # (B,H,N,D) fp32, 
     return p @ v
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"])
 @pytest.mark.parametrize("D", [64, 128])
 def test_attn_q(D, fmt):
     B, H, N = 1, 2, 64
@@ -38,7 +38,7 @@ def test_attn_q(D, fmt):
     assert rel < 0.1, f"{fmt} D{D} rel {rel}"
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"])
 @pytest.mark.parametrize("D", [64, 128])
 def test_attn_q_causal(D, fmt):
     B, H, N = 1, 2, 64
@@ -59,7 +59,7 @@ def test_attn_q_causal(D, fmt):
     assert rel < 0.1, f"{fmt} D{D} causal rel {rel}"
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "fp8_e4m3"])
+@pytest.mark.parametrize("fmt", ["q8_0", "fp8_e4m3", "mxfp8"])
 @pytest.mark.parametrize("D", [64, 128])
 def test_attn_q_multiwarp(D, fmt):
     B, H, N = 1, 4, 128                                       # N % (8*4) == 0 for multiwarp
@@ -78,6 +78,6 @@ def test_attn_q_multiwarp(D, fmt):
 
 
 if __name__ == "__main__":
-    for f in ["q8_0", "q4_0", "fp8_e4m3"]:
+    for f in ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"]:
         test_attn_q(64, f); test_attn_q(128, f)
     print("ok")

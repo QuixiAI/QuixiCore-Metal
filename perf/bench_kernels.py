@@ -884,8 +884,8 @@ def attn_q_cases(be, preset, formats):
     tk = be.tk()
     from tk.quant import quantize_kv, dequantize_kv
     rng = np.random.default_rng(14)
-    fmts = formats or _pick(preset, ["q8_0"], ["q8_0", "q4_0", "fp8_e4m3"],
-                            ["q8_0", "q4_0", "fp8_e4m3"])
+    fmts = formats or _pick(preset, ["q8_0"], ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"],
+                            ["q8_0", "q4_0", "fp8_e4m3", "mxfp8"])
     shapes = _pick(preset, [(1, 8, 1024, 128)],
                    [(1, 8, 1024, 128)],
                    [(1, 8, 1024, 64), (1, 8, 2048, 128), (2, 8, 2048, 128)])
@@ -911,7 +911,7 @@ def attn_q_cases(be, preset, formats):
                            tk.attn_q(q_d, kq_d, vq_d, format=f),
                        baselines=baselines, ref=None,
                        flops=4.0 * B * H * N * N * D, weight_bytes=kv_bytes)
-            if fmt in ("q8_0", "fp8_e4m3") and N % 32 == 0:
+            if fmt in ("q8_0", "fp8_e4m3", "mxfp8") and N % 32 == 0:
                 yield Case("attn_q", f"{fmt}_mw_B{B}H{H}N{N}D{D}",
                            {"B": B, "H": H, "N": N, "D": D}, "bf16", fmt=fmt,
                            target=lambda q_d=q_d, kq_d=kq_d, vq_d=vq_d, f=fmt:
@@ -1775,8 +1775,8 @@ def moe_q_cases(be, preset, formats):
     tk = be.tk()
     from tk.quant import quantize_expert_stack
     rng = np.random.default_rng(29)
-    fmts = formats or _pick(preset, ["mxfp4"], ["mxfp4", "q8_0"],
-                            ["mxfp4", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
+    fmts = formats or _pick(preset, ["mxfp4"], ["mxfp4", "mxfp8", "q8_0"],
+                            ["mxfp4", "mxfp8", "kU4", "fp8_e4m3", "q8_0", "nvfp4", "q4_K"])
     # (E, K_dim, N_out, rows): gpt-oss-ish (2880x2880) decode/prefill + a Qwen3-MoE-ish rect.
     shapes = _pick(preset, [(4, 1024, 1024, 32)],
                    [(4, 2880, 2880, 32), (4, 2880, 2880, 512)],
@@ -1806,7 +1806,8 @@ def moe_q_cases(be, preset, formats):
                        flops=2.0 * rows * K_dim * N_out)
         del Wd, W_dense
 
-    # Fused quantized SwiGLU GEMM1, gpt-oss config (swiglu_oai + expert bias), mxfp4.
+    # Fused quantized SwiGLU GEMM1, gpt-oss config (swiglu_oai + expert bias).
+    sw_fmts = ["mxfp4"] if formats is None else [f for f in formats if f in fmts]
     sw_shapes = _pick(preset, [(4, 1024, 512, 32)], [(4, 2880, 2880, 32), (4, 2880, 2880, 512)],
                       [(4, 2880, 2880, 32), (4, 2880, 2880, 512), (4, 2880, 2880, 4096)])
     for E, Hd, inter, rows in sw_shapes:
@@ -1815,22 +1816,25 @@ def moe_q_cases(be, preset, formats):
         A = (0.1 * rng.standard_normal((rows, Hd))).astype(np.float32)
         W1 = (0.1 * rng.standard_normal((E, Hd, 2 * inter))).astype(np.float32)
         bias = (0.1 * rng.standard_normal((E, 2 * inter))).astype(np.float32)
-        W1q = quantize_expert_stack(W1, "mxfp4")
         A_d, eot_d = be.array(A, "bf16"), be.int_array(eot)
-        W1_dense, W1q_d, b_d = be.array(W1, "bf16"), be.raw_array(W1q), be.array(bias, "bf16")
-        bk, bb = BLOCK_INFO["mxfp4"]
-        yield Case("moe_q", f"swiglu_oai_mxfp4_H{Hd}_I{inter}_rows{rows}",
-                   {"E": E, "H": Hd, "inter": inter, "rows": rows}, "bf16", fmt="mxfp4",
-                   target=lambda A_d=A_d, W1q_d=W1q_d, eot_d=eot_d, b_d=b_d:
-                       tk.moe_grouped_gemm_swiglu_q(A_d, W1q_d, eot_d, format="mxfp4",
-                                                    bias=b_d, act="swiglu_oai",
-                                                    alpha=1.702, limit=7.0),
-                   baselines={"dense_bf16_swiglu":
-                              lambda A_d=A_d, W=W1_dense, eot_d=eot_d:
-                                  tk.moe_grouped_gemm_swiglu(A_d, W, eot_d)},
-                   ref=None,
-                   weight_bytes=tiles * 2 * inter * (Hd // bk) * bb,
-                   flops=2.0 * rows * Hd * 2 * inter)
+        W1_dense, b_d = be.array(W1, "bf16"), be.array(bias, "bf16")
+        for fmt in sw_fmts:
+            bk, bb = BLOCK_INFO[fmt]
+            if Hd % bk:
+                continue
+            W1q_d = be.raw_array(quantize_expert_stack(W1, fmt))
+            yield Case("moe_q", f"swiglu_oai_{fmt}_H{Hd}_I{inter}_rows{rows}",
+                       {"E": E, "H": Hd, "inter": inter, "rows": rows}, "bf16", fmt=fmt,
+                       target=lambda A_d=A_d, W1q_d=W1q_d, eot_d=eot_d, b_d=b_d, f=fmt:
+                           tk.moe_grouped_gemm_swiglu_q(A_d, W1q_d, eot_d, format=f,
+                                                        bias=b_d, act="swiglu_oai",
+                                                        alpha=1.702, limit=7.0),
+                       baselines={"dense_bf16_swiglu":
+                                  lambda A_d=A_d, W=W1_dense, eot_d=eot_d:
+                                      tk.moe_grouped_gemm_swiglu(A_d, W, eot_d)},
+                       ref=None,
+                       weight_bytes=tiles * 2 * inter * (Hd // bk) * bb,
+                       flops=2.0 * rows * Hd * 2 * inter)
         del W1, W1_dense
 
 
@@ -2104,7 +2108,7 @@ def lm_head_beam_cases(be, preset, formats):
         h_d = be.array(h, "f16")
         cum_d = be.array(cum, "f32")
         for fmt in fmts:
-            if fmt not in ("q4_0", "q8_0", "nvfp4"):
+            if fmt not in ("q4_0", "q8_0", "mxfp8", "nvfp4", "mxfp4"):
                 continue
             bk, bb = BLOCK_INFO[fmt]
             wq, wdq = _packed_weight(fmt, V, K, seed=225)
@@ -2952,8 +2956,10 @@ def quantized_embedding_bag_cases(be, preset, formats):
         preset, [(1024, 256, 16, 4)],
         [(8192, 1024, 128, 8), (8192, 1024, 32, 32)],
         [(32768, 1536, 256, 8), (32768, 4096, 512, 16)])
-    fmt = "q4_0"
+    fmt = "q4_0" if formats is None else next((f for f in formats if f in BLOCK_INFO), "q4_0")
     for rows, dimension, bags, bag_size in shapes:
+        block_k = BLOCK_INFO[fmt][0]
+        dimension = ((dimension + block_k - 1) // block_k) * block_k
         packed, dequantized = _packed_weight(fmt, rows, dimension, seed=307)
         ids = rng.integers(0, rows, size=bags * bag_size, dtype=np.int32)
         offsets = np.arange(0, ids.size + 1, bag_size, dtype=np.int32)
@@ -2997,7 +3003,7 @@ def decode_linear_epilogue_cases(be, preset, formats):
         bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
         residual = (0.03 * rng.standard_normal((batch, output))).astype(np.float32)
         x_d, bias_d, residual_d = be.array(x), be.array(bias), be.array(residual)
-        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "nvfp4")
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "mxfp8", "nvfp4", "mxfp4")
                           if formats is None or f in formats]
         for fmt in [None, *packed_formats]:
             if fmt is None:
@@ -3036,7 +3042,7 @@ def decode_swiglu_cases(be, preset, formats):
     for batch, hidden, output in shapes:
         x = (0.07 * rng.standard_normal((batch, hidden))).astype(np.float32)
         x_d = be.array(x)
-        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "nvfp4")
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "mxfp8", "nvfp4", "mxfp4")
                           if formats is None or f in formats]
         for fmt in [None, *packed_formats]:
             if fmt is None:
@@ -3086,7 +3092,7 @@ def lm_head_masked_cases(be, preset, formats):
                    [(1, 32768, 1536, 512), (16, 32768, 1536, 128)])
     topk = 4
     fmt = "q4_0" if formats is None else next(
-        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "nvfp4")), "q4_0")
+        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "mxfp8", "nvfp4", "mxfp4")), "q4_0")
     for tokens, vocab, hidden, legal in shapes:
         packed, weight = _packed_weight(fmt, vocab, hidden, seed=331)
         h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
@@ -3134,7 +3140,7 @@ def lm_head_candidates_cases(be, preset, formats):
                    [(16, 32768, 1536, 512)])
     topk = 4
     fmt = "q4_0" if formats is None else next(
-        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "nvfp4")), "q4_0")
+        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "mxfp8", "nvfp4", "mxfp4")), "q4_0")
     for tokens, vocab, hidden, candidates in shapes:
         packed, weight = _packed_weight(fmt, vocab, hidden, seed=337)
         h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)

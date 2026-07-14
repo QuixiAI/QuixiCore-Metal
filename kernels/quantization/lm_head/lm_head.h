@@ -30,7 +30,7 @@ array lm_head_sample(
 
 /**
  *  Fused LM-head + sampling over QUANTIZED weights (dequantized on read). Wq is the packed weight
- *  tensor for format `fmt` (q8_0/q4_0/q6_K/nvfp4), K is the full hidden dim.
+ *  tensor for format `fmt` (q8_0/q4_0/q6_K/mxfp8/nvfp4/mxfp4), K is the full hidden dim.
  *  Returns (T,) int32. h is fp16/bf16/f32; q6_K is fp32-only.
  **/
 array lm_head_sample_q(
@@ -48,7 +48,7 @@ array lm_head_sample_q(
     StreamOrDevice s = {});
 
 /** Quantized LM-head + exact beam-search advance without materializing (B*BM,V)
- *  logits. Wq is q4_0/q8_0/nvfp4 packed (V,K/block_k,block_bytes); h is (B*BM,K),
+ *  logits. Wq is q4_0/q8_0/mxfp8/nvfp4/mxfp4 packed (V,K/block_k,block_bytes); h is (B*BM,K),
  *  cum_log_probs is (B,BM), and BM <= 16. Returns next token, parent beam,
  *  and updated cumulative log-probability, each (B,BM). */
 std::vector<array> lm_head_beam_advance(
@@ -73,7 +73,7 @@ std::vector<array> lm_head_constrained(
     bool forbid_eos = false,
     StreamOrDevice s = {});
 
-/** Fused dense or q4_0/q8_0/q6_K/nvfp4 LM-head projection with a packed
+/** Fused dense or q4_0/q8_0/q6_K/mxfp8/nvfp4/mxfp4 LM-head projection with a packed
  *  allow bitmask. Returns top-k ids and
  *  log-probabilities, both (T, topk).  `normalize_allowed=true` normalizes over
  *  legal tokens; false normalizes over the full vocabulary before masking. */
@@ -87,7 +87,7 @@ std::vector<array> lm_head_masked(
     bool normalize_allowed = true,
     StreamOrDevice s = {});
 
-/** Sparse dense or q4_0/q8_0/q6_K/nvfp4 candidate LM head. `candidate_ids`
+/** Sparse dense or q4_0/q8_0/q6_K/mxfp8/nvfp4/mxfp4 candidate LM head. `candidate_ids`
  *  is flat and `offsets` has T+1
  *  entries. Candidate ids within each row must be unique. */
 std::vector<array> lm_head_candidates(

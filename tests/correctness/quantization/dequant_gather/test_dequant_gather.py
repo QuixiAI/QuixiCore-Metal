@@ -21,6 +21,7 @@ EMBEDDING_FORMATS = {
     "kU4": 128,
     "hqq": 64,
     "fp8_e4m3": 32,
+    "mxfp8": 32,
     "nvfp4": 16,
     "mxfp4": 32,
 }
@@ -74,7 +75,9 @@ def test_quantized_embedding_formats_add_and_invalid_ids(fmt, block_k):
     np.testing.assert_allclose(np.array(got), ref, rtol=3e-6, atol=3e-6)
 
 
-@pytest.mark.parametrize("fmt,columns", [("q4_0", 96), ("q8_0", 96), ("q6_K", 512)])
+@pytest.mark.parametrize("fmt,columns", [
+    ("q4_0", 96), ("q8_0", 96), ("q6_K", 512), ("mxfp8", 96),
+])
 @pytest.mark.parametrize("mode", ["sum", "mean"])
 def test_quantized_embedding_bag_weights_repeats_and_invalid(fmt, columns, mode):
     quantize, dequantize = QUANT_FORMATS[fmt]

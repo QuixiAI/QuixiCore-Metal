@@ -30,6 +30,7 @@ std::pair<int, int> format_layout(const std::string& format) {
   if (format == "kU4") return {128, 68};
   if (format == "hqq") return {64, 36};
   if (format == "fp8_e4m3") return {32, 34};
+  if (format == "mxfp8") return {32, 33};
   if (format == "nvfp4") return {16, 9};
   if (format == "mxfp4") return {32, 17};
   throw std::invalid_argument(

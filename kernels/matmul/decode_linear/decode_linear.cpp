@@ -26,9 +26,11 @@ std::pair<int, int> decode_format_layout(const std::string& format) {
   if (format == "q4_0") return {32, 18};
   if (format == "q8_0") return {32, 34};
   if (format == "q6_K") return {256, 210};
+  if (format == "mxfp8") return {32, 33};
   if (format == "nvfp4") return {16, 9};
+  if (format == "mxfp4") return {32, 17};
   throw std::invalid_argument(
-      "decode_linear_epilogue: format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
+      "decode_linear_epilogue: format must be empty/dense, q4_0, q8_0, q6_K, mxfp8, nvfp4, or mxfp4");
 }
 
 void check_dense(const array& x, const array& weight, const array& bias, const char* name) {

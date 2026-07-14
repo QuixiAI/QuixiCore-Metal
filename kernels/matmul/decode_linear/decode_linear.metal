@@ -270,6 +270,49 @@ specialize_decode_packed_dot_nvfp4(float)
 specialize_decode_packed_dot_nvfp4(half)
 specialize_decode_packed_dot_nvfp4(bf16)
 
+// MXFP4 stores one E8M0 scale and sixteen packed bytes per 32-value block.
+// Consume the complete block per lane so the power-of-two scale expansion and
+// each packed byte are paid once while preserving FP32 dequantization.
+template <typename T>
+METAL_FUNC float decode_packed_dot_mxfp4(
+    device const T *input, device const uchar *weight, long input_base,
+    int output_channel, int in_dim, uint lane) {
+    const int blocks_per_row = in_dim / mxfp4::block_k;
+    const long row_base =
+        (long)output_channel * blocks_per_row * mxfp4::block_bytes;
+    float accumulator = 0.0f;
+    for (int block = int(lane); block < blocks_per_row; block += 32) {
+        device const uchar *base =
+            weight + row_base + (long)block * mxfp4::block_bytes;
+        const float scale = tk_e8m0_decode_f32(base[0]);
+        device const uchar *codes = base + 1;
+        const long x0 = input_base + block * mxfp4::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            const float low =
+                scale * float(tk_e2m1_decode(uint(packed & 0x0f)));
+            const float high =
+                scale * float(tk_e2m1_decode(uint(packed >> 4)));
+            accumulator += float(input[x0 + i]) * low;
+            accumulator += float(input[x0 + i + 16]) * high;
+        }
+    }
+    return metal::simd_sum(accumulator);
+}
+
+#define specialize_decode_packed_dot_mxfp4(T)                              \
+  template <> METAL_FUNC float decode_packed_dot<T, mxfp4>(                 \
+    device const T *input, device const uchar *weight, long input_base,     \
+    int output_channel, int in_dim, uint lane) {                            \
+    return decode_packed_dot_mxfp4<T>(                                      \
+        input, weight, input_base, output_channel, in_dim, lane);           \
+  }
+
+specialize_decode_packed_dot_mxfp4(float)
+specialize_decode_packed_dot_mxfp4(half)
+specialize_decode_packed_dot_mxfp4(bf16)
+
 // Unified dense decode-linear epilogue.  The operation is
 // residual + activation(x @ weight.T + bias), with each optional component
 // controlled by a scalar flag and a single output-dtype rounding at the store.
@@ -445,7 +488,9 @@ kernel void decode_swiglu_packed(
   instantiate_decode_epilogue_packed("q4_0", q4_0, type_name, T)            \
   instantiate_decode_epilogue_packed("q8_0", q8_0, type_name, T)            \
   instantiate_decode_epilogue_packed("q6_K", q6_K, type_name, T)            \
-  instantiate_decode_epilogue_packed("nvfp4", nvfp4, type_name, T)
+  instantiate_decode_epilogue_packed("mxfp8", mxfp8, type_name, T)          \
+  instantiate_decode_epilogue_packed("nvfp4", nvfp4, type_name, T)          \
+  instantiate_decode_epilogue_packed("mxfp4", mxfp4, type_name, T)
 
 instantiate_decode_epilogue_type(float32, float)
 instantiate_decode_epilogue_type(float16, half)

@@ -3,6 +3,8 @@
 #include <cassert>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
+#include <utility>
 
 #include "mlx/backend/common/copy.h"
 #include "mlx/backend/common/utils.h"
@@ -22,13 +24,42 @@
 
 namespace mlx::core {
 
+namespace {
+std::pair<int, int> attn_q_format_layout(const std::string& format) {
+  if (format == "q8_0") return {32, 34};
+  if (format == "q4_0") return {32, 18};
+  if (format == "fp8_e4m3") return {32, 34};
+  if (format == "mxfp8") return {32, 33};
+  throw std::invalid_argument(
+      "attn_q: format must be q8_0, q4_0, fp8_e4m3, or mxfp8");
+}
+} // namespace
+
 array attn_q(const array& q, const array& kq, const array& vq,
              const std::string& format, bool causal, bool multiwarp, StreamOrDevice s) {
-  assert(q.dtype() == bfloat16 && kq.dtype() == uint8 && vq.dtype() == uint8);
-  assert(q.ndim() == 4 && kq.ndim() == 5 && vq.ndim() == 5);
+  const auto [block_k, block_bytes] = attn_q_format_layout(format);
+  if (q.dtype() != bfloat16 || kq.dtype() != uint8 || vq.dtype() != uint8) {
+    throw std::invalid_argument("attn_q: q must be bfloat16 and kq/vq uint8");
+  }
+  if (q.ndim() != 4 || kq.ndim() != 5 || vq.ndim() != 5) {
+    throw std::invalid_argument(
+        "attn_q: q must be (B,H,N,D), kq/vq (B,H,N,D/block_k,block_bytes)");
+  }
   const int D = q.shape(3);
-  assert((D == 64 || D == 128) && q.shape(2) % 8 == 0);
-  (void)D;
+  const int N = q.shape(2);
+  if ((D != 64 && D != 128) || N % 8 != 0 || D % block_k != 0) {
+    throw std::invalid_argument("attn_q: D must be 64 or 128 and N must be divisible by 8");
+  }
+  if (kq.shape() != vq.shape() || kq.shape(0) != q.shape(0) ||
+      kq.shape(1) != q.shape(1) || kq.shape(2) != N ||
+      kq.shape(3) != D / block_k || kq.shape(4) != block_bytes) {
+    throw std::invalid_argument(
+        "attn_q: packed kq/vq shape does not match q and format");
+  }
+  if (multiwarp && (causal || N % 32 != 0)) {
+    throw std::invalid_argument(
+        "attn_q: multiwarp requires non-causal attention and N divisible by 32");
+  }
   return array(q.shape(), bfloat16,
                std::make_shared<AttnQ>(to_stream(s), format, causal, multiwarp), {q, kq, vq});
 }

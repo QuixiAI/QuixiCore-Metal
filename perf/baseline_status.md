@@ -55,6 +55,24 @@ durable decisions are in `perf/optimization_status.md`.
 | Cross-kernel follow-up MPS | `bc90717-dirty` | PyTorch MPS / quick | 10 / 30 | `perf/results/2026-07-13/cross-kernel-final-mps/` |
 | NVFP4 inference baseline | `c880769-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/nvfp4-experiments-baseline/` |
 | NVFP4 inference final | `c880769-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/nvfp4-experiments-final/` |
+| MXFP4 inference baseline | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/mxfp4-inference-baseline/` |
+| MXFP4 generic coverage control | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/mxfp4-coverage-generic/` |
+| MXFP4 inference final | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/mxfp4-inference-final/` |
+
+## 2026-07-14 MXFP8 Coverage Baseline
+
+The compatibility run covers packed embedding lookup/bag, decode epilogues and
+SwiGLU, LM-head sampling/sparse projection/beam advance, rectangular and
+SwiGLU quantized MoE, and single-/multi-warp quantized-KV attention. Per-case
+p20/p80, CV, correctness fields, and equivalent controls are in the JSONL;
+durable decisions are in `perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| MXFP8 inference brainstorm baseline | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-inference-baseline/` |
+| MXFP8 QGEMV repeat | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-qgemv-baseline-repeat/` |
+| MXFP8 inference comprehensive | `3cab797-dirty` | MLX / comprehensive | 10 / 30 | `perf/results/2026-07-14/mxfp8-inference-comprehensive/` |
+| MXFP8 coverage control | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-coverage-generic/` |
 
 ## Migration Tasks
 

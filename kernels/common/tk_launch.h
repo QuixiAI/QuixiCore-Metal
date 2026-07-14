@@ -834,7 +834,7 @@ void launch_moe_route_grouped(Enc& e, typename Enc::in_t logits, typename Enc::i
 // expert stack (E, N_out, K_dim/block_k, block_bytes) — (N, K) orientation, TRANSPOSED vs the
 // dense kernels, contracted as A @ Wq^T. bias is (E, N_out) bf16 (rect) / (E, 2*inter) (swiglu);
 // pass a 1-element dummy with has_bias=0 when absent. fmt selects the [[host_name]] variant
-// (mxfp4 / kU4 / fp8_e4m3 / q8_0 / nvfp4 / q4_K). -----
+// (mxfp4 / mxfp8 / kU4 / fp8_e4m3 / q8_0 / nvfp4 / q4_K). -----
 // rect_q: out@0 A@1 Wq@2(u8) expert_of_tile@3(i32) bias@4 ; rows@5 K_dim@6 N_out@7 has_bias@8 ;
 //         grid (N_out/32, rows/32, 1), 32 thr.
 template <class Enc>

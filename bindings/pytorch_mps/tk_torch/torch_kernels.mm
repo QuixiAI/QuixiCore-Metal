@@ -2577,16 +2577,33 @@ static std::tuple<at::Tensor, at::Tensor> moe_route_grouped_mps(
 // Quantized grouped expert GEMMs: Wq is the packed (E, N_out, row_bytes) uint8 expert stack
 // (quant groups along K — tk.quant.quantize_expert_stack layout), contracted as A @ Wq^T.
 // bias: pass a 1-element dummy with has_bias=false when absent. bf16 activations only.
+static std::tuple<int, int> moe_q_layout(const std::string& format) {
+  if (format == "mxfp4") return {32, 17};
+  if (format == "mxfp8") return {32, 33};
+  if (format == "fp8_e4m3" || format == "q8_0") return {32, 34};
+  if (format == "nvfp4") return {16, 9};
+  if (format == "kU4") return {128, 68};
+  if (format == "q4_K") return {256, 144};
+  if (format == "tq2_0") return {256, 66};
+  TORCH_CHECK(false, "quantized MoE: unsupported format ", format);
+  return {0, 0};
+}
+
 static at::Tensor moe_grouped_gemm_rect_q_mps(const at::Tensor& A_in, const at::Tensor& Wq_in,
                                               const at::Tensor& eot_in, const at::Tensor& bias_in,
                                               bool has_bias, const std::string& format) {
   TORCH_CHECK(A_in.device().is_mps() && A_in.scalar_type() == at::kBFloat16,
               "moe_grouped_gemm_rect_q: A must be a bfloat16 MPS tensor");
-  TORCH_CHECK(A_in.dim() == 2 && Wq_in.dim() == 3 && Wq_in.scalar_type() == at::kByte,
+  TORCH_CHECK(Wq_in.device().is_mps() && eot_in.device().is_mps() &&
+              A_in.dim() == 2 && Wq_in.dim() == 3 && Wq_in.scalar_type() == at::kByte,
               "moe_grouped_gemm_rect_q: A (rows,K), Wq (E,N_out,row_bytes) uint8");
+  const auto [block_k, block_bytes] = moe_q_layout(format);
   const int total_rows = A_in.size(0), K_dim = A_in.size(1), N_out = Wq_in.size(1);
-  TORCH_CHECK(total_rows % 32 == 0 && K_dim % 32 == 0 && N_out % 32 == 0,
-              "moe_grouped_gemm_rect_q: rows%32, K%32, N%32");
+  TORCH_CHECK(total_rows % 32 == 0 && K_dim % 32 == 0 && K_dim % block_k == 0 &&
+              N_out % 32 == 0 && Wq_in.size(2) == (K_dim / block_k) * block_bytes,
+              "moe_grouped_gemm_rect_q: rows%32, K%32, K%block_k, N%32, and packed row_bytes");
+  TORCH_CHECK(eot_in.dim() == 1 && eot_in.size(0) == total_rows / 32,
+              "moe_grouped_gemm_rect_q: expert_of_tile must be (rows/32,)");
   if (has_bias) {
     TORCH_CHECK(bias_in.dim() == 2 && bias_in.size(0) == Wq_in.size(0) &&
                 bias_in.size(1) == N_out, "moe_grouped_gemm_rect_q: bias must be (E, N_out)");
@@ -2608,13 +2625,18 @@ static at::Tensor moe_grouped_gemm_swiglu_q_mps(const at::Tensor& A_in, const at
                                                 double limit, const std::string& format) {
   TORCH_CHECK(A_in.device().is_mps() && A_in.scalar_type() == at::kBFloat16,
               "moe_grouped_gemm_swiglu_q: A must be a bfloat16 MPS tensor");
-  TORCH_CHECK(A_in.dim() == 2 && W1q_in.dim() == 3 && W1q_in.scalar_type() == at::kByte,
+  TORCH_CHECK(W1q_in.device().is_mps() && eot_in.device().is_mps() &&
+              A_in.dim() == 2 && W1q_in.dim() == 3 && W1q_in.scalar_type() == at::kByte,
               "moe_grouped_gemm_swiglu_q: A (rows,H), W1q (E,2*inter,row_bytes) uint8");
+  const auto [block_k, block_bytes] = moe_q_layout(format);
   const int total_rows = A_in.size(0), H = A_in.size(1);
   TORCH_CHECK(W1q_in.size(1) % 2 == 0, "moe_grouped_gemm_swiglu_q: W1q dim 1 must be 2*inter");
   const int inter = W1q_in.size(1) / 2;
-  TORCH_CHECK(total_rows % 32 == 0 && H % 32 == 0 && inter % 32 == 0,
-              "moe_grouped_gemm_swiglu_q: rows%32, H%32, inter%32");
+  TORCH_CHECK(total_rows % 32 == 0 && H % 32 == 0 && H % block_k == 0 &&
+              inter % 32 == 0 && W1q_in.size(2) == (H / block_k) * block_bytes,
+              "moe_grouped_gemm_swiglu_q: rows%32, H%32, H%block_k, inter%32, and packed row_bytes");
+  TORCH_CHECK(eot_in.dim() == 1 && eot_in.size(0) == total_rows / 32,
+              "moe_grouped_gemm_swiglu_q: expert_of_tile must be (rows/32,)");
   if (has_bias) {
     TORCH_CHECK(bias_in.dim() == 2 && bias_in.size(0) == W1q_in.size(0) &&
                 bias_in.size(1) == 2 * inter,
@@ -3785,7 +3807,7 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
   return out;
 }
 
-// Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/nvfp4 weights (dequantized on read).
+// Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/mxfp8/nvfp4/mxfp4 weights.
 static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
                                        const at::Tensor& bias_in, int64_t V, int64_t K,
                                        const std::string& fmt, int64_t mode, int64_t topk,
@@ -3800,14 +3822,16 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   int block_k = 0, block_bytes = 0;
   if (fmt == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (fmt == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (fmt == "mxfp8") { block_k = 32; block_bytes = 33; }
   else if (fmt == "nvfp4") { block_k = 16; block_bytes = 9; }
+  else if (fmt == "mxfp4") { block_k = 32; block_bytes = 17; }
   else if (fmt == "q6_K") {
     block_k = 256; block_bytes = 210;
     TORCH_CHECK(h_in.scalar_type() == at::kFloat && mode <= 1,
                 "lm_head_sample_q: q6_K requires fp32 h and argmax/categorical mode");
   } else {
     TORCH_CHECK(false,
-                "lm_head_sample_q: format must be q8_0, q4_0, q6_K, or nvfp4");
+                "lm_head_sample_q: format must be q8_0, q4_0, q6_K, mxfp8, nvfp4, or mxfp4");
   }
   TORCH_CHECK(K % block_k == 0 && Wq_in.scalar_type() == at::kByte && Wq_in.dim() == 3 &&
               Wq_in.size(0) == V && Wq_in.size(1) == K / block_k &&
@@ -3882,9 +3906,11 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> lm_head_beam_advance_mps(
   int block_k = 0, block_bytes = 0;
   if (fmt == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (fmt == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (fmt == "mxfp8") { block_k = 32; block_bytes = 33; }
   else if (fmt == "nvfp4") { block_k = 16; block_bytes = 9; }
+  else if (fmt == "mxfp4") { block_k = 32; block_bytes = 17; }
   else TORCH_CHECK(false,
-                   "lm_head_beam_advance: format must be q4_0, q8_0, or nvfp4");
+                   "lm_head_beam_advance: format must be q4_0, q8_0, mxfp8, nvfp4, or mxfp4");
   TORCH_CHECK(beam_width >= 1 && beam_width <= 16,
               "lm_head_beam_advance: beam_width must be in [1,16]");
   const int rows = static_cast<int>(h_in.size(0));
@@ -4495,15 +4521,29 @@ static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in
 
 static at::Tensor attn_q_mps(const at::Tensor& q_in, const at::Tensor& kq_in,
                              const at::Tensor& vq_in, const std::string& format, bool causal, bool multiwarp) {
-  TORCH_CHECK(q_in.device().is_mps(), "attn_q: q must be an MPS tensor");
+  TORCH_CHECK(q_in.device().is_mps() && kq_in.device().is_mps() && vq_in.device().is_mps(),
+              "attn_q: q, kq, and vq must be MPS tensors");
   TORCH_CHECK(q_in.scalar_type() == at::kBFloat16, "attn_q: q must be bfloat16");
   TORCH_CHECK(kq_in.scalar_type() == at::kByte && vq_in.scalar_type() == at::kByte,
               "attn_q: kq, vq must be uint8 packed blocks");
+  int block_k = 0, block_bytes = 0;
+  if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "fp8_e4m3") { block_k = 32; block_bytes = 34; }
+  else if (format == "mxfp8") { block_k = 32; block_bytes = 33; }
+  else TORCH_CHECK(false, "attn_q: format must be q8_0, q4_0, fp8_e4m3, or mxfp8");
   auto q = q_in.contiguous(), kq = kq_in.contiguous(), vq = vq_in.contiguous();
-  TORCH_CHECK(q.dim() == 4 && kq.dim() == 5, "attn_q: q (B,H,N,D), kq (B,H,N,D/bk,bytes)");
+  TORCH_CHECK(q.dim() == 4 && kq.dim() == 5 && vq.dim() == 5,
+              "attn_q: q (B,H,N,D), kq/vq (B,H,N,D/bk,bytes)");
   const int B = q.size(0), H = q.size(1), D = q.size(3);
   const unsigned N = static_cast<unsigned>(q.size(2));
-  TORCH_CHECK((D == 64 || D == 128) && N % 8 == 0, "attn_q: D in {64,128}, N%8==0");
+  TORCH_CHECK((D == 64 || D == 128) && N % 8 == 0 && D % block_k == 0,
+              "attn_q: D in {64,128}, N%8==0");
+  TORCH_CHECK(kq.sizes() == vq.sizes() && kq.size(0) == B && kq.size(1) == H &&
+              kq.size(2) == N && kq.size(3) == D / block_k && kq.size(4) == block_bytes,
+              "attn_q: packed kq/vq shape does not match q and format");
+  TORCH_CHECK(!multiwarp || (!causal && N % 32 == 0),
+              "attn_q: multiwarp requires non-causal attention and N%32==0");
   auto out = at::empty_like(q);
   tk_encode([&](TorchEncoder& e) { tk::launch_attn_q(e, q, kq, vq, out, N, H, B, D, format, causal, multiwarp); });
   return out;
@@ -4950,10 +4990,12 @@ static int check_decode_epilogue_weight(
   if (format == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else if (format == "mxfp8") { block_k = 32; block_bytes = 33; }
   else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
+  else if (format == "mxfp4") { block_k = 32; block_bytes = 17; }
   else {
     TORCH_CHECK(false,
-                name, ": format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
+                name, ": format must be empty/dense, q4_0, q8_0, q6_K, mxfp8, nvfp4, or mxfp4");
   }
   TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
               weight.size(0) > 0 && K % block_k == 0 &&
@@ -5062,6 +5104,7 @@ static std::tuple<int, int> quantized_embedding_layout(const std::string& format
   if (format == "kU4") return {128, 68};
   if (format == "hqq") return {64, 36};
   if (format == "fp8_e4m3") return {32, 34};
+  if (format == "mxfp8") return {32, 33};
   if (format == "nvfp4") return {16, 9};
   if (format == "mxfp4") return {32, 17};
   TORCH_CHECK(false, "quantized_embedding: unsupported packed format '", format, "'");
@@ -5196,10 +5239,12 @@ static int check_masked_lm_weight(
   if (format == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else if (format == "mxfp8") { block_k = 32; block_bytes = 33; }
   else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
+  else if (format == "mxfp4") { block_k = 32; block_bytes = 17; }
   else {
     TORCH_CHECK(false,
-                name, ": format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
+                name, ": format must be empty/dense, q4_0, q8_0, q6_K, mxfp8, nvfp4, or mxfp4");
   }
   TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
               weight.size(0) > 0 && K % block_k == 0 &&

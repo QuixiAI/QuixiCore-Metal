@@ -3,6 +3,7 @@
 #include <stdexcept>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "mlx/backend/common/copy.h"
@@ -458,21 +459,24 @@ array moe_grouped_gemm_swiglu(
 // --------------------- quantized grouped GEMMs ---------------------
 
 namespace {
-// Instantiated [[host_name]] format variants and their quant-group sizes (contraction axis).
+// Instantiated [[host_name]] format variants and their packed layouts (contraction axis).
 // Must stay in sync with instantiate_moe_gemm_q in moe.metal and the structs in dequant.metal.
-int tk_moe_q_block_k(const std::string& f) {
-  if (f == "mxfp4" || f == "fp8_e4m3" || f == "q8_0") return 32;
-  if (f == "nvfp4") return 16;
-  if (f == "kU4") return 128;
-  if (f == "q4_K" || f == "tq2_0") return 256;
-  return -1;
+std::pair<int, int> tk_moe_q_layout(const std::string& f) {
+  if (f == "mxfp4") return {32, 17};
+  if (f == "mxfp8") return {32, 33};
+  if (f == "fp8_e4m3" || f == "q8_0") return {32, 34};
+  if (f == "nvfp4") return {16, 9};
+  if (f == "kU4") return {128, 68};
+  if (f == "q4_K") return {256, 144};
+  if (f == "tq2_0") return {256, 66};
+  return {-1, -1};
 }
 } // namespace
 
 array moe_grouped_gemm_rect_q(
     const array& A, const array& Wq, const array& expert_of_tile, const array& bias,
     bool has_bias, int K_dim, int N_out, const std::string& format, StreamOrDevice s) {
-  const int block_k = tk_moe_q_block_k(format);
+  const auto [block_k, block_bytes] = tk_moe_q_layout(format);
   if (block_k < 0) {
     throw std::invalid_argument("moe_grouped_gemm_rect_q: unsupported format " + format);
   }
@@ -487,6 +491,10 @@ array moe_grouped_gemm_rect_q(
   if (total_rows % 32 != 0 || K_dim % 32 != 0 || K_dim % block_k != 0 || N_out % 32 != 0) {
     throw std::invalid_argument(
         "moe_grouped_gemm_rect_q: total_rows%32, K_dim%32, K_dim%block_k, N_out%32 required");
+  }
+  if (Wq.shape(2) != (K_dim / block_k) * block_bytes) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_rect_q: Wq row_bytes does not match K_dim/format");
   }
   if (A.dtype() != bfloat16 || Wq.dtype() != uint8) {
     throw std::invalid_argument("moe_grouped_gemm_rect_q: A must be bfloat16, Wq uint8");
@@ -510,7 +518,7 @@ array moe_grouped_gemm_swiglu_q(
     const array& A, const array& W1q, const array& expert_of_tile, const array& bias,
     bool has_bias, int inter, int act_mode, float alpha, float limit,
     const std::string& format, StreamOrDevice s) {
-  const int block_k = tk_moe_q_block_k(format);
+  const auto [block_k, block_bytes] = tk_moe_q_layout(format);
   if (block_k < 0) {
     throw std::invalid_argument("moe_grouped_gemm_swiglu_q: unsupported format " + format);
   }
@@ -525,6 +533,10 @@ array moe_grouped_gemm_swiglu_q(
   if (total_rows % 32 != 0 || H % 32 != 0 || H % block_k != 0 || inter % 32 != 0) {
     throw std::invalid_argument(
         "moe_grouped_gemm_swiglu_q: total_rows%32, H%32, H%block_k, inter%32 required");
+  }
+  if (W1q.shape(2) != (H / block_k) * block_bytes) {
+    throw std::invalid_argument(
+        "moe_grouped_gemm_swiglu_q: W1q row_bytes does not match H/format");
   }
   if (A.dtype() != bfloat16 || W1q.dtype() != uint8) {
     throw std::invalid_argument("moe_grouped_gemm_swiglu_q: A must be bfloat16, W1q uint8");

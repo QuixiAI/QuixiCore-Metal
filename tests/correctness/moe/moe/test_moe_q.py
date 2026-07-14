@@ -71,7 +71,7 @@ def test_rect_q(format, with_bias):
     np.testing.assert_allclose(got[mask], ref[mask], atol=6e-2, rtol=6e-2)
 
 
-@pytest.mark.parametrize("format", ["mxfp4", "q8_0"])
+@pytest.mark.parametrize("format", ["mxfp4", "mxfp8", "q8_0"])
 @pytest.mark.parametrize("act", ["swiglu", "swiglu_oai"])
 def test_swiglu_q(format, act):
     rng = np.random.default_rng(1)

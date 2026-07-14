@@ -87,7 +87,8 @@ array moe_grouped_gemm_swiglu(
  *  over (N_out, K_dim) with quant groups along K_dim (tk.quant.quantize_expert_stack layout;
  *  row_bytes = K_dim/block_k * block_bytes). bias (E, N_out) bfloat16 added per output column
  *  when has_bias (pass a 1-element dummy otherwise). total_rows % 32 == 0, K_dim % 32 == 0
- *  (and % block_k), N_out % 32 == 0. format in {mxfp4,kU4,fp8_e4m3,q8_0,nvfp4,q4_K}. **/
+ *  (and % block_k), N_out % 32 == 0. format in
+ *  {mxfp4,mxfp8,kU4,fp8_e4m3,q8_0,nvfp4,q4_K}. **/
 array moe_grouped_gemm_rect_q(
     const array& A, const array& Wq, const array& expert_of_tile, const array& bias,
     bool has_bias, int K_dim, int N_out, const std::string& format, StreamOrDevice s = {});

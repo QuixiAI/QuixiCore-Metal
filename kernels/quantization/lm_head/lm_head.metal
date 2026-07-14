@@ -115,6 +115,42 @@ specialize_lmh_sampler_nvfp4(float)
 specialize_lmh_sampler_nvfp4(half)
 specialize_lmh_sampler_nvfp4(bf16)
 
+// MXFP4's 32 values share one E8M0 scale. Decode all sixteen packed
+// bytes together so the sampler expands that scale once per block. The
+// scale/code product remains half-rounded to match mxfp4::dequant.
+template <typename T>
+METAL_FUNC float lmh_sampler_quant_dot_mxfp4(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / mxfp4::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base =
+            wrow + (long)block * mxfp4::block_bytes;
+        const half scale = tk_e8m0_decode(base[0]);
+        device const uchar *codes = base + 1;
+        const int input_base = block * mxfp4::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            const half low = scale * tk_e2m1_decode(uint(packed & 0x0f));
+            const half high = scale * tk_e2m1_decode(uint(packed >> 4));
+            result += float(low) * float(hrow[input_base + i]);
+            result += float(high) * float(hrow[input_base + i + 16]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_sampler_mxfp4(T)                                  \
+  template <> METAL_FUNC float lmh_sampler_quant_dot<mxfp4, T>(           \
+    device const T *hrow, device const uchar *wrow, int K) {              \
+    return lmh_sampler_quant_dot_mxfp4<T>(hrow, wrow, K);                  \
+  }
+
+specialize_lmh_sampler_mxfp4(float)
+specialize_lmh_sampler_mxfp4(half)
+specialize_lmh_sampler_mxfp4(bf16)
+
 // emit functor for the Family-B masked_topk_local merge in the top-k/top-p partials kernels: writes
 // each round's winner into the per-tile (part_val, part_id) partials on lane 0 (-1 id for an empty
 // round). Shared by lm_head_topk_partials / lm_head_topk_partials_q / lm_head_topp_partials_q.
@@ -258,9 +294,15 @@ instantiate_lm_head_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_q("mxfp8_float32", mxfp8, float)
+instantiate_lm_head_q("mxfp8_float16", mxfp8, half)
+instantiate_lm_head_q("mxfp8_bfloat16", mxfp8, bf16)
 instantiate_lm_head_q("nvfp4_float32", nvfp4, float)
 instantiate_lm_head_q("nvfp4_float16", nvfp4, half)
 instantiate_lm_head_q("nvfp4_bfloat16", nvfp4, bf16)
+instantiate_lm_head_q("mxfp4_float32", mxfp4, float)
+instantiate_lm_head_q("mxfp4_float16", mxfp4, half)
+instantiate_lm_head_q("mxfp4_bfloat16", mxfp4, bf16)
 
 // Q6_K f32 specialization. Unlike the generic quantized LM head, this keeps
 // the exact GGUF dequant product in fp32 instead of first
@@ -589,9 +631,15 @@ instantiate_lm_head_topk_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_topk_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_topk_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_topk_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_topk_q("mxfp8_float32", mxfp8, float)
+instantiate_lm_head_topk_q("mxfp8_float16", mxfp8, half)
+instantiate_lm_head_topk_q("mxfp8_bfloat16", mxfp8, bf16)
 instantiate_lm_head_topk_q("nvfp4_float32", nvfp4, float)
 instantiate_lm_head_topk_q("nvfp4_float16", nvfp4, half)
 instantiate_lm_head_topk_q("nvfp4_bfloat16", nvfp4, bf16)
+instantiate_lm_head_topk_q("mxfp4_float32", mxfp4, float)
+instantiate_lm_head_topk_q("mxfp4_float16", mxfp4, half)
+instantiate_lm_head_topk_q("mxfp4_bfloat16", mxfp4, bf16)
 
 // Quantized top-p partials: identical top-k selection to lm_head_topk_partials_q, but ALSO emits a
 // per-tile tempered log-sum-exp (part_lse) over EVERY dequantized logit in the tile (not just the
@@ -673,9 +721,15 @@ instantiate_lm_head_topp_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_topp_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_topp_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_topp_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_topp_q("mxfp8_float32", mxfp8, float)
+instantiate_lm_head_topp_q("mxfp8_float16", mxfp8, half)
+instantiate_lm_head_topp_q("mxfp8_bfloat16", mxfp8, bf16)
 instantiate_lm_head_topp_q("nvfp4_float32", nvfp4, float)
 instantiate_lm_head_topp_q("nvfp4_float16", nvfp4, half)
 instantiate_lm_head_topp_q("nvfp4_bfloat16", nvfp4, bf16)
+instantiate_lm_head_topp_q("mxfp4_float32", mxfp4, float)
+instantiate_lm_head_topp_q("mxfp4_float16", mxfp4, half)
+instantiate_lm_head_topp_q("mxfp4_bfloat16", mxfp4, bf16)
 
 #define instantiate_lm_head(type_name, T)                                          \
   template [[host_name("lm_head_argcat_partials_" #type_name)]] [[kernel]] void     \
@@ -939,6 +993,43 @@ METAL_FUNC float lmh_quant_dot_nvfp4_f32(
 specialize_lmh_quant_dot_nvfp4(float)
 specialize_lmh_quant_dot_nvfp4(half)
 specialize_lmh_quant_dot_nvfp4(bf16)
+
+// FP32-dequant MXFP4 companion for masked and candidate projection. One pass
+// expands the E8M0 scale once and consumes both nibbles of each packed byte.
+template <typename T>
+METAL_FUNC float lmh_quant_dot_mxfp4_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / mxfp4::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base =
+            wrow + (long)block * mxfp4::block_bytes;
+        const float scale = tk_e8m0_decode_f32(base[0]);
+        device const uchar *codes = base + 1;
+        const int input_base = block * mxfp4::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 16; ++i) {
+            const uchar packed = codes[i];
+            const float low =
+                scale * float(tk_e2m1_decode(uint(packed & 0x0f)));
+            const float high =
+                scale * float(tk_e2m1_decode(uint(packed >> 4)));
+            result += low * float(hrow[input_base + i]);
+            result += high * float(hrow[input_base + i + 16]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_quant_dot_mxfp4(T)                                  \
+  template <> METAL_FUNC float lmh_quant_dot_f32<mxfp4, T>(                 \
+    device const T *hrow, device const uchar *wrow, int K) {                \
+    return lmh_quant_dot_mxfp4_f32<T>(hrow, wrow, K);                        \
+  }
+
+specialize_lmh_quant_dot_mxfp4(float)
+specialize_lmh_quant_dot_mxfp4(half)
+specialize_lmh_quant_dot_mxfp4(bf16)
 
 METAL_FUNC void lmh_lse_update(float value, thread float &maximum,
                                thread float &sum) {
@@ -1276,7 +1367,9 @@ kernel void lm_head_candidates_q(
   instantiate_lm_head_masked_q("q4_0", q4_0, type_name, T)                  \
   instantiate_lm_head_masked_q("q8_0", q8_0, type_name, T)                  \
   instantiate_lm_head_masked_q("q6_K", q6_K, type_name, T)                  \
-  instantiate_lm_head_masked_q("nvfp4", nvfp4, type_name, T)
+  instantiate_lm_head_masked_q("mxfp8", mxfp8, type_name, T)                \
+  instantiate_lm_head_masked_q("nvfp4", nvfp4, type_name, T)                \
+  instantiate_lm_head_masked_q("mxfp4", mxfp4, type_name, T)
 
 instantiate_lm_head_masked_type(float32, float)
 instantiate_lm_head_masked_type(float16, half)
