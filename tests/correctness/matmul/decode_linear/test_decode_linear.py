@@ -152,7 +152,7 @@ def test_decode_linear_epilogue_dense(activation, use_bias, use_residual, use_ke
     np.testing.assert_allclose(np.array(got), ref, rtol=4e-4, atol=4e-4)
 
 
-@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "q6_K"])
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "q6_K", "nvfp4"])
 @pytest.mark.parametrize("activation", ["none", "gelu", "silu"])
 def test_decode_linear_epilogue_packed(fmt, activation):
     quantize, dequantize = QUANT_FORMATS[fmt]
@@ -173,7 +173,7 @@ def test_decode_linear_epilogue_packed(fmt, activation):
 
 @pytest.mark.parametrize("fmt,use_kernel", [
     (None, None), (None, False), (None, True),
-    ("q4_0", True), ("q8_0", True), ("q6_K", True)])
+    ("q4_0", True), ("q8_0", True), ("q6_K", True), ("nvfp4", True)])
 def test_decode_swiglu_dense_and_packed(fmt, use_kernel):
     rng = np.random.default_rng(151 + (0 if fmt is None else len(fmt)))
     B, K, N = 2, 512, 33

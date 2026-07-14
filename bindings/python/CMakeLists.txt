@@ -168,6 +168,13 @@ set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/vision/edge_mlp/edge_mlp.metal"
     "${KERNELS_ROOT}/vision/patch_merge/patch_merge.metal")
 
+# mlx_build_metallib only tracks explicitly listed dependencies. Every kernel
+# includes tk.metal, so header-only kernel changes must also invalidate the
+# generated library; otherwise incremental builds can silently benchmark stale
+# Metal code.
+file(GLOB_RECURSE METAL_HEADER_DEPS CONFIGURE_DEPENDS
+    "${METAL_INCLUDE_ROOT}/*.metal")
+
 find_package(MLX CONFIG REQUIRED)
 find_package(
   Python 3.8
@@ -201,6 +208,8 @@ if(MLX_BUILD_METAL)
     "${METAL_INCLUDE_ROOT}"
     "${KERNELS_ROOT}/common"
     ${MLX_INCLUDE_DIRS}
+    DEPS
+    ${METAL_HEADER_DEPS}
     OUTPUT_DIRECTORY
     ${CMAKE_LIBRARY_OUTPUT_DIRECTORY})
 

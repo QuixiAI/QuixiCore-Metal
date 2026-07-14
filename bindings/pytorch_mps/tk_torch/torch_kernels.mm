@@ -3785,7 +3785,7 @@ static at::Tensor lm_head_sample_mps(const at::Tensor& h_in, const at::Tensor& W
   return out;
 }
 
-// Fused LM-head + sampling over quantized q8_0/q4_0/q6_K weights (dequantized on read).
+// Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/nvfp4 weights (dequantized on read).
 static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor& Wq_in,
                                        const at::Tensor& bias_in, int64_t V, int64_t K,
                                        const std::string& fmt, int64_t mode, int64_t topk,
@@ -3800,12 +3800,14 @@ static at::Tensor lm_head_sample_q_mps(const at::Tensor& h_in, const at::Tensor&
   int block_k = 0, block_bytes = 0;
   if (fmt == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (fmt == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (fmt == "nvfp4") { block_k = 16; block_bytes = 9; }
   else if (fmt == "q6_K") {
     block_k = 256; block_bytes = 210;
     TORCH_CHECK(h_in.scalar_type() == at::kFloat && mode <= 1,
                 "lm_head_sample_q: q6_K requires fp32 h and argmax/categorical mode");
   } else {
-    TORCH_CHECK(false, "lm_head_sample_q: format must be q8_0, q4_0, or q6_K");
+    TORCH_CHECK(false,
+                "lm_head_sample_q: format must be q8_0, q4_0, q6_K, or nvfp4");
   }
   TORCH_CHECK(K % block_k == 0 && Wq_in.scalar_type() == at::kByte && Wq_in.dim() == 3 &&
               Wq_in.size(0) == V && Wq_in.size(1) == K / block_k &&
@@ -3877,18 +3879,20 @@ static std::tuple<at::Tensor, at::Tensor, at::Tensor> lm_head_beam_advance_mps(
               "lm_head_beam_advance: inputs must be MPS and h floating point");
   TORCH_CHECK(h_in.dim() == 2 && h_in.size(0) > 0 && h_in.size(1) > 0,
               "lm_head_beam_advance: h must be non-empty (B*BM,K)");
-  int block_bytes = 0;
-  if (fmt == "q4_0") block_bytes = 18;
-  else if (fmt == "q8_0") block_bytes = 34;
-  else TORCH_CHECK(false, "lm_head_beam_advance: format must be q4_0 or q8_0");
+  int block_k = 0, block_bytes = 0;
+  if (fmt == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (fmt == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (fmt == "nvfp4") { block_k = 16; block_bytes = 9; }
+  else TORCH_CHECK(false,
+                   "lm_head_beam_advance: format must be q4_0, q8_0, or nvfp4");
   TORCH_CHECK(beam_width >= 1 && beam_width <= 16,
               "lm_head_beam_advance: beam_width must be in [1,16]");
   const int rows = static_cast<int>(h_in.size(0));
   const int hidden = static_cast<int>(h_in.size(1));
-  TORCH_CHECK(hidden % 32 == 0 && Wq_in.scalar_type() == at::kByte &&
+  TORCH_CHECK(hidden % block_k == 0 && Wq_in.scalar_type() == at::kByte &&
                   Wq_in.dim() == 3 && Wq_in.size(0) > 0 &&
-                  Wq_in.size(1) == hidden / 32 && Wq_in.size(2) == block_bytes,
-              "lm_head_beam_advance: packed W must be uint8 (V,K/32,block_bytes)");
+                  Wq_in.size(1) == hidden / block_k && Wq_in.size(2) == block_bytes,
+              "lm_head_beam_advance: packed W has invalid shape for its format");
   TORCH_CHECK(cum_in.dim() == 2 && cum_in.size(1) == beam_width &&
                   rows == cum_in.size(0) * beam_width,
               "lm_head_beam_advance: cum_log_probs must be (B,BM), h rows B*BM");
@@ -4946,9 +4950,10 @@ static int check_decode_epilogue_weight(
   if (format == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
   else {
     TORCH_CHECK(false,
-                name, ": format must be empty/dense, q4_0, q8_0, or q6_K");
+                name, ": format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
   }
   TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
               weight.size(0) > 0 && K % block_k == 0 &&
@@ -5191,9 +5196,10 @@ static int check_masked_lm_weight(
   if (format == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
   else {
     TORCH_CHECK(false,
-                name, ": format must be empty/dense, q4_0, q8_0, or q6_K");
+                name, ": format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
   }
   TORCH_CHECK(weight.scalar_type() == at::kByte && weight.dim() == 3 &&
               weight.size(0) > 0 && K % block_k == 0 &&

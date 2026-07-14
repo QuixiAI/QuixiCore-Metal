@@ -230,6 +230,46 @@ specialize_decode_packed_dot_q4(float)
 specialize_decode_packed_dot_q4(half)
 specialize_decode_packed_dot_q4(bf16)
 
+// NVFP4 stores both 8-value halves of a 16-value block in the same eight
+// bytes.  Consuming a complete block per lane halves the scale/address work
+// relative to the generic 8-value span decoder while retaining its FP32
+// dequantization contract.
+template <typename T>
+METAL_FUNC float decode_packed_dot_nvfp4(
+    device const T *input, device const uchar *weight, long input_base,
+    int output_channel, int in_dim, uint lane) {
+    const int blocks_per_row = in_dim / 16;
+    const long row_base = (long)output_channel * blocks_per_row * 9;
+    float accumulator = 0.0f;
+    for (int block = int(lane); block < blocks_per_row; block += 32) {
+        device const uchar *base = weight + row_base + (long)block * 9;
+        const float scale = float(tk_e4m3_decode(base[0]));
+        device const uchar *codes = base + 1;
+        const long x0 = input_base + block * 16;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            const uchar packed = codes[i];
+            const float low = scale * float(tk_e2m1_decode(uint(packed & 0x0f)));
+            const float high = scale * float(tk_e2m1_decode(uint(packed >> 4)));
+            accumulator += float(input[x0 + i]) * low;
+            accumulator += float(input[x0 + i + 8]) * high;
+        }
+    }
+    return metal::simd_sum(accumulator);
+}
+
+#define specialize_decode_packed_dot_nvfp4(T)                              \
+  template <> METAL_FUNC float decode_packed_dot<T, nvfp4>(                \
+    device const T *input, device const uchar *weight, long input_base,     \
+    int output_channel, int in_dim, uint lane) {                            \
+    return decode_packed_dot_nvfp4<T>(                                      \
+        input, weight, input_base, output_channel, in_dim, lane);           \
+  }
+
+specialize_decode_packed_dot_nvfp4(float)
+specialize_decode_packed_dot_nvfp4(half)
+specialize_decode_packed_dot_nvfp4(bf16)
+
 // Unified dense decode-linear epilogue.  The operation is
 // residual + activation(x @ weight.T + bias), with each optional component
 // controlled by a scalar flag and a single output-dtype rounding at the store.
@@ -404,7 +444,8 @@ kernel void decode_swiglu_packed(
   instantiate_decode_epilogue_dense(type_name, T)                            \
   instantiate_decode_epilogue_packed("q4_0", q4_0, type_name, T)            \
   instantiate_decode_epilogue_packed("q8_0", q8_0, type_name, T)            \
-  instantiate_decode_epilogue_packed("q6_K", q6_K, type_name, T)
+  instantiate_decode_epilogue_packed("q6_K", q6_K, type_name, T)            \
+  instantiate_decode_epilogue_packed("nvfp4", nvfp4, type_name, T)
 
 instantiate_decode_epilogue_type(float32, float)
 instantiate_decode_epilogue_type(float16, half)

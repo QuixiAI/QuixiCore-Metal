@@ -150,7 +150,7 @@ def test_lm_head_sample_parity(mode, k):
     _assert_parity(om, ot, atol=0)   # integer token ids: exact
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
 @pytest.mark.parametrize("mode,k", [("argmax", 0), ("topk", 8)])
 def test_lm_head_sample_quant_parity(fmt, mode, k):
     from tk.quant import QUANT_FORMATS
@@ -166,7 +166,7 @@ def test_lm_head_sample_quant_parity(fmt, mode, k):
     _assert_parity(om, ot, atol=0)   # same dequant + reduce metallib -> exact token ids
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
 @pytest.mark.parametrize("p", [0.5, 0.9])
 def test_lm_head_sample_quant_topp_parity(fmt, p):
     from tk.quant import QUANT_FORMATS
@@ -2388,12 +2388,13 @@ def test_packed_decode_epilogue_and_swiglu_parity():
     _assert_parity(swiglu_m, swiglu_t, atol=2e-6)
 
 
-def test_masked_and_candidate_output_projection_parity():
+@pytest.mark.parametrize("fmt", ["q4_0", "nvfp4"])
+def test_masked_and_candidate_output_projection_parity(fmt):
     from tk.quant import QUANT_FORMATS
 
     rng = np.random.default_rng(2007)
     tokens, vocab, hidden, topk = 2, 73, 256, 3
-    quantize, _ = QUANT_FORMATS["q4_0"]
+    quantize, _ = QUANT_FORMATS[fmt]
     h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
     packed = quantize((0.1 * rng.standard_normal((vocab, hidden))).astype(np.float32))
     bias = (0.02 * rng.standard_normal(vocab)).astype(np.float32)
@@ -2409,31 +2410,32 @@ def test_masked_and_candidate_output_projection_parity():
 
     masked_m = tk.lm_head_masked(
         _mk(h, "mlx", "f32"), _packed_on(packed, "mlx"), _int_on(allow, "mlx"),
-        bias=_mk(bias, "mlx", "f32"), format="q4_0", topk=topk)
+        bias=_mk(bias, "mlx", "f32"), format=fmt, topk=topk)
     masked_t = tk.lm_head_masked(
         _mk(h, "torch", "f32"), _packed_on(packed, "torch"), _int_on(allow, "torch"),
-        bias=_mk(bias, "torch", "f32"), format="q4_0", topk=topk)
+        bias=_mk(bias, "torch", "f32"), format=fmt, topk=topk)
     _assert_parity(masked_m[0], masked_t[0], atol=0)
     _assert_parity(masked_m[1], masked_t[1], atol=2e-5)
 
     candidate_m = tk.lm_head_candidates(
         _mk(h, "mlx", "f32"), _packed_on(packed, "mlx"),
         _int_on(candidates, "mlx"), _int_on(offsets, "mlx"),
-        bias=_mk(bias, "mlx", "f32"), format="q4_0", topk=topk)
+        bias=_mk(bias, "mlx", "f32"), format=fmt, topk=topk)
     candidate_t = tk.lm_head_candidates(
         _mk(h, "torch", "f32"), _packed_on(packed, "torch"),
         _int_on(candidates, "torch"), _int_on(offsets, "torch"),
-        bias=_mk(bias, "torch", "f32"), format="q4_0", topk=topk)
+        bias=_mk(bias, "torch", "f32"), format=fmt, topk=topk)
     _assert_parity(candidate_m[0], candidate_t[0], atol=0)
     _assert_parity(candidate_m[1], candidate_t[1], atol=2e-5)
 
 
-def test_quantized_lm_head_beam_advance_parity():
+@pytest.mark.parametrize("fmt", ["q4_0", "nvfp4"])
+def test_quantized_lm_head_beam_advance_parity(fmt):
     from tk.quant import QUANT_FORMATS
 
     rng = np.random.default_rng(2009)
     batch, beam_width, vocab, hidden = 1, 4, 1027, 256
-    quantize, _ = QUANT_FORMATS["q4_0"]
+    quantize, _ = QUANT_FORMATS[fmt]
     hidden_states = (0.08 * rng.standard_normal(
         (batch * beam_width, hidden))).astype(np.float32)
     packed = quantize((0.09 * rng.standard_normal(
@@ -2443,11 +2445,11 @@ def test_quantized_lm_head_beam_advance_parity():
     output_m = tk.lm_head_beam_advance(
         _mk(hidden_states, "mlx", "f32"), _packed_on(packed, "mlx"),
         _mk(cumulative, "mlx", "f32"), beam_width,
-        bias=_mk(bias, "mlx", "f32"), format="q4_0")
+        bias=_mk(bias, "mlx", "f32"), format=fmt)
     output_t = tk.lm_head_beam_advance(
         _mk(hidden_states, "torch", "f32"), _packed_on(packed, "torch"),
         _mk(cumulative, "torch", "f32"), beam_width,
-        bias=_mk(bias, "torch", "f32"), format="q4_0")
+        bias=_mk(bias, "torch", "f32"), format=fmt)
     _assert_parity(output_m[0], output_t[0], atol=0)
     _assert_parity(output_m[1], output_t[1], atol=0)
     _assert_parity(output_m[2], output_t[2], atol=2e-5)

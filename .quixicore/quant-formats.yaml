@@ -12,7 +12,7 @@ formats:
     notes: fp8 weight, activation, and KV-cache paths.
   fp4:
     status: implemented
-    notes: fp4/nvfp4-style software dequant and GEMM paths.
+    notes: FP4/NVFP4 software dequant and GEMM paths. NVFP4 also supports fused decode epilogues/SwiGLU, LM-head sampling, masked and candidate projection, and beam advance.
   bitnet:
     status: implemented
     notes: BitNet ternary weight paths.

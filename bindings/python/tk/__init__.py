@@ -1858,7 +1858,7 @@ def fused_linear_cross_entropy(h, W, targets, chunk_size=4096, ignore_index=-100
 _LM_HEAD_MODES = {"argmax": 0, "categorical": 1, "topk": 2, "topp": 3}
 
 
-_LM_QUANT_BLOCK_K = {"q8_0": 32, "q4_0": 32, "q6_K": 256}
+_LM_QUANT_BLOCK_K = {"q8_0": 32, "q4_0": 32, "q6_K": 256, "nvfp4": 16}
 
 
 def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None, fused=False,
@@ -1866,12 +1866,11 @@ def lm_head_sample(h, W, mode="argmax", k=0, temperature=1.0, seed=0, bias=None,
     """LM-head + sampling: a decode token per row of h. h (T, K), W (V, K) row-major, both
     fp16/bf16/f32. mode in {"argmax", "categorical", "topk", "topp"}.
 
-    format ("q8_0"/"q4_0"/"q6_K") selects a packed quantized-weight path. Q6_K at T=1 defaults to
+    format ("q8_0"/"q4_0"/"q6_K"/"nvfp4") selects a packed quantized-weight path. Q6_K at T=1 defaults to
     packed qgemv plus the sampler because it is faster; fused=True selects its no-materialization
-    argmax/categorical path. Q8_0/Q4_0 use the fused path. For "topp" the fused
-    quant path over-selects the top-k' candidate pool (k = the cap, default 32) then does a nucleus
-    (top-p, threshold top_p) reduce over that pool — the standard "top-k then top-p" (the pool's
-    softmax approximates the full normalizer for the peaked LM-head distribution). bias is an
+    argmax/categorical path. Q8_0/Q4_0/NVFP4 use the fused path. For "topp" the fused
+    quant path over-selects the top-k' candidate pool (k = the cap, default 32), computes the exact
+    full-vocabulary normalizer, and performs the nucleus reduce within the retained pool. bias is an
     optional (V,) additive logit bias. Returns (T,) int32 token ids. The Gumbel noise is indexed by
     the global vocab id, so the draw equals the unfused sampler on the same logits + seed.
     Accepts mlx.array or torch.Tensor (MPS).
@@ -1979,7 +1978,7 @@ def lm_head_masked(h, W, allow_mask, bias=None, format=None, topk=1,
     """Project directly into a packed per-row allow mask without materializing logits.
 
     ``h`` is (T,K), dense ``W`` is (V,K), and packed ``W`` is
-    (V,K/block_k,block_bytes) with ``format`` in q4_0/q8_0/q6_K. ``allow_mask`` is
+    (V,K/block_k,block_bytes) with ``format`` in q4_0/q8_0/q6_K/nvfp4. ``allow_mask`` is
     (T,ceil(V/32)) packed int32 words. Returns (ids, logprobs), each (T,topk).
     ``normalize='allowed'`` normalizes over legal tokens; ``'full'`` preserves the
     pre-mask full-vocabulary normalizer. Ties choose the lower token id.
@@ -2004,7 +2003,7 @@ def lm_head_candidates(h, W, candidate_ids, offsets, bias=None, format=None, top
 
     ``candidate_ids`` is flat, ``offsets`` has T+1 entries, and candidate ids within
     each row must be unique. Log-probabilities normalize over valid listed candidates.
-    Dense and q4_0/q8_0/q6_K packed weights are supported.
+    Dense and q4_0/q8_0/q6_K/nvfp4 packed weights are supported.
     """
     fmt = "" if format is None else str(format)
     if _is_torch(h):
@@ -2037,15 +2036,15 @@ def beam_advance(logits, cum_log_probs, beam_width):
 
 def lm_head_beam_advance(h, W, cum_log_probs, beam_width, bias=None,
                          format="q4_0"):
-    """Quantized LM-head plus exact beam-search advance. ``W`` is q4_0/q8_0
-    packed ``(V,K/32,bytes)`` and ``h`` is ``(B*beam_width,K)``. Q4_0 with up
-    to four beam rows uses the no-logits fused kernel; q8_0 and larger row
+    """Quantized LM-head plus exact beam-search advance. ``W`` is q4_0/q8_0/nvfp4
+    packed ``(V,K/block_k,bytes)`` and ``h`` is ``(B*beam_width,K)``. Q4_0/NVFP4 with up
+    to four beam rows use the no-logits fused kernel; q8_0 and larger row
     batches use the packed matrix path so the head weights are shared across
     rows. Returns next token, parent beam, and updated cumulative log-probability,
     each ``(B,beam_width)``.
     """
-    if format not in ("q4_0", "q8_0"):
-        raise ValueError("lm_head_beam_advance: format must be q4_0 or q8_0")
+    if format not in ("q4_0", "q8_0", "nvfp4"):
+        raise ValueError("lm_head_beam_advance: format must be q4_0, q8_0, or nvfp4")
     rows = int(h.shape[0])
     # Q4 row-wise fusion saves a logits allocation and wins at decode-scale
     # row counts. Q8 and larger row batches favor a 32-column packed GEMM that
@@ -3042,7 +3041,7 @@ def decode_linear_epilogue(x, weight, bias=None, residual=None, activation="none
 
     Computes ``residual + activation(x @ weight.T + bias)`` in fp32 accumulation
     and rounds once to x.dtype. ``activation`` is ``none``, ``gelu`` (erf), or
-    ``silu``; packed formats are q4_0/q8_0/q6_K. ``output_quant`` optionally
+    ``silu``; packed formats are q4_0/q8_0/q6_K/nvfp4. ``output_quant`` optionally
     composes the established per-token dynamic FP8 or int8 quantizer and returns
     its (codes, scale) pair. Packed weights always use Metal; dense weights are
     auto-routed by workload size unless ``use_kernel`` is set explicitly.
@@ -3098,7 +3097,7 @@ def decode_swiglu(x, gate_weight, up_weight, gate_bias=None, up_bias=None,
     """Fuse two dense or packed decode projections with ``silu(gate) * up``.
 
     Biases must either both be present or both be omitted. Packed q4_0, q8_0,
-    and q6_K weights are supported. Optional output quantization follows
+    q6_K, and nvfp4 weights are supported. Optional output quantization follows
     ``decode_linear_epilogue``. Packed weights use Metal; the measured framework
     composition is the dense default unless ``use_kernel`` is set explicitly.
     """

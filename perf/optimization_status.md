@@ -27,6 +27,164 @@ Xcode/Metal toolchain version, integration path, command, git commit or
 working-tree label, dtype, shape, quant format, warmups, iterations, median,
 variance, correctness tolerance, and observed error.
 
+## 2026-07-13: NVFP4 inference decode and output-projection pass
+
+Status: landed; retained implementations have passed focused performance and
+repository-wide correctness/parity validation.
+
+Current implementation:
+
+- `dequant_into_register` uses an NVFP4-specific row-fragment decoder for the
+  `{c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}` register layout. It reads the two E4M3
+  scales and four packed bytes needed by the fragment once, preserving the
+  established half-rounded tile contract.
+- `dequant_into_register_col` uses an NVFP4 two-block decoder for the
+  `{c,c+8,c+16,c+24}` column fragment used by rectangular MoE kernels.
+- Fused decode epilogue and SwiGLU kernels consume a complete 16-value NVFP4
+  block per lane. Their decoder keeps scale/code products in fp32 to match the
+  public one-final-rounding contract.
+- Quantized LM-head sampling uses a whole-block half-rounded decoder, while
+  masked and CSR-candidate projection use a whole-block fp32 decoder. NVFP4 is
+  exposed for argmax/categorical/top-k/top-p sampling, masked/candidate output
+  projection, and exact beam advance in MLX and PyTorch MPS.
+- The MLX CMake target now tracks every `include/metal/*.metal` file as a
+  metallib dependency. This prevents header-only decoder changes from leaving
+  a stale incremental-build metallib, which was observed during this pass.
+
+Current public route:
+
+- QGEMM/QFlux keep their existing direct launch geometry and use the new
+  row-fragment decoder. Rectangular MoE keeps four warps and uses the new
+  column-fragment decoder.
+- Decode epilogue/SwiGLU and sequential LM-head row dots use complete-block
+  NVFP4 decode.
+- Beam advance keeps row-wise no-logits fusion for at most four rows and routes
+  larger row batches through packed QGEMM, matching the existing q4_0 policy.
+
+References inspected: existing repository q4_0 whole-block decoders and the
+local NVFP4 `{E4M3 scale, 8 packed E2M1 bytes}` format contract. No external
+implementation code was imported.
+
+Correctness:
+
+- Hardware/toolchain: MacBook Pro (Mac16,5), Apple M4 Max, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Metal 32023.883; Python 3.12.9; MLX 0.21.1.
+- Working-tree label: `c880769-dirty`.
+- QGEMM/QFlux focused suite: 174 passed after the row-fragment change.
+- Quantized MoE focused suite: 18 passed for each tested warp topology and the
+  retained column decoder.
+- `pytest tests/correctness/matmul/decode_linear/test_decode_linear.py -q`:
+  47 passed.
+- `pytest tests/correctness/quantization/lm_head/test_lm_head.py -q`:
+  90 passed before beam coverage was added; subsequent NVFP4 sampling, sparse,
+  and beam subsets passed 9, 1, and 4 cases respectively.
+- Final builds: `scripts/build kernels` and `scripts/build pytorch_mps` passed.
+  Touching `dequant.metal` then rerunning the incremental MLX build emitted
+  `Building mlx_ext.metallib`, validating the new header dependency tracking.
+- Final suites: `scripts/test correctness -q` passed 2085 tests;
+  `scripts/test parity -q` passed 412; `scripts/test mps -q` passed 472.
+- Final benchmark reference errors were `2.29e-7` relative for decode epilogue,
+  `2.39e-7` for SwiGLU, and zero selected-id error for masked/candidate paths.
+
+Focused commands (MLX integration path, `--warmup 10 --iters 40`):
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemm,qflux,moe_q --formats nvfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/nvfp4-experiments-baseline
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel decode_linear_epilogue,decode_swiglu --formats nvfp4 \
+  --warmup 10 --iters 40 --out-dir <variant-directory>
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
+  --formats nvfp4 --warmup 10 --iters 40 --out-dir <variant-directory>
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
+  --formats nvfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/nvfp4-experiments-final
+```
+
+Fragment decoder results (median milliseconds; brackets are p20/p80, followed
+by coefficient of variation):
+
+| Path / shape | Baseline | Candidate | Change | Decision |
+|---|---:|---:|---:|---|
+| QGEMM N4096 K4096 M32 | 0.1291 [0.1235/0.1398], CV .1009 | 0.1151 [0.1132/0.1234], CV .0758 | -10.9% | keep row decoder |
+| QGEMM N4096 K4096 M128 | 0.4307 [0.4160/0.4566], CV .0495 | 0.3745 [0.3623/0.4050], CV .0577 | -13.1% | keep row decoder |
+| QGEMM N4096 K4096 M512 | 1.5207 [1.4695/1.5748], CV .0374 | 1.3976 [1.3577/1.4745], CV .0412 | -8.1% | keep row decoder |
+| QFlux N4096 K4096 M128 | 0.4050 [0.3951/0.4333], CV .0600 | 0.3686 [0.3619/0.3950], CV .0545 | -9.0% | keep row decoder |
+| MoE E4 K2880 N2880 rows32 | 0.1782 [0.1584/0.2629], CV .2714 | 0.1779 [0.1554/0.2601], CV .3496 | flat | keep for larger shape |
+| MoE E4 K2880 N2880 rows512 | 0.8255 [0.7734/0.8970], CV .0680 | 0.7269 [0.7096/0.8144], CV .0672 | -11.9% | keep column decoder |
+
+Whole-block fused results compare the un-specialized generic NVFP4 integration
+against the complete-block decoder:
+
+| Path / shape | Generic median ms | Whole-block median ms | Change | Candidate p20/p80, CV | Decision |
+|---|---:|---:|---:|---:|---|
+| Decode epilogue B1 K1536 N4096 | 0.0752 | 0.0223 | -70.3% | 0.0194/0.0277, .7636 | keep; repeat 0.0170 ms |
+| Decode SwiGLU B1 K1536 N4096 | 0.1589 | 0.0244 | -84.6% | 0.0238/0.0257, .2510 | keep; repeat 0.0300 ms |
+| LM-head top-k T1 V32000 K4096 | 0.4008 | 0.2967 | -26.0% | 0.2867/0.3211, .0999 | keep; repeat 0.2926 ms |
+| LM-head top-k T8 V32000 K4096 | 1.4058 | 1.3460 | -4.2% | 1.3157/1.4519, .0528 | keep; repeat 1.3486 ms |
+| Masked T1 V8192 K1024 legal256 | 0.1051 | 0.0406 | -61.4% | 0.0379/0.0512, .2151 | keep; repeat 0.0457 ms |
+| Masked T8 V8192 K1024 legal64 | 0.0569 | 0.0425 | -25.4% | 0.0414/0.0498, .2100 | keep; repeat 0.0425 ms |
+| Candidates T1 V8192 K1024 C256 | 0.0778 | 0.0400 | -48.6% | 0.0389/0.0443, .0988 | keep; repeat 0.0404 ms |
+| Candidates T8 V8192 K1024 C64 | 0.0327 | 0.0169 | -48.5% | 0.0163/0.0213, .2786 | keep; repeat 0.0164 ms |
+| Beam B1 BM4 V32000 K4096 | 0.8477 | 0.8152 | -3.8% | 0.8065/0.8289, .0284 | keep shared decoder |
+| Beam B4 BM4 V32000 K4096 | 0.9823 | 0.9831 | flat | 0.9714/1.0088, .0221 | keep QGEMM route |
+
+Final retained run medians were 0.1121/0.3582/1.3264 ms for QGEMM M32/M128/M512,
+0.3581 ms for QFlux M128, 0.1360/0.6980 ms for MoE rows32/rows512,
+0.0187/0.0246 ms for decode epilogue/SwiGLU, 0.2854/1.3310 ms for LM-head
+top-k T1/T8, 0.0329/0.0422 ms for masked T1/T8, 0.0346/0.0163 ms for
+candidate T1/T8, and 0.8216/0.9794 ms for beam B1/B4. Per-case p20/p80,
+CV, bandwidth, and baseline data are in the final JSONL.
+
+Rejected experiments:
+
+- Two-warp, 64-row decoded-weight reuse: M128 was 0.3686 versus 0.3602 ms
+  direct (+2.3%); M512 was 1.3667 versus 1.3630 ms (flat). Reject the extra
+  barriers and routing.
+- Four-warp, 128-row decoded-weight reuse: repeat medians were 0.3589 versus
+  0.3643 ms direct at M128 and 1.3566 versus 1.3692 ms at M512 (only 1.5% and
+  0.9%). It still trails resident fp16 matmul and does not justify a second
+  pipeline or synchronization cost. Reject.
+- Rectangular MoE at two warps: rows32 improved only 1.7% (0.1748 versus
+  0.1779 ms) while rows512 was flat/slightly worse (0.7281 versus 0.7269 ms).
+  One warp regressed rows32 to 0.3136 ms and rows512 to 0.7347 ms. Keep four.
+- Forcing 16 NVFP4 beam rows through serial row fusion regressed 0.9831 to
+  2.6393 ms. Keep the packed-QGEMM route above four rows.
+
+Decision: keep both fragment decoders, all three whole-block decoder uses, and
+the new NVFP4 fused inference coverage. Reject decoded-weight sharing, reduced
+MoE warp counts, and the larger-row beam routing change. The main remaining
+QGEMM opportunity is a different matrix execution strategy; small launch or
+barrier variations did not pay for their complexity.
+
+Open questions: profile instruction mix/register pressure for the complete-block
+decode at larger hidden sizes; revisit T8 LM-head sampling only with a design
+that shares packed weights across rows without materializing logits.
+
+Raw results:
+
+- Baseline/fragment runs: `nvfp4-experiments-baseline`,
+  `nvfp4-experiments-row-fragment`, `nvfp4-experiments-column-fragment`.
+- Rejected launch runs: `nvfp4-experiments-reuse-m64-controlled`,
+  `nvfp4-experiments-reuse-m128-controlled`,
+  `nvfp4-experiments-reuse-m128-repeat`, `nvfp4-experiments-moe-w1`,
+  `nvfp4-experiments-moe-w2`, `nvfp4-experiments-lm-head-beam-force-row`.
+- Fused decoder runs: `nvfp4-experiments-decode-generic`,
+  `nvfp4-experiments-decode-whole-block`,
+  `nvfp4-experiments-decode-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-generic`,
+  `nvfp4-experiments-lm-head-whole-block`,
+  `nvfp4-experiments-lm-head-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-sparse-generic`,
+  `nvfp4-experiments-lm-head-sparse-whole-block`,
+  `nvfp4-experiments-lm-head-sparse-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-beam-generic`, and
+  `nvfp4-experiments-lm-head-beam-whole-block`.
+- Final retained run: `perf/results/2026-07-13/nvfp4-experiments-final/`.
+
 ## 2026-07-07: BitNet remaining kernel parity port
 
 Status: landed as parity/coverage; no performance claim.

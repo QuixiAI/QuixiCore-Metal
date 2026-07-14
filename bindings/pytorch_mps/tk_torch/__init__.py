@@ -707,7 +707,7 @@ def lm_head_sample(h, W, bias, mode, k, temperature, seed):
 
 
 def lm_head_sample_q(h, Wq, bias, V, K, fmt, mode, topk, temperature, seed, top_p=0.0):
-    """Fused LM-head + sampling over quantized q8_0/q4_0/q6_K weights. mode 0=argmax, 1=categorical,
+    """Fused LM-head + sampling over quantized q8_0/q4_0/q6_K/nvfp4 weights. mode 0=argmax, 1=categorical,
     2=topk, 3=topp (nucleus over the top-k candidate pool, top_p in (0,1]). Returns (T,) int32. MPS."""
     return _ext.lm_head_sample_q(h, Wq, bias, int(V), int(K), str(fmt), int(mode), int(topk),
                                  float(temperature), int(seed), float(top_p))

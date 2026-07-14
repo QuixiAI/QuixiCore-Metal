@@ -80,6 +80,41 @@ specialize_lmh_sampler_q4(float)
 specialize_lmh_sampler_q4(half)
 specialize_lmh_sampler_q4(bf16)
 
+// NVFP4 has one E4M3 scale and eight packed bytes per 16-value block. Decode
+// the complete block in one pass so the sequential vocab-row dot does not
+// reload the same scale and byte once for each 8-value half.
+template <typename T>
+METAL_FUNC float lmh_sampler_quant_dot_nvfp4(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / nvfp4::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * nvfp4::block_bytes;
+        const half scale = tk_e4m3_decode(base[0]);
+        device const uchar *codes = base + 1;
+        const int input_base = block * nvfp4::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            const uchar packed = codes[i];
+            const half low = scale * tk_e2m1_decode(uint(packed & 0x0f));
+            const half high = scale * tk_e2m1_decode(uint(packed >> 4));
+            result += float(low) * float(hrow[input_base + i]);
+            result += float(high) * float(hrow[input_base + i + 8]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_sampler_nvfp4(T)                                  \
+  template <> METAL_FUNC float lmh_sampler_quant_dot<nvfp4, T>(           \
+    device const T *hrow, device const uchar *wrow, int K) {              \
+    return lmh_sampler_quant_dot_nvfp4<T>(hrow, wrow, K);                  \
+  }
+
+specialize_lmh_sampler_nvfp4(float)
+specialize_lmh_sampler_nvfp4(half)
+specialize_lmh_sampler_nvfp4(bf16)
+
 // emit functor for the Family-B masked_topk_local merge in the top-k/top-p partials kernels: writes
 // each round's winner into the per-tile (part_val, part_id) partials on lane 0 (-1 id for an empty
 // round). Shared by lm_head_topk_partials / lm_head_topk_partials_q / lm_head_topp_partials_q.
@@ -223,6 +258,9 @@ instantiate_lm_head_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_q("nvfp4_float32", nvfp4, float)
+instantiate_lm_head_q("nvfp4_float16", nvfp4, half)
+instantiate_lm_head_q("nvfp4_bfloat16", nvfp4, bf16)
 
 // Q6_K f32 specialization. Unlike the generic quantized LM head, this keeps
 // the exact GGUF dequant product in fp32 instead of first
@@ -551,6 +589,9 @@ instantiate_lm_head_topk_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_topk_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_topk_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_topk_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_topk_q("nvfp4_float32", nvfp4, float)
+instantiate_lm_head_topk_q("nvfp4_float16", nvfp4, half)
+instantiate_lm_head_topk_q("nvfp4_bfloat16", nvfp4, bf16)
 
 // Quantized top-p partials: identical top-k selection to lm_head_topk_partials_q, but ALSO emits a
 // per-tile tempered log-sum-exp (part_lse) over EVERY dequantized logit in the tile (not just the
@@ -632,6 +673,9 @@ instantiate_lm_head_topp_q("q8_0_bfloat16", q8_0, bf16)
 instantiate_lm_head_topp_q("q4_0_float32", q4_0, float)
 instantiate_lm_head_topp_q("q4_0_float16", q4_0, half)
 instantiate_lm_head_topp_q("q4_0_bfloat16", q4_0, bf16)
+instantiate_lm_head_topp_q("nvfp4_float32", nvfp4, float)
+instantiate_lm_head_topp_q("nvfp4_float16", nvfp4, half)
+instantiate_lm_head_topp_q("nvfp4_bfloat16", nvfp4, bf16)
 
 #define instantiate_lm_head(type_name, T)                                          \
   template [[host_name("lm_head_argcat_partials_" #type_name)]] [[kernel]] void     \
@@ -860,6 +904,41 @@ METAL_FUNC float lmh_quant_dot_q4_f32(
 specialize_lmh_quant_dot_q4(float)
 specialize_lmh_quant_dot_q4(half)
 specialize_lmh_quant_dot_q4(bf16)
+
+// FP32-dequant companion for masked and sparse-candidate projection. As in
+// the sampling path, one pass consumes the scale and both nibbles in each
+// packed byte while preserving the no-intermediate-half-rounding contract.
+template <typename T>
+METAL_FUNC float lmh_quant_dot_nvfp4_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / nvfp4::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base = wrow + (long)block * nvfp4::block_bytes;
+        const float scale = float(tk_e4m3_decode(base[0]));
+        device const uchar *codes = base + 1;
+        const int input_base = block * nvfp4::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+            const uchar packed = codes[i];
+            const float low = scale * float(tk_e2m1_decode(uint(packed & 0x0f)));
+            const float high = scale * float(tk_e2m1_decode(uint(packed >> 4)));
+            result += low * float(hrow[input_base + i]);
+            result += high * float(hrow[input_base + i + 8]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_quant_dot_nvfp4(T)                                  \
+  template <> METAL_FUNC float lmh_quant_dot_f32<nvfp4, T>(                 \
+    device const T *hrow, device const uchar *wrow, int K) {                \
+    return lmh_quant_dot_nvfp4_f32<T>(hrow, wrow, K);                        \
+  }
+
+specialize_lmh_quant_dot_nvfp4(float)
+specialize_lmh_quant_dot_nvfp4(half)
+specialize_lmh_quant_dot_nvfp4(bf16)
 
 METAL_FUNC void lmh_lse_update(float value, thread float &maximum,
                                thread float &sum) {
@@ -1196,7 +1275,8 @@ kernel void lm_head_candidates_q(
   instantiate_lm_head_masked_dense(type_name, T)                             \
   instantiate_lm_head_masked_q("q4_0", q4_0, type_name, T)                  \
   instantiate_lm_head_masked_q("q8_0", q8_0, type_name, T)                  \
-  instantiate_lm_head_masked_q("q6_K", q6_K, type_name, T)
+  instantiate_lm_head_masked_q("q6_K", q6_K, type_name, T)                  \
+  instantiate_lm_head_masked_q("nvfp4", nvfp4, type_name, T)
 
 instantiate_lm_head_masked_type(float32, float)
 instantiate_lm_head_masked_type(float16, half)

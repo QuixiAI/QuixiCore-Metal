@@ -53,6 +53,8 @@ durable decisions are in `perf/optimization_status.md`.
 | Cross-kernel follow-up baseline | `bc90717` | MLX / quick | 10 / 30 | `perf/results/2026-07-13/cross-kernel-followups-baseline/` |
 | Cross-kernel follow-up final | `bc90717-dirty` | MLX / quick | 10 / 30 | `perf/results/2026-07-13/cross-kernel-final-mlx/` |
 | Cross-kernel follow-up MPS | `bc90717-dirty` | PyTorch MPS / quick | 10 / 30 | `perf/results/2026-07-13/cross-kernel-final-mps/` |
+| NVFP4 inference baseline | `c880769-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/nvfp4-experiments-baseline/` |
+| NVFP4 inference final | `c880769-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-13/nvfp4-experiments-final/` |
 
 ## Migration Tasks
 

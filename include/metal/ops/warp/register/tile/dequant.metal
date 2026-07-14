@@ -1193,6 +1193,42 @@ METAL_FUNC void dequant_into_shared(threadgroup st<half, BN, BK>& dst,
     }
 }
 
+// A row-layout fragment lane owns adjacent pairs at columns
+// {c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}.  Most formats use the scalar fallback below, but
+// nvfp4's 16-value block maps this pattern onto exactly two scales and four packed bytes.
+// Keep the helper format-gated so another future block_k=16 layout cannot silently inherit it.
+template<typename FMT>
+struct tk_dequant_row8_s8 {
+    constant static constexpr const bool enabled = false;
+    static METAL_FUNC void run(device const uchar* b0, device const uchar* b1,
+                               int c, thread half* w) {
+        w[0] = FMT::dequant(b0, c);      w[1] = FMT::dequant(b0, c + 1);
+        w[2] = FMT::dequant(b0, c + 8);  w[3] = FMT::dequant(b0, c + 9);
+        w[4] = FMT::dequant(b1, c);      w[5] = FMT::dequant(b1, c + 1);
+        w[6] = FMT::dequant(b1, c + 8);  w[7] = FMT::dequant(b1, c + 9);
+    }
+};
+
+template<>
+struct tk_dequant_row8_s8<nvfp4> {
+    constant static constexpr const bool enabled = true;
+    static METAL_FUNC void run(device const uchar* b0, device const uchar* b1,
+                               int c, thread half* w) {
+        const half s0 = tk_e4m3_decode(b0[0]);
+        const half s1 = tk_e4m3_decode(b1[0]);
+        const uchar q00 = b0[1 + c], q01 = b0[2 + c];
+        const uchar q10 = b1[1 + c], q11 = b1[2 + c];
+        w[0] = s0 * tk_e2m1_decode(q00 & 0x0F);
+        w[1] = s0 * tk_e2m1_decode(q01 & 0x0F);
+        w[2] = s0 * tk_e2m1_decode(q00 >> 4);
+        w[3] = s0 * tk_e2m1_decode(q01 >> 4);
+        w[4] = s1 * tk_e2m1_decode(q10 & 0x0F);
+        w[5] = s1 * tk_e2m1_decode(q11 & 0x0F);
+        w[6] = s1 * tk_e2m1_decode(q10 >> 4);
+        w[7] = s1 * tk_e2m1_decode(q11 >> 4);
+    }
+};
+
 // Dequantize an (RT::rows x RT::cols) weight tile DIRECTLY into the simdgroup register fragment —
 // no threadgroup round-trip, no barrier (Marlin's "zero-shuffle" idea on Apple). Each lane fills
 // only its own 2 elements per 8x8 subtile, using the substrate's lane->(row,col) fragment map
@@ -1205,6 +1241,26 @@ METAL_FUNC void dequant_into_register(thread RT& dst, device const uchar* Wq, in
     const int simd_y = (qid & 4) + ((int)laneid / 2) % 4;
     const int simd_x = (qid & 2) * 2 + ((int)laneid % 2) * 2;
     const int bpr = K / FMT::block_k;
+    if (tk_dequant_row8_s8<FMT>::enabled && RT::cols == 32 && RT::width == 4) {
+        const int gc0 = kb * RT::cols + simd_x;
+        const int blk0 = gc0 / FMT::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < RT::height; i++) {
+            const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y;
+            device const uchar* b0 = Wq + (uint)(grow * bpr + blk0) * FMT::block_bytes;
+            device const uchar* b1 = b0 + FMT::block_bytes;
+            half w[8];
+            tk_dequant_row8_s8<FMT>::run(b0, b1, simd_x, w);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < RT::width; j++) {
+                dst.tiles[i][j].data.thread_elements()[0] =
+                    (typename RT::dtype)(float)w[2 * j];
+                dst.tiles[i][j].data.thread_elements()[1] =
+                    (typename RT::dtype)(float)w[2 * j + 1];
+            }
+        }
+        return;
+    }
     #pragma clang loop unroll(full)
     for (int i = 0; i < RT::height; i++) {
         #pragma clang loop unroll(full)
@@ -1286,6 +1342,34 @@ template<> struct tk_dequant_cols4_s8<kU4> {
     }
 };
 
+// Two-block companion for 16-value formats.  In the col-layout fragment map, nvfp4 columns
+// {c,c+8} are the low/high nibbles of byte c in the first block and {c+16,c+24} are the
+// corresponding byte in the second block.  Two scale decodes and two byte loads cover the span.
+template<typename FMT>
+struct tk_dequant_cols4_s8x2 {
+    constant static constexpr const bool enabled = false;
+    static METAL_FUNC void run(device const uchar* b0, device const uchar* b1,
+                               int c, thread half* w) {
+        w[0] = FMT::dequant(b0, c);      w[1] = FMT::dequant(b0, c + 8);
+        w[2] = FMT::dequant(b1, c);      w[3] = FMT::dequant(b1, c + 8);
+    }
+};
+
+template<>
+struct tk_dequant_cols4_s8x2<nvfp4> {
+    constant static constexpr const bool enabled = true;
+    static METAL_FUNC void run(device const uchar* b0, device const uchar* b1,
+                               int c, thread half* w) {
+        const half s0 = tk_e4m3_decode(b0[0]);
+        const half s1 = tk_e4m3_decode(b1[0]);
+        const uchar q0 = b0[1 + c], q1 = b1[1 + c];
+        w[0] = s0 * tk_e2m1_decode(q0 & 0x0F);
+        w[1] = s0 * tk_e2m1_decode(q0 >> 4);
+        w[2] = s1 * tk_e2m1_decode(q1 & 0x0F);
+        w[3] = s1 * tk_e2m1_decode(q1 >> 4);
+    }
+};
+
 // Col-layout companion to dequant_into_register, for feeding mma_ABt's B operand
 // (rt<T, M, K, col>) straight from a row-major (N, K)-packed weight — the quantized
 // A @ W^T path (grouped expert GEMMs). Mirrors the col-layout load in
@@ -1303,6 +1387,26 @@ METAL_FUNC void dequant_into_register_col(thread RT& dst, device const uchar* Wq
     const int simd_x = (qid & 4) + ((int)laneid / 2) % 4;
     const int simd_y = (qid & 2) * 2 + ((int)laneid % 2) * 2;
     const int bpr = K / FMT::block_k;
+    if (tk_dequant_cols4_s8x2<FMT>::enabled && RT::cols == 32 && RT::width == 4) {
+        const int gc0 = kb * RT::cols + simd_x;
+        const int blk0 = gc0 / FMT::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < RT::height; i++) {
+            #pragma clang loop unroll(full)
+            for (int el = 0; el < 2; el++) {
+                const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y + el;
+                device const uchar* b0 = Wq + (uint)(grow * bpr + blk0) * FMT::block_bytes;
+                device const uchar* b1 = b0 + FMT::block_bytes;
+                half w[4];
+                tk_dequant_cols4_s8x2<FMT>::run(b0, b1, simd_x, w);
+                #pragma clang loop unroll(full)
+                for (int j = 0; j < RT::width; j++)
+                    dst.tiles[i][j].data.thread_elements()[el] =
+                        (typename RT::dtype)(float)w[j];
+            }
+        }
+        return;
+    }
     if (FMT::block_k >= 32 && RT::width == 4) {   // constexpr-foldable fast path
         const int gc0  = kb * RT::cols + simd_x;
         const int blk  = gc0 / FMT::block_k;

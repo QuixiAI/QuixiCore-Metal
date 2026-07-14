@@ -50,9 +50,10 @@ int check_masked_weight(
   if (format == "q4_0") { block_k = 32; block_bytes = 18; }
   else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
   else if (format == "q6_K") { block_k = 256; block_bytes = 210; }
+  else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
   else {
     throw std::invalid_argument(std::string(name) +
-        ": format must be empty/dense, q4_0, q8_0, or q6_K");
+        ": format must be empty/dense, q4_0, q8_0, q6_K, or nvfp4");
   }
   if (W.dtype() != uint8 || W.ndim() != 3 || W.shape(0) <= 0 ||
       K % block_k != 0 || W.shape(1) != K / block_k ||
@@ -165,6 +166,8 @@ array lm_head_sample_q(
     block_k = 32; block_bytes = 34;
   } else if (fmt == "q4_0") {
     block_k = 32; block_bytes = 18;
+  } else if (fmt == "nvfp4") {
+    block_k = 16; block_bytes = 9;
   } else if (fmt == "q6_K") {
     block_k = 256; block_bytes = 210;
     if (h.dtype() != float32 || mode > 1) {
@@ -172,7 +175,8 @@ array lm_head_sample_q(
           "lm_head_sample_q: q6_K requires fp32 h and supports argmax/categorical only");
     }
   } else {
-    throw std::invalid_argument("lm_head_sample_q: format must be q8_0, q4_0, or q6_K");
+    throw std::invalid_argument(
+        "lm_head_sample_q: format must be q8_0, q4_0, q6_K, or nvfp4");
   }
   if (K % block_k != 0 || Wq.dtype() != uint8 || Wq.ndim() != 3 ||
       Wq.shape(0) != V || Wq.shape(1) != K / block_k || Wq.shape(2) != block_bytes) {
@@ -242,20 +246,21 @@ std::vector<array> lm_head_beam_advance(
     throw std::invalid_argument(
         "lm_head_beam_advance: h must be non-empty (B*BM,K) fp32/fp16/bf16");
   }
-  int block_bytes = 0;
-  if (format == "q4_0") block_bytes = 18;
-  else if (format == "q8_0") block_bytes = 34;
+  int block_k = 0, block_bytes = 0;
+  if (format == "q4_0") { block_k = 32; block_bytes = 18; }
+  else if (format == "q8_0") { block_k = 32; block_bytes = 34; }
+  else if (format == "nvfp4") { block_k = 16; block_bytes = 9; }
   else {
     throw std::invalid_argument(
-        "lm_head_beam_advance: format must be q4_0 or q8_0");
+        "lm_head_beam_advance: format must be q4_0, q8_0, or nvfp4");
   }
   const int rows = h.shape(0);
   const int hidden = h.shape(1);
-  if (hidden % 32 != 0 || Wq.dtype() != uint8 || Wq.ndim() != 3 ||
-      Wq.shape(0) <= 0 || Wq.shape(1) != hidden / 32 ||
+  if (hidden % block_k != 0 || Wq.dtype() != uint8 || Wq.ndim() != 3 ||
+      Wq.shape(0) <= 0 || Wq.shape(1) != hidden / block_k ||
       Wq.shape(2) != block_bytes) {
     throw std::invalid_argument(
-        "lm_head_beam_advance: packed W must be uint8 (V,K/32,block_bytes)");
+        "lm_head_beam_advance: packed W has invalid shape for its format");
   }
   if (beam_width < 1 || beam_width > 16) {
     throw std::invalid_argument(

@@ -129,7 +129,7 @@ def test_fused_kernel_vs_oracle(dtype, mode, k, T, V, K):
             assert tok[t] in top or (L[t].max() - L[t, tok[t]]) < 1e-3
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("mode", ["argmax", "categorical"])
 def test_quant(fmt, dtype, mode):
@@ -253,7 +253,7 @@ def test_lm_head_constrained_bfloat16_path():
     np.testing.assert_allclose(np.array(logprob), expected_logprob, rtol=3e-2, atol=3e-2)
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
 @pytest.mark.parametrize("k", [1, 8, 32])
 def test_quant_topk(fmt, k):
     # Fused quantized-weight top-k (no logits materialization) vs the dequantize(Wq)@h top-k oracle.
@@ -275,7 +275,7 @@ def test_quant_topk(fmt, k):
             assert tok[t] == L[t].argmax() or (L[t].max() - L[t, tok[t]]) < 1e-2
 
 
-@pytest.mark.parametrize("fmt", ["q8_0", "q4_0"])
+@pytest.mark.parametrize("fmt", ["q8_0", "q4_0", "nvfp4"])
 @pytest.mark.parametrize("p", [0.5, 0.9])
 def test_quant_topp(fmt, p):
     # Fused quant top-p (nucleus over the over-selected top-k' pool) vs the dequant-logits nucleus.
@@ -427,7 +427,7 @@ def test_lm_head_masked_ties_choose_lower_token_id():
     np.testing.assert_allclose(np.array(logprobs), -np.log(4.0), atol=1e-6)
 
 
-@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "q6_K"])
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "q6_K", "nvfp4"])
 def test_lm_head_masked_and_candidates_packed(fmt):
     quantize, dequantize = QUANT_FORMATS[fmt]
     rng = np.random.default_rng(433 + len(fmt))
@@ -479,7 +479,7 @@ def test_lm_head_candidates_skips_invalid_and_pads_short_rows():
     assert np.isneginf(np.array(logprobs)[1, 2:]).all()
 
 
-@pytest.mark.parametrize("fmt", ["q4_0", "q8_0"])
+@pytest.mark.parametrize("fmt", ["q4_0", "q8_0", "nvfp4"])
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 @pytest.mark.parametrize("V", [1024, 1027])
 def test_quantized_lm_head_beam_advance(fmt, dtype, V):

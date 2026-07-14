@@ -2104,7 +2104,7 @@ def lm_head_beam_cases(be, preset, formats):
         h_d = be.array(h, "f16")
         cum_d = be.array(cum, "f32")
         for fmt in fmts:
-            if fmt not in ("q4_0", "q8_0"):
+            if fmt not in ("q4_0", "q8_0", "nvfp4"):
                 continue
             bk, bb = BLOCK_INFO[fmt]
             wq, wdq = _packed_weight(fmt, V, K, seed=225)
@@ -2997,7 +2997,7 @@ def decode_linear_epilogue_cases(be, preset, formats):
         bias = (0.02 * rng.standard_normal(output)).astype(np.float32)
         residual = (0.03 * rng.standard_normal((batch, output))).astype(np.float32)
         x_d, bias_d, residual_d = be.array(x), be.array(bias), be.array(residual)
-        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K")
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "nvfp4")
                           if formats is None or f in formats]
         for fmt in [None, *packed_formats]:
             if fmt is None:
@@ -3036,7 +3036,7 @@ def decode_swiglu_cases(be, preset, formats):
     for batch, hidden, output in shapes:
         x = (0.07 * rng.standard_normal((batch, hidden))).astype(np.float32)
         x_d = be.array(x)
-        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K")
+        packed_formats = [f for f in ("q4_0", "q8_0", "q6_K", "nvfp4")
                           if formats is None or f in formats]
         for fmt in [None, *packed_formats]:
             if fmt is None:
@@ -3084,7 +3084,9 @@ def lm_head_masked_cases(be, preset, formats):
     shapes = _pick(preset, [(1, 1025, 256, 32)],
                    [(1, 8192, 1024, 256), (8, 8192, 1024, 64)],
                    [(1, 32768, 1536, 512), (16, 32768, 1536, 128)])
-    topk, fmt = 4, "q4_0"
+    topk = 4
+    fmt = "q4_0" if formats is None else next(
+        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "nvfp4")), "q4_0")
     for tokens, vocab, hidden, legal in shapes:
         packed, weight = _packed_weight(fmt, vocab, hidden, seed=331)
         h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
@@ -3130,7 +3132,9 @@ def lm_head_candidates_cases(be, preset, formats):
     shapes = _pick(preset, [(1, 1025, 256, 32)],
                    [(1, 8192, 1024, 256), (8, 8192, 1024, 64)],
                    [(16, 32768, 1536, 512)])
-    topk, fmt = 4, "q4_0"
+    topk = 4
+    fmt = "q4_0" if formats is None else next(
+        (f for f in formats if f in ("q4_0", "q8_0", "q6_K", "nvfp4")), "q4_0")
     for tokens, vocab, hidden, candidates in shapes:
         packed, weight = _packed_weight(fmt, vocab, hidden, seed=337)
         h = (0.08 * rng.standard_normal((tokens, hidden))).astype(np.float32)
