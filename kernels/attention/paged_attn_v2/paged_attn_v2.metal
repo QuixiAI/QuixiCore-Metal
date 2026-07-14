@@ -109,7 +109,7 @@ kernel void paged_attention_partition(
 // fp8 partition: identical online-softmax, but the caches hold uint8 (e4m3/e5m2) codes
 // dequantized on read with per-head k_scale/v_scale. tmp_out/max_logits/exp_sums stay fp32
 // so the existing (format-agnostic) reduce kernel merges the partitions unchanged.
-template <typename T, int D>
+template <typename T, int D, int FMT>
 kernel void paged_attention_partition_fp8(
     device const T *q [[buffer(0)]],
     device const uchar *key_cache [[buffer(1)]],
@@ -140,6 +140,7 @@ kernel void paged_attention_partition_fp8(
     const int part = (int)tgid.z;
     const int kv_head = head / (num_heads / num_kv_heads);
     const float ks = k_scale[kv_head], vs = v_scale[kv_head];
+    const float score_scale = scale * ks;
     const int context_len = context_lens[batch];
     const int start = part * partition_size;
     const int end = min(start + partition_size, context_len);
@@ -171,10 +172,10 @@ kernel void paged_attention_partition_fp8(
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar kc = key_cache[cache_base + d];
-            const float kdec = fmt == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
-            partial += qv[i] * (kdec * ks);
+            const float kdec = FMT == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
+            partial += qv[i] * kdec;
         }
-        float score = simd_sum(partial) * scale;
+        float score = simd_sum(partial) * score_scale;
         if (capped) score = softcap * metal::tanh(score / softcap);
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
@@ -182,8 +183,8 @@ kernel void paged_attention_partition_fp8(
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar vc = value_cache[cache_base + d];
-            const float vdec = fmt == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
-            acc[i] = acc[i] * alpha + beta * (vdec * vs);
+            const float vdec = FMT == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
+            acc[i] = acc[i] * alpha + beta * vdec;
         }
         l = l * alpha + beta;
         m = new_m;
@@ -195,7 +196,7 @@ kernel void paged_attention_partition_fp8(
     }
     for (int i = 0; i < VALUES_PER_LANE; ++i) {
         const int d = (int)lane + 32 * i;
-        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l) * vs;
     }
 }
 
@@ -340,7 +341,7 @@ kernel void cascade_prefix_partition(
 // KV is uint8 fp8 (e4m3/e5m2) dequantized on read with per-kv-head scales (mirrors
 // paged_attention_partition_fp8). Emits the same (tmp_out, max_logits, exp_sums) partials so it
 // concatenates with the (bf16 or fp8) suffix partials into the shared reduce.
-template <typename T, int D>
+template <typename T, int D, int FMT>
 kernel void cascade_prefix_partition_fp8(
     device const T     *q          [[buffer(0)]],   // (B, H, D)
     device const uchar *prefix_k   [[buffer(1)]],   // (prefix_len, H_KV, D) uint8 fp8
@@ -363,6 +364,7 @@ kernel void cascade_prefix_partition_fp8(
     const int head = (int)tgid.x, batch = (int)tgid.y, part = (int)tgid.z;
     const int kv_head = head / (num_heads / num_kv_heads);
     const float ks = k_scale[kv_head], vs = v_scale[kv_head];
+    const float score_scale = scale * ks;
     const int start = part * partition_size;
     const int end = min(start + partition_size, prefix_len);
     const long q_base = ((long)batch * num_heads + head) * D;
@@ -382,18 +384,18 @@ kernel void cascade_prefix_partition_fp8(
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar kc = prefix_k[cache_base + d];
-            const float kdec = fmt == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
-            partial += qv[i] * (kdec * ks);
+            const float kdec = FMT == 1 ? float(tk_e5m2_decode(kc)) : float(tk_e4m3_decode(kc));
+            partial += qv[i] * kdec;
         }
-        const float score = simd_sum(partial) * scale;
+        const float score = simd_sum(partial) * score_scale;
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
         const float beta = exp(score - new_m);
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar vc = prefix_v[cache_base + d];
-            const float vdec = fmt == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
-            acc[i] = acc[i] * alpha + beta * (vdec * vs);
+            const float vdec = FMT == 1 ? float(tk_e5m2_decode(vc)) : float(tk_e4m3_decode(vc));
+            acc[i] = acc[i] * alpha + beta * vdec;
         }
         l = l * alpha + beta;
         m = new_m;
@@ -404,7 +406,7 @@ kernel void cascade_prefix_partition_fp8(
     }
     for (int i = 0; i < VALUES_PER_LANE; ++i) {
         const int d = (int)lane + 32 * i;
-        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l);
+        tmp_out[out_base + d] = l == 0.0f ? 0.0f : (acc[i] / l) * vs;
     }
 }
 
@@ -459,9 +461,9 @@ kernel void cascade_prefix_partition_fp8(
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);
 
-#define instantiate_paged_v2_fp8(type_name, T, DVAL)                          \
-  template [[host_name("paged_attention_partition_fp8_" #type_name "_" #DVAL)]] \
-  [[kernel]] void paged_attention_partition_fp8<T, DVAL>(                      \
+#define instantiate_paged_v2_fp8(fmt_name, FMT, type_name, T, DVAL)           \
+  template [[host_name("paged_attention_partition_fp8_" #fmt_name "_" #type_name "_" #DVAL)]] \
+  [[kernel]] void paged_attention_partition_fp8<T, DVAL, FMT>(                 \
       device const T *q [[buffer(0)]],                                        \
       device const uchar *key_cache [[buffer(1)]],                            \
       device const uchar *value_cache [[buffer(2)]],                          \
@@ -484,8 +486,8 @@ kernel void cascade_prefix_partition_fp8(
       constant float &softcap [[buffer(19)]],                                 \
       uint3 tgid [[threadgroup_position_in_grid]],                            \
       uint lane [[thread_index_in_simdgroup]]);                               \
-  template [[host_name("cascade_prefix_partition_fp8_" #type_name "_" #DVAL)]] \
-  [[kernel]] void cascade_prefix_partition_fp8<T, DVAL>(                       \
+  template [[host_name("cascade_prefix_partition_fp8_" #fmt_name "_" #type_name "_" #DVAL)]] \
+  [[kernel]] void cascade_prefix_partition_fp8<T, DVAL, FMT>(                  \
       device const T *q [[buffer(0)]],                                        \
       device const uchar *prefix_k [[buffer(1)]],                             \
       device const uchar *prefix_v [[buffer(2)]],                             \
@@ -525,9 +527,15 @@ template [[host_name("paged_attention_reduce_bfloat16_512")]]
     constant int &has_sink [[buffer(7)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]);
-instantiate_paged_v2_fp8(float32, float, 64)
-instantiate_paged_v2_fp8(float32, float, 128)
-instantiate_paged_v2_fp8(float16, half, 64)
-instantiate_paged_v2_fp8(float16, half, 128)
-instantiate_paged_v2_fp8(bfloat16, bf16, 64)
-instantiate_paged_v2_fp8(bfloat16, bf16, 128)
+instantiate_paged_v2_fp8(e4m3, 0, float32, float, 64)
+instantiate_paged_v2_fp8(e4m3, 0, float32, float, 128)
+instantiate_paged_v2_fp8(e4m3, 0, float16, half, 64)
+instantiate_paged_v2_fp8(e4m3, 0, float16, half, 128)
+instantiate_paged_v2_fp8(e4m3, 0, bfloat16, bf16, 64)
+instantiate_paged_v2_fp8(e4m3, 0, bfloat16, bf16, 128)
+instantiate_paged_v2_fp8(e5m2, 1, float32, float, 64)
+instantiate_paged_v2_fp8(e5m2, 1, float32, float, 128)
+instantiate_paged_v2_fp8(e5m2, 1, float16, half, 64)
+instantiate_paged_v2_fp8(e5m2, 1, float16, half, 128)
+instantiate_paged_v2_fp8(e5m2, 1, bfloat16, bf16, 64)
+instantiate_paged_v2_fp8(e5m2, 1, bfloat16, bf16, 128)

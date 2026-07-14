@@ -1,4 +1,4 @@
-"""Correctness test for the quantized GEMM (Marlin's method, dequant-to-shared).
+"""Correctness test for the quantized GEMM (Marlin's method).
 
 Oracle: out = dequantize(Wq) @ X (the exact kernel target — isolates kernel correctness from
 quantization error, so the tolerance is format-independent). Parametrized over every packed

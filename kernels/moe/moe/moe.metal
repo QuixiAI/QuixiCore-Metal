@@ -564,6 +564,111 @@ kernel void moe_grouped_gemm_swiglu(device T *out                    [[buffer(0)
     store(gl_d, gate, {0, 0, OY, OX}, simd_lane_id);
 }
 
+// Two-warp gate/up split for byte-per-value FP8 formats. Each warp owns one complete
+// projection over K; warp 1 stages the finished up tile once, while warp 0
+// retains gate and applies the epilogue. This replaces four-way split-K plus
+// two reduction passes with one exchange barrier.
+template <typename FMT>
+kernel void moe_grouped_gemm_swiglu_q_fp8_2w(
+    device bf16 *out [[buffer(0)]],
+    device bf16 *A [[buffer(1)]],
+    device const uchar *W1q [[buffer(2)]],
+    device const int *expert_of_tile [[buffer(3)]],
+    device const bf16 *bias [[buffer(4)]],
+    constant int &total_rows [[buffer(5)]],
+    constant int &H [[buffer(6)]],
+    constant int &inter [[buffer(7)]],
+    constant int &has_bias [[buffer(8)]],
+    constant int &act_mode [[buffer(9)]],
+    constant float &alpha [[buffer(10)]],
+    constant float &limit [[buffer(11)]],
+    uint3 threadgroup_id [[threadgroup_position_in_grid]],
+    uint warp [[simdgroup_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]]) {
+    const int OY = (int)threadgroup_id.y;
+    const int OX = (int)threadgroup_id.x;
+    const int e = expert_of_tile[OY];
+    if (e < 0) return;
+
+    using global_layout = gl<bf16, 1, 1, -1, -1>;
+    global_layout gl_a(A, nullptr, nullptr, total_rows, H);
+    global_layout gl_d(out, nullptr, nullptr, total_rows, inter);
+    const int blocks_per_row = H / FMT::block_k;
+    device const uchar *Wq_e = W1q +
+        (long)e * (long)(2 * inter) * (long)blocks_per_row *
+        FMT::block_bytes;
+
+    constexpr const int BN = 32, BK = 32, BM = 32;
+    const int up_tile = inter / BM + OX;
+    const int weight_tile = warp == 0 ? OX : up_tile;
+    threadgroup st<float, BN, BM> sUp;
+    rt<bf16, BN, BK> a_reg;
+    rt<bf16, BM, BK, ducks::rt_layout::col> w_reg;
+    rt<float, BN, BM> acc;
+    zero(acc);
+    for (int kb = 0; kb < H / BK; ++kb) {
+        load(a_reg, gl_a, {0, 0, OY, kb}, simd_lane_id);
+        dequant_into_register_col_swiglu<FMT>(
+            w_reg, Wq_e, 2 * inter, H, weight_tile, kb, simd_lane_id);
+        mma_ABt(acc, a_reg, w_reg, acc);
+    }
+    if (warp == 1) store(sUp, acc, simd_lane_id);
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    if (warp != 0) return;
+
+    rt<float, BN, BM> up;
+    load(up, sUp, simd_lane_id);
+    const int qid = (int)simd_lane_id / 4;
+    const int sx = (qid & 2) * 2 + ((int)simd_lane_id % 2) * 2;
+    device const bf16 *bg = bias + (long)e * (2 * inter) + OX * BM;
+    device const bf16 *bu = bias +
+        (long)e * (2 * inter) + inter + OX * BM;
+    #pragma clang loop unroll(full)
+    for (int i = 0; i < acc.height; i++) {
+        #pragma clang loop unroll(full)
+        for (int j = 0; j < acc.width; j++) {
+            #pragma clang loop unroll(full)
+            for (int el = 0; el < 2; el++) {
+                const int c = j * TILE_DIM + sx + el;
+                float g = acc.tiles[i][j].data.thread_elements()[el];
+                float u = up.tiles[i][j].data.thread_elements()[el];
+                if (has_bias != 0) {
+                    g += (float)bg[c];
+                    u += (float)bu[c];
+                }
+                if (act_mode == 1) {
+                    g = metal::min(g, limit);
+                    u = metal::clamp(u, -limit, limit);
+                    acc.tiles[i][j].data.thread_elements()[el] =
+                        (g / (1.0f + metal::exp(-g * alpha))) * (1.0f + u);
+                } else {
+                    acc.tiles[i][j].data.thread_elements()[el] =
+                        (g / (1.0f + metal::exp(-g))) * u;
+                }
+            }
+        }
+    }
+    store(gl_d, acc, {0, 0, OY, OX}, simd_lane_id);
+}
+
+#define instantiate_moe_swiglu_fp8_2w(fmt_name, FMT)                             \
+  template [[host_name("moe_grouped_gemm_swiglu_q_" #fmt_name)]] [[kernel]] void \
+  moe_grouped_gemm_swiglu_q_fp8_2w<FMT>(                                         \
+      device bf16 *out [[buffer(0)]], device bf16 *A [[buffer(1)]],               \
+      device const uchar *W1q [[buffer(2)]],                                      \
+      device const int *expert_of_tile [[buffer(3)]],                             \
+      device const bf16 *bias [[buffer(4)]],                                      \
+      constant int &total_rows [[buffer(5)]], constant int &H [[buffer(6)]],       \
+      constant int &inter [[buffer(7)]], constant int &has_bias [[buffer(8)]],     \
+      constant int &act_mode [[buffer(9)]], constant float &alpha [[buffer(10)]],  \
+      constant float &limit [[buffer(11)]],                                       \
+      uint3 threadgroup_id [[threadgroup_position_in_grid]],                       \
+      uint warp [[simdgroup_index_in_threadgroup]],                               \
+      uint simd_lane_id [[thread_index_in_simdgroup]]);
+
+instantiate_moe_swiglu_fp8_2w(mxfp8, mxfp8)
+instantiate_moe_swiglu_fp8_2w(fp8_e4m3, fp8_e4m3)
+
 #define instantiate_moe_grouped_gemm_rect(type_name, T)                        \
   template [[host_name("moe_grouped_gemm_rect_" #type_name)]] [[kernel]] void   \
   moe_grouped_gemm_rect<T, 4, 2, 4>(device T *out [[buffer(0)]],               \
@@ -884,8 +989,10 @@ kernel void moe_grouped_gemm_swiglu_q(device bf16 *out                 [[buffer(
     zero(up);
     for (int kb = (int)warp; kb < H / BK; kb += N_WARPS) {
         load(a_reg, gl_a, {0, 0, OY, kb}, simd_lane_id);
-        dequant_into_register_col<FMT>(wg_reg, Wq_e, 2 * inter, H, OX, kb, simd_lane_id);
-        dequant_into_register_col<FMT>(wu_reg, Wq_e, 2 * inter, H, up_tile, kb, simd_lane_id);
+        dequant_into_register_col_swiglu<FMT>(
+            wg_reg, Wq_e, 2 * inter, H, OX, kb, simd_lane_id);
+        dequant_into_register_col_swiglu<FMT>(
+            wu_reg, Wq_e, 2 * inter, H, up_tile, kb, simd_lane_id);
         mma_ABt(gate, a_reg, wg_reg, gate);
         mma_ABt(up, a_reg, wu_reg, up);
     }
@@ -973,10 +1080,25 @@ kernel void moe_grouped_gemm_swiglu_q(device bf16 *out                 [[buffer(
                                  uint warp [[simdgroup_index_in_threadgroup]],       \
                                  uint simd_lane_id [[thread_index_in_simdgroup]]);
 
+#define instantiate_moe_gemm_rect_q_only(fmt_name, FMT)                            \
+  template [[host_name("moe_grouped_gemm_rect_q_" #fmt_name)]] [[kernel]] void     \
+  moe_grouped_gemm_rect_q<FMT>(device bf16 *out [[buffer(0)]],                     \
+                               device bf16 *A [[buffer(1)]],                       \
+                               device const uchar *Wq [[buffer(2)]],               \
+                               device const int *expert_of_tile [[buffer(3)]],     \
+                               device const bf16 *bias [[buffer(4)]],              \
+                               constant int &total_rows [[buffer(5)]],             \
+                               constant int &K_dim [[buffer(6)]],                  \
+                               constant int &N_out [[buffer(7)]],                  \
+                               constant int &has_bias [[buffer(8)]],               \
+                               uint3 threadgroup_id [[threadgroup_position_in_grid]],\
+                               uint warp [[simdgroup_index_in_threadgroup]],       \
+                               uint simd_lane_id [[thread_index_in_simdgroup]]);
+
 instantiate_moe_gemm_q(mxfp4, mxfp4)
 instantiate_moe_gemm_q(kU4, kU4)
-instantiate_moe_gemm_q(fp8_e4m3, fp8_e4m3)
-instantiate_moe_gemm_q(mxfp8, mxfp8)
+instantiate_moe_gemm_rect_q_only(fp8_e4m3, fp8_e4m3)
+instantiate_moe_gemm_rect_q_only(mxfp8, mxfp8)
 instantiate_moe_gemm_q(tq2_0, tq2_0)
 instantiate_moe_gemm_q(q8_0, q8_0)
 instantiate_moe_gemm_q(nvfp4, nvfp4)

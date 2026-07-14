@@ -2045,20 +2045,20 @@ def beam_advance(logits, cum_log_probs, beam_width):
 def lm_head_beam_advance(h, W, cum_log_probs, beam_width, bias=None,
                          format="q4_0"):
     """Quantized LM-head plus exact beam-search advance. ``W`` is q4_0/q8_0/mxfp8/nvfp4/mxfp4
-    packed ``(V,K/block_k,bytes)`` and ``h`` is ``(B*beam_width,K)``. Q4_0/MXFP8/NVFP4/MXFP4 with up
-    to four beam rows use the no-logits fused kernel; q8_0 and larger row
-    batches use the packed matrix path so the head weights are shared across
-    rows. Returns next token, parent beam, and updated cumulative log-probability,
-    each ``(B,beam_width)``.
+    packed ``(V,K/block_k,bytes)`` and ``h`` is ``(B*beam_width,K)``.
+    Q4_0/NVFP4/MXFP4 with up to four beam rows use the no-logits fused kernel;
+    Q8_0/MXFP8 and larger row batches use the packed matrix path so the head
+    weights are shared across rows. Returns next token, parent beam, and updated
+    cumulative log-probability, each ``(B,beam_width)``.
     """
     if format not in ("q4_0", "q8_0", "mxfp8", "nvfp4", "mxfp4"):
         raise ValueError(
             "lm_head_beam_advance: format must be q4_0, q8_0, mxfp8, nvfp4, or mxfp4")
     rows = int(h.shape[0])
-    # Q4 row-wise fusion saves a logits allocation and wins at decode-scale
-    # row counts. Q8 and larger row batches favor a 32-column packed GEMM that
-    # amortizes each weight read; pad only its small activation side.
-    use_matrix = (format == "q8_0" or rows > 4) and int(W.shape[0]) % 32 == 0
+    # Q4/NVFP4/MXFP4 row-wise fusion saves a logits allocation at decode-scale
+    # row counts. Q8/MXFP8 and larger row batches favor a 32-column packed GEMM
+    # that amortizes each weight read; pad only its small activation side.
+    use_matrix = (format in ("q8_0", "mxfp8") or rows > 4) and int(W.shape[0]) % 32 == 0
     if _is_torch(h):
         import torch
         if use_matrix:

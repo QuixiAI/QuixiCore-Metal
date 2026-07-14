@@ -104,14 +104,16 @@ inline std::string paged_attention_xcache_kernel_name(const std::string& t, int 
   return "paged_attention_xcache_" + t + "_" + std::to_string(D);
 }
 inline std::string kv_cache_scatter_fp8_kernel_name(const std::string& t) { return "kv_cache_scatter_fp8_" + t; }
-inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D) {
-  return "paged_attention_fp8_" + t + "_" + std::to_string(D);
+inline std::string paged_attention_fp8_kernel_name(const std::string& t, int D, int fmt) {
+  return "paged_attention_fp8_" + std::string(fmt == 1 ? "e5m2_" : "e4m3_") + t + "_" +
+         std::to_string(D);
 }
 inline std::string paged_attention_partition_kernel_name(const std::string& t, int D) {
   return "paged_attention_partition_" + t + "_" + std::to_string(D);
 }
-inline std::string paged_attention_partition_fp8_kernel_name(const std::string& t, int D) {
-  return "paged_attention_partition_fp8_" + t + "_" + std::to_string(D);
+inline std::string paged_attention_partition_fp8_kernel_name(const std::string& t, int D, int fmt) {
+  return "paged_attention_partition_fp8_" +
+         std::string(fmt == 1 ? "e5m2_" : "e4m3_") + t + "_" + std::to_string(D);
 }
 inline std::string paged_attention_reduce_kernel_name(const std::string& t, int D) {
   return "paged_attention_reduce_" + t + "_" + std::to_string(D);
@@ -850,18 +852,20 @@ void launch_moe_grouped_gemm_rect_q(Enc& e, typename Enc::out_t out, typename En
 
 // swiglu_q: out@0 A@1 W1q@2(u8, [gate|up] along N) expert_of_tile@3(i32) bias@4 ; rows@5 H@6
 //           inter@7 has_bias@8 act_mode@9 (0 swiglu, 1 swiglu_oai) alpha@10(f32) limit@11(f32) ;
-//           grid (inter/32, rows/32, 1), 32 thr.
+//           grid (inter/32, rows/32, 1), 64 threads for byte-per-value FP8, 128 otherwise.
 template <class Enc>
 void launch_moe_grouped_gemm_swiglu_q(Enc& e, typename Enc::out_t out, typename Enc::in_t A,
                                       typename Enc::in_t W1q, typename Enc::in_t expert_of_tile,
                                       typename Enc::in_t bias, int total_rows, int H, int inter,
                                       int has_bias, int act_mode, float alpha, float limit,
                                       const std::string& fmt) {
+  const bool fp8_two_warp = fmt == "mxfp8" || fmt == "fp8_e4m3";
   e.pipeline(moe_grouped_gemm_swiglu_q_kernel_name(fmt));
   e.out(out, 0); e.in(A, 1); e.in(W1q, 2); e.in(expert_of_tile, 3); e.in(bias, 4);
   e.bytes(total_rows, 5); e.bytes(H, 6); e.bytes(inter, 7); e.bytes(has_bias, 8);
   e.bytes(act_mode, 9); e.bytes(alpha, 10); e.bytes(limit, 11);
-  e.dispatch(inter / 32, total_rows / 32, 1, 128, 1, 1);   // 4-warp split-K per tile
+  const int threads = fp8_two_warp ? 64 : 128;
+  e.dispatch(inter / 32, total_rows / 32, 1, threads, 1, 1);
 }
 
 // ----- moe_finalize: expert_out@0 inv_idx@1(i32) topk_weights@2(f32) -> out@3 ; K@4 Hdim@5 ;
@@ -2131,7 +2135,7 @@ void launch_paged_attention_fp8(E& e, typename E::in_t q, typename E::in_t key_c
                                 int block_size, int block_table_stride, float scale,
                                 typename E::in_t k_scale, typename E::in_t v_scale, int fmt,
                                 int window, const std::string& type_name) {
-  e.pipeline(paged_attention_fp8_kernel_name(type_name, head_size));
+  e.pipeline(paged_attention_fp8_kernel_name(type_name, head_size, fmt));
   e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
   e.in(block_table, 3); e.in(context_lens, 4); e.out(out, 5);
   e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
@@ -2188,7 +2192,7 @@ void launch_paged_attention_partition_fp8(
     int block_table_stride, float scale, int num_partitions, int partition_size,
     typename E::in_t k_scale, typename E::in_t v_scale, int fmt, int window, float softcap,
     const std::string& type_name) {
-  e.pipeline(paged_attention_partition_fp8_kernel_name(type_name, head_size));
+  e.pipeline(paged_attention_partition_fp8_kernel_name(type_name, head_size, fmt));
   e.in(q, 0); e.in(key_cache, 1); e.in(value_cache, 2);
   e.in(block_table, 3); e.in(context_lens, 4);
   e.out(tmp_out, 5); e.out(max_logits, 6); e.out(exp_sums, 7);
@@ -2207,7 +2211,8 @@ void launch_cascade_prefix_partition_fp8(
     int batch, int num_heads, int num_kv_heads, int head_size, int prefix_len, float scale,
     int num_partitions, int partition_size, typename E::in_t k_scale, typename E::in_t v_scale,
     int fmt, const std::string& type_name) {
-  e.pipeline("cascade_prefix_partition_fp8_" + type_name + "_" + std::to_string(head_size));
+  e.pipeline("cascade_prefix_partition_fp8_" + std::string(fmt == 1 ? "e5m2_" : "e4m3_") +
+             type_name + "_" + std::to_string(head_size));
   e.in(q, 0); e.in(prefix_k, 1); e.in(prefix_v, 2);
   e.out(tmp_out, 3); e.out(max_logits, 4); e.out(exp_sums, 5);
   e.bytes(prefix_len, 6); e.bytes(scale, 7); e.bytes(num_heads, 8); e.bytes(num_kv_heads, 9);
@@ -2877,7 +2882,7 @@ void launch_fftconv(E& e, typename E::out_t out, typename E::in_t x, typename E:
 }
 
 // ----- qgemm (quantized GEMM, dequant-to-shared): D@0 Wq@1 X@2 ; N@3 K@4 M@5 (i32) ;
-//        grid (M/32, N/32, 1), 64 threads (2 simdgroups). D=W@X, W (N,K) quantized blocks
+//        grid (M/tile_m, N/32, 1), 64 threads (2 simdgroups). D=W@X, W (N,K) quantized blocks
 //        (format `fmt`), X (K,M) half, D (N,M) half. -----
 template <class E>
 void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq, typename E::in_t x,
@@ -2885,7 +2890,8 @@ void launch_qgemm(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.pipeline(qgemm_kernel_name(fmt));
   e.out(d, 0); e.in(wq, 1); e.in(x, 2);
   e.bytes(N, 3); e.bytes(K, 4); e.bytes(M, 5);
-  e.dispatch(M / 32, N / 32, 1, 64, 1, 1);  // 64 threads = 2 simdgroups, BM=32
+  const int tile_m = fmt == "mxfp8" ? 64 : 32;
+  e.dispatch(M / tile_m, N / 32, 1, 64, 1, 1);
 }
 
 // ----- qgemm_actorder: GPTQ act-order, in-kernel g_idx gather. D@0 Wq@1 X@2 perm@3(int) ; N@4 K@5

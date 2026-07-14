@@ -11,8 +11,9 @@ namespace mlx::core {
 
 /** Quantized GEMM (Marlin's method): out = dequantize(wq) @ x.
  *  wq is packed weight blocks of shape (N, K/block_k, block_bytes) uint8 for the given
- *  `format` (e.g. "q8_0"); x is (K, M) float16; out is (N, M) float16. Dequant-to-shared
- *  then a standard simdgroup MMA. Shapes: N%32, M%32, K%block_k. */
+ *  `format` (e.g. "q8_0"); x is (K, M) float16; out is (N, M) float16. The implementation
+ *  selects direct-fragment or staged weight dequantization by format and shape.
+ *  Shapes: N%32, M%32, K%block_k. */
 array qgemm(const array& wq, const array& x, const std::string& format = "q8_0",
             StreamOrDevice s = {});
 

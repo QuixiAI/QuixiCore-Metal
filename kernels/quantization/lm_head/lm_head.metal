@@ -1031,6 +1031,114 @@ specialize_lmh_quant_dot_mxfp4(float)
 specialize_lmh_quant_dot_mxfp4(half)
 specialize_lmh_quant_dot_mxfp4(bf16)
 
+// FP32 companion for masked/candidate projection. One complete block shares
+// the reconstructed E8M0 scale while retaining one-final-rounding semantics.
+template <typename T>
+METAL_FUNC float lmh_quant_dot_mxfp8_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / mxfp8::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base =
+            wrow + (long)block * mxfp8::block_bytes;
+        const float scale = tk_e8m0_decode_f32(base[0]);
+        device const uchar *codes = base + 1;
+        const int input_base = block * mxfp8::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < mxfp8::block_k; ++i) {
+            result += scale * float(tk_e4m3_decode(codes[i])) *
+                float(hrow[input_base + i]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_quant_dot_mxfp8(T)                                  \
+  template <> METAL_FUNC float lmh_quant_dot_f32<mxfp8, T>(                \
+    device const T *hrow, device const uchar *wrow, int K) {               \
+    return lmh_quant_dot_mxfp8_f32<T>(hrow, wrow, K);                       \
+  }
+
+specialize_lmh_quant_dot_mxfp8(float)
+specialize_lmh_quant_dot_mxfp8(half)
+specialize_lmh_quant_dot_mxfp8(bf16)
+
+// The masked projection kernel has enough independent row work to hide a
+// constant-codebook lookup and benefits from removing E4M3 bit arithmetic.
+// Keep this LUT local to that path: the same strategy regresses QGEMV,
+// candidate projection, and the large-row MoE SwiGLU path.
+constant ushort lmh_e4m3_half_lut[256] = {
+    0x0000u, 0x1800u, 0x1c00u, 0x1e00u, 0x2000u, 0x2100u, 0x2200u, 0x2300u,
+    0x2400u, 0x2480u, 0x2500u, 0x2580u, 0x2600u, 0x2680u, 0x2700u, 0x2780u,
+    0x2800u, 0x2880u, 0x2900u, 0x2980u, 0x2a00u, 0x2a80u, 0x2b00u, 0x2b80u,
+    0x2c00u, 0x2c80u, 0x2d00u, 0x2d80u, 0x2e00u, 0x2e80u, 0x2f00u, 0x2f80u,
+    0x3000u, 0x3080u, 0x3100u, 0x3180u, 0x3200u, 0x3280u, 0x3300u, 0x3380u,
+    0x3400u, 0x3480u, 0x3500u, 0x3580u, 0x3600u, 0x3680u, 0x3700u, 0x3780u,
+    0x3800u, 0x3880u, 0x3900u, 0x3980u, 0x3a00u, 0x3a80u, 0x3b00u, 0x3b80u,
+    0x3c00u, 0x3c80u, 0x3d00u, 0x3d80u, 0x3e00u, 0x3e80u, 0x3f00u, 0x3f80u,
+    0x4000u, 0x4080u, 0x4100u, 0x4180u, 0x4200u, 0x4280u, 0x4300u, 0x4380u,
+    0x4400u, 0x4480u, 0x4500u, 0x4580u, 0x4600u, 0x4680u, 0x4700u, 0x4780u,
+    0x4800u, 0x4880u, 0x4900u, 0x4980u, 0x4a00u, 0x4a80u, 0x4b00u, 0x4b80u,
+    0x4c00u, 0x4c80u, 0x4d00u, 0x4d80u, 0x4e00u, 0x4e80u, 0x4f00u, 0x4f80u,
+    0x5000u, 0x5080u, 0x5100u, 0x5180u, 0x5200u, 0x5280u, 0x5300u, 0x5380u,
+    0x5400u, 0x5480u, 0x5500u, 0x5580u, 0x5600u, 0x5680u, 0x5700u, 0x5780u,
+    0x5800u, 0x5880u, 0x5900u, 0x5980u, 0x5a00u, 0x5a80u, 0x5b00u, 0x5b80u,
+    0x5c00u, 0x5c80u, 0x5d00u, 0x5d80u, 0x5e00u, 0x5e80u, 0x5f00u, 0x5f80u,
+    0x8000u, 0x9800u, 0x9c00u, 0x9e00u, 0xa000u, 0xa100u, 0xa200u, 0xa300u,
+    0xa400u, 0xa480u, 0xa500u, 0xa580u, 0xa600u, 0xa680u, 0xa700u, 0xa780u,
+    0xa800u, 0xa880u, 0xa900u, 0xa980u, 0xaa00u, 0xaa80u, 0xab00u, 0xab80u,
+    0xac00u, 0xac80u, 0xad00u, 0xad80u, 0xae00u, 0xae80u, 0xaf00u, 0xaf80u,
+    0xb000u, 0xb080u, 0xb100u, 0xb180u, 0xb200u, 0xb280u, 0xb300u, 0xb380u,
+    0xb400u, 0xb480u, 0xb500u, 0xb580u, 0xb600u, 0xb680u, 0xb700u, 0xb780u,
+    0xb800u, 0xb880u, 0xb900u, 0xb980u, 0xba00u, 0xba80u, 0xbb00u, 0xbb80u,
+    0xbc00u, 0xbc80u, 0xbd00u, 0xbd80u, 0xbe00u, 0xbe80u, 0xbf00u, 0xbf80u,
+    0xc000u, 0xc080u, 0xc100u, 0xc180u, 0xc200u, 0xc280u, 0xc300u, 0xc380u,
+    0xc400u, 0xc480u, 0xc500u, 0xc580u, 0xc600u, 0xc680u, 0xc700u, 0xc780u,
+    0xc800u, 0xc880u, 0xc900u, 0xc980u, 0xca00u, 0xca80u, 0xcb00u, 0xcb80u,
+    0xcc00u, 0xcc80u, 0xcd00u, 0xcd80u, 0xce00u, 0xce80u, 0xcf00u, 0xcf80u,
+    0xd000u, 0xd080u, 0xd100u, 0xd180u, 0xd200u, 0xd280u, 0xd300u, 0xd380u,
+    0xd400u, 0xd480u, 0xd500u, 0xd580u, 0xd600u, 0xd680u, 0xd700u, 0xd780u,
+    0xd800u, 0xd880u, 0xd900u, 0xd980u, 0xda00u, 0xda80u, 0xdb00u, 0xdb80u,
+    0xdc00u, 0xdc80u, 0xdd00u, 0xdd80u, 0xde00u, 0xde80u, 0xdf00u, 0xdf80u
+};
+
+template <typename FMT, typename T>
+METAL_FUNC float lmh_masked_quant_dot_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    return lmh_quant_dot_f32<FMT>(hrow, wrow, K);
+}
+
+template <typename T>
+METAL_FUNC float lmh_masked_quant_dot_mxfp8_f32(
+    device const T *hrow, device const uchar *wrow, int K) {
+    const int blocks = K / mxfp8::block_k;
+    float result = 0.0f;
+    for (int block = 0; block < blocks; ++block) {
+        device const uchar *base =
+            wrow + (long)block * mxfp8::block_bytes;
+        const float scale = tk_e8m0_decode_f32(base[0]);
+        device const uchar *codes = base + 1;
+        const int input_base = block * mxfp8::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < mxfp8::block_k; ++i) {
+            result += scale *
+                float(as_type<half>(lmh_e4m3_half_lut[codes[i]])) *
+                float(hrow[input_base + i]);
+        }
+    }
+    return result;
+}
+
+#define specialize_lmh_masked_quant_dot_mxfp8(T)                           \
+  template <> METAL_FUNC float lmh_masked_quant_dot_f32<mxfp8, T>(         \
+    device const T *hrow, device const uchar *wrow, int K) {               \
+    return lmh_masked_quant_dot_mxfp8_f32<T>(hrow, wrow, K);                \
+  }
+
+specialize_lmh_masked_quant_dot_mxfp8(float)
+specialize_lmh_masked_quant_dot_mxfp8(half)
+specialize_lmh_masked_quant_dot_mxfp8(bf16)
+
 METAL_FUNC void lmh_lse_update(float value, thread float &maximum,
                                thread float &sum) {
     if (value > maximum) {
@@ -1130,7 +1238,7 @@ kernel void lm_head_masked_partials_q(
             (allow_mask[(long)token * mask_words + (vocab >> 5)] &
              (1u << (vocab & 31))) != 0;
         if (normalize_allowed && !allowed) continue;
-        float logit = lmh_quant_dot_f32<FMT>(
+        float logit = lmh_masked_quant_dot_f32<FMT>(
             hrow, W + (long)vocab * row_bytes, K);
         if (use_bias != 0) logit += bias[vocab];
         if (!normalize_allowed || allowed) lmh_lse_update(logit, local_max, local_sum);

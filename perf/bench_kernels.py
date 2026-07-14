@@ -1174,6 +1174,82 @@ def qgemm_cases(be, preset, formats):
                            weight_bytes=N * (K // bk) * bb, flops=2.0 * N * K * M)
 
 
+@register("qgemm_fp8_scaled")
+def qgemm_fp8_scaled_cases(be, preset, formats):
+    """Rank-1-scaled W8A8 FP8 GEMM, including the serving-critical M sweep.
+
+    The framework baseline materializes the same decoded-and-scaled operands in fp16. It is not a
+    storage-equivalent baseline, but isolates the decode/scale overhead from dense matmul throughput.
+    """
+    tk = be.tk()
+    from tk.quant import _e4m3_decode_arr
+    rng = np.random.default_rng(221)
+    shapes = _pick(preset,
+                   [(256, 256, 32)],
+                   [(4096, 4096, 32), (4096, 4096, 128), (4096, 4096, 512)],
+                   [(4096, 4096, 32), (4096, 4096, 64), (4096, 4096, 128),
+                    (4096, 4096, 256), (4096, 4096, 512),
+                    (11008, 4096, 32), (11008, 4096, 128)])
+    for N, K, M in shapes:
+        # Restrict magnitudes to finite E4M3 codes representative of quantized normal operands.
+        wq = rng.integers(0, 0x77, (N, K), dtype=np.uint8)
+        wq |= (rng.integers(0, 2, (N, K), dtype=np.uint8) << 7)
+        xq = rng.integers(0, 0x77, (K, M), dtype=np.uint8)
+        xq |= (rng.integers(0, 2, (K, M), dtype=np.uint8) << 7)
+        ws = rng.uniform(1.0e-3, 3.0e-3, N).astype(np.float16)
+        xs = rng.uniform(1.0e-3, 3.0e-3, M).astype(np.float16)
+        wq_d, xq_d = be.raw_array(wq), be.raw_array(xq)
+        ws_d, xs_d = be.array(ws, "f16"), be.array(xs, "f16")
+        w_d = be.array(_e4m3_decode_arr(wq).astype(np.float32) * ws[:, None], "f16")
+        x_d = be.array(_e4m3_decode_arr(xq).astype(np.float32) * xs[None, :], "f16")
+        if be.name == "mlx":
+            dense = lambda w_d=w_d, x_d=x_d: be.mx.matmul(w_d, x_d)
+        else:
+            dense = lambda w_d=w_d, x_d=x_d: w_d @ x_d
+        yield Case("qgemm_fp8_scaled", f"N{N}_K{K}_M{M}",
+                   {"N": N, "K": K, "M": M}, "fp8", fmt="fp8_e4m3",
+                   target=lambda wq_d=wq_d, xq_d=xq_d, ws_d=ws_d, xs_d=xs_d:
+                       tk.qgemm_fp8_scaled(wq_d, xq_d, ws_d, xs_d),
+                   baselines={"fp16_matmul": dense}, ref=None,
+                   weight_bytes=float(N * K), flops=2.0 * N * K * M,
+                   notes="codes-only E4M3 operands with rank-1 fp16 scales")
+
+
+@register("qgemm_fp8_block2d")
+def qgemm_fp8_block2d_cases(be, preset, formats):
+    """Codes-only E4M3 weight GEMM with one fp16 scale per 128x128 weight tile."""
+    tk = be.tk()
+    from tk.quant import _e4m3_decode_arr
+    rng = np.random.default_rng(222)
+    shapes = _pick(preset,
+                   [(256, 256, 64)],
+                   [(4096, 4096, 32), (4096, 4096, 128), (4096, 4096, 512)],
+                   [(4096, 4096, 32), (4096, 4096, 64), (4096, 4096, 128),
+                    (4096, 4096, 256), (4096, 4096, 512),
+                    (11008, 4096, 32), (11008, 4096, 128)])
+    for N, K, M in shapes:
+        wq = rng.integers(0, 0x77, (N, K // 128, 128), dtype=np.uint8)
+        wq |= (rng.integers(0, 2, wq.shape, dtype=np.uint8) << 7)
+        scale = rng.uniform(1.0e-3, 3.0e-3, (N // 128, K // 128)).astype(np.float16)
+        x = (0.2 * rng.standard_normal((K, M))).astype(np.float32)
+        wq_d, scale_d, x_d = be.raw_array(wq), be.array(scale, "f16"), be.array(x, "f16")
+        scale_rows = np.repeat(scale.astype(np.float32), 128, axis=0)
+        w = (_e4m3_decode_arr(wq).astype(np.float32) * scale_rows[:, :, None]).reshape(N, K)
+        w_d = be.array(w, "f16")
+        if be.name == "mlx":
+            dense = lambda w_d=w_d, x_d=x_d: be.mx.matmul(w_d, x_d)
+        else:
+            dense = lambda w_d=w_d, x_d=x_d: w_d @ x_d
+        yield Case("qgemm_fp8_block2d", f"N{N}_K{K}_M{M}",
+                   {"N": N, "K": K, "M": M}, "fp8", fmt="fp8_block2d",
+                   target=lambda wq_d=wq_d, x_d=x_d, scale_d=scale_d:
+                       tk.qgemm_fp8_block2d(wq_d, x_d, scale_d),
+                   baselines={"fp16_matmul": dense}, ref=None,
+                   weight_bytes=float(N * K + (N // 128) * (K // 128) * 2),
+                   flops=2.0 * N * K * M,
+                   notes="codes-only E4M3 weights with 128x128 fp16 block scales")
+
+
 @register("qflux")
 def qflux_cases(be, preset, formats):
     tk = be.tk()
@@ -1324,13 +1400,43 @@ def kv_gather_fp8_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=float(2 * total * H * D * 1))
 
 
+@register("kv_scatter_fp8")
+def kv_scatter_fp8_cases(be, preset, formats):
+    """FP8 KV-cache producer, including both attention head sizes."""
+    tk = be.tk()
+    rng = np.random.default_rng(240)
+    shapes = _pick(preset, [(512, 8, 64)], [(512, 8, 64), (512, 8, 128)],
+                   [(1, 8, 64), (1, 8, 128), (512, 8, 64), (512, 8, 128),
+                    (4096, 8, 64), (4096, 8, 128)])
+    for T, H, D in shapes:
+        bs = 16
+        nb = (T + bs - 1) // bs
+        key = (0.3 * rng.standard_normal((T, H, D))).astype(np.float32)
+        value = (0.3 * rng.standard_normal((T, H, D))).astype(np.float32)
+        key_d, value_d = be.array(key, "bf16"), be.array(value, "bf16")
+        slots_d = be.int_array(np.arange(T, dtype=np.int64))
+        for fmt, qmax in (("e4m3", 448.0), ("e5m2", 57344.0)):
+            ks = np.maximum(np.abs(key).max(axis=(0, 2)) / qmax, 1e-8).astype(np.float32)
+            vs = np.maximum(np.abs(value).max(axis=(0, 2)) / qmax, 1e-8).astype(np.float32)
+            ks_d, vs_d = be.array(ks, "f32"), be.array(vs, "f32")
+            yield Case("kv_scatter_fp8", f"{fmt}_T{T}_H{H}_D{D}",
+                       {"T": T, "H": H, "D": D}, "bf16", fmt=f"fp8_{fmt}",
+                       target=lambda key_d=key_d, value_d=value_d, slots_d=slots_d,
+                                     nb=nb, bs=bs, ks_d=ks_d, vs_d=vs_d, fmt=fmt:
+                           tk.kv_cache_scatter_fp8(key_d, value_d, slots_d, nb, bs,
+                                                   ks_d, vs_d, fmt=fmt)[0],
+                       baselines={}, ref=None,
+                       bytes_moved=float(2 * T * H * D * 2 + 2 * T * H * D))
+
+
 @register("paged_attn")
 def paged_attn_cases(be, preset, formats):
     tk = be.tk()
     rng = np.random.default_rng(26)
     shapes = _pick(preset, [(4, 16, 4, 128, 512)],
-                   [(8, 32, 8, 128, 2048)],
-                   [(8, 32, 8, 128, 2048), (16, 32, 8, 128, 4096), (8, 32, 8, 128, 8192)])
+                   [(8, 32, 8, 64, 2048), (8, 32, 8, 128, 2048)],
+                   [(8, 32, 8, 64, 2048), (8, 32, 8, 128, 2048),
+                    (16, 32, 8, 128, 4096), (8, 32, 8, 128, 8192)])
     for B, H, H_KV, D, ctx in shapes:
         block_size = 16
         max_blocks = (ctx + block_size - 1) // block_size
@@ -1361,11 +1467,30 @@ def paged_attn_cases(be, preset, formats):
         codes_k = rng.integers(0, 127, kc.shape, dtype=np.uint8)
         codes_v = rng.integers(0, 127, vc.shape, dtype=np.uint8)
         kc8_d, vc8_d = be.raw_array(codes_k), be.raw_array(codes_v)
-        yield Case("paged_attn", f"v2_fp8_B{B}H{H}ctx{ctx}",
+        yield Case("paged_attn", f"v1_fp8_e4m3_B{B}H{H}ctx{ctx}",
+                   {"B": B, "H": H, "ctx": ctx, "D": D}, "fp8",
+                   target=lambda q_d=q_d, kc8_d=kc8_d, vc8_d=vc8_d, bt_d=bt_d, cl_d=cl_d:
+                       tk.paged_attention_fp8(q_d, kc8_d, vc8_d, bt_d, cl_d, 0.01, 0.01),
+                   baselines={"tk.paged_attention_bf16": v1}, ref=None, bytes_moved=kv_bytes / 2)
+        yield Case("paged_attn", f"v2_fp8_e4m3_B{B}H{H}ctx{ctx}",
                    {"B": B, "H": H, "ctx": ctx, "D": D}, "fp8",
                    target=lambda q_d=q_d, kc8_d=kc8_d, vc8_d=vc8_d, bt_d=bt_d, cl_d=cl_d:
                        tk.paged_attention_v2_fp8(q_d, kc8_d, vc8_d, bt_d, cl_d,
                                                  0.01, 0.01, partition_size=256),
+                   baselines={"tk.paged_attention_v2_bf16":
+                              (lambda a=args: tk.paged_attention_v2(*a, partition_size=256))},
+                   ref=None, bytes_moved=kv_bytes / 2)
+        yield Case("paged_attn", f"v1_fp8_e5m2_B{B}H{H}ctx{ctx}",
+                   {"B": B, "H": H, "ctx": ctx, "D": D}, "fp8",
+                   target=lambda q_d=q_d, kc8_d=kc8_d, vc8_d=vc8_d, bt_d=bt_d, cl_d=cl_d:
+                       tk.paged_attention_fp8(q_d, kc8_d, vc8_d, bt_d, cl_d, 0.01, 0.01,
+                                              fmt="e5m2"),
+                   baselines={"tk.paged_attention_bf16": v1}, ref=None, bytes_moved=kv_bytes / 2)
+        yield Case("paged_attn", f"v2_fp8_e5m2_B{B}H{H}ctx{ctx}",
+                   {"B": B, "H": H, "ctx": ctx, "D": D}, "fp8",
+                   target=lambda q_d=q_d, kc8_d=kc8_d, vc8_d=vc8_d, bt_d=bt_d, cl_d=cl_d:
+                       tk.paged_attention_v2_fp8(q_d, kc8_d, vc8_d, bt_d, cl_d,
+                                                 0.01, 0.01, partition_size=256, fmt="e5m2"),
                    baselines={"tk.paged_attention_v2_bf16":
                               (lambda a=args: tk.paged_attention_v2(*a, partition_size=256))},
                    ref=None, bytes_moved=kv_bytes / 2)
@@ -1390,6 +1515,27 @@ def mla_cases(be, preset, formats):
                    target=lambda q_d=q_d, c_d=c_d, bt_d=bt_d, cl_d=cl_d:
                        tk.mla_decode(q_d, c_d, bt_d, cl_d),
                    baselines={}, ref=None, bytes_moved=float(B * ctx * 576 * 2))
+
+        # V4 cache: 448 E4M3 values with seven UE8M0 scales plus 64 bf16 RoPE values.
+        total = num_blocks * block_size
+        kv = (0.3 * rng.standard_normal((total, 512))).astype(np.float32)
+        cos = np.ones((total, 32), dtype=np.float32)
+        sin = np.zeros((total, 32), dtype=np.float32)
+        data0 = np.zeros((num_blocks, block_size, 576), dtype=np.uint8)
+        scale0 = np.zeros((num_blocks, block_size, 8), dtype=np.uint8)
+        data_d, scale_d = tk.mla_kv_insert_fp8(
+            be.array(kv, "bf16"), be.array(cos, "bf16"), be.array(sin, "bf16"),
+            be.int_array(np.arange(total, dtype=np.int32)),
+            be.int_array(np.arange(total, dtype=np.int64)),
+            be.raw_array(data0), be.raw_array(scale0))
+        be.sync([data_d, scale_d])
+        q8_d = be.array(q[:, :, :512], "bf16")
+        yield Case("mla", f"decode_fp8_B{B}H{NH}ctx{ctx}",
+                   {"B": B, "H": NH, "ctx": ctx}, "fp8", fmt="fp8_e4m3_ue8m0",
+                   target=lambda q8_d=q8_d, data_d=data_d, scale_d=scale_d, bt_d=bt_d, cl_d=cl_d:
+                       tk.mla_decode_fp8(q8_d, data_d, scale_d, bt_d, cl_d),
+                   baselines={}, ref=None,
+                   bytes_moved=float(B * ctx * (448 + 64 * 2 + 8)))
 
 
 @register("logit_transforms")
@@ -1634,6 +1780,14 @@ def act_quant_cases(be, preset, formats):
         yield Case("act_quant", f"int8_T{T}_D{D}", {"T": T, "D": D}, "bf16",
                    target=lambda x_d=x_d, g_d=g_d: tk.silu_mul_quant_int8(x_d, g_d)[0],
                    baselines=baselines, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+        fp8_baselines = {"glu_then_quant":
+                         lambda x_d=x_d, g_d=g_d:
+                             tk.quantize_per_token_fp8(tk.swiglu(x_d, g_d))[0]}
+        yield Case("act_quant", f"fp8_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   fmt="fp8_e4m3",
+                   target=lambda x_d=x_d, g_d=g_d: tk.silu_mul_quant_fp8(x_d, g_d)[0],
+                   baselines=fp8_baselines, ref=None,
                    bytes_moved=(2.0 * T * D * 2 + T * D))
 
 

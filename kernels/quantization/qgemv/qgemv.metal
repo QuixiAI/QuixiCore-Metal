@@ -145,6 +145,38 @@ kernel void qgemv_mxfp4_fast(
     if (lane == 0) D[row] = half(accumulator);
 }
 
+// MXFP8 whole-block decode. One lane consumes all 32 E4M3 codes behind
+// an E8M0 scale, replacing the generic four-lanes-per-block schedule.
+[[host_name("qgemv_mxfp8")]]
+kernel void qgemv_mxfp8_fast(
+    device half *D [[buffer(0)]],
+    device const uchar *Wq [[buffer(1)]],
+    device const half *X [[buffer(2)]],
+    const constant int &N [[buffer(3)]],
+    const constant int &K [[buffer(4)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    const int row = int(tgid.x);
+    const int blocks_per_row = K / mxfp8::block_k;
+    device const uchar *row_base =
+        Wq + (uint)(row * blocks_per_row) * mxfp8::block_bytes;
+    float accumulator = 0.0f;
+    for (int block = int(lane); block < blocks_per_row; block += 32) {
+        device const uchar *base =
+            row_base + (uint)block * mxfp8::block_bytes;
+        const half scale = metal::exp2(half((int)base[0] - 127));
+        device const uchar *codes = base + 1;
+        const int input_base = block * mxfp8::block_k;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < mxfp8::block_k; ++i) {
+            const half value = scale * tk_e4m3_decode(codes[i]);
+            accumulator += float(value) * float(X[input_base + i]);
+        }
+    }
+    accumulator = metal::simd_sum(accumulator);
+    if (lane == 0) D[row] = half(accumulator);
+}
+
 // The f32 decode specializations preserve f32 activations and output instead
 // of routing through the fp16 decode contract. They are intentionally limited
 // to the q4_0 and q6_K GGUF layouts.
@@ -291,7 +323,6 @@ instantiate_qgemv("qgemv_kU4B8", kU4B8);
 instantiate_qgemv("qgemv_kU4", kU4);
 instantiate_qgemv("qgemv_fp8_e4m3", fp8_e4m3);
 instantiate_qgemv("qgemv_fp4_e2m1", fp4_e2m1);
-instantiate_qgemv("qgemv_mxfp8", mxfp8);
 instantiate_qgemv("qgemv_nvfp4", nvfp4);
 instantiate_qgemv("qgemv_bitnet", bitnet);
 instantiate_qgemv("qgemv_tq2_0", tq2_0);

@@ -537,7 +537,7 @@ kernel void kv_cache_scatter_fp8(device const T *key [[buffer(0)]],
     }
 }
 
-template <typename T, int D>
+template <typename T, int D, int FMT>
 kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
                                 device const uchar *key_cache [[buffer(1)]],
                                 device const uchar *value_cache [[buffer(2)]],
@@ -560,6 +560,8 @@ kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
     const int batch = (int)tgid.y;
     const int kv_head = head / (num_heads / num_kv_heads);
     const int context_len = context_lens[batch];
+    const float ks = k_scale[kv_head], vs = v_scale[kv_head];
+    const float score_scale = scale * ks;
     const long row_base = ((long)batch * num_heads + head) * D;
     // Sliding window: attend only the `window` most recent keys.
     const int t_start = (window > 0) ? max(0, context_len - window) : 0;
@@ -583,25 +585,25 @@ kernel void paged_attention_fp8(device const T *q [[buffer(0)]],
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar kcode = key_cache[cache_base + d];
-            const float kdec = fmt == 1 ? float(tk_e5m2_decode(kcode)) : float(tk_e4m3_decode(kcode));
-            partial += qv[i] * (kdec * k_scale[kv_head]);
+            const float kdec = FMT == 1 ? float(tk_e5m2_decode(kcode)) : float(tk_e4m3_decode(kcode));
+            partial += qv[i] * kdec;
         }
-        const float score = simd_sum(partial) * scale;
+        const float score = simd_sum(partial) * score_scale;
         const float new_m = max(m, score);
         const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
         const float beta = exp(score - new_m);
         for (int i = 0; i < VALUES_PER_LANE; ++i) {
             const int d = (int)lane + 32 * i;
             const uchar vcode = value_cache[cache_base + d];
-            const float vdec = fmt == 1 ? float(tk_e5m2_decode(vcode)) : float(tk_e4m3_decode(vcode));
-            acc[i] = acc[i] * alpha + beta * (vdec * v_scale[kv_head]);
+            const float vdec = FMT == 1 ? float(tk_e5m2_decode(vcode)) : float(tk_e4m3_decode(vcode));
+            acc[i] = acc[i] * alpha + beta * vdec;
         }
         l = l * alpha + beta;
         m = new_m;
     }
     for (int i = 0; i < VALUES_PER_LANE; ++i) {
         const int d = (int)lane + 32 * i;
-        out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
+        out[row_base + d] = l == 0.0f ? T(0) : T((acc[i] / l) * vs);
     }
 }
 
@@ -743,9 +745,9 @@ kernel void kv_cache_scale_update(device const T *key [[buffer(0)]],
                            constant ulong &n [[buffer(6)]],                   \
                            uint tid [[thread_position_in_threadgroup]]);
 
-#define instantiate_paged_attention_fp8(type_name, T, DVAL)                   \
-  template [[host_name("paged_attention_fp8_" #type_name "_" #DVAL)]]         \
-  [[kernel]] void paged_attention_fp8<T, DVAL>(                               \
+#define instantiate_paged_attention_fp8(fmt_name, FMT, type_name, T, DVAL)    \
+  template [[host_name("paged_attention_fp8_" #fmt_name "_" #type_name "_" #DVAL)]] \
+  [[kernel]] void paged_attention_fp8<T, DVAL, FMT>(                          \
       device const T *q [[buffer(0)]],                                        \
       device const uchar *key_cache [[buffer(1)]],                            \
       device const uchar *value_cache [[buffer(2)]],                          \
@@ -767,12 +769,18 @@ kernel void kv_cache_scale_update(device const T *key [[buffer(0)]],
 instantiate_kv_cache_scatter_fp8(float32, float)
 instantiate_kv_cache_scatter_fp8(float16, half)
 instantiate_kv_cache_scatter_fp8(bfloat16, bf16)
-instantiate_paged_attention_fp8(float32, float, 64)
-instantiate_paged_attention_fp8(float32, float, 128)
-instantiate_paged_attention_fp8(float16, half, 64)
-instantiate_paged_attention_fp8(float16, half, 128)
-instantiate_paged_attention_fp8(bfloat16, bf16, 64)
-instantiate_paged_attention_fp8(bfloat16, bf16, 128)
+instantiate_paged_attention_fp8(e4m3, 0, float32, float, 64)
+instantiate_paged_attention_fp8(e4m3, 0, float32, float, 128)
+instantiate_paged_attention_fp8(e4m3, 0, float16, half, 64)
+instantiate_paged_attention_fp8(e4m3, 0, float16, half, 128)
+instantiate_paged_attention_fp8(e4m3, 0, bfloat16, bf16, 64)
+instantiate_paged_attention_fp8(e4m3, 0, bfloat16, bf16, 128)
+instantiate_paged_attention_fp8(e5m2, 1, float32, float, 64)
+instantiate_paged_attention_fp8(e5m2, 1, float32, float, 128)
+instantiate_paged_attention_fp8(e5m2, 1, float16, half, 64)
+instantiate_paged_attention_fp8(e5m2, 1, float16, half, 128)
+instantiate_paged_attention_fp8(e5m2, 1, bfloat16, bf16, 64)
+instantiate_paged_attention_fp8(e5m2, 1, bfloat16, bf16, 128)
 
 #define instantiate_kv_cache_type(type_name, T)                               \
   template [[host_name("kv_cache_zero_" #type_name)]] [[kernel]] void        \

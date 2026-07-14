@@ -49,10 +49,11 @@ array qgemm(const array& wq, const array& x, const std::string& format, StreamOr
                    std::make_shared<QDequant>(to_stream(s), format), {wq});
     return matmul(w, x, s);
   }
-  // dequant-direct-to-fragment (Marlin zero-shuffle) — ~40% faster than dequant-to-shared and
-  // bit-identical; it is the default. The staged path remains available via the frag flag = false.
+  // MXFP8 can share each staged 32x32 weight tile across two 32-column warps.
+  // Other formats and the 32-column edge keep the direct-fragment route.
+  const bool direct = format != "mxfp8" || M % 64 != 0;
   return array({N, M}, float16,
-               std::make_shared<QGemm>(to_stream(s), format, true), {wq, x});
+               std::make_shared<QGemm>(to_stream(s), format, direct), {wq, x});
 }
 
 void QDequant::eval_cpu(const std::vector<array>&, std::vector<array>&) {

@@ -330,18 +330,20 @@ METAL_FUNC uchar tk_e4m3_encode(float x) {
             return uchar(sign);
         }
     }
-    int e;
-    float m = metal::frexp(a, e);               // a = m * 2^e, m in [0.5,1)
-    (void)m;
-    int E = e - 1;                               // a = (a/2^E) * 2^E, a/2^E in [1,2)
+    // The IEEE exponent is the E4M3 exponent before rebiasing. For normal outputs the top
+    // three fraction bits are the mantissa and bit 19 is the half-ULP rounding bit, so encoding
+    // needs no frexp/ldexp/divide sequence. Quantized inference values overwhelmingly take this
+    // path; retain the explicit arithmetic path only for E4M3 subnormals.
+    const uint bits = as_type<uint>(a);
+    const int E = int((bits >> 23) & 0xFFu) - 127;
     if (E < -6) {
         int mant = int(metal::round(a * 512.0f)); // a / 2^-9
         if (mant <= 0) return uchar(sign);
         if (mant >= 8) return uchar(sign | (1u << 3)); // promote to smallest normal
         return uchar(sign | uint(mant));
     }
-    float two_m = a / metal::ldexp(1.0f, E);     // in [1,2)
-    int mant = int(metal::round((two_m - 1.0f) * 8.0f));
+    const uint fraction = bits & 0x7FFFFFu;
+    int mant = int((fraction + 0x80000u) >> 20); // nearest, halfway rounds up like metal::round
     int exp = E + 7;
     if (mant >= 8) { mant = 0; exp += 1; }
     if (exp >= 15 && mant >= 7) return uchar(sign | 0x7Eu);
@@ -359,18 +361,16 @@ METAL_FUNC uchar tk_e5m2_encode(float x) {
     if (a < 3.0517578125e-05f / 2.0f) {          // < 2^-16 (half smallest subnormal) -> 0
         return uchar(sign);
     }
-    int e;
-    float m = metal::frexp(a, e);
-    (void)m;
-    int E = e - 1;
+    const uint bits = as_type<uint>(a);
+    const int E = int((bits >> 23) & 0xFFu) - 127;
     if (E < -14) {
         int mant = int(metal::round(a * 65536.0f)); // a / 2^-16
         if (mant <= 0) return uchar(sign);
         if (mant >= 4) return uchar(sign | (1u << 2));
         return uchar(sign | uint(mant));
     }
-    float two_m = a / metal::ldexp(1.0f, E);
-    int mant = int(metal::round((two_m - 1.0f) * 4.0f));
+    const uint fraction = bits & 0x7FFFFFu;
+    int mant = int((fraction + 0x100000u) >> 21);
     int exp = E + 15;
     if (mant >= 4) { mant = 0; exp += 1; }
     if (exp >= 31) return uchar(sign | 0x7Bu);
@@ -1397,6 +1397,45 @@ struct tk_dequant_cols4_s8x2<nvfp4> {
     }
 };
 
+// Pair-of-rows column decoder with simdgroup scale broadcast. In a col-layout
+// fragment, eight lanes cover the same row pair and different c values across
+// one 32-column block. MXFP8 therefore needs only two E8M0 expansions for the
+// pair; the other lanes receive those scales by shuffle and decode their own
+// E4M3 codes.
+template<typename FMT>
+struct tk_dequant_cols4_s8_pair_shuffle {
+    constant static constexpr const bool enabled = false;
+    static METAL_FUNC void run(device const uchar*, device const uchar*,
+                               int, ushort, thread half*, thread half*) {}
+};
+
+template<>
+struct tk_dequant_cols4_s8_pair_shuffle<mxfp8> {
+    constant static constexpr const bool enabled = true;
+    static METAL_FUNC void run(device const uchar* b0,
+                               device const uchar* b1,
+                               int c, ushort leader,
+                               thread half* w0, thread half* w1) {
+        half d0 = 0.0h, d1 = 0.0h;
+        if (c == 0) {
+            d0 = metal::exp2(half((int)b0[0] - 127));
+            d1 = metal::exp2(half((int)b1[0] - 127));
+        }
+        d0 = metal::simd_shuffle(d0, leader);
+        d1 = metal::simd_shuffle(d1, leader);
+        device const uchar* q0 = b0 + 1;
+        device const uchar* q1 = b1 + 1;
+        w0[0] = d0 * tk_e4m3_decode(q0[c]);
+        w0[1] = d0 * tk_e4m3_decode(q0[c + 8]);
+        w0[2] = d0 * tk_e4m3_decode(q0[c + 16]);
+        w0[3] = d0 * tk_e4m3_decode(q0[c + 24]);
+        w1[0] = d1 * tk_e4m3_decode(q1[c]);
+        w1[1] = d1 * tk_e4m3_decode(q1[c + 8]);
+        w1[2] = d1 * tk_e4m3_decode(q1[c + 16]);
+        w1[3] = d1 * tk_e4m3_decode(q1[c + 24]);
+    }
+};
+
 // Col-layout companion to dequant_into_register, for feeding mma_ABt's B operand
 // (rt<T, M, K, col>) straight from a row-major (N, K)-packed weight — the quantized
 // A @ W^T path (grouped expert GEMMs). Mirrors the col-layout load in
@@ -1466,6 +1505,46 @@ METAL_FUNC void dequant_into_register_col(thread RT& dst, device const uchar* Wq
             dst.tiles[i][j].data.thread_elements()[1] = (typename RT::dtype)(float)FMT::dequant(b1, cib);
         }
     }
+}
+
+// SwiGLU-specific column decoder route. The paired scale-broadcast strategy
+// wins when gate and up double the decoder work, but regresses the rectangular
+// large-row projection; keep it behind a distinct call site.
+template<typename FMT, typename RT>
+METAL_FUNC void dequant_into_register_col_swiglu(
+    thread RT& dst, device const uchar* Wq, int N, int K,
+    int by, int kb, uint laneid) {
+    if (tk_dequant_cols4_s8_pair_shuffle<FMT>::enabled &&
+        FMT::block_k >= 32 && RT::width == 4) {
+        const int qid = (int)laneid / 4;
+        const int simd_x = (qid & 4) + ((int)laneid / 2) % 4;
+        const int simd_y = (qid & 2) * 2 + ((int)laneid % 2) * 2;
+        const int bpr = K / FMT::block_k;
+        const int gc0 = kb * RT::cols + simd_x;
+        const int blk = gc0 / FMT::block_k;
+        const int cib0 = gc0 % FMT::block_k;
+        const ushort leader = ushort(((simd_y & 4) ? 8 : 0) +
+                                     ((simd_y & 2) ? 1 : 0));
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < RT::height; i++) {
+            const int grow = by * RT::rows + i * mittens::TILE_DIM + simd_y;
+            device const uchar* b0 =
+                Wq + (uint)(grow * bpr + blk) * FMT::block_bytes;
+            device const uchar* b1 = b0 + (uint)bpr * FMT::block_bytes;
+            half w0[4], w1[4];
+            tk_dequant_cols4_s8_pair_shuffle<FMT>::run(
+                b0, b1, cib0, leader, w0, w1);
+            #pragma clang loop unroll(full)
+            for (int j = 0; j < RT::width; j++) {
+                dst.tiles[i][j].data.thread_elements()[0] =
+                    (typename RT::dtype)(float)w0[j];
+                dst.tiles[i][j].data.thread_elements()[1] =
+                    (typename RT::dtype)(float)w1[j];
+            }
+        }
+        return;
+    }
+    dequant_into_register_col<FMT>(dst, Wq, N, K, by, kb, laneid);
 }
 
 } // namespace mittens

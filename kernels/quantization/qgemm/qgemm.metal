@@ -67,7 +67,7 @@ instantiate_qgemm("qgemm_kU4B8", kU4B8, 2, 16);
 instantiate_qgemm("qgemm_kU4", kU4, 2, 16);
 instantiate_qgemm("qgemm_fp8_e4m3", fp8_e4m3, 2, 16);
 instantiate_qgemm("qgemm_fp4_e2m1", fp4_e2m1, 2, 16);
-instantiate_qgemm("qgemm_mxfp8", mxfp8, 2, 16);
+instantiate_qgemm("qgemm_mxfp8", mxfp8, 2, 32);
 instantiate_qgemm("qgemm_nvfp4", nvfp4, 2, 16);
 instantiate_qgemm("qgemm_mxfp4", mxfp4, 2, 16);
 instantiate_qgemm("qgemm_bitnet", bitnet, 2, 16);

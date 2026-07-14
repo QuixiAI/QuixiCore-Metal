@@ -6,7 +6,7 @@ into `perf/optimization_status.md`.
 
 ## Environment
 
-Date: 2026-07-13.
+Most recent run date: 2026-07-14.
 
 Each real baseline entry should record:
 
@@ -73,6 +73,60 @@ durable decisions are in `perf/optimization_status.md`.
 | MXFP8 QGEMV repeat | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-qgemv-baseline-repeat/` |
 | MXFP8 inference comprehensive | `3cab797-dirty` | MLX / comprehensive | 10 / 30 | `perf/results/2026-07-14/mxfp8-inference-comprehensive/` |
 | MXFP8 coverage control | `3cab797-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-coverage-generic/` |
+
+## 2026-07-14 MXFP8 Hot-Path Optimization Index
+
+These runs use the MLX integration on MacBook Pro Mac16,5 (Apple M4 Max,
+40-core GPU, 128 GB), macOS 26.5.1 (25F80), Xcode 26.6 (17F113), Apple Metal
+32023.883 / toolchain 17.6.109.0, Python 3.12.9, and MLX 0.21.1. Exact
+p20/p80, CV, correctness fields, and controls are in each JSONL; all durable
+decisions are in `perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Core baseline | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-experiments-baseline-core/` |
+| Fused baseline | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-experiments-baseline-fused/` |
+| QGEMV whole/span interleaved | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-qgemv-whole-vs-span-interleaved/` |
+| Masked LUT narrow route | `455463c-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-exp-masked-lut-narrow/` |
+| MoE SwiGLU scale broadcast | `455463c-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-14/mxfp8-exp-moe-scale-shuffle-swiglu-only/` |
+| MoE SwiGLU two warp | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-moe-swiglu-2warp/` |
+| Beam matrix route (MLX) | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-beam-matrix-all/` |
+| Beam row control (MLX) | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-beam-row-control/` |
+| Beam matrix route (MPS) | `455463c-dirty` | PyTorch MPS / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-beam-matrix-mps/` |
+| Beam row control (MPS) | `455463c-dirty` | PyTorch MPS / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-beam-row-control-mps/` |
+| QGEMM 2x32 comprehensive | `455463c-dirty` | MLX / comprehensive | 10 / 40 | `perf/results/2026-07-14/mxfp8-exp-qgemm-2x32-comprehensive/` |
+| Attention staging/warp sweep | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-exp-attn-mw4-stage4-repeat/` |
+| Split-plane repeat | `455463c-dirty` | MLX / quick | 30 / 200 | `perf/results/2026-07-14/mxfp8-exp-split-plane-repeat/` |
+| Final retained state | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/mxfp8-experiments-final-quick/` |
+
+## 2026-07-14 FP8 Hot-Path Optimization Index
+
+These runs use the MLX integration on MacBook Pro Mac16,5 (Apple M4 Max,
+40-core GPU, 128 GB), macOS 26.5.1 (25F80), Xcode 26.6 (17F113), Apple Metal
+32023.883 / toolchain 17.6.109.0, Python 3.12.9, and MLX 0.21.1. Each JSONL
+contains the exact shape, dtype/format, median, p20/p80, CV, framework control
+where available, and throughput fields. Keep/reject decisions and correctness
+commands are recorded in `perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Core inference baseline | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-experiments-baseline-core/` |
+| Serving baseline | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-experiments-baseline-serving/` |
+| Added-coverage baseline | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-experiments-baseline-added/` |
+| Paged scale-hoist control | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-paged-scale-hoist-baseline-d64-d128/` |
+| Paged scale-hoist candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-paged-scale-hoist-candidate-d64-d128/` |
+| Paged format-specialization control | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-paged-format-specialization-baseline/` |
+| Paged format-specialization candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-paged-format-specialization-candidate/` |
+| E4M3 bit-encoder control repeat | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-bit-encoder-baseline-repeat/` |
+| E4M3 bit-encoder candidate repeat | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-bit-encoder-candidate-repeat/` |
+| E5M2 bit-encoder control | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-e5m2-encoder-baseline/` |
+| E5M2 bit-encoder candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-e5m2-encoder-candidate/` |
+| FP8 SwiGLU two-warp candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-moe-swiglu-two-warp-candidate/` |
+| QGEMM shared-weight candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-qgemm-shared-weight-64-candidate/` |
+| Blockscale grouped-scale candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-blockscale-grouped-scale-candidate/` |
+| Quantized-attention topology candidates | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-attn-q-d128-q16-candidate/` |
+| QGEMV whole-block candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-qgemv-whole-block-candidate/` |
+| Final retained state | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-experiments-final-quick/` |
 
 ## Migration Tasks
 

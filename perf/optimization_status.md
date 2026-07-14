@@ -2099,3 +2099,321 @@ Decisions and follow-ups:
   N1024 D128 and should not be preferred on this evidence alone.
 
 Raw results: `perf/results/2026-07-14/mxfp8-coverage-generic/`.
+
+## 2026-07-14: MXFP8 inference hot-path experiments
+
+Status: complete. Retained variants pass focused and repository-wide
+correctness, parity, MPS, Metal, and Xcode validation. Performance claims are
+limited to the measured MLX integration path and shapes below.
+
+Current implementation and public route:
+
+- QGEMV assigns one complete 32-value MXFP8 block to each lane. One E8M0
+  expansion feeds all 32 E4M3 values instead of four independent 8-value span
+  decoders.
+- MLX MXFP8 QGEMM keeps the direct-fragment kernel for `M%64 != 0`, including
+  the M32 edge, and uses a two-warp staged kernel for `M%64 == 0`. The two
+  warps share each decoded 32x32 weight tile and produce 64 output columns.
+  PyTorch MPS QGEMM retains its direct-fragment route.
+- Masked LM-head projection uses a path-local 256-entry E4M3-to-half constant
+  table and one fp32 E8M0 reconstruction per complete block. CSR candidate
+  projection uses the same complete-block schedule with arithmetic E4M3
+  decode; the table is intentionally not global.
+- MXFP8 beam advance uses packed QGEMM plus the established exact beam kernel
+  even at four rows. Other four-row formats retain their existing no-logits
+  fusion where measured.
+- MXFP8 MoE SwiGLU uses a two-warp gate/up split. Lanes covering the same
+  column-fragment row pair broadcast two E8M0 scales with SIMD shuffles. The
+  rectangular MoE path retains its original decoder and four-warp schedule.
+- Quantized-KV attention retains its original generic 8-value shared decoder,
+  four-warps, and four-tile staging depth. Every attention-specific candidate
+  was neutral or slower.
+- The canonical `{E8M0, 32 E4M3 codes}` host layout is unchanged. The
+  experimental 32-scale/1024-code split-plane form was removed.
+
+References inspected: repository MXFP8 format and decoder contracts, existing
+MXFP4/NVFP4 complete-block kernels, the q4_0 whole-block QGEMV, staged/direct
+QGEMM implementations, MoE split-K reduction, and quantized-KV attention
+staging code. No external implementation code was imported.
+
+Environment and method:
+
+- MacBook Pro Mac16,5; Apple M4 Max, 40 GPU cores, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Apple Metal 32023.883, toolchain
+  17.6.109.0; Python 3.12.9; MLX 0.21.1.
+- Working-tree label: `455463c-dirty`.
+- Integration path: MLX Python extension, packed MXFP8 weights, fp16
+  QGEMV/QGEMM/beam inputs, bf16 MoE/attention inputs, and fp32/bf16 LM-head
+  correctness coverage.
+- The harness performs clock ramp, adaptive per-sample batching, and a device
+  synchronization per sample. Baseline, final, and most controlled candidates
+  requested 15 warmups and 60 measured samples and report per-call median,
+  p20/p80, and CV. Some narrowing runs used 10/40; the split-plane repeat used
+  30/200 because the first run was noisy.
+
+Primary commands:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick --kernel qgemv,qgemm,qflux \
+  --formats mxfp8 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/mxfp8-experiments-baseline-core
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam,moe_q,attn_q \
+  --formats mxfp8 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/mxfp8-experiments-baseline-fused
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel qgemv,qgemm,lm_head_masked,lm_head_candidates,lm_head_beam,moe_q,attn_q \
+  --formats mxfp8 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/mxfp8-experiments-final-quick
+```
+
+Retained controlled results (milliseconds; brackets are p20/p80, followed by
+CV):
+
+| Path / shape | Control | Candidate | Change | Decision |
+|---|---:|---:|---:|---|
+| QGEMV N4096 K4096 | span 0.03695 [0.03572/0.03754], .0408 | whole block 0.03558 [0.03463/0.03630], .0528 | -3.7% | keep |
+| QGEMV N11008 K4096 | span 0.11153 [0.10928/0.11378], .0367 | whole block 0.10659 [0.10388/0.11195], .0469 | -4.4% | keep |
+| Masked T1 V8192 K1024 L256 | arithmetic 0.04007 [0.03914/0.04290], .0784 | narrow LUT 0.02656 [0.02564/0.02816], .1924 | -33.7% | keep masked-only LUT |
+| Masked T8 V8192 K1024 L64 | arithmetic 0.05262 [0.05012/0.05579], .0709 | narrow LUT 0.03556 [0.03417/0.03905], .0981 | -32.4% | keep masked-only LUT |
+| Candidates T1 V8192 K1024 C256 | spans 0.06031 [0.05875/0.06388], .1012 | whole block 0.05534 [0.05405/0.05627], .0587 | -8.2% | keep arithmetic whole block |
+| Candidates T8 V8192 K1024 C64 | spans 0.01925 [0.01802/0.02313], .1797 | whole block 0.01718 [0.01662/0.01802], .1396 | -10.7% | keep arithmetic whole block |
+| Beam B1 BM4 V32000 K4096 | no-logits 1.13108 [1.12290/1.18208], .0501 | matrix 1.01334 [0.99763/1.06385], .0450 | -10.4% | keep matrix route |
+| MoE SwiGLU H/I2880 rows32 | original 0.26927 [0.25432/0.28059], .0620 | two warp 0.18980 [0.18711/0.20329], .0606 | -29.5% | keep |
+| MoE SwiGLU H/I2880 rows512 | original 3.10281 [3.08138/3.13913], .0113 | two warp 1.49516 [1.48942/1.50296], .0068 | -51.8% | keep |
+
+The QGEMM 2x32 run compares the retained staged target against
+`tk.qgemm_direct` in every row of the same comprehensive run. At N4096, staged
+M128/M256/M512 improved 2.2%/2.6%/1.1%; at N11008, M64/M128/M512 improved
+3.2%/0.7%/2.9%. N4096 M64 was flat and staged N11008 M256 was 0.5% slower,
+within the overlapping central bands. M32 always remains direct.
+
+The equivalent PyTorch MPS beam A/B also favored the shared route: B1/BM4
+fell from 1.3988 ms with no-logits fusion to 1.2317 ms through matrix
+projection (-11.9%). B4 was already matrix-routed and remained flat at
+1.23 ms. Both MPS runs requested 15 warmups and 60 measured samples.
+
+Rejected experiments:
+
+| Factor | Representative result | Decision |
+|---|---|---|
+| Explicit MXFP8 8-value half decoder | LM top-k T1 rose from 0.3541 to 0.5274 ms; QGEMV and attention did not establish wins | reject; compiler-generated generic path is better |
+| Complete-block sequential decode everywhere | Decode epilogue 0.02087 -> 0.02214 ms, SwiGLU 0.03339 -> 0.03468, top-k T1 0.35406 -> 0.37178; sparse projections improved | retain only sparse-projection specializations |
+| Gate/up interleaved decode SwiGLU | 0.03339 -> about 0.0360 ms | reject |
+| Vector E4M3 `decode4` | QGEMV 0.03170/0.10923 -> 0.0340/0.1106 ms; sparse results mixed | reject |
+| Global E4M3 LUT | QGEMV regressed to 0.0552/0.1576 ms and candidate/MoE large shapes regressed, although masked projection improved | narrow to masked projection only |
+| Combined E8M0+E4M3 exponent reconstruction | QGEMV rose to 0.1124/0.2800 ms and sparse projection regressed by an order of magnitude | reject |
+| MoE scale broadcast on every column decoder | Rectangular rows512 rose from 0.7103 to 0.7605 ms | restrict to SwiGLU |
+| Four-warp/two-warp dual-symbol MoE hybrid | Duplicate specialization raised rows32 to 0.253-0.354 ms; all-two-warp remained 0.1898 ms and won the large shape | keep the single two-warp MXFP8 symbol |
+| MXFP8 attention scale broadcast | single/multi-warp rose from 0.4772/0.4848 to 0.5189/0.5196 ms | reject |
+| Direct register V decode | 0.4745 vs 0.4772 ms at N1024 D128, with no durable comprehensive advantage | reject as flat/complex |
+| Two-warp attention | multi-warp 0.7383 vs four-warp repeat 0.4788 ms | reject |
+| Attention staging depth 1/2/4 | 0.4786/0.4763/0.4788 ms with overlapping bands | keep established depth 4 |
+| QGEMM four warps x 32 columns | improved several N4096 cases but regressed N11008 M128/M256 about 1%; 2x32 was broader | reject 4x32, keep 2x32 |
+| Split-plane 32-scale/1024-code layout | N4096 0.03212 -> 0.03103 ms, but N11008 0.10481 -> 0.11183 (+6.7%) and K%1024 required | reject and remove layout |
+
+Correctness and validation:
+
+- Focused final selection: 32 MXFP8 QGEMV/QGEMM/LM-head/MoE/attention tests
+  passed. QGEMV final relative errors were 6.38e-6 and 2.22e-5; masked and
+  candidate benchmark selected-id errors were zero. Beam token/parent outputs
+  are exact in the correctness suite.
+- `scripts/build kernels` and `scripts/build pytorch_mps` passed.
+- `scripts/test correctness -q`: 2155 passed.
+- `scripts/test parity -q`: 432 passed.
+- `scripts/test mps -q`: 472 passed.
+- `scripts/test xcode`: test build succeeded.
+
+Decision: keep the six scoped improvements above. Do not change the MXFP8
+wire layout or quantized-KV attention path based on this pass. The remaining
+attention gap is dominated by the attention schedule rather than MXFP8 scale
+decode, and the tested dequant/layout changes did not move it safely.
+
+Raw results: baseline and final are
+`mxfp8-experiments-baseline-core`, `mxfp8-experiments-baseline-fused`, and
+`mxfp8-experiments-final-quick`. Retained controlled runs are
+`mxfp8-exp-qgemv-whole-vs-span-interleaved`,
+`mxfp8-exp-sequential-whole-block`, `mxfp8-exp-masked-lut-narrow`,
+`mxfp8-exp-moe-scale-shuffle-swiglu-only`,
+`mxfp8-exp-moe-swiglu-2warp`, `mxfp8-exp-beam-matrix-all`,
+`mxfp8-exp-beam-row-control`, `mxfp8-exp-beam-matrix-mps`,
+`mxfp8-exp-beam-row-control-mps`, and
+`mxfp8-exp-qgemm-2x32-comprehensive`.
+Rejected runs are the other `mxfp8-exp-*` directories under
+`perf/results/2026-07-14/`, including the attention, global LUT, combined
+exponent, 4x32 QGEMM, hybrid MoE, and split-plane variants.
+
+## 2026-07-14: FP8 inference hot-path experiments
+
+Status: candidate; the retained implementation passes the focused kernel
+build and 389 affected correctness cases. The changes are measured but not yet
+committed.
+
+Current implementation:
+
+- E4M3 and E5M2 normal-value encoders derive the unbiased exponent and rounded
+  mantissa directly from IEEE-754 bits. Their existing arithmetic subnormal,
+  saturation, NaN, and infinity handling remains in place.
+- FP8 paged-attention v1, v2 partition, and cascade-prefix kernels move the K
+  scale into the score multiplier and apply the V scale once after online
+  softmax normalization. E4M3 and E5M2 decode selection is compile-time in
+  distinct pipeline symbols; the public format argument and cache layout are
+  unchanged.
+- FP8 E4M3 SwiGLU MoE uses the measured two-warp gate/up kernel. Rectangular
+  MoE retains its established four-warp kernel.
+- The benchmark harness now covers rank-1-scaled FP8 GEMM, 128x128-block-scaled
+  FP8 GEMM, D64/D128 E4M3/E5M2 KV scatter and paged attention, a populated FP8
+  MLA cache, and fused FP8 activation quantization.
+
+References inspected: the repository's existing E4M3/E5M2 encoder and decoder
+contracts, FP8 KV-cache/paged-attention paths, FP8/MXFP8 grouped MoE kernels,
+and established QGEMV/QGEMM topology. No external implementation code was
+imported.
+
+Hypotheses:
+
+- FP8 attention pays avoidable scale multiplies and a uniform runtime format
+  branch for every K/V element.
+- FP8 producers are limited by `frexp`/`ldexp` and division on the overwhelmingly
+  normal-value encoding path.
+- Fused FP8 SwiGLU repeats gate/up dequantization work and may benefit from the
+  two-warp topology established for byte-per-value MXFP8.
+- Dense/blocked GEMM, QGEMV, MLA, and quantized attention might benefit from
+  broader scale sharing or additional warp parallelism, but those changes must
+  beat the current priority shapes rather than only reduce source-level work.
+
+Environment and method:
+
+- MacBook Pro Mac16,5; Apple M4 Max, 40-core GPU, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Apple Metal 32023.883 / toolchain
+  17.6.109.0; Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1.
+- Working-tree label `455463c-dirty`; MLX Python-extension integration path;
+  BF16/FP16 activations and FP8 E4M3/E5M2 or FP8-block-scaled weights/caches.
+- All reported focused runs requested 15 warmups and 60 measured samples. The
+  harness also performs its clock ramp and per-thunk warmup, adaptively batches
+  calls, synchronizes samples, and records per-call median, p20/p80, and CV.
+- Initial baselines:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel qgemv,qgemm,qflux,moe_q,attn_q,quantized_embedding,quantized_embedding_bag \
+  --formats fp8_e4m3 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/fp8-experiments-baseline-core
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel paged_attn,kv_gather_fp8,quant_rt,act_quant,mla \
+  --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/fp8-experiments-baseline-serving
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel qgemm_fp8_scaled,qgemm_fp8_block2d,kv_scatter_fp8,mla,act_quant \
+  --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/fp8-experiments-baseline-added
+```
+
+- The final retained configuration used:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel paged_attn,quant_rt,act_quant,kv_scatter_fp8,moe_q \
+  --formats fp8_e4m3 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/fp8-experiments-final-quick
+```
+
+Retained controlled results are milliseconds; brackets contain p20/p80 and the
+last number is CV.
+
+| Factor / priority shape | Control | Candidate | Change | Decision |
+|---|---:|---:|---:|---|
+| Scale hoist, paged v1 E4M3 D64 B8 H32 ctx2048 | 0.52622 [0.50750/0.55167], .0542 | 0.51531 [0.49892/0.54383], .0511 | -2.1% | keep |
+| Scale hoist, paged v2 E4M3 D64 | 0.35998 [0.35266/0.37442], .0430 | 0.34671 [0.33854/0.36535], .0461 | -3.7% | keep |
+| Scale hoist, paged v1 E4M3 D128 | 0.68397 [0.66479/0.70394], .1791 | 0.65818 [0.64594/0.67827], .0348 | -3.8% | keep |
+| Scale hoist, paged v2 E4M3 D128 | 0.56668 [0.55123/0.58858], .3186 | 0.51488 [0.50175/0.53604], .0442 | -9.1% | keep |
+| Format specialization, v1 E4M3 D64 | 0.37997 [0.37399/0.38903], .0316 | 0.35712 [0.35224/0.36686], .0374 | -6.0% | keep |
+| Format specialization, v2 E4M3 D64 | 0.34496 [0.33313/0.35778], .0392 | 0.32421 [0.31828/0.33634], .0391 | -6.0% | keep |
+| Format specialization, v1 E5M2 D64 | 0.37951 [0.37382/0.39588], .0398 | 0.31433 [0.31032/0.33115], .0377 | -17.2% | keep |
+| Format specialization, v2 E5M2 D64 | 0.33839 [0.33181/0.34820], .0321 | 0.29531 [0.29082/0.30255], .0461 | -12.7% | keep |
+| Format specialization, v1 E4M3 D128 | 0.64513 [0.63598/0.66721], .0334 | 0.63585 [0.63075/0.65210], .0257 | -1.4% | keep |
+| Format specialization, v2 E4M3 D128 | 0.48786 [0.47897/0.50115], .0293 | 0.45708 [0.44774/0.47129], .0691 | -6.3% | keep |
+| Format specialization, v1 E5M2 D128 | 0.65035 [0.63708/0.67058], .0364 | 0.58823 [0.57579/0.60200], .0334 | -9.6% | keep |
+| Format specialization, v2 E5M2 D128 | 0.48924 [0.47845/0.50118], .0304 | 0.38811 [0.38146/0.40266], .0422 | -20.7% | keep |
+| E4M3 bits, per-tensor N4096 D1024 | 0.14169 [0.12653/0.20402], .2624 | 0.09464 [0.09209/0.10183], .0947 | -33.2% | keep |
+| E4M3 bits, per-token N4096 D1024 | 0.10629 [0.08931/0.12525], .1965 | 0.03446 [0.03298/0.03613], .2270 | -67.6% | keep |
+| E4M3 bits, per-tensor N16384 D1024 | 0.37754 [0.36697/0.39182], .0937 | 0.37030 [0.35797/0.39467], .0866 | -1.9% | keep; no large-shape regression |
+| E4M3 bits, per-token N16384 D1024 | 0.21197 [0.20720/0.22365], .1095 | 0.12752 [0.12422/0.13352], .1911 | -39.8% | keep |
+| E4M3 bits, fused act quant T512 D2880 | 0.03940 [0.03863/0.04106], .0860 | 0.03042 [0.02968/0.03188], .1044 | -22.8% | keep |
+| E4M3 bits, fused act quant T4096 D2880 | 0.28415 [0.27845/0.29530], .0638 | 0.23904 [0.23318/0.24818], .0726 | -15.9% | keep |
+| E4M3 bits, KV scatter T512 H8 D64 | 0.03138 [0.02976/0.03520], .1292 | 0.02195 [0.02117/0.02503], .1302 | -30.1% | keep |
+| E4M3 bits, KV scatter T512 H8 D128 | 0.03684 [0.03573/0.03945], .0905 | 0.03258 [0.03063/0.03572], .1480 | -11.6% | keep |
+| E5M2 bits, KV scatter T512 H8 D64 | 0.02464 [0.02409/0.02562], .0651 | 0.02364 [0.02343/0.02404], .0879 | -4.1% | keep |
+| E5M2 bits, KV scatter T512 H8 D128 | 0.03656 [0.03545/0.03703], .0814 | 0.02971 [0.02859/0.03444], .6165 | -18.7% | keep; final repeat 0.02952 [.02932/.02996], .0764 |
+| FP8 SwiGLU MoE H/I2880 rows32 | 0.26140 [0.24922/0.31133], .1360 | 0.21183 [0.18680/0.24543], .1489 | -19.0% | keep two warps |
+| FP8 SwiGLU MoE H/I2880 rows512 | 2.91865 [2.86096/2.99012], .0215 | 1.38616 [1.37210/1.43369], .0236 | -52.5% | keep two warps |
+
+The final retained run independently measured E4M3/E5M2 paged-attention v1/v2
+at both D64 and D128, producer shapes N4096/N16384 and T512/T4096, both KV
+scatter head sizes, and FP8 rectangular/SwiGLU MoE at 32/512 rows. Its stable
+large-shape results include E5M2 paged v2 D128 at 0.38491 ms
+[0.38100/0.38761], CV .0173, fused FP8 activation quant T4096 at 0.22987 ms
+[0.22765/0.23139], CV .0656, and FP8 SwiGLU MoE rows512 at 1.36326 ms
+[1.36023/1.37177], CV .0089.
+
+Rejected experiments:
+
+| Factor | Representative result | Decision |
+|---|---|---|
+| MLA grouped scale loads | FP8 decode 0.67368 -> 0.66291 ms, then 0.67590 ms on repeat | reject as flat/noisy |
+| MLA lane-0 scale broadcast | 0.66291 -> 0.90632 ms (+36.7%) | reject |
+| Two-warp shared weights in scaled FP8 GEMM | M128 0.42744 -> 0.50924 ms; M512 1.48512 -> 1.72944 | reject |
+| Two-warp shared weights in block2d FP8 GEMM | M128 0.37019 -> 0.47786 ms; M512 1.35321 -> 1.67152 | reject |
+| Grouped outer scale loop in block2d GEMM | M32/M128/M512 0.11208/0.37019/1.35321 -> 0.12756/0.38513/1.41206 ms | reject |
+| Standard FP8 QGEMM 2x32 shared-weight staging | M128/M512 0.36750/1.35244 -> 0.36452/1.34891 ms with overlapping bands | reject as flat/extra complexity |
+| FP8 MoE decoder-scale shuffle after two-warp route | rows32 flat at 0.21165 ms; rows512 1.38616 -> 1.51084 ms | reject; keep two-warp topology only |
+| Quantized attention eight warps | multi-warp 0.50458 -> 0.50324 ms | reject as flat |
+| Quantized attention D128 Q16 row tile | single/multi 0.50613/0.50458 -> 0.60115/0.59942 ms | reject |
+| FP8 QGEMV whole-block decode | N4096/N11008 0.03041/0.10581 -> 0.03188/0.10952 ms | reject |
+| First E4M3 bit-encoder rounding constant | 23 focused correctness failures | reject immediately; corrected half-ULP constant before timing |
+
+Correctness and validation:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python -m pytest \
+  tests/correctness/quantization/quant_rt/test_quant_rt.py \
+  tests/correctness/quantization/act_quant/test_act_quant.py \
+  tests/correctness/attention/mla/test_mla.py \
+  tests/correctness/serving/kv_cache/test_kv_cache.py \
+  tests/correctness/attention/paged_attn_v2/test_paged_attn_v2.py \
+  tests/correctness/moe/moe/test_moe_q.py \
+  tests/correctness/quantization/qgemm/test_fp8_scaled.py \
+  tests/correctness/quantization/qgemm/test_fp8_block2d.py -q
+```
+
+- Result: 389 passed. The kernel build also passed after restoring every
+  rejected candidate.
+- FP8 code/scale reference cases are exact where the contract requires exact
+  codes; there were zero code mismatches. Quantized paged-attention cases pass
+  their path-specific bounds (up to `atol=3e-2`, `rtol=3e-3`), and MoE passes
+  `atol=rtol=6e-2`.
+- This was a focused affected-path validation, not a repository-wide
+  correctness/parity/MPS run.
+
+Decision: keep the scale algebra and compile-time format specialization in all
+FP8 paged/cascade attention variants, the E4M3 and E5M2 normal-value bit
+encoders, the E4M3 two-warp SwiGLU MoE route, and the new benchmark coverage.
+Restore the MLA, GEMM, QGEMV, and quantized-attention topology candidates.
+
+Raw results: initial baselines are `fp8-experiments-baseline-core`,
+`fp8-experiments-baseline-serving`, and `fp8-experiments-baseline-added`.
+Retained controlled runs are `fp8-paged-scale-hoist-{baseline,candidate}-d64-d128`,
+`fp8-paged-format-specialization-{baseline,candidate}`,
+`fp8-bit-encoder-{baseline,candidate}-repeat`,
+`fp8-e5m2-encoder-{baseline,candidate}`, and
+`fp8-moe-swiglu-two-warp-candidate`. The final retained run is
+`fp8-experiments-final-quick`; rejected variants are preserved in the other
+`fp8-*candidate` and MLA experiment directories under
+`perf/results/2026-07-14/`.
