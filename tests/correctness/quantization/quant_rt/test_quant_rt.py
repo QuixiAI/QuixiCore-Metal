@@ -100,6 +100,14 @@ def test_quantize_per_tensor_int8(dtype, shape):
     assert np.all(np.abs(deq - xd) <= 0.5 * ssafe + 1e-6)
 
 
+@pytest.mark.parametrize("quantize", [quantize_per_tensor_fp8, quantize_per_tensor_int8])
+def test_quantize_per_tensor_zero_has_zero_scale_and_codes(quantize):
+    codes, scale = quantize(mx.zeros((17, 65), dtype=mx.bfloat16))
+    mx.eval(codes, scale)
+    np.testing.assert_array_equal(np.array(codes), 0)
+    np.testing.assert_array_equal(np.array(scale), 0.0)
+
+
 if __name__ == "__main__":
     for shp in SHAPES:
         test_quantize_per_token_fp8("float32", shp)

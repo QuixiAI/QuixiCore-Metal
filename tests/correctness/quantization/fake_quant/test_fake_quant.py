@@ -2,7 +2,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import fake_quant_int8, silu_mul_fake_quant_int8
+from tk import fake_quant_fp8, fake_quant_int8, silu_mul_fake_quant_int8
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
 
@@ -47,3 +47,30 @@ def test_silu_mul_fake_quant_int8_matches_composition():
     np.testing.assert_array_equal(np.array(codes), ref_codes)
     np.testing.assert_allclose(np.array(scale), ref_scale, rtol=1e-3, atol=1e-8)
     np.testing.assert_allclose(np.array(x_q.astype(mx.float32)), ref_deq, rtol=1 / 128, atol=1e-6)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_fake_quant_fp8_matches_torch_e4m3fn(dtype):
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(112)
+    x = (2.0 * rng.standard_normal((9, 128))).astype(np.float32)
+    xm = mx.array(x).astype(_MX[dtype])
+    x_post = np.array(xm.astype(mx.float32))
+    x_q, scale = fake_quant_fp8(xm)
+    mx.eval(x_q, scale)
+
+    ref_scale = np.float32(np.max(np.abs(x_post)) / np.float32(448.0))
+    ref = (torch.from_numpy(x_post / ref_scale)
+           .to(torch.float8_e4m3fn).to(torch.float32).numpy() * ref_scale)
+    ref = np.array(mx.array(ref).astype(_MX[dtype]).astype(mx.float32))
+
+    np.testing.assert_allclose(np.array(scale), ref_scale, rtol=0.0, atol=1e-8)
+    np.testing.assert_array_equal(np.array(x_q.astype(mx.float32)), ref)
+
+
+def test_fake_quant_fp8_zero_tensor():
+    x = mx.zeros((17, 65), dtype=mx.bfloat16)
+    x_q, scale = fake_quant_fp8(x)
+    mx.eval(x_q, scale)
+    np.testing.assert_array_equal(np.array(x_q.astype(mx.float32)), 0.0)
+    np.testing.assert_array_equal(np.array(scale), 0.0)

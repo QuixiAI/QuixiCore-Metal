@@ -30,6 +30,10 @@ static METAL_FUNC uint float_to_orderable_uint(float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 static METAL_FUNC float orderable_uint_to_float(uint u) {
+    // Atomic max scratch buffers are cleared with the shared integer-zero
+    // kernel. Treat that raw-zero initializer as +0.0 when no positive value
+    // reached the accumulator; no finite float maps to orderable uint zero.
+    if (u == 0) { return 0.0f; }
     uint f = (u & 0x80000000u) ? (u & 0x7FFFFFFFu) : ~u;
     return as_type<float>(f);
 }

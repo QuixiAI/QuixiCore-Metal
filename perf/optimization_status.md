@@ -2417,3 +2417,118 @@ Retained controlled runs are `fp8-paged-scale-hoist-{baseline,candidate}-d64-d12
 `fp8-experiments-final-quick`; rejected variants are preserved in the other
 `fp8-*candidate` and MLA experiment directories under
 `perf/results/2026-07-14/`.
+
+## 2026-07-14: Cross-kernel FP8 transfer experiments
+
+Status: complete; the retained implementation is measured and the focused,
+repository-wide, parity, and PyTorch MPS validations pass.
+
+This pass tested whether the successful FP8 encoder, format-specialization,
+and two-warp ideas transfer to neighboring kernels. The starting hypothesis
+was deliberately broad, but each experiment changed one factor at a time and
+all non-wins were restored.
+
+Retained changes:
+
+- Grouped fused activation quantization now has compile-time SwiGLU and
+  SwiGLU-OAI symbols. The per-token FP8/INT8 kernels retain their original
+  runtime-mode implementation; only the grouped path, which evaluates the
+  branch repeatedly for every 64-value group, is specialized.
+- `orderable_uint_to_float(0)` treats the raw integer-zero atomic initializer
+  as `+0.0`. No finite float maps to orderable integer zero. This fixes NaN
+  scales for all-zero per-tensor FP8/INT8 and FP8 fake-quant inputs without
+  changing nonzero quantization.
+- Benchmark coverage now includes D64/D128 E4M3/E5M2 KV gather/scatter,
+  indexer plain/UE8M0 modes, timed MLA FP8 insertion, FP8 fake quantization,
+  grouped activation/quantization modes, FP8 UE8M0 norm quantization, and
+  capped/non-capped attention.
+
+Environment and method:
+
+- MacBook Pro Mac16,5; Apple M4 Max, 40-core GPU, 128 GB; macOS 26.5.2
+  (25F84); Xcode 26.6 (17F113); Apple Metal 32023.883 / toolchain
+  17.6.109.0; Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1.
+- Working-tree label `376e5e4-dirty`; MLX Python-extension integration path;
+  BF16 inputs and FP8 E4M3/E5M2 or UE8M0-scaled formats.
+- Initial coverage used 15 warmups and 60 measured samples. Decisions used
+  30-50 warmups and 120-240 samples. The harness adaptively batches calls,
+  synchronizes samples, and records median, p20/p80, and CV.
+
+Initial baseline command:
+
+```bash
+PYTHONPATH=bindings/python .venv/bin/python perf/bench_kernels.py \
+  --backend mlx --preset quick \
+  --kernel kv_gather_fp8,kv_scatter_fp8,indexer_quant,mla,fake_quant_fp8,act_quant,quant_rt,norm_quant_block,attn,decode_swiglu \
+  --formats mxfp8 --warmup 15 --iters 60 \
+  --out-dir perf/results/2026-07-14/cross-kernel-specialization-baseline
+```
+
+The retained activation result used a same-metallib A/B: both runtime and
+specialized group symbols were compiled together and a temporary process-only
+selector routed the control. The selector and runtime duplicate were removed
+after measurement. Times are milliseconds; brackets are p20/p80 followed by
+CV.
+
+| Grouped activation path / shape | Runtime control | Specialized | Change | Decision |
+|---|---:|---:|---:|---|
+| SwiGLU UE8M0 T512 D2880 G64 | 0.06755 [0.06316/0.08244], .2032 | 0.06100 [0.05967/0.06875], .1096 | -9.7% | keep |
+| SwiGLU-OAI UE8M0 T512 D2880 G64 | 0.06696 [0.06457/0.06874], .0456 | 0.06141 [0.06065/0.06304], .0536 | -8.3% | keep |
+| SwiGLU UE8M0 T4096 D2880 G64 | 0.40894 [0.40315/0.41974], .0261 | 0.39573 [0.38778/0.41202], .0396 | -3.2% | keep |
+| SwiGLU-OAI UE8M0 T4096 D2880 G64 | 0.46063 [0.44983/0.47335], .0425 | 0.42711 [0.41108/0.44406], .0416 | -7.3% | keep |
+
+The atomic-zero fix is a correctness change, not a speedup claim. With the
+fix present, the nonzero corrected baseline measured FP8 fake quantization at
+0.04306/0.23776 ms for T512/T4096 D2880 and per-tensor FP8 quantization at
+0.07856/0.37391 ms for N4096/N16384 D1024. Random FP8 fake-quant output is
+bit-exact after output-dtype rounding against Torch E4M3FN, and zero FP8/INT8
+per-tensor inputs now return zero codes/data and a zero scale.
+
+Rejected experiments:
+
+| Factor | Representative result | Decision |
+|---|---|---|
+| KV FP8 compile-time format symbols | Gather control E4/E5 D64 0.1355/0.0960 and D128 0.1407/0.1023 ms vs candidate 0.1603/0.0861 and 0.1268/0.1141; specialized scatter regressed substantially | reject mixed result and symbol growth |
+| KV scatter one-head-per-warp | E4/E5 D64 0.0236/0.0215 -> 0.0242/0.0235 ms; D128 0.0317/0.0295 -> 0.0315/0.0326 | reject |
+| Bit-built power-of-two producer scales | Quant group 0.0402/0.1499 -> 0.0501/0.1668 ms; activation group mixed; norm/indexer/MLA flat | reject; scale selection is only once per 64-128 values |
+| MLA E8M0 bit decode per value | FP8 decode 0.6735 -> 0.6805 and 0.6782 ms on repeat | reject |
+| FP8 fake-quant bit exponent/step | Corrected control 0.0431/0.2378 ms; candidate 0.0371/0.2348, then 0.0331/0.2778 | reject; realistic large shape is unstable/regressed |
+| Per-token activation mode symbols | Small OAI cases improved, but the large cases were flat and templating perturbed standard-path codegen | restrict specialization to grouped path |
+| Attention softcap symbols | Repeat D64 fwd/causal 0.2404/0.1324 -> 0.2428/0.1351; D128 N1024 0.4438/0.2323 -> 0.4556/0.2446; N2048 1.7503/0.9449 -> 1.7795/0.9855 | reject; uniform tile branch is already cheap |
+| MXFP8 decode SwiGLU two warps | 0.0320 -> 0.0339 ms at B1 K1536 N4096 | reject; output-channel parallelism already saturates the GPU |
+
+Indexer-consumer fusion was assessed but not implemented. The library exposes
+indexer cache quantization/gather and sparse MLA consumption, but it has no
+public query projection, scoring definition, or top-k selection contract that
+connects them. Adding a fused scorer would invent model/application semantics,
+contrary to the pure-kernel scope; it remains deferred until that reusable
+contract exists.
+
+Focused correctness completed during the experiment: 294 KV format cases,
+154 KV geometry cases, 19 MLA cases, 50 FP8 fake/per-tensor quantization cases,
+43 dense/causal attention cases, 55 decode-linear cases, and 8 activation
+quantization cases passed for their respective candidates. After restoring all
+rejected variants and removing the temporary A/B selector:
+
+- `scripts/build kernels` passed.
+- The final affected command passed 58 activation/fake/per-tensor quantization
+  cases.
+- `scripts/test correctness -q`: 2164 passed.
+- `scripts/test parity -q`: 432 passed.
+- `scripts/build pytorch_mps` passed.
+- `scripts/test mps -q`: 472 passed.
+- `scripts/test xcode`: test build succeeded.
+
+The production-only final run (`cross-kernel-transfer-final-retained`, 50
+warmups / 240 samples) independently reproduced the retained grouped medians:
+0.0587/0.3984 ms for standard T512/T4096 and 0.0617/0.4216 ms for OAI.
+
+Decision: keep grouped activation-mode specialization, the atomic-zero
+correctness fix, its FP8 oracle/zero tests, and the expanded benchmark matrix.
+Restore all other source variants. Raw controls/candidates are under
+`perf/results/2026-07-14/`: `cross-kernel-specialization-baseline-repeat`,
+`act-quant-group-{runtime-ab-control,specialized-ab-candidate}`,
+`atomic-zero-sentinel-corrected-baseline`, and the `kv-fp8-*`, `pow2-*`,
+`mla-e8m0-*`, `fake-quant-fp8-*`, `attention-softcap-*`, and
+`decode-swiglu-mxfp8-two-warp-candidate` directories. The production-only
+confirmation is `cross-kernel-transfer-final-retained`.

@@ -19,6 +19,11 @@ METAL_FUNC float actq_eval(int mode, float x0, float x1, float alpha, float limi
     return glu_eval(mode == 1 ? 3 : 2, x0, x1, alpha, limit);
 }
 
+template <int MODE>
+METAL_FUNC float actq_eval_mode(float x0, float x1, float alpha, float limit) {
+    return glu_eval(MODE == 1 ? 3 : 2, x0, x1, alpha, limit);
+}
+
 template <typename T>
 kernel void silu_mul_quant_fp8(device const T *x     [[buffer(0)]],
                                device const T *gate  [[buffer(1)]],
@@ -105,7 +110,7 @@ kernel void silu_mul_quant_int8(device const T *x     [[buffer(0)]],
     }
 }
 
-template <typename T>
+template <typename T, int MODE>
 kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
                                      device const T *gate  [[buffer(1)]],
                                      device uchar   *codes [[buffer(2)]],
@@ -129,7 +134,7 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
             const float4 xv = float4(((device const T4*)(x + gbase))[c]);
             const float4 gv = float4(((device const T4*)(gate + gbase))[c]);
             #pragma clang loop unroll(full)
-            for (int j = 0; j < 4; ++j) amax = max(amax, fabs(actq_eval(mode, xv[j], gv[j], alpha, limit)));
+            for (int j = 0; j < 4; ++j) amax = max(amax, fabs(actq_eval_mode<MODE>(xv[j], gv[j], alpha, limit)));
         }
         amax = simd_max(amax);
         float s = amax / 448.0f;
@@ -142,7 +147,7 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
             const float4 gv = float4(((device const T4*)(gate + gbase))[c]);
             uchar4 out;
             #pragma clang loop unroll(full)
-            for (int j = 0; j < 4; ++j) out[j] = tk_e4m3_encode(actq_eval(mode, xv[j], gv[j], alpha, limit) * inv);
+            for (int j = 0; j < 4; ++j) out[j] = tk_e4m3_encode(actq_eval_mode<MODE>(xv[j], gv[j], alpha, limit) * inv);
             ((device uchar4*)(codes + gbase))[c] = out;
         }
         if (lane == 0) {
@@ -151,31 +156,9 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
     }
 }
 
-#define instantiate_act_quant(type_name, T)                                          \
-  template [[host_name("silu_mul_quant_fp8_" #type_name)]] [[kernel]] void           \
-  silu_mul_quant_fp8<T>(device const T *x [[buffer(0)]],                             \
-                        device const T *gate [[buffer(1)]],                          \
-                        device uchar *codes [[buffer(2)]],                           \
-                        device float *scale [[buffer(3)]],                           \
-                        constant int &D [[buffer(4)]],                               \
-                        constant int &mode [[buffer(5)]],                            \
-                        constant float &alpha [[buffer(6)]],                         \
-                        constant float &limit [[buffer(7)]],                         \
-                        uint row [[threadgroup_position_in_grid]],                   \
-                        uint lane [[thread_index_in_simdgroup]]);                    \
-  template [[host_name("silu_mul_quant_int8_" #type_name)]] [[kernel]] void          \
-  silu_mul_quant_int8<T>(device const T *x [[buffer(0)]],                            \
-                         device const T *gate [[buffer(1)]],                         \
-                         device char *codes [[buffer(2)]],                           \
-                         device float *scale [[buffer(3)]],                          \
-                         constant int &D [[buffer(4)]],                              \
-                         constant int &mode [[buffer(5)]],                           \
-                         constant float &alpha [[buffer(6)]],                        \
-                         constant float &limit [[buffer(7)]],                        \
-                         uint row [[threadgroup_position_in_grid]],                  \
-                         uint lane [[thread_index_in_simdgroup]]);                   \
-  template [[host_name("silu_mul_quant_fp8_group_" #type_name)]] [[kernel]] void     \
-  silu_mul_quant_fp8_group<T>(device const T *x [[buffer(0)]],                       \
+#define instantiate_act_quant_group(MODE_NAME, MODE_ID, type_name, T)                \
+  template [[host_name("silu_mul_quant_fp8_group_" #MODE_NAME "_" #type_name)]] [[kernel]] void\
+  silu_mul_quant_fp8_group<T, MODE_ID>(device const T *x [[buffer(0)]],              \
                               device const T *gate [[buffer(1)]],                    \
                               device uchar *codes [[buffer(2)]],                     \
                               device float *scale [[buffer(3)]],                     \
@@ -188,6 +171,38 @@ kernel void silu_mul_quant_fp8_group(device const T *x     [[buffer(0)]],
                               uint row [[threadgroup_position_in_grid]],             \
                               uint lane [[thread_index_in_simdgroup]]);
 
-instantiate_act_quant(float32, float)
-instantiate_act_quant(float16, half)
-instantiate_act_quant(bfloat16, bf16)
+#define instantiate_act_quant_group_mode(MODE_NAME, MODE_ID)             \
+  instantiate_act_quant_group(MODE_NAME, MODE_ID, float32, float)        \
+  instantiate_act_quant_group(MODE_NAME, MODE_ID, float16, half)         \
+  instantiate_act_quant_group(MODE_NAME, MODE_ID, bfloat16, bf16)
+
+instantiate_act_quant_group_mode(swiglu, 0)
+instantiate_act_quant_group_mode(swiglu_oai, 1)
+
+#define instantiate_act_quant_token(type_name, T)                                \
+  template [[host_name("silu_mul_quant_fp8_" #type_name)]] [[kernel]] void       \
+  silu_mul_quant_fp8<T>(device const T *x [[buffer(0)]],                        \
+                        device const T *gate [[buffer(1)]],                      \
+                        device uchar *codes [[buffer(2)]],                       \
+                        device float *scale [[buffer(3)]],                       \
+                        constant int &D [[buffer(4)]],                           \
+                        constant int &mode [[buffer(5)]],                        \
+                        constant float &alpha [[buffer(6)]],                     \
+                        constant float &limit [[buffer(7)]],                     \
+                        uint row [[threadgroup_position_in_grid]],               \
+                        uint lane [[thread_index_in_simdgroup]]);                \
+  template [[host_name("silu_mul_quant_int8_" #type_name)]] [[kernel]] void      \
+  silu_mul_quant_int8<T>(device const T *x [[buffer(0)]],                       \
+                         device const T *gate [[buffer(1)]],                     \
+                         device char *codes [[buffer(2)]],                       \
+                         device float *scale [[buffer(3)]],                      \
+                         constant int &D [[buffer(4)]],                          \
+                         constant int &mode [[buffer(5)]],                       \
+                         constant float &alpha [[buffer(6)]],                    \
+                         constant float &limit [[buffer(7)]],                    \
+                         uint row [[threadgroup_position_in_grid]],              \
+                         uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_act_quant_token(float32, float)
+instantiate_act_quant_token(float16, half)
+instantiate_act_quant_token(bfloat16, bf16)

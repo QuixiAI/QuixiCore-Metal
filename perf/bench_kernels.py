@@ -697,17 +697,24 @@ def attn_cases(be, preset, formats):
         v = (0.5 * rng.standard_normal((B, H, N, D))).astype(np.float32)
         q_d, k_d, v_d = be.array(q, "bf16"), be.array(k, "bf16"), be.array(v, "bf16")
         flops = 4.0 * B * H * N * N * D
-        for variant, fn, causal in (
-                ("fwd", tk.attn_fwd, False),
-                ("causal", tk.attn_causal, True),
-                ("multiwarp", tk.attn_multiwarp, False)):
-            baselines = {"sdpa": _sdpa_baseline(be, q_d, k_d, v_d, D, causal)}
+        for variant, fn, causal, softcap in (
+                ("fwd", tk.attn_fwd, False, 0.0),
+                ("causal", tk.attn_causal, True, 0.0),
+                ("multiwarp", tk.attn_multiwarp, False, 0.0),
+                ("fwd_softcap", tk.attn_fwd, False, 30.0),
+                ("causal_softcap", tk.attn_causal, True, 30.0)):
+            baselines = ({"sdpa": _sdpa_baseline(be, q_d, k_d, v_d, D, causal)}
+                         if softcap == 0.0 else {})
             if variant == "multiwarp":
                 baselines["tk.attn_fwd"] = lambda q_d=q_d, k_d=k_d, v_d=v_d: \
                     tk.attn_fwd(q_d, k_d, v_d)
+            target = ((lambda fn=fn, q_d=q_d, k_d=k_d, v_d=v_d:
+                       fn(q_d, k_d, v_d)) if variant == "multiwarp" else
+                      (lambda fn=fn, q_d=q_d, k_d=k_d, v_d=v_d, softcap=softcap:
+                       fn(q_d, k_d, v_d, softcap=softcap)))
             yield Case("attn", f"{variant}_B{B}H{H}N{N}D{D}",
                        {"B": B, "H": H, "N": N, "D": D}, "bf16",
-                       target=lambda fn=fn, q_d=q_d, k_d=k_d, v_d=v_d: fn(q_d, k_d, v_d),
+                       target=target,
                        baselines=baselines, ref=None,
                        flops=flops / (2 if causal else 1))
 
@@ -1370,10 +1377,14 @@ def indexer_quant_cases(be, preset, formats):
         k_d = be.array(k, "bf16")
         c_d, s_d = be.raw_array(code0), be.array(scale0, "f32")
         sm = be.int_array(np.arange(T, dtype=np.int32))
-        yield Case("indexer_quant", f"T{T}_hd{hd}", {"T": T, "hd": hd}, "bf16",
-                   target=lambda k_d=k_d, sm=sm, c_d=c_d, s_d=s_d:
-                       tk.indexer_k_quant_and_cache(k_d, sm, c_d, s_d)[0],
-                   baselines={}, ref=None, bytes_moved=float(T * hd * 2 + T * hd))
+        for ue8m0 in (False, True):
+            suffix = "_ue8m0" if ue8m0 else ""
+            yield Case("indexer_quant", f"T{T}_hd{hd}{suffix}", {"T": T, "hd": hd},
+                       "bf16", fmt="fp8_e4m3_ue8m0" if ue8m0 else "fp8_e4m3",
+                       target=lambda k_d=k_d, sm=sm, c_d=c_d, s_d=s_d, ue8m0=ue8m0:
+                           tk.indexer_k_quant_and_cache(
+                               k_d, sm, c_d, s_d, ue8m0=ue8m0)[0],
+                       baselines={}, ref=None, bytes_moved=float(T * hd * 2 + T * hd))
 
 
 @register("kv_gather_fp8")
@@ -1382,22 +1393,29 @@ def kv_gather_fp8_cases(be, preset, formats):
     path for a paged fp8 prefix cache; the win is halving the cache read bandwidth."""
     tk = be.tk()
     rng = np.random.default_rng(241)
-    for nb, bs, H, D in _pick(preset, [(64, 16, 8, 128)], [(256, 16, 8, 128)],
-                              [(512, 16, 8, 128), (1024, 16, 8, 128)]):
+    for nb, bs, H, D in _pick(preset, [(64, 16, 8, 64)],
+                              [(256, 16, 8, 64), (256, 16, 8, 128)],
+                              [(512, 16, 8, 64), (512, 16, 8, 128),
+                               (1024, 16, 8, 64), (1024, 16, 8, 128)]):
         total = nb * bs
         K = (0.3 * rng.standard_normal((total, H, D))).astype(np.float32)
         V = (0.3 * rng.standard_normal((total, H, D))).astype(np.float32)
-        ks = float(np.abs(K).max() / 448.0)
-        vs = float(np.abs(V).max() / 448.0)
-        kc, vc = tk.kv_cache_scatter_fp8(be.array(K, "bf16"), be.array(V, "bf16"),
-                                         be.int_array(np.arange(total, dtype=np.int64)), nb, bs, ks, vs)
         bt = be.int_array(np.arange(nb, dtype=np.int32).reshape(1, nb))
         cu = be.int_array(np.array([0, total], np.int32))
-        ksa, vsa = be.array(np.full((H,), ks, np.float32), "f32"), be.array(np.full((H,), vs, np.float32), "f32")
-        yield Case("kv_gather_fp8", f"nb{nb}_H{H}_D{D}", {"nb": nb, "H": H, "D": D}, "fp8",
-                   target=lambda kc=kc, vc=vc, bt=bt, cu=cu, ksa=ksa, vsa=vsa, t=total:
-                       tk.kv_cache_gather_fp8(kc, vc, bt, cu, ksa, vsa, t)[0],
-                   baselines={}, ref=None, bytes_moved=float(2 * total * H * D * 1))
+        for fmt, fmt_code, qmax in (("e4m3", 0, 448.0), ("e5m2", 1, 57344.0)):
+            ks = np.maximum(np.abs(K).max(axis=(0, 2)) / qmax, 1e-8).astype(np.float32)
+            vs = np.maximum(np.abs(V).max(axis=(0, 2)) / qmax, 1e-8).astype(np.float32)
+            ksa, vsa = be.array(ks, "f32"), be.array(vs, "f32")
+            kc, vc = tk.kv_cache_scatter_fp8(
+                be.array(K, "bf16"), be.array(V, "bf16"),
+                be.int_array(np.arange(total, dtype=np.int64)), nb, bs, ksa, vsa, fmt=fmt)
+            yield Case("kv_gather_fp8", f"{fmt}_nb{nb}_H{H}_D{D}",
+                       {"nb": nb, "H": H, "D": D}, "fp8", fmt=f"fp8_{fmt}",
+                       target=lambda kc=kc, vc=vc, bt=bt, cu=cu, ksa=ksa, vsa=vsa,
+                                     t=total, fmt_code=fmt_code:
+                           tk.kv_cache_gather_fp8(
+                               kc, vc, bt, cu, ksa, vsa, t, fmt=fmt_code)[0],
+                       baselines={}, ref=None, bytes_moved=float(2 * total * H * D))
 
 
 @register("kv_scatter_fp8")
@@ -1536,6 +1554,19 @@ def mla_cases(be, preset, formats):
                        tk.mla_decode_fp8(q8_d, data_d, scale_d, bt_d, cl_d),
                    baselines={}, ref=None,
                    bytes_moved=float(B * ctx * (448 + 64 * 2 + 8)))
+        kv_d = be.array(kv, "bf16")
+        cos_d, sin_d = be.array(cos, "bf16"), be.array(sin, "bf16")
+        pos_d = be.int_array(np.arange(total, dtype=np.int32))
+        slot_d = be.int_array(np.arange(total, dtype=np.int64))
+        data0_d, scale0_d = be.raw_array(data0), be.raw_array(scale0)
+        yield Case("mla", f"insert_fp8_T{total}", {"T": total, "D": 512}, "bf16",
+                   fmt="fp8_e4m3_ue8m0",
+                   target=lambda kv_d=kv_d, cos_d=cos_d, sin_d=sin_d, pos_d=pos_d,
+                                 slot_d=slot_d, data0_d=data0_d, scale0_d=scale0_d:
+                       tk.mla_kv_insert_fp8(
+                           kv_d, cos_d, sin_d, pos_d, slot_d, data0_d, scale0_d)[0],
+                   baselines={}, ref=None,
+                   bytes_moved=float(total * (512 * 2 + 576 + 8)))
 
 
 @register("logit_transforms")
@@ -1688,6 +1719,21 @@ def fake_quant_cases(be, preset, formats):
                    bytes_moved=float(3 * T * D * 2 + T * D + T * 4))
 
 
+@register("fake_quant_fp8")
+def fake_quant_fp8_cases(be, preset, formats):
+    """Per-tensor E4M3 fake quantization with exact RNE midpoint handling."""
+    tk = be.tk()
+    rng = np.random.default_rng(361)
+    shapes = _pick(preset, [(512, 2048)], [(512, 2880), (4096, 2880)],
+                   [(512, 2880), (4096, 2880), (4096, 11008)])
+    for T, D in shapes:
+        x_d = be.array((0.5 * rng.standard_normal((T, D))).astype(np.float32), "bf16")
+        yield Case("fake_quant_fp8", f"T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   fmt="fp8_e4m3",
+                   target=lambda x_d=x_d: tk.fake_quant_fp8(x_d)[0],
+                   baselines={}, ref=None, bytes_moved=float(3 * T * D * 2))
+
+
 @register("weight_quant_ternary")
 def weight_quant_ternary_cases(be, preset, formats):
     """BitNet weight quantization port vs framework decomposed dequant-only baseline."""
@@ -1788,6 +1834,33 @@ def act_quant_cases(be, preset, formats):
                    fmt="fp8_e4m3",
                    target=lambda x_d=x_d, g_d=g_d: tk.silu_mul_quant_fp8(x_d, g_d)[0],
                    baselines=fp8_baselines, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+        yield Case("act_quant", f"fp8_oai_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   fmt="fp8_e4m3",
+                   target=lambda x_d=x_d, g_d=g_d:
+                       tk.silu_mul_quant_fp8(x_d, g_d, act="swiglu_oai")[0],
+                   baselines={}, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+        yield Case("act_quant", f"int8_oai_T{T}_D{D}", {"T": T, "D": D}, "bf16",
+                   target=lambda x_d=x_d, g_d=g_d:
+                       tk.silu_mul_quant_int8(x_d, g_d, act="swiglu_oai")[0],
+                   baselines={}, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+        group_size = 128 if D % 128 == 0 else 64
+        yield Case("act_quant", f"fp8_group_ue8m0_T{T}_D{D}_G{group_size}",
+                   {"T": T, "D": D, "G": group_size}, "bf16", fmt="fp8_e4m3_ue8m0",
+                   target=lambda x_d=x_d, g_d=g_d, group_size=group_size:
+                       tk.silu_mul_quant_fp8_group(
+                           x_d, g_d, group_size=group_size, ue8m0=True)[0],
+                   baselines={}, ref=None,
+                   bytes_moved=(2.0 * T * D * 2 + T * D))
+        yield Case("act_quant", f"fp8_group_oai_ue8m0_T{T}_D{D}_G{group_size}",
+                   {"T": T, "D": D, "G": group_size}, "bf16", fmt="fp8_e4m3_ue8m0",
+                   target=lambda x_d=x_d, g_d=g_d, group_size=group_size:
+                       tk.silu_mul_quant_fp8_group(
+                           x_d, g_d, group_size=group_size, ue8m0=True,
+                           act="swiglu_oai")[0],
+                   baselines={}, ref=None,
                    bytes_moved=(2.0 * T * D * 2 + T * D))
 
 
@@ -2083,6 +2156,11 @@ def quant_rt_cases(be, preset, formats):
                    baselines={}, ref=None, bytes_moved=3.0 * N * Dm)
         yield Case("quant_rt", f"per_token_fp8_N{N}_D{Dm}", {"N": N, "D": Dm}, "f16",
                    target=lambda x_d=x_d: tk.quantize_per_token_fp8(x_d),
+                   baselines={}, ref=None, bytes_moved=3.0 * N * Dm)
+        yield Case("quant_rt", f"per_group_fp8_ue8m0_N{N}_D{Dm}",
+                   {"N": N, "D": Dm, "G": 128}, "f16", fmt="fp8_e4m3_ue8m0",
+                   target=lambda x_d=x_d:
+                       tk.quantize_per_group_fp8(x_d, group_size=128, ue8m0=True),
                    baselines={}, ref=None, bytes_moved=3.0 * N * Dm)
 
 
@@ -2638,6 +2716,12 @@ def norm_quant_block_cases(be, preset, formats):
                    target=lambda x_d=x_d, r_d=r_d, w_d=w_d:
                        tk.rms_norm_add_per_block(x_d, r_d, w_d, int8=True)[0],
                    baselines=base, ref=None, bytes_moved=float(3 * N * D * 2))
+        yield Case("norm_quant_block", f"fp8_ue8m0_N{N}_D{D}",
+                   {"N": N, "D": D, "G": 128}, "bf16", fmt="fp8_e4m3_ue8m0",
+                   target=lambda x_d=x_d, r_d=r_d, w_d=w_d:
+                       tk.rms_norm_add_per_block(
+                           x_d, r_d, w_d, int8=False, ue8m0=True)[0],
+                   baselines={}, ref=None, bytes_moved=float(3 * N * D * 2))
 
 
 @register("embedding_backward")

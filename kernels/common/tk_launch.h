@@ -3269,7 +3269,8 @@ void launch_silu_mul_quant_fp8_group(E& e, typename E::in_t x, typename E::in_t 
                                      typename E::out_t codes, typename E::out_t scale,
                                      int rows, int D, int G, int ue8m0, int mode, float alpha,
                                      float limit, const std::string& type_name) {
-  e.pipeline("silu_mul_quant_fp8_group_" + type_name);
+  const std::string mode_name = mode == 1 ? "swiglu_oai_" : "swiglu_";
+  e.pipeline("silu_mul_quant_fp8_group_" + mode_name + type_name);
   e.in(x, 0); e.in(gate, 1); e.out(codes, 2); e.out(scale, 3);
   e.bytes(D, 4); e.bytes(G, 5); e.bytes(ue8m0, 6); e.bytes(mode, 7);
   e.bytes(alpha, 8); e.bytes(limit, 9);

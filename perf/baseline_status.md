@@ -128,6 +128,24 @@ commands are recorded in `perf/optimization_status.md`.
 | QGEMV whole-block candidate | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-qgemv-whole-block-candidate/` |
 | Final retained state | `455463c-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/fp8-experiments-final-quick/` |
 
+## 2026-07-14 Cross-Kernel FP8 Transfer Index
+
+These MLX runs use MacBook Pro Mac16,5 (Apple M4 Max, 40-core GPU,
+128 GB), macOS 26.5.2 (25F84), Xcode 26.6 (17F113), Apple Metal
+32023.883 / toolchain 17.6.109.0, Python 3.12.9, and MLX 0.21.1.
+Exact per-case p20/p80, CV, formats, and shapes are in each JSONL. The
+keep/reject analysis is in `perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Expanded baseline repeat | `376e5e4-dirty` | MLX / quick | 15 / 60 | `perf/results/2026-07-14/cross-kernel-specialization-baseline-repeat/` |
+| Atomic-zero corrected baseline | `376e5e4-dirty` | MLX / quick | 30 / 120 | `perf/results/2026-07-14/atomic-zero-sentinel-corrected-baseline/` |
+| Group-mode runtime A/B control | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/act-quant-group-runtime-ab-control/` |
+| Group-mode specialized A/B candidate | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/act-quant-group-specialized-ab-candidate/` |
+| Production-only retained state | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/cross-kernel-transfer-final-retained/` |
+| Attention softcap repeat | `376e5e4-dirty` | MLX / quick | 40 / 180 | `perf/results/2026-07-14/attention-softcap-specialization-candidate-repeat/` |
+| MXFP8 decode SwiGLU two-warp | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/decode-swiglu-mxfp8-two-warp-candidate/` |
+
 ## Migration Tasks
 
 - Promote stable benchmark runs into compact per-kernel baseline tables.

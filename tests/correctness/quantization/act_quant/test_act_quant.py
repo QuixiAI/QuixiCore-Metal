@@ -57,17 +57,18 @@ def test_silu_mul_quant_int8_reconstruction(act):
     assert (np.abs(recon - ref) <= 0.51 * sn + 1e-6).all()
 
 
-def test_silu_mul_quant_fp8_group_scales():
+@pytest.mark.parametrize("act", ["swiglu", "swiglu_oai"])
+def test_silu_mul_quant_fp8_group_scales(act):
     rng = np.random.default_rng(2)
     T, D, G = 8, 512, 128
     x = rng.standard_normal((T, D)).astype(np.float32)
     gate = rng.standard_normal((T, D)).astype(np.float32)
     codes, scale = tk.silu_mul_quant_fp8_group(mx.array(x), mx.array(gate), group_size=G,
-                                               ue8m0=True)
+                                               ue8m0=True, act=act)
     mx.eval(codes, scale)
     sn = np.array(scale)
     assert sn.shape == (T, D // G)
-    ref = _act("swiglu", x, gate).reshape(T, D // G, G)
+    ref = _act(act, x, gate).reshape(T, D // G, G)
     exp = np.log2(np.where(sn > 0, sn, 1.0))
     np.testing.assert_array_equal(exp, np.round(exp))       # power-of-two scales
     assert (sn * 448.0 >= np.abs(ref).max(-1) - 1e-3).all() # coverage
