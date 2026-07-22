@@ -216,6 +216,43 @@ def test_rms_norm_residual_next(shape):
     assert _maxdiff(next_out, exp_next.to(torch.bfloat16)) < 0.03
 
 
+@pytest.mark.parametrize("T", [8, 40, 65])
+@pytest.mark.parametrize("Hq,Hkv", [(3, 1), (4, 2), (2, 2)])   # MQA-3, GQA-2, MHA
+@pytest.mark.parametrize("window", [0, 16])
+def test_attn_fwd_sg_d256(T, Hq, Hkv, window):
+    import numpy as np
+    D = 256
+    torch.manual_seed(T + Hq + window)
+    q = torch.randn(T, Hq, D, dtype=torch.float32, device="mps")
+    k = torch.randn(T, Hkv, D, dtype=torch.float32, device="mps")
+    v = torch.randn(T, Hkv, D, dtype=torch.float32, device="mps")
+    scale = 1.0 / (D ** 0.5)
+    got = tk_torch.attn_fwd_sg_d256(q, k, v, scale, window)
+    torch.mps.synchronize()
+
+    # fp32 bidirectional GQA oracle over the f16-rounded K/V the kernel reads
+    qn = q.cpu().numpy().astype(np.float64)
+    kn = k.to(torch.float16).float().cpu().numpy().astype(np.float64)
+    vn = v.to(torch.float16).float().cpu().numpy().astype(np.float64)
+    G = Hq // Hkv
+    i = np.arange(T)[:, None]
+    j = np.arange(T)[None, :]
+    mask = np.ones((T, T), bool) if window == 0 else \
+        (j + window // 2 >= i) & (j <= i + window // 2)
+    out = np.zeros((T, Hq, D))
+    for h in range(Hq):
+        kv = h // G
+        s = (qn[:, h] * scale) @ kn[:, kv].T          # (T, T)
+        s = np.where(mask, s, -np.inf)
+        s = s - s.max(-1, keepdims=True)
+        p = np.exp(s)
+        p /= p.sum(-1, keepdims=True)
+        out[:, h] = p @ vn[:, kv]
+    g = got.float().cpu().numpy().astype(np.float64)
+    assert got.shape == (T, Hq, D)
+    assert np.abs(g - out).max() / (np.abs(out).max() + 1e-9) < 2e-2
+
+
 def _qk_norm_rope_ref(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps, interleaved, gemma):
     import numpy as np
     T, W = qkv.shape

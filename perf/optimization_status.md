@@ -2679,3 +2679,38 @@ Keep decision: 1.3-2.3x over composing, by folding the KV un-pack + f16 cast int
 norm-rope pass. Additive (the packed qk_norm_rope path is untouched).
 
 Results: perf/results/2026-07-22/005647-torch-comprehensive/
+
+## 2026-07-22: attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV)
+
+Status: kept.
+
+New shape-keyed attention op under kernels/attention/attn_fwd_sg. Bidirectional
+(non-causal) flash attention with an optional symmetric sliding window, built on raw
+simdgroup_float8x8 MMA tiles (Metal 3 8x8 cooperative matrices) instead of QuixiCore's
+TK register tiles — head_dim=256 is wider than the TK attn_fwd D in {64,128}. GQA: Hq
+query heads share Hkv KV heads; f32 Q/O, f16 K/V, token-major (T, H, 256). One
+threadgroup (4 simdgroups / 128 lanes) owns 8 query rows of one head; per 32-key block
+the 4 simdgroups compute the 8x32 QK^T tile, a warp-parallel online softmax rescales
+the running output, and the 4 simdgroups split the 256 output columns for the P·V MMA.
+
+Host binding pads K/V up to the 32-key block with zeros so the tail block's
+simdgroup_load stays in-bounds (masked keys read zeros; this avoids a 0*nan trap when
+the loaded-but-masked value tile falls on uninitialized memory — the fix for an initial
+sporadic-nan failure).
+
+Hardware: Apple M5 Max, macOS (Darwin 25.5), xcrun metal 32023.883 -std=metal3.1 (this
+kernel needs NO Metal 4 — simdgroup_float8x8 is Metal 3), PyTorch 2.13 MPS. Correctness
+vs an fp32 bidirectional GQA oracle over the f16-rounded K/V: max rel err ~2e-4, 18/18
+new MPS tests pass (T x {MQA,GQA,MHA} x window). Perf (torch, comprehensive), tk vs
+torch F.scaled_dot_product_attention with the GQA groups expanded:
+
+| shape (T x Hq x Hkv)     | tk ms   | sdpa ms | speedup |
+|--------------------------|---------|---------|---------|
+| 512 x 3 x 1              | 0.2499  | 0.6351  | 2.54x   |
+| 2048 x 4 x 2             | 2.2553  | 3.8649  | 1.71x   |
+| 4096 x 8 x 2             | 16.666  | 31.793  | 1.91x   |
+
+Keep decision: 1.7-2.5x over torch SDPA at the D=256 GQA f16-KV shape, which the TK
+attn_fwd path (D in {64,128}) does not cover. Additive; nothing regresses.
+
+Results: perf/results/2026-07-22/010655-torch-comprehensive/

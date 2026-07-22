@@ -127,6 +127,15 @@ def attn_fwd(q, k, v, softcap=0.0, sinks=None):
     return _mlx().attn_fwd(q, k, v, softcap=float(softcap), sinks=sinks)
 
 
+def attn_fwd_sg_d256(q, k, v, scale=0.0, window=0):
+    """simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV. q/o (T, Hq, 256) f32,
+    k/v (T, Hkv, 256) f16 (Hq a multiple of Hkv). Bidirectional; window > 0 keeps keys within
+    window/2 of the query; scale <= 0 defaults to 1/sqrt(256). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(q):
+        return _torch().attn_fwd_sg_d256(q, k, v, scale=scale, window=window)
+    return _mlx().attn_fwd_sg_d256(q, k, v, scale=float(scale), window=int(window))
+
+
 def _varlen_worklist(cu_seqlens_q):
     """Host-side (numpy) prefill tile plan. Returns qlens, padded qlens, pad offsets, and the
     per-tile (batch, local-row-0) worklist — all derived from the host cu_seqlens ints."""

@@ -27,6 +27,7 @@ families:
     status: implemented
     paths:
       - kernels/attention/attn_fwd
+      - kernels/attention/attn_fwd_sg
       - kernels/attention/attn_bwd
       - kernels/attention/attn_causal
       - kernels/attention/attn_decode

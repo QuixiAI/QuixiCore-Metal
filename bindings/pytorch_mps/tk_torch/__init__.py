@@ -29,6 +29,7 @@ def _kernel_source(path: str) -> Path:
 _METAL_SOURCES = [
     _kernel_source("utils/add_rt/add_rt.metal"),
     _kernel_source("attention/attn_fwd/attn_fwd.metal"),
+    _kernel_source("attention/attn_fwd_sg/attn_fwd_sg.metal"),
     _kernel_source("matmul/matmul_custom/matmul_custom.metal"),
     _kernel_source("norms/layernorm/layernorm.metal"),
     _kernel_source("norms/rms_norm/rms_norm.metal"),
@@ -165,6 +166,13 @@ def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float =
     """Non-causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
     softcap > 0 = Gemma-style logit capping; sinks (H,) = gpt-oss attention sinks."""
     return _ext.attn_fwd(q, k, v, float(softcap), sinks)
+
+
+def attn_fwd_sg_d256(q, k, v, scale: float = 0.0, window: int = 0):
+    """simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV. q/o (T, Hq, 256) f32,
+    k/v (T, Hkv, 256) (cast to f16); Hq a multiple of Hkv. Bidirectional; window>0 keeps keys
+    within window/2 of the query. scale<=0 defaults to 1/sqrt(256). Returns (T, Hq, 256). MPS."""
+    return _ext.attn_fwd_sg_d256(q, k, v, float(scale), int(window))
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):

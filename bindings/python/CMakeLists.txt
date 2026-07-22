@@ -31,6 +31,7 @@ set(KERNEL_FAMILY_INCLUDE_DIRS
 set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.cpp"
     "${KERNELS_ROOT}/attention/attn_fwd/attn_fwd.cpp"
+    "${KERNELS_ROOT}/attention/attn_fwd_sg/attn_fwd_sg.cpp"
     "${KERNELS_ROOT}/matmul/matmul_custom/matmul_custom.cpp"
     "${KERNELS_ROOT}/norms/layernorm/layernorm.cpp"
     "${KERNELS_ROOT}/norms/rms_norm/rms_norm.cpp"
@@ -105,6 +106,7 @@ set(KERNEL_CPP_SOURCES
 set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.metal"
     "${KERNELS_ROOT}/attention/attn_fwd/attn_fwd.metal"
+    "${KERNELS_ROOT}/attention/attn_fwd_sg/attn_fwd_sg.metal"
     "${KERNELS_ROOT}/matmul/matmul_custom/matmul_custom.metal"
     "${KERNELS_ROOT}/norms/layernorm/layernorm.metal"
     "${KERNELS_ROOT}/norms/rms_norm/rms_norm.metal"

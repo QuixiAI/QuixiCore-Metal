@@ -2135,6 +2135,40 @@ def qk_norm_rope_cases(be, preset, formats):
                        bytes_moved=2.0 * T * (hq + hk + hv) * D * 2)
 
 
+@register("attn_fwd_sg")
+def attn_fwd_sg_cases(be, preset, formats):
+    """simdgroup_matrix flash attention (D=256, GQA, f16 KV) vs torch SDPA (torch backend only)."""
+    if be.name != "torch":
+        return
+    tk = be.tk()
+    t = be.torch
+    rng = np.random.default_rng(51)
+    D = 256
+    shapes = _pick(preset, [(512, 3, 1)],
+                   [(512, 3, 1), (2048, 4, 2)],
+                   [(512, 3, 1), (2048, 4, 2), (4096, 8, 2)])
+    for T, Hq, Hkv in shapes:
+        q = rng.standard_normal((T, Hq, D)).astype(np.float32)
+        k = rng.standard_normal((T, Hkv, D)).astype(np.float32)
+        v = rng.standard_normal((T, Hkv, D)).astype(np.float32)
+        q_d, k_d, v_d = be.array(q, "f32"), be.array(k, "f32"), be.array(v, "f32")
+        scale = 1.0 / (D ** 0.5)
+        G = Hq // Hkv
+
+        def torch_sdpa(q_d=q_d, k_d=k_d, v_d=v_d, T=T, Hq=Hq, Hkv=Hkv, G=G, scale=scale):
+            qh = q_d.reshape(T, Hq, D).permute(1, 0, 2).unsqueeze(0)              # (1,Hq,T,D)
+            kh = k_d.reshape(T, Hkv, D).permute(1, 0, 2).repeat_interleave(G, 0).unsqueeze(0)
+            vh = v_d.reshape(T, Hkv, D).permute(1, 0, 2).repeat_interleave(G, 0).unsqueeze(0)
+            o = t.nn.functional.scaled_dot_product_attention(qh, kh, vh, scale=scale)
+            return o
+        yield Case("attn_fwd_sg", f"T{T}_Hq{Hq}_Hkv{Hkv}_D{D}",
+                   {"T": T, "Hq": Hq, "Hkv": Hkv, "D": D}, "f32",
+                   target=lambda q_d=q_d, k_d=k_d, v_d=v_d, scale=scale:
+                       tk.attn_fwd_sg_d256(q_d, k_d, v_d, scale, 0),
+                   baselines={"torch sdpa (GQA expand)": torch_sdpa}, ref=None,
+                   flops=4.0 * Hq * T * T * D)
+
+
 @register("moe_route")
 def moe_route_cases(be, preset, formats):
     """DeepSeek grouped routing vs the plain top-k router (same T,E,K): the grouped kernel

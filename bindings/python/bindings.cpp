@@ -59,6 +59,7 @@
 
 #include "add_rt/add_rt.h"
 #include "attn_fwd/attn_fwd.h"
+#include "attn_fwd_sg/attn_fwd_sg.h"
 #include "matmul_custom/matmul_custom.h"
 #include "layernorm/layernorm.h"
 #include "rms_norm/rms_norm.h"
@@ -161,6 +162,22 @@ NB_MODULE(_ext, m) {
         Dense attention forward (B,H,N,D bf16). softcap > 0 applies Gemma-style logit
         soft-capping (softcap*tanh(s/softcap)); sinks is an optional per-head (H,) fp32
         attention-sink logit added to the softmax denominator (gpt-oss).
+      )");
+
+    m.def(
+      "attn_fwd_sg_d256",
+      &attn_fwd_sg_d256,
+      "q"_a,
+      "k"_a,
+      "v"_a,
+      nb::kw_only(),
+      "scale"_a = 0.0f,
+      "window"_a = 0,
+      "stream"_a = nb::none(),
+      R"(
+        simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV. q/o (T, Hq, 256) f32,
+        k/v (T, Hkv, 256) f16 (Hq a multiple of Hkv). Bidirectional; window > 0 keeps keys
+        within window/2 of the query; scale <= 0 defaults to 1/sqrt(256).
       )");
 
     m.def(

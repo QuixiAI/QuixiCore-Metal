@@ -255,6 +255,44 @@ static at::Tensor attn_fwd_mps(const at::Tensor& q_in, const at::Tensor& k_in,
   return out;
 }
 
+// simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV. q/o (T, Hq, 256) f32,
+// k/v (T, Hkv, 256) f16. Bidirectional with optional symmetric window.
+static at::Tensor attn_fwd_sg_d256_mps(const at::Tensor& q_in, const at::Tensor& k_in,
+                                       const at::Tensor& v_in, double scale, int64_t window) {
+  TORCH_CHECK(q_in.device().is_mps() && k_in.device().is_mps() && v_in.device().is_mps(),
+              "attn_fwd_sg_d256: q, k, v must be MPS tensors");
+  TORCH_CHECK(q_in.dim() == 3 && k_in.dim() == 3 && v_in.dim() == 3,
+              "attn_fwd_sg_d256: q/k/v must be (T, H, 256)");
+  TORCH_CHECK(q_in.size(2) == 256 && k_in.size(2) == 256 && v_in.size(2) == 256,
+              "attn_fwd_sg_d256: head_dim must be 256");
+  TORCH_CHECK(q_in.scalar_type() == at::kFloat, "attn_fwd_sg_d256: q must be float32");
+  const int T = q_in.size(0), Hq = q_in.size(1), Hkv = k_in.size(1);
+  TORCH_CHECK(k_in.size(0) == T && v_in.size(0) == T && v_in.size(1) == Hkv,
+              "attn_fwd_sg_d256: k/v must share T and Hkv");
+  TORCH_CHECK(Hkv > 0 && Hq % Hkv == 0, "attn_fwd_sg_d256: Hq must be a multiple of Hkv (GQA)");
+  auto q = q_in.contiguous();
+  // Pad K/V token count up to the 32-key block so the simdgroup_load of the tail block
+  // stays in-bounds (masked keys read zeros; 0*0 avoids the 0*nan trap on garbage memory).
+  const int T_pad = ((T + 31) / 32) * 32;
+  auto k = k_in.to(at::kHalf);
+  auto v = v_in.to(at::kHalf);
+  if (T_pad != T) {
+    k = at::constant_pad_nd(k, {0, 0, 0, 0, 0, T_pad - T}, 0);
+    v = at::constant_pad_nd(v, {0, 0, 0, 0, 0, T_pad - T}, 0);
+  }
+  k = k.contiguous();
+  v = v.contiguous();
+  auto out = at::empty({T, Hq, 256}, q.options());
+  const float scale_f = scale > 0.0 ? static_cast<float>(scale)
+                                    : static_cast<float>(1.0 / std::sqrt(256.0));
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_attn_fwd_sg_d256(e, q, k, v, out, static_cast<uint32_t>(T),
+                                static_cast<uint32_t>(window), scale_f,
+                                static_cast<uint32_t>(Hq), static_cast<uint32_t>(Hkv));
+  });
+  return out;
+}
+
 static at::Tensor rms_norm_mps(const at::Tensor& x_in, const at::Tensor& w_in, double eps) {
   TORCH_CHECK(x_in.device().is_mps(), "rms_norm: x must be an MPS tensor");
   TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rms_norm: x must be bfloat16");
@@ -5494,6 +5532,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("attn_fwd", &attn_fwd_mps, "ThunderMittens attention forward (MPS)",
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
+  m.def("attn_fwd_sg_d256", &attn_fwd_sg_d256_mps,
+        "ThunderMittens simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV (MPS)",
+        pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+        pybind11::arg("scale") = 0.0, pybind11::arg("window") = 0);
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
   m.def("mean_pool_rms_l2", &mean_pool_rms_l2_mps,
         "ThunderMittens mean-pool + RMSNorm + L2-normalize embedding pooling (MPS)");

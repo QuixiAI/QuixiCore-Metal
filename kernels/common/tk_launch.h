@@ -242,6 +242,20 @@ void launch_attn_fwd(E& e, typename E::in_t q, typename E::in_t k, typename E::i
   e.dispatch(static_cast<int>(N) / (q16 ? 16 : 8), static_cast<int>(H), B, 32, 1, 1);
 }
 
+// ----- attn_fwd_sg_d256 (simdgroup_matrix flash attention, head-dim 256, GQA, f16 KV):
+//        q@0(f32) k@1(f16) v@2(f16) o@3(f32) ; n_tokens@4 window@5 scale@6(f32) Hq@7 Hkv@8 ;
+//        grid (ceil(T/8), Hq, 1), 128 threads (4 simdgroups). Bidirectional + optional window. -----
+template <class E>
+void launch_attn_fwd_sg_d256(E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+                             typename E::out_t o, uint32_t n_tokens, uint32_t window, float scale,
+                             uint32_t Hq, uint32_t Hkv) {
+  e.pipeline("mittens::attn_fwd_sg_d256");   // namespaced non-template kernel
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.out(o, 3);
+  e.bytes(n_tokens, 4); e.bytes(window, 5); e.bytes(scale, 6);
+  e.bytes(Hq, 7); e.bytes(Hkv, 8);
+  e.dispatch(static_cast<int>((n_tokens + 7) / 8), static_cast<int>(Hq), 1, 128, 1, 1);
+}
+
 // ----- attn_q (quantized-KV attention): q@0(bf16) Kq@1(uchar) Vq@2(uchar) o@3(bf16) ; N@4 H@5 ;
 //        grid (N/8, H, B), 32 threads. Same online-softmax flow as attn_fwd, K/V dequantized. -----
 template <class E>
