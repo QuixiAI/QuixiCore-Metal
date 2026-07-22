@@ -32,6 +32,7 @@ _METAL_SOURCES = [
     _kernel_source("matmul/matmul_custom/matmul_custom.metal"),
     _kernel_source("norms/layernorm/layernorm.metal"),
     _kernel_source("norms/rms_norm/rms_norm.metal"),
+    _kernel_source("norms/rms_norm_residual_next/rms_norm_residual_next.metal"),
     _kernel_source("serving/mean_pool_rms_l2/mean_pool_rms_l2.metal"),
     _kernel_source("norms/add_norm/add_norm.metal"),
     _kernel_source("activations/softmax/softmax.metal"),
@@ -203,6 +204,13 @@ def layernorm_bwd_fused(x, weight, dy, eps):
 def rms_norm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     """Fused residual-add + RMSNorm. Returns (out, x+residual). bf16 MPS; D in {256,512,768,1024}."""
     return _ext.rms_norm_add(x, residual, weight, float(eps))
+
+
+def rms_norm_residual_next(x, post_weight, residual, next_weight, eps: float = 1e-5):
+    """Fused residual-stream seam: res_out = residual + rms_norm(x) * post_weight, then
+    next_out = rms_norm(res_out) * next_weight. Returns (res_out, next_out). bf16 MPS;
+    D in {256,512,768,1024}."""
+    return tuple(_ext.rms_norm_residual_next(x, post_weight, residual, next_weight, float(eps)))
 
 
 def layernorm_add(x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,

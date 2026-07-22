@@ -195,6 +195,27 @@ def test_rms_norm_add(shape):
     assert _maxdiff(out, exp_out) < 0.03
 
 
+@pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (37, 256)])
+def test_rms_norm_residual_next(shape):
+    D = shape[-1]
+    torch.manual_seed(1)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    r = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    pw = torch.randn(D, dtype=torch.bfloat16, device="mps")
+    nw = torch.randn(D, dtype=torch.bfloat16, device="mps")
+    eps = 1e-6
+
+    def rms(v):
+        return v * torch.rsqrt(v.pow(2).mean(-1, keepdim=True) + eps)
+
+    res_out, next_out = tk_torch.rms_norm_residual_next(x, pw, r, nw, eps)
+    exp_res = r.float() + rms(x.float()) * pw.float()
+    exp_next = rms(exp_res) * nw.float()
+    assert res_out.shape == tuple(shape) and next_out.shape == tuple(shape)
+    assert _maxdiff(res_out, exp_res.to(torch.bfloat16)) < 0.03
+    assert _maxdiff(next_out, exp_next.to(torch.bfloat16)) < 0.03
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 2), (4, 1)])  # MHA, GQA group 2, MQA
 def test_paged_attention_gqa(D, H, H_KV):

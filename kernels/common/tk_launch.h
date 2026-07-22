@@ -31,6 +31,9 @@ inline std::string matmul_custom_kernel_name(const std::string& t) { return "mat
 inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
 inline std::string mean_pool_rms_l2_kernel_name(int D) { return "mean_pool_rms_l2_" + std::to_string(D); }
 inline std::string rms_norm_add_kernel_name(int D) { return "rms_norm_add_" + std::to_string(D); }
+inline std::string rms_norm_residual_next_kernel_name(int D) {
+  return "rms_norm_residual_next_" + std::to_string(D);
+}
 inline std::string layernorm_add_kernel_name(int D) { return "layernorm_add_" + std::to_string(D); }
 inline std::string rope_kv_insert_kernel_name(const std::string& t, int D) {
   return "rope_kv_insert_" + t + "_" + std::to_string(D);
@@ -462,6 +465,21 @@ void launch_mean_pool_rms_l2(E& e, typename E::in_t x, typename E::in_t w,
   e.in(x, 0); e.in(w, 1); e.out(o, 2);
   e.bytes(M, 3); e.bytes(eps, 4);
   e.dispatch(1, 1, 1, 32, 1, 1);
+}
+
+// ----- rms_norm_residual_next: x@0 post_w@1 residual@2 next_w@3 -> res_out@4 next_out@5 ;
+//        M@6(u32) eps@7(f32) ; grid (M,1,1) group (32,1,1). Post-norm x, add to residual,
+//        pre-norm the result for the next block — the residual-stream seam in one pass. -----
+template <class E>
+void launch_rms_norm_residual_next(E& e, typename E::in_t x, typename E::in_t post_w,
+                                   typename E::in_t residual, typename E::in_t next_w,
+                                   typename E::out_t res_out, typename E::out_t next_out,
+                                   uint32_t M, int D, float eps) {
+  e.pipeline(rms_norm_residual_next_kernel_name(D));
+  e.in(x, 0); e.in(post_w, 1); e.in(residual, 2); e.in(next_w, 3);
+  e.out(res_out, 4); e.out(next_out, 5);
+  e.bytes(M, 6); e.bytes(eps, 7);
+  e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
 }
 template <class E>
 void launch_rms_norm_dyn(E& e, typename E::in_t x, typename E::in_t w,

@@ -411,6 +411,46 @@ def rms_norm_cases(be, preset, formats):
                    baselines=baselines, ref=ref, bytes_moved=2 * N * D * 2)
 
 
+@register("rms_norm_residual_next")
+def rms_norm_residual_next_cases(be, preset, formats):
+    """Fused post-norm + residual-add + next-block pre-norm vs composing two norms + an add."""
+    tk = be.tk()
+    rng = np.random.default_rng(9)
+    eps = 1e-6
+    shapes = _pick(preset, [(128, 768)],
+                   [(128, 768), (512, 1024)],
+                   [(m, d) for m in (128, 512, 2048) for d in (256, 512, 768, 1024)])
+
+    def rms_np(v):
+        return v / np.sqrt((v * v).mean(-1, keepdims=True) + eps)
+
+    for M, D in shapes:
+        x = rng.standard_normal((M, D)).astype(np.float32)
+        r = rng.standard_normal((M, D)).astype(np.float32)
+        pw = rng.standard_normal(D).astype(np.float32)
+        nw = rng.standard_normal(D).astype(np.float32)
+        x_d, r_d = be.array(x, "bf16"), be.array(r, "bf16")
+        pw_d, nw_d = be.array(pw, "bf16"), be.array(nw, "bf16")
+        # compose the same result with two standalone RMSNorms + a residual add
+        baselines = {"tk rms_norm x2 + add": (
+            lambda x_d=x_d, r_d=r_d, pw_d=pw_d, nw_d=nw_d:
+            (lambda res: (res, tk.rms_norm(res, nw_d, eps=eps)))(
+                r_d + tk.rms_norm(x_d, pw_d, eps=eps)))}
+        xb = be.to_numpy(x_d).astype(np.float64)
+        rb = be.to_numpy(r_d).astype(np.float64)
+        pwb = be.to_numpy(pw_d).astype(np.float64)
+        nwb = be.to_numpy(nw_d).astype(np.float64)
+        res_ref = rb + rms_np(xb) * pwb
+        next_ref = rms_np(res_ref) * nwb
+        ref = np.concatenate([res_ref, next_ref], axis=0)
+        yield Case("rms_norm_residual_next", f"M{M}_D{D}", {"M": M, "D": D}, "bf16",
+                   target=lambda x_d=x_d, r_d=r_d, pw_d=pw_d, nw_d=nw_d:
+                       tk.rms_norm_residual_next(x_d, pw_d, r_d, nw_d, eps),
+                   out_to_numpy=lambda o: np.concatenate([be.to_numpy(o[0]), be.to_numpy(o[1])],
+                                                         axis=0),
+                   baselines=baselines, ref=ref, bytes_moved=(4 * M + 2) * D * 2)
+
+
 @register("mean_pool_rms_l2")
 def mean_pool_rms_l2_cases(be, preset, formats):
     tk = be.tk()

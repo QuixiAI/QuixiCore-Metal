@@ -62,6 +62,7 @@
 #include "matmul_custom/matmul_custom.h"
 #include "layernorm/layernorm.h"
 #include "rms_norm/rms_norm.h"
+#include "rms_norm_residual_next/rms_norm_residual_next.h"
 #include "mean_pool_rms_l2/mean_pool_rms_l2.h"
 #include "add_norm/add_norm.h"
 #include "rope_kv/rope_kv.h"
@@ -275,6 +276,22 @@ NB_MODULE(_ext, m) {
       R"(
         fused residual-add + rms_norm. Returns (out, x+residual):
         out = rms_norm(x + residual) * weight
+      )");
+
+    m.def(
+      "rms_norm_residual_next",
+      &rms_norm_residual_next,
+      "x"_a,
+      "post_weight"_a,
+      "residual"_a,
+      "next_weight"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        fused residual-stream seam. Returns (res_out, next_out):
+        res_out  = residual + rms_norm(x) * post_weight
+        next_out = rms_norm(res_out) * next_weight
       )");
 
     m.def(

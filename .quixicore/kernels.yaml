@@ -13,6 +13,7 @@ families:
     status: implemented
     paths:
       - kernels/norms/rms_norm
+      - kernels/norms/rms_norm_residual_next
       - kernels/norms/layernorm
       - kernels/norms/add_norm
       - kernels/norms/qk_norm_rope

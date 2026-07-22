@@ -329,6 +329,28 @@ static std::tuple<at::Tensor, at::Tensor> rms_norm_add_mps(
   return {out, res_out};
 }
 
+// Post-norm + residual-add + next-block pre-norm in one pass. Returns (res_out, next_out).
+static std::tuple<at::Tensor, at::Tensor> rms_norm_residual_next_mps(
+    const at::Tensor& x_in, const at::Tensor& pw_in, const at::Tensor& r_in,
+    const at::Tensor& nw_in, double eps) {
+  TORCH_CHECK(x_in.device().is_mps(), "rms_norm_residual_next: x must be an MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "rms_norm_residual_next: x must be bfloat16");
+  TORCH_CHECK(r_in.sizes() == x_in.sizes(), "rms_norm_residual_next: residual must match x shape");
+  auto x = x_in.contiguous(), pw = pw_in.contiguous(), r = r_in.contiguous(),
+       nw = nw_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "rms_norm_residual_next: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto res_out = at::empty_like(x);
+  auto next_out = at::empty_like(x);
+  const float eps_f = static_cast<float>(eps);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_rms_norm_residual_next(e, x, pw, r, nw, res_out, next_out, M, D, eps_f);
+  });
+  return {res_out, next_out};
+}
+
 // Fused residual-add + LayerNorm. Returns (out, x+residual).
 static std::tuple<at::Tensor, at::Tensor> layernorm_add_mps(
     const at::Tensor& x_in, const at::Tensor& r_in, const at::Tensor& w_in,
@@ -5450,6 +5472,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("rms_norm_bwd_fused", &rms_norm_bwd_fused_mps,
         "ThunderMittens fused RMSNorm backward -> [dX, dweight] (MPS)");
   m.def("rms_norm_add", &rms_norm_add_mps, "ThunderMittens fused residual-add + RMSNorm (MPS)");
+  m.def("rms_norm_residual_next", &rms_norm_residual_next_mps,
+        "ThunderMittens fused post-norm + residual-add + next-block pre-norm (MPS)");
   m.def("layernorm_add", &layernorm_add_mps, "ThunderMittens fused residual-add + LayerNorm (MPS)");
   m.def("rms_norm_add_fp8", &rms_norm_add_fp8_mps, "ThunderMittens fused add+rms_norm static fp8 (MPS)");
   m.def("rms_norm_add_fp8_dyn", &rms_norm_add_fp8_dyn_mps, "ThunderMittens fused add+rms_norm dyn fp8 (MPS)");

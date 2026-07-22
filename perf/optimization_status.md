@@ -2609,3 +2609,39 @@ decode-sized shapes and completes the fused family; kept. All three are additive
 standalone qgemv path is untouched), so nothing regresses.
 
 Results: perf/results/2026-07-22/004219-torch-comprehensive/
+
+## 2026-07-22: rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add)
+
+Status: kept.
+
+New shape-keyed norm op under kernels/norms/rms_norm_residual_next. Fuses the
+post-norm / residual-add / next-block pre-norm sandwich (Gemma-style) that sits
+between two transformer sub-blocks into one launch: given a sub-block projection x,
+its post-norm weight, the running residual, and the next block's pre-norm weight,
+
+  res_out  = residual + rms_norm(x) * post_weight
+  next_out = rms_norm(res_out) * next_weight
+
+bf16 I/O, fp32 compute; one simdgroup owns one row of width D in {256,512,768,1024}
+with TK register tiles (no threadgroup memory, both reductions are simd shuffles).
+Returns (res_out, next_out). Collapses three (M,D) round-trips (two RMSNorms + an
+add) into one read of x/residual/weights and one write of the two outputs.
+
+Hardware: Apple M5 Max, macOS (Darwin 25.5), xcrun metal 32023.883, PyTorch 2.13 MPS.
+Correctness vs an fp64 two-RMSNorm+add oracle: max abs err ~2-3e-3 (bf16 tier);
+4/4 new MPS tests pass. Perf (torch, comprehensive), tk vs composing two standalone
+tk.rms_norm + a residual add:
+
+| shape      | tk ms  | base ms | result |
+|------------|--------|---------|--------|
+| M2048_D1024| 0.0444 | 0.0495  | 1.15x  |
+| M2048_D768 | 0.0292 | 0.0383  | 1.31x  |
+| M2048_D512 | 0.0241 | 0.0374  | 1.55x  |
+| M512_D256  | 0.0144 | 0.0264  | 1.83x  |
+| M128_D1024 | 0.0146 | 0.0203  | 1.39x  |
+
+Keep decision: faster across the sweep (1.1-1.8x) by fusing three launches into one;
+a couple of sub-0.02 ms small shapes wobble to parity (launch-latency noise). Additive
+(the standalone rms_norm/rms_norm_add paths are untouched).
+
+Results: perf/results/2026-07-22/004943-torch-comprehensive/

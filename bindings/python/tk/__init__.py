@@ -407,6 +407,16 @@ def rms_norm_add(x, residual, weight, eps=1e-5):
     return _mlx().rms_norm_add(x, residual, weight, eps=eps)
 
 
+def rms_norm_residual_next(x, post_weight, residual, next_weight, eps=1e-5):
+    """Fused residual-stream seam between two sub-blocks. Returns (res_out, next_out):
+    res_out  = residual + rms_norm(x) * post_weight   (post-norm + residual add)
+    next_out = rms_norm(res_out) * next_weight        (next block's pre-norm input)
+    Accepts mlx.array or torch.Tensor (MPS). D in {256,512,768,1024}."""
+    if _is_torch(x):
+        return _torch().rms_norm_residual_next(x, post_weight, residual, next_weight, eps)
+    return _mlx().rms_norm_residual_next(x, post_weight, residual, next_weight, eps=eps)
+
+
 def layernorm_add(x, residual, weight, bias, eps=1e-5):
     """Fused residual-add + LayerNorm. Returns (out, x+residual).
 
