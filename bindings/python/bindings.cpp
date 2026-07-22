@@ -842,6 +842,15 @@ NB_MODULE(_ext, m) {
          interleaved: False = NeoX split-half, True = GPT-J pairs. Returns the new qkv.)");
 
     m.def(
+      "qk_norm_rope_kv_f16", &qk_norm_rope_kv_f16,
+      "qkv"_a, "q_weight"_a, "k_weight"_a, "cos"_a, "sin"_a, "positions"_a,
+      "num_heads_q"_a, "num_heads_k"_a, "num_heads_v"_a,
+      nb::kw_only(), "eps"_a = 1e-6f, "interleaved"_a = false, "gemma"_a = false,
+      "stream"_a = nb::none(),
+      R"(qk_norm_rope with a fused f16 KV split-store. Returns [q_out bf16, k_out f16,
+         v_out f16] (Q roped in bf16, K/V cast to the f16 KV cache in one pass).)");
+
+    m.def(
       "moe_route_grouped", &moe_route_grouped,
       "logits"_a, "bias"_a, "has_bias"_a, "k"_a, "n_group"_a, "topk_group"_a,
       "renormalize"_a, "routed_scaling_factor"_a, "scoring_func"_a,

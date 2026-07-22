@@ -2645,3 +2645,37 @@ a couple of sub-0.02 ms small shapes wobble to parity (launch-latency noise). Ad
 (the standalone rms_norm/rms_norm_add paths are untouched).
 
 Results: perf/results/2026-07-22/004943-torch-comprehensive/
+
+## 2026-07-22: qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store
+
+Status: kept.
+
+New shape-keyed variant alongside kernels/norms/qk_norm_rope. Same fused per-head
+QK-RMSNorm + RoPE over a packed (T, HT*D) bf16 QKV buffer, but instead of writing every
+head back into one packed bf16 output it SPLITS the normed+roped result into the three
+tensors an attention step consumes, casting the KV halves to f16 in the same pass:
+
+  Q heads (normed+roped)  -> q_out (T, Hq*D) bf16
+  K heads (normed+roped)  -> k_out (T, Hk*D) f16   (contiguous KV-cache layout)
+  V heads (copy-through)  -> v_out (T, Hv*D) f16
+
+So the K/V heads land directly in the half KV cache the decoder reads, removing the
+separate un-pack + bf16->f16 cast pass after attention-prep. One warp per (token, head);
+grid ((Hq+Hk+Hv), T, 1). Both interleave modes (NeoX / GPT-J) and gemma (1+w) supported;
+D in {64,128,256}. K/V stores go through TK's gl<half> tiles (NeoX) / half() casts (GPT-J).
+
+Hardware: Apple M5 Max, macOS (Darwin 25.5), xcrun metal 32023.883, PyTorch 2.13 MPS.
+Correctness vs an fp64 per-head RMSNorm+RoPE oracle (K/V dtype checked f16): 12/12 new
+MPS tests pass (D x interleaved x gemma), existing qk_norm_rope parity unchanged. Perf
+(torch, comprehensive), tk fused vs composing tk.qk_norm_rope + the un-pack/f16 cast:
+
+| shape (T x Hq x D)      | tk ms  | base ms | speedup |
+|-------------------------|--------|---------|---------|
+| 512 x 32 x 128          | 0.0596 | 0.1346  | 2.26x   |
+| 4096 x 32 x 128         | 0.2273 | 0.4401  | 1.94x   |
+| 4096 x 64 x 64          | 0.2708 | 0.3641  | 1.34x   |
+
+Keep decision: 1.3-2.3x over composing, by folding the KV un-pack + f16 cast into the
+norm-rope pass. Additive (the packed qk_norm_rope path is untouched).
+
+Results: perf/results/2026-07-22/005647-torch-comprehensive/

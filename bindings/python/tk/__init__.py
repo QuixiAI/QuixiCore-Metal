@@ -1384,6 +1384,21 @@ def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_
                                gemma=bool(gemma))
 
 
+def qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+                        num_heads_v, eps=1e-6, interleaved=False, gemma=False):
+    """qk_norm_rope with a fused f16 KV split-store. The normed+roped result is split into
+    Q (T, Hq*D) bf16 and contiguous K/V (T, Hk*D)/(T, Hv*D) f16 KV-cache tensors in one pass.
+    Returns (q_out, k_out, v_out). Accepts mlx.array or torch.Tensor (MPS)."""
+    if _is_torch(qkv):
+        return _torch().qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions,
+                                            num_heads_q, num_heads_k, num_heads_v,
+                                            eps=eps, interleaved=interleaved, gemma=gemma)
+    return _mlx().qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions,
+                                      num_heads_q, num_heads_k, num_heads_v,
+                                      eps=float(eps), interleaved=bool(interleaved),
+                                      gemma=bool(gemma))
+
+
 def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,
                       routed_scaling_factor=1.0, scoring="sigmoid"):
     """DeepSeek-style grouped (node-limited) MoE routing (HF noaux_tc semantics).

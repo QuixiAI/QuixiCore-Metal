@@ -216,6 +216,76 @@ def test_rms_norm_residual_next(shape):
     assert _maxdiff(next_out, exp_next.to(torch.bfloat16)) < 0.03
 
 
+def _qk_norm_rope_ref(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps, interleaved, gemma):
+    import numpy as np
+    T, W = qkv.shape
+    HT = hq + hk + hv
+    D = W // HT
+    x = qkv.reshape(T, HT, D).astype(np.float64)
+    out = x.copy()
+    for h in range(hq + hk):
+        w = (qw if h < hq else kw).astype(np.float64)
+        if gemma:
+            w = 1.0 + w
+        v = x[:, h]
+        v = v * (1.0 / np.sqrt((v * v).mean(-1, keepdims=True) + eps)) * w
+        c, s = cos[pos].astype(np.float64), sin[pos].astype(np.float64)
+        if interleaved:
+            v0, v1 = v[:, 0::2], v[:, 1::2]
+            r = np.empty_like(v)
+            r[:, 0::2] = v0 * c - v1 * s
+            r[:, 1::2] = v0 * s + v1 * c
+        else:
+            half = D // 2
+            v1, v2 = v[:, :half], v[:, half:]
+            r = np.concatenate([v1 * c - v2 * s, v2 * c + v1 * s], axis=-1)
+        out[:, h] = r
+    return out.reshape(T, W)  # (T, HT*D)
+
+
+@pytest.mark.parametrize("D", [64, 128, 256])
+@pytest.mark.parametrize("interleaved", [False, True])
+@pytest.mark.parametrize("gemma", [False, True])
+def test_qk_norm_rope_kv_f16(D, interleaved, gemma):
+    import numpy as np
+    hq, hk, hv, T = 3, 1, 1, 33
+    HT = hq + hk + hv
+    rng = np.random.default_rng(0)
+    qkv = rng.standard_normal((T, HT * D)).astype(np.float32)
+    qw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    kw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    inv = 1.0 / (10000.0 ** (np.arange(D // 2) / (D // 2)))
+    ang = np.outer(np.arange(4096), inv)
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    pos = rng.integers(0, 4096, T).astype(np.int32)
+
+    qkv_b = torch.from_numpy(qkv).to(torch.bfloat16).to("mps")
+    q_out, k_out, v_out = tk_torch.qk_norm_rope_kv_f16(
+        qkv_b, torch.from_numpy(qw).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(kw).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(cos).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(sin).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(pos).to("mps"), hq, hk, hv, eps=1e-6,
+        interleaved=interleaved, gemma=gemma)
+    torch.mps.synchronize()
+
+    # reference over bf16-rounded inputs, then split into q/k/v heads
+    def r32(a, dt):
+        return torch.from_numpy(a).to(dt).float().numpy()
+    ref = _qk_norm_rope_ref(r32(qkv, torch.bfloat16), r32(qw, torch.bfloat16),
+                            r32(kw, torch.bfloat16), r32(cos, torch.bfloat16),
+                            r32(sin, torch.bfloat16), pos, hq, hk, hv, 1e-6, interleaved, gemma)
+    ref = ref.reshape(T, HT, D)
+    q_ref = ref[:, :hq].reshape(T, hq * D)
+    k_ref = ref[:, hq:hq + hk].reshape(T, hk * D)
+    v_ref = r32(qkv, torch.bfloat16).reshape(T, HT, D)[:, hq + hk:].reshape(T, hv * D)
+    assert q_out.shape == (T, hq * D) and k_out.shape == (T, hk * D) and v_out.shape == (T, hv * D)
+    assert q_out.dtype == torch.bfloat16 and k_out.dtype == torch.float16
+    assert np.abs(q_out.float().cpu().numpy() - q_ref).max() < 0.05
+    assert np.abs(k_out.float().cpu().numpy() - k_ref).max() < 0.05
+    assert np.abs(v_out.float().cpu().numpy() - v_ref).max() < 0.02
+
+
 @pytest.mark.parametrize("D", [64, 128])
 @pytest.mark.parametrize("H,H_KV", [(2, 2), (4, 2), (4, 1)])  # MHA, GQA group 2, MQA
 def test_paged_attention_gqa(D, H, H_KV):

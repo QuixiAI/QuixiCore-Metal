@@ -64,6 +64,9 @@ inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { ret
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
 inline std::string moe_route_grouped_kernel_name(const std::string& t) { return "moe_route_grouped_" + t; }
 inline std::string qk_norm_rope_kernel_name(int D) { return "qk_norm_rope_" + std::to_string(D); }
+inline std::string qk_norm_rope_kv_f16_kernel_name(int D) {
+  return "qk_norm_rope_kv_f16_" + std::to_string(D);
+}
 inline std::string selective_scan_kernel_name(const std::string& variant, const std::string& t) {
   return "selective_scan_" + variant + "_" + t;
 }
@@ -840,6 +843,25 @@ void launch_qk_norm_rope(E& e, typename E::in_t qkv, typename E::in_t q_weight,
   e.in(positions, 5); e.out(out, 6);
   e.bytes(Hq, 7); e.bytes(Hk, 8); e.bytes(Hv, 9); e.bytes(eps, 10);
   e.bytes(interleave, 11); e.bytes(gemma, 12);
+  e.dispatch(Hq + Hk + Hv, T, 1, 32, 1, 1);
+}
+
+// ----- qk_norm_rope_kv_f16: qkv@0 q_w@1 k_w@2 cos@3 sin@4 positions@5(i32) ->
+//        q_out@6(bf16) k_out@7(half) v_out@8(half) ; Hq@9 Hk@10 Hv@11 eps@12(f32)
+//        interleave@13 gemma@14 ; grid (Hq+Hk+Hv, T, 1), 32 thr. qk_norm_rope with a
+//        fused f16 KV split-store: Q->bf16 q_out, K/V->contiguous half k_out/v_out. -----
+template <class E>
+void launch_qk_norm_rope_kv_f16(E& e, typename E::in_t qkv, typename E::in_t q_weight,
+                                typename E::in_t k_weight, typename E::in_t cosb,
+                                typename E::in_t sinb, typename E::in_t positions,
+                                typename E::out_t q_out, typename E::out_t k_out,
+                                typename E::out_t v_out, int T, int Hq, int Hk, int Hv, int D,
+                                float eps, int interleave, int gemma) {
+  e.pipeline(qk_norm_rope_kv_f16_kernel_name(D));
+  e.in(qkv, 0); e.in(q_weight, 1); e.in(k_weight, 2); e.in(cosb, 3); e.in(sinb, 4);
+  e.in(positions, 5); e.out(q_out, 6); e.out(k_out, 7); e.out(v_out, 8);
+  e.bytes(Hq, 9); e.bytes(Hk, 10); e.bytes(Hv, 11); e.bytes(eps, 12);
+  e.bytes(interleave, 13); e.bytes(gemma, 14);
   e.dispatch(Hq + Hk + Hv, T, 1, 32, 1, 1);
 }
 

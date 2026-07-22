@@ -39,6 +39,7 @@ _METAL_SOURCES = [
     _kernel_source("attention/rotary/rotary.metal"),
     _kernel_source("attention/rope_kv/rope_kv.metal"),
     _kernel_source("norms/qk_norm_rope/qk_norm_rope.metal"),
+    _kernel_source("norms/qk_norm_rope/qk_norm_rope_kv_f16.metal"),
     _kernel_source("ssm/selective_scan/selective_scan.metal"),
     _kernel_source("linear_attention/gdn/gdn.metal"),
     _kernel_source("quantization/act_quant/act_quant.metal"),
@@ -1160,6 +1161,17 @@ def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_
     return _ext.qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions,
                              int(num_heads_q), int(num_heads_k), int(num_heads_v),
                              float(eps), bool(interleaved), bool(gemma))
+
+
+def qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+                        num_heads_v, eps=1e-6, interleaved=False, gemma=False):
+    """qk_norm_rope with a fused f16 KV split-store: the normed+roped result is split into
+    Q (T, Hq*D) bf16 and contiguous K/V (T, Hk*D)/(T, Hv*D) f16 KV-cache tensors in one pass.
+    Returns (q_out, k_out, v_out). MPS."""
+    return tuple(_ext.qk_norm_rope_kv_f16(
+        qkv, q_weight, k_weight, cos, sin, positions,
+        int(num_heads_q), int(num_heads_k), int(num_heads_v),
+        float(eps), bool(interleaved), bool(gemma)))
 
 
 def moe_route_grouped(logits, k, n_group, topk_group, bias=None, renormalize=True,

@@ -2115,6 +2115,25 @@ def qk_norm_rope_cases(be, preset, formats):
                    baselines=baselines, ref=None,
                    bytes_moved=2.0 * T * (hq + hk + hv) * D * 2)
 
+        if be.name == "torch":
+            # composed baseline: the packed norm+rope kernel, then the un-pack + f16 KV
+            # cast the fused split-store avoids.
+            def kv_composed(qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d, p_d=p_d,
+                            T=T, hq=hq, hk=hk, hv=hv, D=D):
+                out = tk.qk_norm_rope(qkv_d, qw_d, kw_d, c_d, s_d, p_d, hq, hk, hv)
+                x = out.reshape(T, hq + hk + hv, D)
+                q = x[:, :hq].reshape(T, hq * D)
+                k = x[:, hq:hq + hk].reshape(T, hk * D).to(be.torch.float16)
+                v = x[:, hq + hk:].reshape(T, hv * D).to(be.torch.float16)
+                return (q, k, v)
+            yield Case("qk_norm_rope_kv_f16", f"T{T}_hq{hq}hk{hk}hv{hv}_D{D}",
+                       {"T": T, "hq": hq, "D": D}, "bf16",
+                       target=lambda qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d,
+                              p_d=p_d, hq=hq, hk=hk, hv=hv:
+                           tk.qk_norm_rope_kv_f16(qkv_d, qw_d, kw_d, c_d, s_d, p_d, hq, hk, hv),
+                       baselines={"tk qk_norm_rope + split/cast": kv_composed}, ref=None,
+                       bytes_moved=2.0 * T * (hq + hk + hv) * D * 2)
+
 
 @register("moe_route")
 def moe_route_cases(be, preset, formats):

@@ -2578,6 +2578,35 @@ static at::Tensor qk_norm_rope_mps(const at::Tensor& qkv_in, const at::Tensor& q
   return out;
 }
 
+// qk_norm_rope with a fused f16 KV split-store. Returns (q_out bf16, k_out f16, v_out f16).
+static std::tuple<at::Tensor, at::Tensor, at::Tensor> qk_norm_rope_kv_f16_mps(
+    const at::Tensor& qkv_in, const at::Tensor& qw_in, const at::Tensor& kw_in,
+    const at::Tensor& cos_in, const at::Tensor& sin_in, const at::Tensor& pos_in,
+    int64_t hq, int64_t hk, int64_t hv, double eps, bool interleaved, bool gemma) {
+  TORCH_CHECK(qkv_in.device().is_mps() && qkv_in.scalar_type() == at::kBFloat16 &&
+              qkv_in.dim() == 2, "qk_norm_rope_kv_f16: qkv must be a bf16 (T, HT*D) MPS tensor");
+  const int HT = static_cast<int>(hq + hk + hv);
+  TORCH_CHECK(HT > 0 && qkv_in.size(1) % HT == 0,
+              "qk_norm_rope_kv_f16: head counts must divide width");
+  const int T = qkv_in.size(0), D = qkv_in.size(1) / HT;
+  TORCH_CHECK(D == 64 || D == 128 || D == 256, "qk_norm_rope_kv_f16: head_dim must be 64/128/256");
+  auto qkv = qkv_in.contiguous();
+  auto qw = qw_in.to(at::kBFloat16).contiguous(), kw = kw_in.to(at::kBFloat16).contiguous();
+  auto cosb = cos_in.to(at::kBFloat16).contiguous(), sinb = sin_in.to(at::kBFloat16).contiguous();
+  auto pos = pos_in.to(at::kInt).contiguous();
+  auto q_out = at::empty({T, static_cast<int>(hq) * D}, qkv.options());
+  auto half_opts = qkv.options().dtype(at::kHalf);
+  auto k_out = at::empty({T, static_cast<int>(hk) * D}, half_opts);
+  auto v_out = at::empty({T, static_cast<int>(hv) * D}, half_opts);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qk_norm_rope_kv_f16(e, qkv, qw, kw, cosb, sinb, pos, q_out, k_out, v_out, T,
+                                   static_cast<int>(hq), static_cast<int>(hk),
+                                   static_cast<int>(hv), D, static_cast<float>(eps),
+                                   interleaved ? 1 : 0, gemma ? 1 : 0);
+  });
+  return {q_out, k_out, v_out};
+}
+
 // DeepSeek-style grouped routing (noaux_tc). Returns (topk_ids int32, topk_weights f32).
 static std::tuple<at::Tensor, at::Tensor> moe_route_grouped_mps(
     const at::Tensor& logits_in, const c10::optional<at::Tensor>& bias_in, int64_t k,
@@ -5675,6 +5704,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("delta_softplus") = true, pybind11::arg("null_block_id") = -1);
   m.def("qk_norm_rope", &qk_norm_rope_mps,
         "ThunderMittens fused per-head QK-RMSNorm + RoPE on packed QKV (MPS)",
+        pybind11::arg("qkv"), pybind11::arg("q_weight"), pybind11::arg("k_weight"),
+        pybind11::arg("cos"), pybind11::arg("sin"), pybind11::arg("positions"),
+        pybind11::arg("num_heads_q"), pybind11::arg("num_heads_k"), pybind11::arg("num_heads_v"),
+        pybind11::arg("eps") = 1e-6, pybind11::arg("interleaved") = false,
+        pybind11::arg("gemma") = false);
+  m.def("qk_norm_rope_kv_f16", &qk_norm_rope_kv_f16_mps,
+        "ThunderMittens qk_norm_rope with a fused f16 KV split-store (MPS)",
         pybind11::arg("qkv"), pybind11::arg("q_weight"), pybind11::arg("k_weight"),
         pybind11::arg("cos"), pybind11::arg("sin"), pybind11::arg("positions"),
         pybind11::arg("num_heads_q"), pybind11::arg("num_heads_k"), pybind11::arg("num_heads_v"),
