@@ -116,6 +116,7 @@
 #include "qgemm_bwd/qgemm_bwd.h"
 #include "qgemm_fused/qgemm_fused.h"
 #include "qgemv/qgemv.h"
+#include "qgemv_fused/qgemv_fused.h"
 #include "qflux/qflux.h"
 #include "qgemv_int/qgemv_int.h"
 #include "attn_q/attn_q.h"
@@ -2154,6 +2155,21 @@ NB_MODULE(_ext, m) {
       R"(
         quantized GEMV (batch-1 decode): out = dequantize(wq) @ x; x is (K,1)
       )");
+
+    m.def(
+      "qgemv_q4_0_up_gate_gelu", &qgemv_q4_0_up_gate_gelu,
+      "up"_a, "gate"_a, "x"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused Q4_0 up+gate decode GEMV + gated-GELU: gelu(gate @ x) * (up @ x); x (K,1) fp32)");
+
+    m.def(
+      "qgemv_q4_0_up_gate", &qgemv_q4_0_up_gate,
+      "up"_a, "gate"_a, "x"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused Q4_0 up+gate decode GEMV in one launch -> [up @ x, gate @ x]; x (K,1) fp32)");
+
+    m.def(
+      "qgemv_q4_0_qkv", &qgemv_q4_0_qkv,
+      "qw"_a, "kw"_a, "vw"_a, "x"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(fused Q4_0 Q/K/V decode GEMV in one launch -> [Wq @ x, Wk @ x, Wv @ x]; x (K,1) fp32)");
 
     m.def(
       "dequant_gather", &dequant_gather,

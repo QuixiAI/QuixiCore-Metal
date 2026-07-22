@@ -2223,6 +2223,78 @@ def test_qgemv(nk, fmt):
     assert np.abs(g - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
 
 
+def _gelu_tanh_np(t):
+    import numpy as np
+    return 0.5 * t * (1.0 + np.tanh(0.7978845608028654 * (t + 0.044715 * t ** 3)))
+
+
+@pytest.mark.parametrize("nk", [(128, 256), (1152, 768), (256, 512)])
+def test_qgemv_q4_0_f32_up_gate_gelu(nk):
+    """Fused Q4_0 up+gate decode GEMV + gated-GELU vs a dequant-then-matmul oracle (MPS)."""
+    import numpy as np
+    from tk.quant import quantize_q4_0, dequantize_q4_0
+    N, K = nk
+    rng = np.random.default_rng(0)
+    Wu = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    Wg = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    x = rng.standard_normal((K, 1)).astype(np.float32)
+    up_q, gate_q = quantize_q4_0(Wu), quantize_q4_0(Wg)
+    up = torch.from_numpy(up_q).to("mps")
+    gate = torch.from_numpy(gate_q).to("mps")
+    xt = torch.from_numpy(x).to("mps")
+    got = tk_torch.qgemv_q4_0_f32_up_gate_gelu(up, gate, xt)
+    torch.mps.synchronize()
+    up_ref = dequantize_q4_0(up_q).astype(np.float32) @ x
+    gate_ref = dequantize_q4_0(gate_q).astype(np.float32) @ x
+    ref = _gelu_tanh_np(gate_ref) * up_ref
+    assert got.shape == (N, 1)
+    assert np.abs(got.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
+@pytest.mark.parametrize("nk", [(128, 256), (1152, 768)])
+def test_qgemv_q4_0_f32_up_gate(nk):
+    """Fused Q4_0 up+gate decode GEMV (two outputs) vs a dequant-then-matmul oracle (MPS)."""
+    import numpy as np
+    from tk.quant import quantize_q4_0, dequantize_q4_0
+    N, K = nk
+    rng = np.random.default_rng(1)
+    Wu = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    Wg = (rng.standard_normal((N, K)) * 0.3).astype(np.float32)
+    x = rng.standard_normal((K, 1)).astype(np.float32)
+    up_q, gate_q = quantize_q4_0(Wu), quantize_q4_0(Wg)
+    up_out, gate_out = tk_torch.qgemv_q4_0_f32_up_gate(
+        torch.from_numpy(up_q).to("mps"), torch.from_numpy(gate_q).to("mps"),
+        torch.from_numpy(x).to("mps"))
+    torch.mps.synchronize()
+    up_ref = dequantize_q4_0(up_q).astype(np.float32) @ x
+    gate_ref = dequantize_q4_0(gate_q).astype(np.float32) @ x
+    assert up_out.shape == (N, 1) and gate_out.shape == (N, 1)
+    assert np.abs(up_out.float().cpu().numpy() - up_ref).max() / (np.abs(up_ref).max() + 1e-9) < 2e-2
+    assert np.abs(gate_out.float().cpu().numpy() - gate_ref).max() / (np.abs(gate_ref).max() + 1e-9) < 2e-2
+
+
+@pytest.mark.parametrize("nq_nkv_k", [(768, 256, 768), (512, 128, 256)])
+def test_qgemv_q4_0_f32_qkv(nq_nkv_k):
+    """Fused Q4_0 Q/K/V decode GEMV (three outputs, GQA-friendly) vs a dequant oracle (MPS)."""
+    import numpy as np
+    from tk.quant import quantize_q4_0, dequantize_q4_0
+    Nq, Nkv, K = nq_nkv_k
+    rng = np.random.default_rng(2)
+    Wq = (rng.standard_normal((Nq, K)) * 0.3).astype(np.float32)
+    Wk = (rng.standard_normal((Nkv, K)) * 0.3).astype(np.float32)
+    Wv = (rng.standard_normal((Nkv, K)) * 0.3).astype(np.float32)
+    x = rng.standard_normal((K, 1)).astype(np.float32)
+    qq, kq, vq = quantize_q4_0(Wq), quantize_q4_0(Wk), quantize_q4_0(Wv)
+    q_out, k_out, v_out = tk_torch.qgemv_q4_0_f32_qkv(
+        torch.from_numpy(qq).to("mps"), torch.from_numpy(kq).to("mps"),
+        torch.from_numpy(vq).to("mps"), torch.from_numpy(x).to("mps"))
+    torch.mps.synchronize()
+    for got, wq_p, N in ((q_out, qq, Nq), (k_out, kq, Nkv), (v_out, vq, Nkv)):
+        ref = dequantize_q4_0(wq_p).astype(np.float32) @ x
+        assert got.shape == (N, 1)
+        assert np.abs(got.float().cpu().numpy() - ref).max() / (np.abs(ref).max() + 1e-9) < 2e-2
+
+
 @pytest.mark.parametrize("nk", [(64, 256), (128, 512)])
 def test_qgemv_w8a8(nk):
     """W8A8 int8xint8 decode (MPS), vs the INTEGER oracle (not the half path)."""

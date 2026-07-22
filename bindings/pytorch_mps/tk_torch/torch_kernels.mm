@@ -4518,6 +4518,77 @@ static at::Tensor qgemv_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
   return out;
 }
 
+// ---- fused packed-Q4_0 decode GEMVs (fp32 activation + output) ----
+// Q4_0 packed weights are uint8 (N, K/32, 18); the shared activation x is (K, 1) fp32.
+static void qgf_check_q4_0(const at::Tensor& w, int K, const char* who) {
+  TORCH_CHECK(w.scalar_type() == at::kByte && w.dim() == 3 && w.size(2) == 18,
+              who, ": weight must be uint8 Q4_0 blocks (N, K/32, 18)");
+  TORCH_CHECK(w.size(1) * 32 == K, who, ": weight K does not match x");
+}
+
+static at::Tensor qgemv_q4_0_f32_up_gate_gelu_mps(const at::Tensor& up_in,
+                                                  const at::Tensor& gate_in,
+                                                  const at::Tensor& x_in) {
+  TORCH_CHECK(up_in.device().is_mps() && x_in.device().is_mps(),
+              "qgemv_q4_0_f32_up_gate_gelu: inputs must be MPS tensors");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat && x_in.dim() == 2 && x_in.size(1) == 1,
+              "qgemv_q4_0_f32_up_gate_gelu: x must be fp32 (K, 1)");
+  auto up = up_in.contiguous(), gate = gate_in.contiguous(), x = x_in.contiguous();
+  const int K = x.size(0), N = up.size(0);
+  qgf_check_q4_0(up, K, "qgemv_q4_0_f32_up_gate_gelu");
+  qgf_check_q4_0(gate, K, "qgemv_q4_0_f32_up_gate_gelu");
+  TORCH_CHECK(gate.size(0) == N, "qgemv_q4_0_f32_up_gate_gelu: up/gate row counts differ");
+  auto out = at::empty({N, 1}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qgemv_q4_0_f32_up_gate_gelu(e, out, up, gate, x, N, K);
+  });
+  return out;
+}
+
+static std::vector<at::Tensor> qgemv_q4_0_f32_up_gate_mps(const at::Tensor& up_in,
+                                                          const at::Tensor& gate_in,
+                                                          const at::Tensor& x_in) {
+  TORCH_CHECK(up_in.device().is_mps() && x_in.device().is_mps(),
+              "qgemv_q4_0_f32_up_gate: inputs must be MPS tensors");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat && x_in.dim() == 2 && x_in.size(1) == 1,
+              "qgemv_q4_0_f32_up_gate: x must be fp32 (K, 1)");
+  auto up = up_in.contiguous(), gate = gate_in.contiguous(), x = x_in.contiguous();
+  const int K = x.size(0), N = up.size(0);
+  qgf_check_q4_0(up, K, "qgemv_q4_0_f32_up_gate");
+  qgf_check_q4_0(gate, K, "qgemv_q4_0_f32_up_gate");
+  TORCH_CHECK(gate.size(0) == N, "qgemv_q4_0_f32_up_gate: up/gate row counts differ");
+  auto up_out = at::empty({N, 1}, x.options());
+  auto gate_out = at::empty({N, 1}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qgemv_q4_0_f32_up_gate(e, up_out, gate_out, up, gate, x, N, K);
+  });
+  return {up_out, gate_out};
+}
+
+static std::vector<at::Tensor> qgemv_q4_0_f32_qkv_mps(const at::Tensor& qw_in,
+                                                      const at::Tensor& kw_in,
+                                                      const at::Tensor& vw_in,
+                                                      const at::Tensor& x_in) {
+  TORCH_CHECK(qw_in.device().is_mps() && x_in.device().is_mps(),
+              "qgemv_q4_0_f32_qkv: inputs must be MPS tensors");
+  TORCH_CHECK(x_in.scalar_type() == at::kFloat && x_in.dim() == 2 && x_in.size(1) == 1,
+              "qgemv_q4_0_f32_qkv: x must be fp32 (K, 1)");
+  auto qw = qw_in.contiguous(), kw = kw_in.contiguous(), vw = vw_in.contiguous();
+  auto x = x_in.contiguous();
+  const int K = x.size(0), Nq = qw.size(0), Nkv = kw.size(0);
+  qgf_check_q4_0(qw, K, "qgemv_q4_0_f32_qkv");
+  qgf_check_q4_0(kw, K, "qgemv_q4_0_f32_qkv");
+  qgf_check_q4_0(vw, K, "qgemv_q4_0_f32_qkv");
+  TORCH_CHECK(vw.size(0) == Nkv, "qgemv_q4_0_f32_qkv: k/v row counts differ");
+  auto q_out = at::empty({Nq, 1}, x.options());
+  auto k_out = at::empty({Nkv, 1}, x.options());
+  auto v_out = at::empty({Nkv, 1}, x.options());
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_qgemv_q4_0_f32_qkv(e, q_out, k_out, v_out, qw, kw, vw, x, Nq, Nkv, K);
+  });
+  return {q_out, k_out, v_out};
+}
+
 static at::Tensor qflux_gelu_mps(const at::Tensor& wq_in, const at::Tensor& x_in,
                                  const at::Tensor& bias_in, const std::string& format) {
   TORCH_CHECK(wq_in.device().is_mps(), "qflux_gelu: wq must be an MPS tensor");
@@ -5720,6 +5791,12 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("qgemm_fp8_scaled", &qgemm_fp8_scaled_mps, "ThunderMittens fp8 rank-1 scaled GEMM (MPS)");
   m.def("qgemm_actorder_k", &qgemm_actorder_k_mps, "ThunderMittens GPTQ act-order qgemm, in-kernel gather (MPS)");
   m.def("qgemv", &qgemv_mps, "ThunderMittens quantized GEMV decode (MPS)");
+  m.def("qgemv_q4_0_f32_up_gate_gelu", &qgemv_q4_0_f32_up_gate_gelu_mps,
+        "ThunderMittens fused Q4_0 up+gate decode GEMV with gated-GELU epilogue (MPS)");
+  m.def("qgemv_q4_0_f32_up_gate", &qgemv_q4_0_f32_up_gate_mps,
+        "ThunderMittens fused Q4_0 up+gate decode GEMV -> (up, gate) (MPS)");
+  m.def("qgemv_q4_0_f32_qkv", &qgemv_q4_0_f32_qkv_mps,
+        "ThunderMittens fused Q4_0 Q/K/V decode GEMV -> (q, k, v) (MPS)");
   m.def("qflux_gelu", &qflux_gelu_mps, "ThunderMittens quantized fused GEMM+GELU (MPS)");
   m.def("attn_q", &attn_q_mps, "ThunderMittens quantized-KV flash attention (MPS)");
   m.def("qgemv_w8a8", &qgemv_w8a8_mps, "ThunderMittens W8A8 int8xint8 decode GEMV (MPS)");

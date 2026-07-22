@@ -3255,6 +3255,30 @@ def qgemv(wq, x, format="q8_0"):
     return _mlx().qgemv(wq, x, format=format)
 
 
+def qgemv_q4_0_f32_up_gate_gelu(up, gate, x):
+    """Fused Q4_0 up+gate decode GEMV + gated-GELU: out = gelu(gate @ x) * (up @ x). up/gate
+    packed Q4_0 (N, K/32, 18) uint8, x (K,1) fp32 -> (N,1) fp32. Accepts mlx.array or torch (MPS)."""
+    if _is_torch(up):
+        return _torch().qgemv_q4_0_f32_up_gate_gelu(up, gate, x)
+    return _mlx().qgemv_q4_0_up_gate_gelu(up, gate, x)
+
+
+def qgemv_q4_0_f32_up_gate(up, gate, x):
+    """Fused Q4_0 up+gate decode GEMV in one launch. up/gate packed Q4_0 (N, K/32, 18) uint8,
+    x (K,1) fp32. Returns (up_out, gate_out), each (N,1) fp32. Accepts mlx.array or torch (MPS)."""
+    if _is_torch(up):
+        return _torch().qgemv_q4_0_f32_up_gate(up, gate, x)
+    return _mlx().qgemv_q4_0_up_gate(up, gate, x)
+
+
+def qgemv_q4_0_f32_qkv(qw, kw, vw, x):
+    """Fused Q4_0 Q/K/V decode GEMV in one launch (GQA-friendly). qw/kw/vw packed Q4_0
+    (N, K/32, 18) uint8, x (K,1) fp32. Returns (q, k, v). Accepts mlx.array or torch (MPS)."""
+    if _is_torch(qw):
+        return _torch().qgemv_q4_0_f32_qkv(qw, kw, vw, x)
+    return _mlx().qgemv_q4_0_qkv(qw, kw, vw, x)
+
+
 def dequant_gather(table, ids, format, scale=1.0):
     """Gather packed q4_0/q8_0/q6_K rows directly to fp16; invalid ids yield zero rows."""
     if _is_torch(table):

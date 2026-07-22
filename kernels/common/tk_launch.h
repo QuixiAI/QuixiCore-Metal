@@ -2983,6 +2983,43 @@ void launch_qgemv(E& e, typename E::out_t d, typename E::in_t wq, typename E::in
   e.dispatch(N, 1, 1, 32, 1, 1);
 }
 
+// ----- fused packed-Q4_0 decode GEMVs (batch-1), fp32 activation + output. -----
+// One simdgroup per output row; a shared (K,1) activation is streamed once for
+// the fused projections. Weights are GGUF Q4_0 packed blocks (N, K/32, 18) u8.
+
+// up+gate+GELU: out@0 = gelu(gate@x) * (up@x). up@1 gate@2 x@3 ; N@4 K@5 (i32) ; grid (N,1,1).
+template <class E>
+void launch_qgemv_q4_0_f32_up_gate_gelu(E& e, typename E::out_t out, typename E::in_t up,
+                                        typename E::in_t gate, typename E::in_t x, int N, int K) {
+  e.pipeline("qgemv_q4_0_f32_up_gate_gelu");
+  e.out(out, 0); e.in(up, 1); e.in(gate, 2); e.in(x, 3);
+  e.bytes(N, 4); e.bytes(K, 5);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+// up+gate: up_out@0 = up@x, gate_out@1 = gate@x. up@2 gate@3 x@4 ; N@5 K@6 ; grid (2N,1,1).
+template <class E>
+void launch_qgemv_q4_0_f32_up_gate(E& e, typename E::out_t up_out, typename E::out_t gate_out,
+                                   typename E::in_t up, typename E::in_t gate, typename E::in_t x,
+                                   int N, int K) {
+  e.pipeline("qgemv_q4_0_f32_up_gate");
+  e.out(up_out, 0); e.out(gate_out, 1); e.in(up, 2); e.in(gate, 3); e.in(x, 4);
+  e.bytes(N, 5); e.bytes(K, 6);
+  e.dispatch(2 * N, 1, 1, 32, 1, 1);
+}
+
+// QKV: q_out@0 k_out@1 v_out@2 ; qw@3 kw@4 vw@5 x@6 ; Nq@7 Nkv@8 K@9 ; grid (Nq+2*Nkv,1,1).
+template <class E>
+void launch_qgemv_q4_0_f32_qkv(E& e, typename E::out_t q_out, typename E::out_t k_out,
+                               typename E::out_t v_out, typename E::in_t qw, typename E::in_t kw,
+                               typename E::in_t vw, typename E::in_t x, int Nq, int Nkv, int K) {
+  e.pipeline("qgemv_q4_0_f32_qkv");
+  e.out(q_out, 0); e.out(k_out, 1); e.out(v_out, 2);
+  e.in(qw, 3); e.in(kw, 4); e.in(vw, 5); e.in(x, 6);
+  e.bytes(Nq, 7); e.bytes(Nkv, 8); e.bytes(K, 9);
+  e.dispatch(Nq + 2 * Nkv, 1, 1, 32, 1, 1);
+}
+
 // Packed embedding/PLE gather: table@0 ids@1 -> fp16 output@2.
 template <class E>
 void launch_dequant_gather(E& e, typename E::in_t table, typename E::in_t ids,

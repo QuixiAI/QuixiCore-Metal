@@ -76,6 +76,7 @@ families:
       - kernels/quantization/qgemm_fused
       - kernels/quantization/qgemm_int
       - kernels/quantization/qgemv
+      - kernels/quantization/qgemv_fused
       - kernels/quantization/qgemv_int
       - kernels/quantization/qflux
       - kernels/quantization/lm_head

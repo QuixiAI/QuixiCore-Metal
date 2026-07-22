@@ -1141,6 +1141,79 @@ def qgemv_cases(be, preset, formats):
                        weight_bytes=N * (K // bk) * bb, flops=2.0 * N * K)
 
 
+@register("qgemv_fused")
+def qgemv_fused_cases(be, preset, formats):
+    """Fused packed-Q4_0 decode GEMVs (fp32 act) vs composing the standalone q4_0 qgemv path."""
+    if be.name != "torch":
+        return                       # torch-MPS only wrappers (fp32 q4_0 fused decode)
+    tk = be.tk()
+    rng = np.random.default_rng(41)
+
+    def q4_0(N, K, seed):
+        wq, wdq = _packed_weight("q4_0", N, K, seed)
+        return be.raw_array(wq), wdq.astype(np.float64)
+
+    # up+gate+GELU and up+gate share (N=ffn, K=model) FFN-projection shapes.
+    ug_shapes = _pick(preset, [(1152, 768)],
+                      [(1152, 768), (14336, 4096)],
+                      [(1152, 768), (8192, 4096), (14336, 4096)])
+    for N, K in ug_shapes:
+        x = rng.standard_normal((K, 1)).astype(np.float32)
+        x_d = be.array(x, "f32")
+        up_d, up_dq = q4_0(N, K, 0)
+        gate_d, gate_dq = q4_0(N, K, 1)
+        xb = be.to_numpy(x_d).astype(np.float64)
+        up_ref = up_dq @ xb
+        gate_ref = gate_dq @ xb
+        ref_gelu = _gelu_tanh_np(gate_ref) * up_ref
+        base_gelu = {"tk q4_0 x2 + gelu": (lambda up_d=up_d, gate_d=gate_d, x_d=x_d: (
+            _gelu_tanh_torch(be, tk.qgemv(gate_d, x_d, format="q4_0")) *
+            tk.qgemv(up_d, x_d, format="q4_0")))}
+        yield Case("qgemv_fused", f"up_gate_gelu_N{N}_K{K}", {"N": N, "K": K, "M": 1}, "f32",
+                   fmt="q4_0",
+                   target=lambda up_d=up_d, gate_d=gate_d, x_d=x_d:
+                       tk.qgemv_q4_0_f32_up_gate_gelu(up_d, gate_d, x_d),
+                   baselines=base_gelu, ref=ref_gelu,
+                   weight_bytes=2 * N * (K // 32) * 18, flops=2.0 * 2 * N * K)
+
+        base_ug = {"tk q4_0 x2": (lambda up_d=up_d, gate_d=gate_d, x_d=x_d: (
+            tk.qgemv(up_d, x_d, format="q4_0"), tk.qgemv(gate_d, x_d, format="q4_0")))}
+        yield Case("qgemv_fused", f"up_gate_N{N}_K{K}", {"N": N, "K": K, "M": 1}, "f32",
+                   fmt="q4_0",
+                   target=lambda up_d=up_d, gate_d=gate_d, x_d=x_d:
+                       tk.qgemv_q4_0_f32_up_gate(up_d, gate_d, x_d),
+                   out_to_numpy=lambda o: np.concatenate([be.to_numpy(t) for t in o]),
+                   baselines=base_ug, ref=np.concatenate([up_ref, gate_ref]),
+                   weight_bytes=2 * N * (K // 32) * 18, flops=2.0 * 2 * N * K)
+
+    # QKV fusion over grouped-query shapes (Nkv < Nq).
+    qkv_shapes = _pick(preset, [(768, 256, 768)],
+                       [(768, 256, 768), (4096, 1024, 4096)],
+                       [(768, 256, 768), (4096, 1024, 4096), (4096, 512, 4096)])
+    for Nq, Nkv, K in qkv_shapes:
+        x = rng.standard_normal((K, 1)).astype(np.float32)
+        x_d = be.array(x, "f32")
+        qd, qdq = q4_0(Nq, K, 2)
+        kd, kdq = q4_0(Nkv, K, 3)
+        vd, vdq = q4_0(Nkv, K, 4)
+        xb = be.to_numpy(x_d).astype(np.float64)
+        ref = np.concatenate([qdq @ xb, kdq @ xb, vdq @ xb])
+        base = {"tk q4_0 x3": (lambda qd=qd, kd=kd, vd=vd, x_d=x_d: (
+            tk.qgemv(qd, x_d, format="q4_0"), tk.qgemv(kd, x_d, format="q4_0"),
+            tk.qgemv(vd, x_d, format="q4_0")))}
+        yield Case("qgemv_fused", f"qkv_Nq{Nq}_Nkv{Nkv}_K{K}",
+                   {"Nq": Nq, "Nkv": Nkv, "K": K, "M": 1}, "f32", fmt="q4_0",
+                   target=lambda qd=qd, kd=kd, vd=vd, x_d=x_d:
+                       tk.qgemv_q4_0_f32_qkv(qd, kd, vd, x_d),
+                   out_to_numpy=lambda o: np.concatenate([be.to_numpy(t) for t in o]),
+                   baselines=base, ref=ref, weight_bytes=(Nq + 2 * Nkv) * (K // 32) * 18,
+                   flops=2.0 * (Nq + 2 * Nkv) * K)
+
+
+def _gelu_tanh_torch(be, t):
+    return 0.5 * t * (1.0 + be.torch.tanh(0.7978845608028654 * (t + 0.044715 * t ** 3)))
+
+
 @register("qgemv_int")
 def qgemv_int_cases(be, preset, formats):
     tk = be.tk()

@@ -86,6 +86,7 @@ _METAL_SOURCES = [
     _kernel_source("quantization/qgemm_bwd/qgemm_bwd.metal"),
     _kernel_source("quantization/qgemm_fused/qgemm_fused.metal"),
     _kernel_source("quantization/qgemv/qgemv.metal"),
+    _kernel_source("quantization/qgemv_fused/qgemv_fused.metal"),
     _kernel_source("quantization/qflux/qflux.metal"),
     _kernel_source("quantization/qgemv_int/qgemv_int.metal"),
     _kernel_source("attention/attn_q/attn_q.metal"),
@@ -1502,6 +1503,25 @@ def qgemm_fp8_scaled(wq, xq, w_scale, a_scale):
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     """Quantized GEMV. x is float16, or fp32 for q4_0/q6_K."""
     return _ext.qgemv(wq, x, format)
+
+
+def qgemv_q4_0_f32_up_gate_gelu(up, gate, x):
+    """Fused Q4_0 up+gate decode GEMV with a gated-GELU epilogue in one launch:
+    out = gelu_tanh(gate @ x) * (up @ x). up/gate uint8 Q4_0 (N, K/32, 18), x fp32 (K, 1).
+    Returns (N, 1) fp32. MPS."""
+    return _ext.qgemv_q4_0_f32_up_gate_gelu(up, gate, x)
+
+
+def qgemv_q4_0_f32_up_gate(up, gate, x):
+    """Fused Q4_0 up+gate decode GEMV in one launch. up/gate uint8 Q4_0 (N, K/32, 18),
+    x fp32 (K, 1). Returns (up_out, gate_out), each (N, 1) fp32. MPS."""
+    return tuple(_ext.qgemv_q4_0_f32_up_gate(up, gate, x))
+
+
+def qgemv_q4_0_f32_qkv(qw, kw, vw, x):
+    """Fused Q4_0 Q/K/V decode GEMV in one launch (GQA-friendly, Nkv may differ from Nq).
+    qw/kw/vw uint8 Q4_0 (N, K/32, 18), x fp32 (K, 1). Returns (q, k, v). MPS."""
+    return tuple(_ext.qgemv_q4_0_f32_qkv(qw, kw, vw, x))
 
 
 def dequant_gather(table, ids, format, scale=1.0):

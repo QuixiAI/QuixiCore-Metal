@@ -2561,3 +2561,51 @@ single-simdgroup design (rows accumulated serially); a multi-simdgroup
 row-parallel variant is the next optimization for long pooled sequences.
 
 Results: perf/results/2026-07-22/002351-torch-quick/
+
+## 2026-07-22: qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV)
+
+Status: kept (up_gate_gelu and qkv are wins; up_gate is parity-to-win, kept for the
+fused-family API and single-launch coalescing).
+
+New shape-keyed quantization ops under kernels/quantization/qgemv_fused. Each fuses
+the two or three back-to-back projection GEMVs a transformer block runs over the SAME
+activation into one launch, so the shared (K,1) fp32 activation is streamed once. Weights
+are GGUF Q4_0 packed blocks (N, K/32, 18); one simdgroup owns one output row with the
+standard q4_0 lane-per-block walk + simd_sum, matching the existing qgemv_q4_0_float32.
+Keyed by the FUSION SHAPE, not any model's dims (N/K, or Nq/Nkv/K for QKV are runtime):
+
+  - qgemv_q4_0_f32_up_gate_gelu: out = gelu_tanh(gate @ x) * (up @ x). up and gate share
+    every x load, and the gated-GELU epilogue is in-register (no up/gate device round-trip
+    and no extra elementwise activation op). GELU tanh uses the repo's stable
+    1 - 2/(exp(2z)+1) form so a large argument saturates instead of nan'ing on fast-math.
+  - qgemv_q4_0_f32_up_gate: [up @ x, gate @ x] over a combined 2N row grid, one launch.
+  - qgemv_q4_0_f32_qkv: [Wq @ x, Wk @ x, Wv @ x] over a combined Nq+2*Nkv grid (GQA-friendly).
+
+Hardware: Apple M5 Max, macOS (Darwin 25.5), xcrun metal 32023.883 (-std=metal3.1 -O2),
+PyTorch 2.13 MPS backend. Correctness vs an fp64 dequant-then-matmul oracle: max rel err
+~1e-7 (fp32 activation, exact q4_0 decode); 7/7 new MPS tests pass, existing qgemv/gelu
+suite unchanged (105/105).
+
+Perf (torch backend, comprehensive preset), tk fused vs composing the standalone q4_0
+qgemv path (2-3 tk.qgemv calls + the torch gated-GELU epilogue for the gelu case):
+
+| shape                         | tk ms  | base ms | speedup |
+|-------------------------------|--------|---------|---------|
+| up_gate_gelu N1152 K768       | 0.0186 | 0.0587  | 3.16x   |
+| up_gate_gelu N8192 K4096      | 0.0648 | 0.0929  | 1.43x   |
+| up_gate_gelu N14336 K4096     | 0.1302 | 0.1935  | 1.49x   |
+| up_gate N1152 K768            | 0.0320 | 0.0416  | 1.30x   |
+| up_gate N8192 K4096           | 0.0628 | 0.0695  | 1.11x   |
+| up_gate N14336 K4096          | 0.1309 | 0.1344  | 1.03x   |
+| qkv Nq768 Nkv256 K768         | 0.0209 | 0.0234  | 1.12x   |
+| qkv Nq4096 Nkv1024 K4096      | 0.0459 | 0.0774  | 1.69x   |
+| qkv Nq4096 Nkv512 K4096       | 0.0561 | 0.0754  | 1.34x   |
+
+Keep decision: up_gate_gelu wins everywhere (the fused gated-GELU epilogue removes an
+extra device round-trip and a separate elementwise activation op) and qkv wins by
+collapsing three launches into one. Plain up_gate (no epilogue) is roughly parity at the
+largest shapes — its only benefit is one launch instead of two — but is a small win at
+decode-sized shapes and completes the fused family; kept. All three are additive (the
+standalone qgemv path is untouched), so nothing regresses.
+
+Results: perf/results/2026-07-22/004219-torch-comprehensive/
