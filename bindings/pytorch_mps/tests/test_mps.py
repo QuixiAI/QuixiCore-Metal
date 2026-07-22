@@ -164,6 +164,21 @@ def test_rms_norm(shape):
     assert _maxdiff(got, exp) < 0.03
 
 
+@pytest.mark.parametrize("D", [256, 512, 768, 1024])
+@pytest.mark.parametrize("M", [1, 37, 128])
+def test_mean_pool_rms_l2(M, D):
+    torch.manual_seed(M + D)
+    x = torch.randn(M, D, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(D, dtype=torch.bfloat16, device="mps")
+    eps = 1e-6
+    got = tk_torch.mean_pool_rms_l2(x, w, eps)
+    p = x.float().mean(0)
+    n = p * torch.rsqrt((p * p).mean() + eps) * w.float()
+    exp = (n / torch.sqrt((n * n).sum())).to(torch.bfloat16)
+    assert got.shape == (D,)
+    assert _maxdiff(got, exp) < 0.03
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
 def test_rms_norm_add(shape):
     D = shape[-1]

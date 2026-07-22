@@ -62,6 +62,7 @@
 #include "matmul_custom/matmul_custom.h"
 #include "layernorm/layernorm.h"
 #include "rms_norm/rms_norm.h"
+#include "mean_pool_rms_l2/mean_pool_rms_l2.h"
 #include "add_norm/add_norm.h"
 #include "rope_kv/rope_kv.h"
 #include "qk_norm_rope/qk_norm_rope.h"
@@ -221,6 +222,18 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(
         rms_norm over the last axis: x * rsqrt(mean(x^2) + eps) * weight
+      )");
+
+    m.def(
+      "mean_pool_rms_l2",
+      &mean_pool_rms_l2,
+      "x"_a,
+      "weight"_a,
+      nb::kw_only(),
+      "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(
+        mean-pool an (M, D) block into one (D,) embedding, then RMSNorm(weight) + L2-normalize
       )");
 
     m.def(

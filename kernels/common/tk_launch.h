@@ -29,6 +29,7 @@ inline std::string attn_fwd_kernel_name(int D) { return "attn_fwd_" + std::to_st
 inline std::string add_rt_kernel_name(const std::string& t) { return "add_rt_" + t; }
 inline std::string matmul_custom_kernel_name(const std::string& t) { return "matmul_custom_" + t; }
 inline std::string rms_norm_kernel_name(int D) { return "rms_norm_" + std::to_string(D); }
+inline std::string mean_pool_rms_l2_kernel_name(int D) { return "mean_pool_rms_l2_" + std::to_string(D); }
 inline std::string rms_norm_add_kernel_name(int D) { return "rms_norm_add_" + std::to_string(D); }
 inline std::string layernorm_add_kernel_name(int D) { return "layernorm_add_" + std::to_string(D); }
 inline std::string rope_kv_insert_kernel_name(const std::string& t, int D) {
@@ -450,6 +451,17 @@ void launch_rms_norm(E& e, typename E::in_t x, typename E::in_t w,
   e.in(x, 0); e.in(w, 1); e.out(o, 2);
   e.bytes(M, 3); e.bytes(eps, 4);
   e.dispatch(static_cast<int>(M), 1, 1, 32, 1, 1);
+}
+
+// ----- mean_pool_rms_l2: x@0 w@1 -> o@2 ; M@3(u32) eps@4(f32) ; grid (1,1,1) group (32,1,1) -----
+// Pools M rows of width D into one D-vector (mean -> RMSNorm(w) -> L2-normalize).
+template <class E>
+void launch_mean_pool_rms_l2(E& e, typename E::in_t x, typename E::in_t w,
+                             typename E::out_t o, uint32_t M, int D, float eps) {
+  e.pipeline(mean_pool_rms_l2_kernel_name(D));
+  e.in(x, 0); e.in(w, 1); e.out(o, 2);
+  e.bytes(M, 3); e.bytes(eps, 4);
+  e.dispatch(1, 1, 1, 32, 1, 1);
 }
 template <class E>
 void launch_rms_norm_dyn(E& e, typename E::in_t x, typename E::in_t w,

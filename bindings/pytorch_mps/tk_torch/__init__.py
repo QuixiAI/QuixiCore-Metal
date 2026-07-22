@@ -32,6 +32,7 @@ _METAL_SOURCES = [
     _kernel_source("matmul/matmul_custom/matmul_custom.metal"),
     _kernel_source("norms/layernorm/layernorm.metal"),
     _kernel_source("norms/rms_norm/rms_norm.metal"),
+    _kernel_source("serving/mean_pool_rms_l2/mean_pool_rms_l2.metal"),
     _kernel_source("norms/add_norm/add_norm.metal"),
     _kernel_source("activations/softmax/softmax.metal"),
     _kernel_source("attention/rotary/rotary.metal"),
@@ -167,6 +168,12 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     """RMSNorm over the last axis. bf16 MPS tensors; static kernels for D in {256,512,768,1024},
     dynamic kernel for other D multiples of 4."""
     return _ext.rms_norm(x, weight, float(eps))
+
+
+def mean_pool_rms_l2(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
+    """Mean-pool an (M, D) block of token states into one D embedding, apply RMSNorm(weight),
+    then L2-normalize. bf16 MPS tensors; D in {256,512,768,1024}. Returns (D,)."""
+    return _ext.mean_pool_rms_l2(x, weight, float(eps))
 
 
 def rms_norm_bwd_dx(x, weight, dy, rstd):

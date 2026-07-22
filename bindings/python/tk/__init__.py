@@ -453,6 +453,14 @@ def rms_norm(x, weight, eps=1e-5):
     return _mlx().rms_norm(x, weight, eps=eps)
 
 
+def mean_pool_rms_l2(x, weight, eps=1e-5):
+    """Mean-pool (M,D)->(D,), then RMSNorm(weight) + L2-normalize. Accepts mlx.array or
+    torch.Tensor (MPS). D in {256,512,768,1024}."""
+    if _is_torch(x):
+        return _torch().mean_pool_rms_l2(x, weight, eps)
+    return _mlx().mean_pool_rms_l2(x, weight, eps=eps)
+
+
 def rms_norm_backward(x, weight, dy, eps=1e-5):
     """RMSNorm backward. Returns (dx, dweight): dx has x's shape, dweight (D,) fp32 is summed over all
     rows. x/dy (..., D), weight (D,). Matches torch autograd. A single fused kernel computes rstd

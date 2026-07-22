@@ -2532,3 +2532,32 @@ Restore all other source variants. Raw controls/candidates are under
 `mla-e8m0-*`, `fake-quant-fp8-*`, `attention-softcap-*`, and
 `decode-swiglu-mxfp8-two-warp-candidate` directories. The production-only
 confirmation is `cross-kernel-transfer-final-retained`.
+
+## 2026-07-22: mean_pool_rms_l2 — new embedding-pooling serving kernel
+
+Status: kept (small-M embedding pooling); large-M variant is future work.
+
+New shape-keyed serving op — no prior QuixiCore pooling kernel existed. Mean-pool
+an (M, D) block of token states into one (D,) embedding, apply RMSNorm(weight),
+then L2-normalize. bf16 I/O, fp32 compute; one simdgroup owns the whole D-vector
+(D in {256,512,768,1024}) with register accumulation over the M rows and
+simd-shuffle reductions — the mean, RMSNorm, and L2 are fused into one launch.
+
+Hardware: Apple M5 Max, Metal (PyTorch MPS backend). Correctness vs an fp64 numpy
+reference and a torch-composed oracle: max abs err 2-3e-3 (bf16 tier), output
+L2-norm ~1.0; 12/12 repo MPS tests pass.
+
+Perf (torch backend, quick preset), tk vs torch-composed baseline (mean + RMSNorm
++ L2):
+
+| shape      | tk ms  | base ms | result |
+|------------|--------|---------|--------|
+| M128_D768  | 0.0388 | 0.0524  | 1.35x faster (representative embedding shape, M<=128) |
+| M512_D1024 | 0.2193 | 0.0640  | slower — single-simdgroup serial over M rows |
+
+Keep decision: wins the common small-M embedding-pool case and collapses 3+
+framework ops into one fused launch. The large-M regression is inherent to the
+single-simdgroup design (rows accumulated serially); a multi-simdgroup
+row-parallel variant is the next optimization for long pooled sequences.
+
+Results: perf/results/2026-07-22/002351-torch-quick/

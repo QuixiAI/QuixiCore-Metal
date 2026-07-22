@@ -274,6 +274,24 @@ static at::Tensor rms_norm_mps(const at::Tensor& x_in, const at::Tensor& w_in, d
   return out;
 }
 
+static at::Tensor mean_pool_rms_l2_mps(const at::Tensor& x_in, const at::Tensor& w_in,
+                                       double eps) {
+  TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
+              "mean_pool_rms_l2: x must be a float MPS tensor");
+  TORCH_CHECK(x_in.scalar_type() == at::kBFloat16, "mean_pool_rms_l2: x must be bfloat16");
+  auto x = x_in.contiguous(), w = w_in.contiguous();
+  const int D = x.size(-1);
+  TORCH_CHECK(D == 256 || D == 512 || D == 768 || D == 1024,
+              "mean_pool_rms_l2: last dim must be 256/512/768/1024");
+  const uint32_t M = static_cast<uint32_t>(x.numel() / D);
+  auto out = at::empty({D}, x.options());
+  const float eps_f = static_cast<float>(eps);
+  tk_encode([&](TorchEncoder& e) {
+    tk::launch_mean_pool_rms_l2(e, x, w, out, M, D, eps_f);
+  });
+  return out;
+}
+
 static at::Tensor rms_norm_bwd_dx_mps(const at::Tensor& x_in, const at::Tensor& w_in,
                                       const at::Tensor& dy_in, const at::Tensor& rstd_in) {
   TORCH_CHECK(x_in.device().is_mps() && tk_is_float_dtype(x_in),
@@ -5355,6 +5373,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
         pybind11::arg("softcap") = 0.0, pybind11::arg("sinks") = pybind11::none());
   m.def("rms_norm", &rms_norm_mps, "ThunderMittens RMSNorm (MPS)");
+  m.def("mean_pool_rms_l2", &mean_pool_rms_l2_mps,
+        "ThunderMittens mean-pool + RMSNorm + L2-normalize embedding pooling (MPS)");
   m.def("rms_norm_bwd_dx", &rms_norm_bwd_dx_mps, "ThunderMittens RMSNorm backward dX (MPS)");
   m.def("rms_norm_bwd_fused", &rms_norm_bwd_fused_mps,
         "ThunderMittens fused RMSNorm backward -> [dX, dweight] (MPS)");

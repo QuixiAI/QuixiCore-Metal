@@ -411,6 +411,39 @@ def rms_norm_cases(be, preset, formats):
                    baselines=baselines, ref=ref, bytes_moved=2 * N * D * 2)
 
 
+@register("mean_pool_rms_l2")
+def mean_pool_rms_l2_cases(be, preset, formats):
+    tk = be.tk()
+    rng = np.random.default_rng(7)
+    shapes = _pick(preset, [(128, 768)],
+                   [(128, 768), (512, 1024)],
+                   [(m, d) for m in (128, 512, 2048) for d in (256, 512, 768, 1024)])
+    for M, D in shapes:
+        x = rng.standard_normal((M, D)).astype(np.float32)
+        w = rng.standard_normal(D).astype(np.float32)
+        x_d, w_d = be.array(x, "bf16"), be.array(w, "bf16")
+        baselines = {}
+        if be.name == "mlx":
+            mx = be.mx
+            baselines["mx compose"] = lambda x_d=x_d, w_d=w_d, mx=mx: (
+                lambda n: n * mx.rsqrt((n * n).sum() + 1e-12))(
+                (lambda p: p * mx.rsqrt((p * p).mean() + 1e-6) * w_d.astype(mx.float32))(
+                    x_d.astype(mx.float32).mean(axis=0)))
+        else:
+            t = be.torch
+            baselines["torch compose"] = lambda x_d=x_d, w_d=w_d, t=t: (
+                lambda n: n / t.sqrt((n * n).sum() + 1e-12))(
+                (lambda p: p * t.rsqrt((p * p).mean() + 1e-6) * w_d.float())(
+                    x_d.float().mean(0)))
+        wb = be.to_numpy(w_d).astype(np.float64)
+        pb = be.to_numpy(x_d).astype(np.float64).mean(0)
+        nb = pb / np.sqrt((pb * pb).mean() + 1e-6) * wb
+        ref = nb / np.sqrt((nb * nb).sum() + 1e-12)
+        yield Case("mean_pool_rms_l2", f"M{M}_D{D}", {"M": M, "D": D}, "bf16",
+                   target=lambda x_d=x_d, w_d=w_d: tk.mean_pool_rms_l2(x_d, w_d),
+                   baselines=baselines, ref=ref, bytes_moved=(M + 2) * D * 2)
+
+
 @register("softmax")
 def softmax_cases(be, preset, formats):
     tk = be.tk()

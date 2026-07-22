@@ -101,6 +101,7 @@ families:
       - kernels/serving/indexer
       - kernels/serving/minference
       - kernels/serving/embedding
+      - kernels/serving/mean_pool_rms_l2
   optimizers:
     status: implemented
     paths:
