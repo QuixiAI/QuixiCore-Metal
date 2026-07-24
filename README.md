@@ -27,11 +27,46 @@ utility operations. The exact supported surface is tracked in
 - Xcode with the Metal Toolchain installed.
 - Python virtual environment for Python integrations.
 
-Install the Metal Toolchain once if `xcrun metal` is present but kernel builds
-fail with a missing toolchain error:
+### One-time Xcode and Metal setup
+
+Install the full Xcode application, then point the command-line developer tools
+at it and complete Xcode's first-launch setup:
+
+```bash
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+sudo xcodebuild -runFirstLaunch
+```
+
+If Xcode is installed somewhere other than `/Applications/Xcode.app`, replace
+that path with the location of your Xcode application. Verify the active
+developer directory and tools:
+
+```bash
+xcode-select -p
+xcodebuild -version
+xcrun --find metal
+```
+
+The active developer directory should be
+`/Applications/Xcode.app/Contents/Developer`, not
+`/Library/Developer/CommandLineTools`. Install the separately distributed Metal
+Toolchain component before the first build:
 
 ```bash
 xcodebuild -downloadComponent MetalToolchain
+```
+
+`xcrun --find metal` may report a launcher path even when this component is not
+installed. If a build reports `cannot execute tool 'metal' due to missing Metal
+Toolchain`, run the download command above and retry.
+
+To use full Xcode for only the current command instead of changing the system
+selection, set `DEVELOPER_DIR`:
+
+```bash
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer scripts/configure
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  scripts/build xcode -configuration Debug
 ```
 
 The MLX binding currently targets the MLX 0.21 C++ extension API. Use Python
