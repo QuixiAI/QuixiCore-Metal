@@ -107,4 +107,233 @@ kernel void rotary_interleaved(device   bf16 *x    [[buffer(0)]],
 instantiate_rotary_interleaved(64);
 instantiate_rotary_interleaved(128);
 
+// ---------------------------------------------------------------------------
+// Positioned/partial RoPE.  This is the generic complement to the optimized
+// implicit-position kernels above:
+//   * positions may be shared across the batch or supplied per batch item;
+//   * rotary_dim may cover only a prefix of the head (the tail is copied);
+//   * split-half and adjacent-pair layouts are both explicit;
+//   * D extends through 512 for multimodal and heterogeneous decoder heads.
+//
+// One thread handles four logical pairs.  For split-half partial rotation, a
+// logical pair p addresses (p, p + rotary_dim/2).  Tail work copies two
+// adjacent values so every output element is written exactly once.
+// ---------------------------------------------------------------------------
+template <int D>
+kernel void rotary_positioned(device const bf16 *x         [[buffer(0)]],
+                              device const bf16 *cosb      [[buffer(1)]],
+                              device const bf16 *sinb      [[buffer(2)]],
+                              device const int  *positions [[buffer(3)]],
+                              device bf16       *o         [[buffer(4)]],
+                              constant uint &M             [[buffer(5)]],
+                              constant uint &N             [[buffer(6)]],
+                              constant uint &heads         [[buffer(7)]],
+                              constant uint &rotary_dim    [[buffer(8)]],
+                              constant uint &pos_bstride   [[buffer(9)]],
+                              constant uint &interleaved   [[buffer(10)]],
+                              uint tid [[thread_position_in_grid]]) {
+    constexpr uint QPR = D / 8; // four logical pairs per thread
+    if (tid >= M * QPR) return;
+    const uint row = tid / QPR;
+    const uint p4 = (tid % QPR) * 4;
+    const uint token = row % N;
+    const uint batch = row / (heads * N);
+    const int pos = positions[batch * pos_bstride + token];
+    const uint rp = rotary_dim / 2;
+    const long xb = (long)row * D;
+    const long csb = (long)pos * rp;
+
+    for (uint j = 0; j < 4; ++j) {
+        const uint p = p4 + j;
+        if (p < rp) {
+            const uint i0 = interleaved != 0 ? 2 * p : p;
+            const uint i1 = interleaved != 0 ? 2 * p + 1 : rp + p;
+            const float a = float(x[xb + i0]);
+            const float b = float(x[xb + i1]);
+            const float c = float(cosb[csb + p]);
+            const float s = float(sinb[csb + p]);
+            o[xb + i0] = bf16(a * c - b * s);
+            o[xb + i1] = bf16(a * s + b * c);
+        } else {
+            const uint i0 = rotary_dim + 2 * (p - rp);
+            o[xb + i0] = x[xb + i0];
+            o[xb + i0 + 1] = x[xb + i0 + 1];
+        }
+    }
+}
+
+#define instantiate_rotary_positioned(DVAL)                                    \
+  template [[host_name("rotary_positioned_" #DVAL)]] [[kernel]] void           \
+  rotary_positioned<DVAL>(device const bf16 *x [[buffer(0)]],                   \
+                          device const bf16 *cosb [[buffer(1)]],                \
+                          device const bf16 *sinb [[buffer(2)]],                \
+                          device const int *positions [[buffer(3)]],            \
+                          device bf16 *o [[buffer(4)]],                         \
+                          constant uint &M [[buffer(5)]],                       \
+                          constant uint &N [[buffer(6)]],                       \
+                          constant uint &heads [[buffer(7)]],                   \
+                          constant uint &rotary_dim [[buffer(8)]],              \
+                          constant uint &pos_bstride [[buffer(9)]],             \
+                          constant uint &interleaved [[buffer(10)]],            \
+                          uint tid [[thread_position_in_grid]]);
+
+instantiate_rotary_positioned(64);
+instantiate_rotary_positioned(128);
+instantiate_rotary_positioned(256);
+instantiate_rotary_positioned(512);
+
+// ---------------------------------------------------------------------------
+// Three-axis multimodal RoPE (M-RoPE), always using split-half/NeoX pairing.
+// positions is either (3,N), shared by the batch, or (B,3,N).  sections count
+// rotary pairs and sum to rotary_dim/2.  section_interleaved selects either
+// contiguous [T...H...W...] sections or the Qwen3-VL THWTHW... axis map.
+// Frequency index p never resets at an axis transition, matching the public
+// BaseRT metadata contract and llama.cpp's rope_multi definition.
+// ---------------------------------------------------------------------------
+template <int D>
+kernel void mrope_positioned(device const bf16 *x         [[buffer(0)]],
+                             device const bf16 *cosb      [[buffer(1)]],
+                             device const bf16 *sinb      [[buffer(2)]],
+                             device const int  *positions [[buffer(3)]],
+                             device bf16       *o         [[buffer(4)]],
+                             constant uint &M             [[buffer(5)]],
+                             constant uint &N             [[buffer(6)]],
+                             constant uint &heads         [[buffer(7)]],
+                             constant uint &rotary_dim    [[buffer(8)]],
+                             constant uint &pos_bstride   [[buffer(9)]],
+                             constant uint &section_t     [[buffer(10)]],
+                             constant uint &section_h     [[buffer(11)]],
+                             constant uint &section_w     [[buffer(12)]],
+                             constant uint &section_interleaved [[buffer(13)]],
+                             uint tid [[thread_position_in_grid]]) {
+    constexpr uint QPR = D / 8;
+    if (tid >= M * QPR) return;
+    const uint row = tid / QPR;
+    const uint p4 = (tid % QPR) * 4;
+    const uint token = row % N;
+    const uint batch = row / (heads * N);
+    const uint rp = rotary_dim / 2;
+    const long xb = (long)row * D;
+    const long pb = (long)batch * pos_bstride;
+
+    for (uint j = 0; j < 4; ++j) {
+        const uint p = p4 + j;
+        if (p < rp) {
+            uint axis;
+            if (section_interleaved != 0) {
+                axis = p % 3;
+            } else if (p < section_t) {
+                axis = 0;
+            } else if (p < section_t + section_h) {
+                axis = 1;
+            } else {
+                axis = 2;
+            }
+            const int pos = positions[pb + (long)axis * N + token];
+            const long cs = (long)pos * rp + p;
+            const float a = float(x[xb + p]);
+            const float b = float(x[xb + rp + p]);
+            const float c = float(cosb[cs]);
+            const float s = float(sinb[cs]);
+            o[xb + p] = bf16(a * c - b * s);
+            o[xb + rp + p] = bf16(a * s + b * c);
+        } else {
+            const uint i0 = rotary_dim + 2 * (p - rp);
+            o[xb + i0] = x[xb + i0];
+            o[xb + i0 + 1] = x[xb + i0 + 1];
+        }
+    }
+    (void)section_w;
+}
+
+#define instantiate_mrope_positioned(DVAL)                                     \
+  template [[host_name("mrope_positioned_" #DVAL)]] [[kernel]] void            \
+  mrope_positioned<DVAL>(device const bf16 *x [[buffer(0)]],                    \
+                         device const bf16 *cosb [[buffer(1)]],                 \
+                         device const bf16 *sinb [[buffer(2)]],                 \
+                         device const int *positions [[buffer(3)]],             \
+                         device bf16 *o [[buffer(4)]],                          \
+                         constant uint &M [[buffer(5)]],                        \
+                         constant uint &N [[buffer(6)]],                        \
+                         constant uint &heads [[buffer(7)]],                    \
+                         constant uint &rotary_dim [[buffer(8)]],               \
+                         constant uint &pos_bstride [[buffer(9)]],              \
+                         constant uint &section_t [[buffer(10)]],               \
+                         constant uint &section_h [[buffer(11)]],               \
+                         constant uint &section_w [[buffer(12)]],               \
+                         constant uint &section_interleaved [[buffer(13)]],     \
+                         uint tid [[thread_position_in_grid]]);
+
+instantiate_mrope_positioned(64);
+instantiate_mrope_positioned(128);
+instantiate_mrope_positioned(256);
+instantiate_mrope_positioned(512);
+
+// Two-axis vision RoPE. Mode 0 is Gemma: two independent split-half rotations
+// over D/2 x/y channel blocks. Mode 1 is Qwen: global split-half pairing, with
+// x/y frequency sections repeated across the two global halves.
+template <int D>
+kernel void vision_rope_2d_kernel(
+    device const bf16 *x [[buffer(0)]], device const bf16 *cosb [[buffer(1)]],
+    device const bf16 *sinb [[buffer(2)]], device const int *positions [[buffer(3)]],
+    device bf16 *out [[buffer(4)]], constant uint &rows [[buffer(5)]],
+    constant uint &tokens [[buffer(6)]], constant uint &heads [[buffer(7)]],
+    constant uint &max_position [[buffer(8)]],
+    constant uint &global_split [[buffer(9)]],
+    uint tid [[thread_position_in_grid]]) {
+  constexpr uint PAIRS = D / 4;
+  constexpr uint QUADS = PAIRS / 4;
+  if (tid >= rows * QUADS) return;
+  const uint row = tid / QUADS;
+  const uint p4 = (tid % QUADS) * 4;
+  const uint token = row % tokens;
+  const uint batch = row / (heads * tokens);
+  const long xb = (long)row * D;
+  for (uint j = 0; j < 4; ++j) {
+    const uint p = p4 + j;
+    const int px = metal::clamp(positions[((long)batch * tokens + token) * 2],
+                                0, int(max_position) - 1);
+    const int py = metal::clamp(positions[((long)batch * tokens + token) * 2 + 1],
+                                0, int(max_position) - 1);
+    const float cx = float(cosb[(long)px * PAIRS + p]);
+    const float sx = float(sinb[(long)px * PAIRS + p]);
+    const float cy = float(cosb[(long)py * PAIRS + p]);
+    const float sy = float(sinb[(long)py * PAIRS + p]);
+    if (global_split == 0) {
+      const float x0 = float(x[xb + p]);
+      const float x1 = float(x[xb + PAIRS + p]);
+      const float y0 = float(x[xb + 2 * PAIRS + p]);
+      const float y1 = float(x[xb + 3 * PAIRS + p]);
+      out[xb + p] = bf16(x0 * cx - x1 * sx);
+      out[xb + PAIRS + p] = bf16(x0 * sx + x1 * cx);
+      out[xb + 2 * PAIRS + p] = bf16(y0 * cy - y1 * sy);
+      out[xb + 3 * PAIRS + p] = bf16(y0 * sy + y1 * cy);
+    } else {
+      const float x0 = float(x[xb + p]);
+      const float y0 = float(x[xb + PAIRS + p]);
+      const float x1 = float(x[xb + 2 * PAIRS + p]);
+      const float y1 = float(x[xb + 3 * PAIRS + p]);
+      out[xb + p] = bf16(x0 * cx - x1 * sx);
+      out[xb + PAIRS + p] = bf16(y0 * cy - y1 * sy);
+      out[xb + 2 * PAIRS + p] = bf16(x0 * sx + x1 * cx);
+      out[xb + 3 * PAIRS + p] = bf16(y0 * sy + y1 * cy);
+    }
+  }
+}
+
+#define instantiate_vision_rope_2d(DVAL)                                      \
+  template [[host_name("vision_rope_2d_D" #DVAL)]] [[kernel]] void           \
+  vision_rope_2d_kernel<DVAL>(device const bf16 *x [[buffer(0)]],              \
+    device const bf16 *cosb [[buffer(1)]], device const bf16 *sinb [[buffer(2)]],\
+    device const int *positions [[buffer(3)]], device bf16 *out [[buffer(4)]], \
+    constant uint &rows [[buffer(5)]], constant uint &tokens [[buffer(6)]],    \
+    constant uint &heads [[buffer(7)]], constant uint &max_position [[buffer(8)]],\
+    constant uint &global_split [[buffer(9)]],                                \
+    uint tid [[thread_position_in_grid]]);
+
+instantiate_vision_rope_2d(64)
+instantiate_vision_rope_2d(128)
+instantiate_vision_rope_2d(256)
+instantiate_vision_rope_2d(512)
+
 }

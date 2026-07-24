@@ -48,6 +48,7 @@ QuixiCore-Metal/
     matmul/
     quantization/
     vision/
+    audio/
     moe/
     sampling/
     serving/
@@ -110,6 +111,7 @@ QuixiCoreMetal
     matmul/
     quantization/
     vision/
+    audio/
     moe/
     sampling/
     serving/
@@ -180,27 +182,43 @@ layouts, and any Metal-only layout constraints.
 The top-level directories under `kernels/` are semantic families, not Xcode
 groups or framework buckets:
 
-- `norms/`: RMSNorm, LayerNorm, add-norm, norm-to-quant, QK norm.
-- `activations/`: GELU, GLU, SiLU/SwiGLU helpers, standalone softmax.
+- `norms/`: RMSNorm, LayerNorm, add-norm, norm-to-quant, and fused Q/K norm
+  with full, partial, positioned, or multimodal RoPE.
+- `activations/`: GELU, GLU, SiLU/SwiGLU and sigmoid-product helpers,
+  standalone softmax.
 - `attention/`: flash attention, causal/non-causal/varlen attention, backward,
-  paged attention, MLA, rotary, quantized-KV attention, functional cache decode,
-  state merging.
+  paged attention, independent-length GQA cross-attention, MLA,
+  full/partial/positioned rotary, Gemma/Qwen two-axis vision layouts,
+  three-axis M-RoPE, quantized-KV attention,
+  functional cache decode, and state merging.
 - `linear_attention/`: Based, Hedgehog, linear attention, causal/decay linear
-  attention, GDN, complex linear attention primitives.
+  attention, and the GDN short-convolution, Q/K preparation, recurrence,
+  decay/beta, and gated-output primitives.
 - `ssm/`: Mamba, SSD, selective scan, FFT convolution.
-- `matmul/`: dense/staged/complex GEMM, Flux, decode epilogues, and packed
-  decode SwiGLU.
-- `quantization/`: act quant, runtime quant, qgemm, qgemv, quantized LM head,
-  packed embedding lookup/reduction, sparse candidate projection,
-  fp8/int8/fp4 packing, TurboQuant.
-- `vision/`: window-attention support operations, patch merging,
+- `matmul/`: dense/staged/complex GEMM, Flux, decode epilogues, packed decode
+  SwiGLU, and measured low-rank adapter application.
+- `quantization/`: canonical separate-plane BaseQN decode/GEMV/GEMM/fused and
+  grouped-expert consumers, act quant, runtime quant, deterministic
+  per-channel calibration absmax, qgemm, qgemv, quantized LM head, packed
+  embedding lookup/reduction, sparse candidate projection, fp8/int8/fp4
+  packing, TurboQuant.
+- `vision/`: general NHWC and temporal NTHWC patch extraction/projection,
+  factorized and interpolated learned positions, coordinate/dense token-map
+  pooling, window-attention support operations, patch merging,
   space-to-depth/norm/projection, and fixed-shape projection heads.
+- `audio/`: NWC general/symmetric/asymmetric/causal depthwise convolution and
+  blocked relative-position attention. Encoder/decoder graphs, media I/O, and
+  runtime scheduling remain outside the kernel repository.
 - `moe/`: routing, expert alignment, gather/scatter, grouped GEMM, quantized
   MoE GEMM, LoRA alignment, finalize.
-- `sampling/`: sampling, logit transforms, penalties, rejection sampling, beam
-  search, speculative decode and EAGLE helpers.
+- `sampling/`: sampling, generic scalar-bounds value clipping, logit transforms,
+  penalties, rejection sampling, beam search, speculative decode and EAGLE
+  helpers.
 - `serving/`: KV cache mutation, block/page tables, indexers, MInference, cache
-  copy/gather helpers.
+  copy/gather helpers, token/type embeddings, mask-aware normalized pooling,
+  and the QuixiCore Q8_0 KV codec. Q8_0 KV uses separate int8 code and F16
+  scale planes per K/V tensor; paged attention reads those planes directly
+  rather than materializing a dense cache.
 - `optimizers/`: AdamW and other training optimizer kernels.
 - `collectives/`: multi-device operations only where meaningful on Apple
   platforms; these are capability-gated extensions.

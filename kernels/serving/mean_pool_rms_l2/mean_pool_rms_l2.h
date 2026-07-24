@@ -28,6 +28,11 @@ array mean_pool_rms_l2(
     StreamOrDevice s = {} // Stream on which to schedule the operation
 );
 
+/** Batched mask-aware pooling over x(B,T,D); mask(B,T) nonzero keeps a row. */
+array masked_mean_pool_rms_l2(
+    const array& x, const array& mask, const array& weight,
+    float eps = 1e-5f, StreamOrDevice s = {});
+
 class MeanPoolRmsL2 : public Primitive {
  public:
   explicit MeanPoolRmsL2(Stream stream, float eps)
@@ -51,6 +56,20 @@ class MeanPoolRmsL2 : public Primitive {
   /** Fall back implementation for evaluation on CPU */
   void eval(const std::vector<array>& inputs, std::vector<array>& outputs);
 
+ private:
+  float eps_;
+};
+
+class MaskedMeanPoolRmsL2 : public Primitive {
+ public:
+  MaskedMeanPoolRmsL2(Stream stream, float eps) : Primitive(stream), eps_(eps) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  const char* name() const { return "MaskedMeanPoolRmsL2"; }
+  void print(std::ostream& os) override { os << "MaskedMeanPoolRmsL2"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return eps_ == static_cast<const MaskedMeanPoolRmsL2&>(other).eps_;
+  }
  private:
   float eps_;
 };

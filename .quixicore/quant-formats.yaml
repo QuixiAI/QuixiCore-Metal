@@ -1,6 +1,33 @@
 schema_version: 0.1
 backend: metal
 formats:
+  base_qn:
+    status: implemented
+    weight_widths: [2, 3, 4, 5, 6, 8]
+    group_sizes: [32, 64, 128]
+    scale_dtypes: [bf16, f16, e8m0, e4m3]
+    layouts:
+      - metal
+      - metal_lane_strided
+      - metal_lane_strided_q2
+      - metal_lane_strided_q3
+      - metal_lane_strided_q4
+      - metal_lane_strided_q5
+      - metal_lane_strided_q6
+      - metal_lane_strided_q8
+    affine_modes: [asymmetric, symmetric]
+    operations: [dequant, gemv, gemm, embedding, qkv, swiglu, lm_head_argmax, moe_gemm, moe_swiglu]
+    notes: Canonical BaseQN separate-plane codes/scales/biases contract. E4M3 is q8-only. GEMV uses direct decode; M>1 GEMM uses the measured dequantize-then-framework route. QKV, gate/up SwiGLU, greedy LM-head selection, and grouped expert projection/SwiGLU have direct kernels or measured composition routes.
+  q8_0_kv:
+    status: implemented
+    block_size: 32
+    code_dtype: int8
+    scale_dtype: f16
+    layouts:
+      - separate_code_scale_planes
+      - block_major_token_head_dimension
+    operations: [scatter, gather, copy_blocks, paged_attention]
+    notes: QuixiCore-owned KV-cache format, distinct from packed GGUF q8_0 weights. K and V each use an int8 code plane shaped (num_blocks, block_size, heads, head_dim) and an F16 scale plane shaped (num_blocks, block_size, heads, head_dim / 32). Encoding uses FP32 absmax/127, round-half-away-from-zero, and the stored F16 scale for reconstruction; the paged read supports D64/D128 with FP32 score and softmax accumulation.
   gguf:
     status: implemented
     notes: GGUF legacy, k-quant, and i-quant weight formats. Packed embedding lookup/bag supports q4_0, q8_0, q2_K through q6_K, IQ4_NL/XS, grouped U4, and HQQ; decode epilogues and sparse output projection support q4_0/q8_0/q6_K.

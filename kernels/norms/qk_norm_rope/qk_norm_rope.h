@@ -2,6 +2,9 @@
 
 #pragma once
 
+#include <utility>
+#include <vector>
+
 #include "mlx/ops.h"
 #include "mlx/primitives.h"
 
@@ -27,6 +30,30 @@ array qk_norm_rope(
     float eps = 1e-6f,
     bool interleaved = false,
     bool gemma = false,
+    StreamOrDevice s = {});
+
+/** Explicit fused Q/K RMSNorm + positioned/partial/M-RoPE over packed QKV.
+ *
+ * positions is (T,) for one-dimensional RoPE. Supplying three mrope_sections
+ * changes it to (3,T), with either contiguous or THW-interleaved axis mapping.
+ * norm_weight_offset expresses weight versus (offset + weight) directly.
+ */
+array qk_norm_rope_positioned(
+    const array& qkv,
+    const array& q_weight,
+    const array& k_weight,
+    const array& cosb,
+    const array& sinb,
+    const array& positions,
+    int num_heads_q,
+    int num_heads_k,
+    int num_heads_v,
+    int rotary_dim = 0,
+    float eps = 1e-6f,
+    bool interleaved = false,
+    float norm_weight_offset = 0.0f,
+    const std::vector<int>& mrope_sections = {},
+    bool section_interleaved = false,
     StreamOrDevice s = {});
 
 /**
@@ -79,6 +106,40 @@ class QkNormRope : public Primitive {
   float eps_;
   bool interleaved_;
   bool gemma_;
+};
+
+class QkNormRopePositioned : public Primitive {
+ public:
+  QkNormRopePositioned(
+      Stream stream, int hq, int hk, int hv, int rotary_dim, float eps,
+      bool interleaved, float weight_offset, std::vector<int> sections,
+      bool section_interleaved)
+      : Primitive(stream), hq_(hq), hk_(hk), hv_(hv), rotary_dim_(rotary_dim), eps_(eps),
+        interleaved_(interleaved), weight_offset_(weight_offset),
+        sections_(std::move(sections)), section_interleaved_(section_interleaved) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&, const std::vector<int>&,
+      const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "QkNormRopePositioned"; }
+  void print(std::ostream& os) override { os << "QkNormRopePositioned"; }
+  bool is_equivalent(const Primitive& other) const override;
+
+ private:
+  int hq_;
+  int hk_;
+  int hv_;
+  int rotary_dim_;
+  float eps_;
+  bool interleaved_;
+  float weight_offset_;
+  std::vector<int> sections_;
+  bool section_interleaved_;
 };
 
 class QkNormRopeKvF16 : public Primitive {

@@ -51,6 +51,46 @@ kernel void embedding_lookup(device const int *token_ids [[buffer(0)]],  // (num
     }
 }
 
+// Two-table embedding preparation used by BERT-family inputs and other
+// token+segment schemes:
+//   out[t] = token_scale * token_table[token_ids[t]] + type_table[type_ids[t]].
+// Each gather is independently bounds checked; an invalid id contributes zero.
+template <typename T>
+kernel void embedding_lookup_types(
+    device const int *token_ids [[buffer(0)]],
+    device const int *type_ids [[buffer(1)]],
+    device const T *token_table [[buffer(2)]],
+    device const T *type_table [[buffer(3)]],
+    device T *out [[buffer(4)]],
+    constant int &D [[buffer(5)]],
+    constant int &token_vocab [[buffer(6)]],
+    constant int &type_vocab [[buffer(7)]],
+    constant float &token_scale [[buffer(8)]],
+    uint t [[threadgroup_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]]) {
+  typedef typename base_types::packing<T>::packed_four T4;
+  const int token_id = token_ids[t];
+  const int type_id = type_ids[t];
+  const bool token_valid = token_id >= 0 && token_id < token_vocab;
+  const bool type_valid = type_id >= 0 && type_id < type_vocab;
+  device const T *token_row = token_table + (long)(token_valid ? token_id : 0) * D;
+  device const T *type_row = type_table + (long)(type_valid ? type_id : 0) * D;
+  device T *out_row = out + (long)t * D;
+  const int D4 = ((D & 3) == 0) ? D : 0;
+  for (int d = int(lid) * 4; d < D4; d += int(nthreads) * 4) {
+    float4 v = token_valid ? float4(*(device const T4 *)(token_row + d)) * token_scale
+                           : float4(0.0f);
+    if (type_valid) v += float4(*(device const T4 *)(type_row + d));
+    *(device T4 *)(out_row + d) = T4(v);
+  }
+  for (int d = D4 + int(lid); d < D; d += int(nthreads)) {
+    float v = token_valid ? float(token_row[d]) * token_scale : 0.0f;
+    if (type_valid) v += float(type_row[d]);
+    out_row[d] = T(v);
+  }
+}
+
 // out[t] = (src[t] >= 0) ? modal[src[t]] : text[t]. src (num_tok,) int: -1 keeps the text embedding,
 // >=0 gathers row src[t] of the modal embeddings. One threadgroup per token (row select + copy).
 template <typename T>
@@ -186,6 +226,14 @@ kernel void embedding_backward_sorted(device const int *sorted_ids [[buffer(0)]]
     constant int &vocab [[buffer(5)]], constant int &n_tok [[buffer(6)]],           \
     constant float &scale [[buffer(7)]], constant int &use_pos [[buffer(8)]],       \
     uint t [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]], \
+    uint nthreads [[threads_per_threadgroup]]);                                     \
+  template [[host_name("embedding_lookup_types_" #type_name)]] [[kernel]] void      \
+  embedding_lookup_types<T>(device const int *token_ids [[buffer(0)]],              \
+    device const int *type_ids [[buffer(1)]], device const T *token_table [[buffer(2)]],\
+    device const T *type_table [[buffer(3)]], device T *out [[buffer(4)]],           \
+    constant int &D [[buffer(5)]], constant int &token_vocab [[buffer(6)]],          \
+    constant int &type_vocab [[buffer(7)]], constant float &token_scale [[buffer(8)]],\
+    uint t [[threadgroup_position_in_grid]], uint lid [[thread_position_in_threadgroup]],\
     uint nthreads [[threads_per_threadgroup]]);                                     \
   template [[host_name("merge_multimodal_spans_" #type_name)]] [[kernel]] void      \
   merge_multimodal_spans<T>(device const T *text [[buffer(0)]],                     \

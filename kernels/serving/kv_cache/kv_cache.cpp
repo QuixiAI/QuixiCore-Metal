@@ -35,6 +35,42 @@ static array contiguous_cast(const array& x, Dtype dtype, StreamOrDevice s) {
   return contiguous(astype(x, dtype, s), false, s);
 }
 
+static Dtype q8_0_output_dtype(const std::string& name) {
+  if (name == "float16" || name == "f16") return float16;
+  if (name == "bfloat16" || name == "bf16") return bfloat16;
+  if (name == "float32" || name == "f32") return float32;
+  throw std::invalid_argument(
+      "Q8_0 KV: output_dtype must be float16, bfloat16, or float32");
+}
+
+static void validate_q8_0_planes(
+    const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales, const char* name) {
+  const std::string prefix = std::string(name) + ": ";
+  if (key_codes.ndim() != 4 || value_codes.shape() != key_codes.shape()) {
+    throw std::invalid_argument(
+        prefix + "code caches must be (num_blocks, block_size, num_kv_heads, head_size)");
+  }
+  if (key_codes.dtype() != int8 || value_codes.dtype() != int8) {
+    throw std::invalid_argument(prefix + "code caches must be int8");
+  }
+  const int D = key_codes.shape(3);
+  if (D <= 0 || D % 32 != 0) {
+    throw std::invalid_argument(prefix + "head_size must be a positive multiple of 32");
+  }
+  if (key_scales.ndim() != 4 || value_scales.shape() != key_scales.shape() ||
+      key_scales.shape(0) != key_codes.shape(0) ||
+      key_scales.shape(1) != key_codes.shape(1) ||
+      key_scales.shape(2) != key_codes.shape(2) ||
+      key_scales.shape(3) != D / 32) {
+    throw std::invalid_argument(
+        prefix + "scale caches must be (num_blocks, block_size, num_kv_heads, head_size/32)");
+  }
+  if (key_scales.dtype() != float16 || value_scales.dtype() != float16) {
+    throw std::invalid_argument(prefix + "scale caches must be float16");
+  }
+}
+
 std::vector<array> kv_cache_scatter(
     const array& key,
     const array& value,
@@ -65,6 +101,119 @@ std::vector<array> kv_cache_scatter(
       {dtype, dtype},
       std::make_shared<KvCacheScatter>(to_stream(s), block_size),
       {key_c, value_c, slot_c});
+}
+
+std::vector<array> kv_cache_scatter_q8_0(
+    const array& key, const array& value, const array& slot_mapping,
+    int num_blocks, int block_size, StreamOrDevice s) {
+  if (key.ndim() != 3 || value.ndim() != 3 || key.shape() != value.shape()) {
+    throw std::invalid_argument(
+        "kv_cache_scatter_q8_0: key/value must be (num_tokens, num_kv_heads, head_size)");
+  }
+  if (slot_mapping.ndim() != 1 || slot_mapping.shape(0) != key.shape(0)) {
+    throw std::invalid_argument("kv_cache_scatter_q8_0: slot_mapping must be (num_tokens,)");
+  }
+  if (num_blocks <= 0 || block_size <= 0) {
+    throw std::invalid_argument("kv_cache_scatter_q8_0: num_blocks and block_size must be positive");
+  }
+  const int H = key.shape(1), D = key.shape(2);
+  if (H <= 0 || D <= 0 || D % 32 != 0) {
+    throw std::invalid_argument(
+        "kv_cache_scatter_q8_0: num_kv_heads must be positive and head_size divisible by 32");
+  }
+  const auto dtype = promoted_float_dtype(key, value, "kv_cache_scatter_q8_0");
+  std::vector<int> code_shape = {num_blocks, block_size, H, D};
+  std::vector<int> scale_shape = {num_blocks, block_size, H, D / 32};
+  return array::make_arrays(
+      {code_shape, scale_shape, code_shape, scale_shape},
+      {int8, float16, int8, float16},
+      std::make_shared<KvCacheScatterQ8_0>(to_stream(s), block_size),
+      {contiguous_cast(key, dtype, s), contiguous_cast(value, dtype, s),
+       contiguous(astype(slot_mapping, int64, s), false, s)});
+}
+
+std::vector<array> kv_cache_gather_q8_0(
+    const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_table, const array& cu_seq_lens, int num_tokens,
+    const std::string& output_dtype, StreamOrDevice s) {
+  validate_q8_0_planes(
+      key_codes, key_scales, value_codes, value_scales, "kv_cache_gather_q8_0");
+  if (block_table.ndim() != 2 || cu_seq_lens.ndim() != 1 ||
+      cu_seq_lens.shape(0) != block_table.shape(0) + 1) {
+    throw std::invalid_argument(
+        "kv_cache_gather_q8_0: block_table must be 2D and cu_seq_lens must be (num_seqs+1,)");
+  }
+  if (num_tokens < 0) {
+    throw std::invalid_argument("kv_cache_gather_q8_0: num_tokens must be non-negative");
+  }
+  const int H = key_codes.shape(2), D = key_codes.shape(3);
+  const auto dtype = q8_0_output_dtype(output_dtype);
+  std::vector<int> out_shape = {num_tokens, H, D};
+  return array::make_arrays(
+      {out_shape, out_shape}, {dtype, dtype},
+      std::make_shared<KvCacheGatherQ8_0>(to_stream(s), num_tokens, output_dtype),
+      {contiguous(key_codes, false, s), contiguous(key_scales, false, s),
+       contiguous(value_codes, false, s), contiguous(value_scales, false, s),
+       contiguous(astype(block_table, int32, s), false, s),
+       contiguous(astype(cu_seq_lens, int32, s), false, s)});
+}
+
+std::vector<array> kv_cache_copy_blocks_q8_0(
+    const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_mapping, StreamOrDevice s) {
+  validate_q8_0_planes(
+      key_codes, key_scales, value_codes, value_scales, "kv_cache_copy_blocks_q8_0");
+  if (block_mapping.ndim() != 2 || block_mapping.shape(1) != 2) {
+    throw std::invalid_argument(
+        "kv_cache_copy_blocks_q8_0: block_mapping must have shape (num_pairs, 2)");
+  }
+  return array::make_arrays(
+      {key_codes.shape(), key_scales.shape(), value_codes.shape(), value_scales.shape()},
+      {int8, float16, int8, float16},
+      std::make_shared<KvCacheCopyBlocksQ8_0>(to_stream(s)),
+      {contiguous(key_codes, false, s), contiguous(key_scales, false, s),
+       contiguous(value_codes, false, s), contiguous(value_scales, false, s),
+       contiguous(astype(block_mapping, int64, s), false, s)});
+}
+
+array paged_attention_q8_0(
+    const array& q, const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_table, const array& context_lens,
+    float scale, int window, StreamOrDevice s) {
+  if (q.ndim() != 3 || !is_supported_float(q.dtype())) {
+    throw std::invalid_argument(
+        "paged_attention_q8_0: q must be float32, float16, or bfloat16 (batch, num_heads, head_size)");
+  }
+  validate_q8_0_planes(
+      key_codes, key_scales, value_codes, value_scales, "paged_attention_q8_0");
+  if (block_table.ndim() != 2 || block_table.shape(0) != q.shape(0) ||
+      context_lens.ndim() != 1 || context_lens.shape(0) != q.shape(0)) {
+    throw std::invalid_argument(
+        "paged_attention_q8_0: block_table must be (batch,max_blocks), context_lens (batch,)");
+  }
+  const int D = q.shape(2), H_KV = key_codes.shape(2);
+  if (key_codes.shape(3) != D || !(D == 64 || D == 128)) {
+    throw std::invalid_argument(
+        "paged_attention_q8_0: cache head_size must match q and be 64 or 128");
+  }
+  if (H_KV <= 0 || q.shape(1) % H_KV != 0) {
+    throw std::invalid_argument(
+        "paged_attention_q8_0: num_q_heads must be a positive multiple of num_kv_heads");
+  }
+  if (window < 0) {
+    throw std::invalid_argument("paged_attention_q8_0: window must be non-negative");
+  }
+  return array(
+      q.shape(), q.dtype(),
+      std::make_shared<PagedAttentionQ8_0>(to_stream(s), scale, window),
+      {contiguous(q, false, s), contiguous(key_codes, false, s),
+       contiguous(key_scales, false, s), contiguous(value_codes, false, s),
+       contiguous(value_scales, false, s),
+       contiguous(astype(block_table, int32, s), false, s),
+       contiguous(astype(context_lens, int32, s), false, s)});
 }
 
 std::vector<array> kv_cache_gather(
@@ -956,6 +1105,97 @@ void PagedAttentionFp8::eval_gpu(
       block_table.shape(1), scale, k_scale, v_scale, fmt_, window_, type_to_name(q));
 }
 
+void KvCacheScatterQ8_0::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheScatterQ8_0 has no CPU implementation.");
+}
+
+void KvCacheScatterQ8_0::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  const uint64_t code_n = static_cast<uint64_t>(outputs[0].size());
+  const uint64_t scale_n = static_cast<uint64_t>(outputs[1].size());
+  tk::launch_kv_cache_zero_q8_0(
+      enc, outputs[0], outputs[1], outputs[2], outputs[3], code_n, scale_n);
+  tk::launch_kv_cache_scatter_q8_0(
+      enc, inputs[0], inputs[1], inputs[2], outputs[0], outputs[1], outputs[2], outputs[3],
+      inputs[0].shape(0), inputs[0].shape(1), inputs[0].shape(2), block_size_,
+      type_to_name(inputs[0]));
+}
+
+void KvCacheGatherQ8_0::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheGatherQ8_0 has no CPU implementation.");
+}
+
+void KvCacheGatherQ8_0::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  outputs[0].set_data(allocator::malloc_or_wait(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc_or_wait(outputs[1].nbytes()));
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_kv_cache_gather_q8_0(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3], outputs[0], outputs[1],
+      inputs[4], inputs[5], num_tokens_, inputs[5].shape(0) - 1,
+      inputs[0].shape(1), inputs[4].shape(1), inputs[0].shape(2), inputs[0].shape(3),
+      type_to_name(outputs[0]));
+}
+
+void KvCacheCopyBlocksQ8_0::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("KvCacheCopyBlocksQ8_0 has no CPU implementation.");
+}
+
+void KvCacheCopyBlocksQ8_0::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  for (auto& output : outputs) {
+    output.set_data(allocator::malloc_or_wait(output.nbytes()));
+  }
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  const uint64_t code_n = static_cast<uint64_t>(inputs[0].size());
+  const uint64_t scale_n = static_cast<uint64_t>(inputs[1].size());
+  tk::launch_kv_cache_clone_q8_0(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3],
+      outputs[0], outputs[1], outputs[2], outputs[3], code_n, scale_n);
+  const int codes_per_block =
+      inputs[0].shape(1) * inputs[0].shape(2) * inputs[0].shape(3);
+  const int scales_per_block =
+      inputs[1].shape(1) * inputs[1].shape(2) * inputs[1].shape(3);
+  tk::launch_kv_cache_copy_blocks_q8_0(
+      enc, inputs[0], inputs[1], inputs[2], inputs[3],
+      outputs[0], outputs[1], outputs[2], outputs[3], inputs[4],
+      inputs[4].shape(0), codes_per_block, scales_per_block);
+}
+
+void PagedAttentionQ8_0::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("PagedAttentionQ8_0 has no CPU implementation.");
+}
+
+void PagedAttentionQ8_0::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& q = inputs[0];
+  auto& out = outputs[0];
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  const int D = q.shape(2);
+  const float scale = scale_ > 0.0f ? scale_ : 1.0f / std::sqrt(static_cast<float>(D));
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_paged_attention_q8_0(
+      enc, q, inputs[1], inputs[2], inputs[3], inputs[4], inputs[5], inputs[6], out,
+      q.shape(0), q.shape(1), inputs[1].shape(2), D, inputs[1].shape(1),
+      inputs[5].shape(1), scale, window_, type_to_name(q));
+}
+
 #define TK_KV_NO_AUTODIFF(CLASS, LABEL)                                      \
   std::vector<array> CLASS::jvp(                                             \
       const std::vector<array>&,                                             \
@@ -978,6 +1218,10 @@ void PagedAttentionFp8::eval_gpu(
 
 TK_KV_NO_AUTODIFF(KvCacheScatter, "KvCacheScatter")
 TK_KV_NO_AUTODIFF(KvCacheScatterFp8, "KvCacheScatterFp8")
+TK_KV_NO_AUTODIFF(KvCacheScatterQ8_0, "KvCacheScatterQ8_0")
+TK_KV_NO_AUTODIFF(KvCacheGatherQ8_0, "KvCacheGatherQ8_0")
+TK_KV_NO_AUTODIFF(KvCacheCopyBlocksQ8_0, "KvCacheCopyBlocksQ8_0")
+TK_KV_NO_AUTODIFF(PagedAttentionQ8_0, "PagedAttentionQ8_0")
 TK_KV_NO_AUTODIFF(PagedAttentionFp8, "PagedAttentionFp8")
 TK_KV_NO_AUTODIFF(KvCacheGather, "KvCacheGather")
 TK_KV_NO_AUTODIFF(KvCacheGatherFp8, "KvCacheGatherFp8")

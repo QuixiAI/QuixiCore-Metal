@@ -41,6 +41,38 @@ std::vector<array> quantize_per_token_int8_azp(const array& x, StreamOrDevice s 
 std::vector<array> quantize_per_tensor_fp8(const array& x, StreamOrDevice s = {});
 std::vector<array> quantize_per_tensor_int8(const array& x, StreamOrDevice s = {});
 
+/** Per-input-channel calibration absmax over x(tokens, channels), returned as
+ *  fp32 (channels,). If has_running is true, running(channels,) is merged with
+ *  max semantics. NaN propagates deterministically; either infinity maps to
+ *  +infinity. Repeated calls with running provide exact chunked accumulation. */
+array calibration_absmax(const array& x, const array& running, bool has_running,
+                         StreamOrDevice s = {});
+
+class CalibrationAbsmax : public Primitive {
+ public:
+  explicit CalibrationAbsmax(Stream stream, bool has_running)
+      : Primitive(stream), has_running_(has_running) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(
+      const std::vector<array>&, const std::vector<array>&,
+      const std::vector<int>&) override;
+  std::vector<array> vjp(
+      const std::vector<array>&, const std::vector<array>&,
+      const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "CalibrationAbsmax"; }
+  void print(std::ostream& os) override { os << "CalibrationAbsmax"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return has_running_ ==
+        static_cast<const CalibrationAbsmax&>(other).has_running_;
+  }
+
+ private:
+  bool has_running_;
+};
+
 class QuantizePerTensor : public Primitive {
  public:
   QuantizePerTensor(Stream stream, bool is_int8) : Primitive(stream), is_int8_(is_int8) {}

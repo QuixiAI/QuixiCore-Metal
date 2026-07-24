@@ -12,7 +12,7 @@ from tk import glu
 
 SHAPES = [(3, 1024), (2, 17, 4096), (1, 11008)]
 DTYPES = [mx.float32, mx.float16, mx.bfloat16]
-MODES = ["reglu", "geglu", "swiglu", "swiglu_oai", "geglu_erf", "geglu_quick"]
+MODES = ["reglu", "geglu", "swiglu", "swiglu_oai", "geglu_erf", "geglu_quick", "sigmoid"]
 
 
 def _gelu_tanh(x):
@@ -40,6 +40,8 @@ def _expected(x, gate, mode, alpha=1.0, limit=1.0e20):
         out = _gelu_erf(xf) * gf
     elif mode == "geglu_quick":
         out = (xf / (1.0 + mx.exp(-1.702 * xf))) * gf
+    elif mode == "sigmoid":
+        out = (1.0 / (1.0 + mx.exp(-xf))) * gf
     else:
         raise AssertionError(mode)
     return out.astype(x.dtype)

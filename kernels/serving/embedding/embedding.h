@@ -19,6 +19,12 @@ array embedding_lookup(
     float scale,
     StreamOrDevice s = {});
 
+/** Token + token-type embedding preparation. Invalid ids contribute zero. */
+array embedding_lookup_types(
+    const array& token_ids, const array& type_ids,
+    const array& token_table, const array& type_table,
+    float token_scale, StreamOrDevice s = {});
+
 /**
  *  Multimodal span merge: out[t] = src[t] >= 0 ? modal[src[t]] : text[t]. text (num_tok, D),
  *  modal (num_modal, D) same dtype, src (num_tok,) int (-1 = keep text, >=0 = modal row). Returns
@@ -159,6 +165,27 @@ class EmbeddingLookup : public Primitive {
  private:
   float scale_;
   bool use_pos_;
+};
+
+class EmbeddingLookupTypes : public Primitive {
+ public:
+  EmbeddingLookupTypes(Stream stream, float token_scale)
+      : Primitive(stream), token_scale_(token_scale) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "EmbeddingLookupTypes"; }
+  void print(std::ostream& os) override { os << "EmbeddingLookupTypes"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return token_scale_ == static_cast<const EmbeddingLookupTypes&>(other).token_scale_;
+  }
+ private:
+  float token_scale_;
 };
 
 class MergeMultimodalSpans : public Primitive {

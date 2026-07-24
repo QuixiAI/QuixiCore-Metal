@@ -596,12 +596,132 @@ def rotary_cases(be, preset, formats):
                    baselines=baselines, ref=ref, bytes_moved=2 * B * H * N * D * 2)
 
 
+@register("rotary_extended")
+def rotary_extended_cases(be, preset, formats):
+    """Explicit-position partial RoPE and three-axis M-RoPE."""
+    tk = be.tk()
+    rng = np.random.default_rng(106)
+    shapes = _pick(
+        preset,
+        [(1, 32, 512, 128, 64, False)],
+        [(1, 32, 2048, 128, 64, False),
+         (1, 16, 1024, 256, 128, False),
+         (1, 8, 512, 512, 128, True)],
+        [(1, 32, 2048, 128, 64, False), (4, 32, 2048, 128, 128, True),
+         (1, 16, 1024, 256, 128, False), (1, 8, 512, 512, 128, True)],
+    )
+    for B, H, N, D, rd, interleaved in shapes:
+        max_pos = 2 * N + 17
+        x = (0.5 * rng.standard_normal((B, H, N, D))).astype(np.float32)
+        inv = 10000.0 ** (-(np.arange(rd // 2, dtype=np.float32) * 2 / rd))
+        ang = np.arange(max_pos, dtype=np.float32)[:, None] * inv[None, :]
+        cos, sin = np.cos(ang), np.sin(ang)
+        positions = ((3 * np.arange(N, dtype=np.int32) + 5) % max_pos)
+        x_d, cos_d, sin_d = be.array(x, "bf16"), be.array(cos, "bf16"), be.array(sin, "bf16")
+        pos_d = be.int_array(positions)
+
+        if be.name == "mlx":
+            mx = be.mx
+
+            def composed(x=x_d, c=cos_d, s=sin_d, p=pos_d, r=rd, il=interleaved):
+                cc, ss = c[p][None, None], s[p][None, None]
+                if il:
+                    a, z = x[..., :r:2], x[..., 1:r:2]
+                    rot = mx.stack((a * cc - z * ss, a * ss + z * cc), axis=-1)
+                    rot = mx.reshape(rot, x.shape[:-1] + (r,))
+                else:
+                    h = r // 2
+                    a, z = x[..., :h], x[..., h:r]
+                    rot = mx.concatenate((a * cc - z * ss, a * ss + z * cc), axis=-1)
+                return mx.concatenate((rot, x[..., r:]), axis=-1) if r < D else rot
+        else:
+            torch = be.torch
+
+            def composed(x=x_d, c=cos_d, s=sin_d, p=pos_d, r=rd, il=interleaved):
+                cc, ss = c[p.long()][None, None], s[p.long()][None, None]
+                if il:
+                    a, z = x[..., :r:2], x[..., 1:r:2]
+                    rot = torch.stack((a * cc - z * ss, a * ss + z * cc), dim=-1).flatten(-2)
+                else:
+                    h = r // 2
+                    a, z = x[..., :h], x[..., h:r]
+                    rot = torch.cat((a * cc - z * ss, a * ss + z * cc), dim=-1)
+                return torch.cat((rot, x[..., r:]), dim=-1) if r < D else rot
+
+        xb = be.to_numpy(x_d).astype(np.float64)
+        cb, sb = be.to_numpy(cos_d).astype(np.float64), be.to_numpy(sin_d).astype(np.float64)
+        ref = xb.copy()
+        cc, ss = cb[positions][None, None], sb[positions][None, None]
+        if interleaved:
+            a, z = xb[..., :rd:2], xb[..., 1:rd:2]
+            ref[..., :rd:2], ref[..., 1:rd:2] = a * cc - z * ss, a * ss + z * cc
+        else:
+            rp = rd // 2
+            a, z = xb[..., :rp], xb[..., rp:rd]
+            ref[..., :rp], ref[..., rp:rd] = a * cc - z * ss, a * ss + z * cc
+        yield Case(
+            "rotary_extended",
+            f"positioned_B{B}H{H}N{N}D{D}R{rd}{'_il' if interleaved else ''}",
+            {"B": B, "H": H, "N": N, "D": D, "rotary_dim": rd}, "bf16",
+            fmt="positioned_interleaved" if interleaved else "positioned_split",
+            target=lambda x=x_d, c=cos_d, s=sin_d, p=pos_d, r=rd, il=interleaved:
+                tk.rotary_positioned(x, c, s, p, rotary_dim=r, interleaved=il),
+            baselines={"framework_gather_rotate_concat": composed}, ref=ref,
+            bytes_moved=2 * B * H * N * D * 2 + 2 * B * H * N * rd * 2)
+
+    # Qwen-style interleaved M-RoPE.  The framework baseline materializes the
+    # selected (position, frequency) table before applying one split-half rotate.
+    B, H, N, D = (1, 32, 512, 64) if preset == "smoke" else (1, 32, 2048, 64)
+    sections = (11, 11, 10)
+    rp = D // 2
+    max_pos = 3 * N + 7
+    x = (0.5 * rng.standard_normal((B, H, N, D))).astype(np.float32)
+    inv = 10000.0 ** (-(np.arange(rp, dtype=np.float32) * 2 / D))
+    ang = np.arange(max_pos, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang), np.sin(ang)
+    ar = np.arange(N, dtype=np.int32)
+    positions = np.stack((ar, 2 * ar + 1, 3 * ar + 2)) % max_pos
+    axes = np.arange(rp, dtype=np.int32) % 3
+    selected = positions[axes, :].T
+    pairs = np.broadcast_to(np.arange(rp, dtype=np.int32), (N, rp))
+    x_d, cos_d, sin_d = be.array(x, "bf16"), be.array(cos, "bf16"), be.array(sin, "bf16")
+    pos_d, selected_d, pairs_d = (be.int_array(positions), be.int_array(selected),
+                                   be.int_array(pairs))
+    if be.name == "mlx":
+        mx = be.mx
+
+        def mrope_composed(x=x_d, c=cos_d, s=sin_d, sp=selected_d, pi=pairs_d):
+            cc, ss = c[sp, pi][None, None], s[sp, pi][None, None]
+            a, z = x[..., :rp], x[..., rp:]
+            return mx.concatenate((a * cc - z * ss, a * ss + z * cc), axis=-1)
+    else:
+        torch = be.torch
+
+        def mrope_composed(x=x_d, c=cos_d, s=sin_d, sp=selected_d, pi=pairs_d):
+            cc, ss = c[sp.long(), pi.long()][None, None], s[sp.long(), pi.long()][None, None]
+            a, z = x[..., :rp], x[..., rp:]
+            return torch.cat((a * cc - z * ss, a * ss + z * cc), dim=-1)
+    xb = be.to_numpy(x_d).astype(np.float64)
+    cb, sb = be.to_numpy(cos_d).astype(np.float64), be.to_numpy(sin_d).astype(np.float64)
+    cc, ss = cb[selected, pairs][None, None], sb[selected, pairs][None, None]
+    a, z = xb[..., :rp], xb[..., rp:]
+    ref = np.concatenate((a * cc - z * ss, a * ss + z * cc), axis=-1)
+    yield Case(
+        "rotary_extended", f"mrope_il_B{B}H{H}N{N}D{D}",
+        {"B": B, "H": H, "N": N, "D": D, "rotary_dim": D}, "bf16", fmt="mrope_il",
+        target=lambda: tk.mrope(x_d, cos_d, sin_d, pos_d, sections,
+                                section_interleaved=True),
+        baselines={"framework_axis_gather_rotate": mrope_composed}, ref=ref,
+        bytes_moved=2 * B * H * N * D * 2 + 2 * B * H * N * D * 2)
+
+
 @register("glu")
 def glu_cases(be, preset, formats):
     tk = be.tk()
     rng = np.random.default_rng(7)
     modes = _pick(preset, ["swiglu"], ["swiglu", "geglu"],
-                  ["swiglu", "geglu", "reglu", "swiglu_oai", "geglu_erf", "geglu_quick"])
+                  ["swiglu", "geglu", "reglu", "swiglu_oai", "geglu_erf", "geglu_quick",
+                   "sigmoid"])
     shapes = _pick(preset, [(4096, 4096)], [(16384, 4096)], [(4096, 4096), (16384, 11008)])
     for mode in modes:
         for N, D in shapes:
@@ -616,6 +736,14 @@ def glu_cases(be, preset, formats):
             elif be.name == "torch" and mode == "swiglu":
                 F = be.torch.nn.functional
                 baselines["torch_silu_mul"] = lambda x_d=x_d, g_d=g_d: F.silu(x_d) * g_d
+            elif be.name == "mlx" and mode == "sigmoid":
+                mx = be.mx
+                baselines["mx_composed_sigmoid_mul"] = lambda x_d=x_d, g_d=g_d: \
+                    mx.sigmoid(x_d) * g_d
+            elif be.name == "torch" and mode == "sigmoid":
+                torch = be.torch
+                baselines["torch_sigmoid_mul"] = lambda x_d=x_d, g_d=g_d: \
+                    torch.sigmoid(x_d) * g_d
             yield Case("glu", f"{mode}_N{N}_D{D}", {"N": N, "D": D}, "bf16", fmt=mode,
                        target=lambda x_d=x_d, g_d=g_d, m=mode: tk.glu(x_d, g_d, mode=m),
                        baselines=baselines, ref=None, bytes_moved=3 * N * D * 2)
@@ -1135,6 +1263,455 @@ QGEMV_FMTS = {
 }
 
 
+@register("base_q")
+def base_q_cases(be, preset, formats):
+    """Canonical BaseQN decode/linear kernels versus decode-then-framework composition."""
+    from tk.base_q import dequantize_base_q, pack_base_q_codes
+
+    tk = be.tk()
+    rng = np.random.default_rng(367)
+    requested = formats or _pick(
+        preset,
+        ["q4"],
+        ["q3", "q4", "q6", "q8"],
+        ["q2", "q3", "q4", "q5", "q6", "q8"],
+    )
+    bits_values = []
+    for name in requested:
+        normalized = name.lower().replace("base_", "")
+        if normalized.startswith("q") and normalized[1:].isdigit():
+            bits = int(normalized[1:])
+        else:
+            continue
+        if bits in (2, 3, 4, 5, 6, 8):
+            bits_values.append(bits)
+    shapes = _pick(
+        preset,
+        [(4096, 4096, 1)],
+        [(4096, 4096, 1), (11008, 4096, 1),
+         (4096, 4096, 2), (4096, 4096, 8)],
+        [(4096, 4096, 1), (11008, 4096, 1), (4096, 11008, 1),
+         (4096, 4096, 8), (4096, 4096, 32)],
+    )
+    group_size = 32
+    for rows, inner, columns in shapes:
+        x = (0.25 * rng.standard_normal((inner, columns))).astype(np.float32)
+        x_d = be.array(x, "f16")
+        for bits in bits_values:
+            if inner * bits % 8:
+                continue
+            codes = rng.integers(0, 1 << bits, size=(rows, inner), dtype=np.uint8)
+            packed = pack_base_q_codes(codes, bits)
+            groups = inner // group_size
+            scales = (0.005 + 0.01 * rng.random((rows, groups))).astype(np.float16)
+            biases = (-0.04 + 0.08 * rng.random((rows, groups))).astype(np.float16)
+            decoded = dequantize_base_q(
+                packed, scales, biases, bits, group_size, "f16"
+            )
+            packed_d = be.raw_array(packed)
+            scales_d = be.array(scales, "f16")
+            biases_d = be.array(biases, "f16")
+            if be.name == "mlx":
+                compose = lambda packed_d=packed_d, scales_d=scales_d, biases_d=biases_d, x_d=x_d, bits=bits: be.mx.matmul(
+                    tk.base_qdequant(
+                        packed_d, scales_d, biases_d, bits, group_size, "f16",
+                        output_dtype="float16"),
+                    x_d)
+            else:
+                compose = lambda packed_d=packed_d, scales_d=scales_d, biases_d=biases_d, x_d=x_d, bits=bits: (
+                    tk.base_qdequant(
+                        packed_d, scales_d, biases_d, bits, group_size, "f16",
+                        output_dtype="float16") @ x_d)
+            operation = "gemv" if columns == 1 else "gemm"
+            if columns == 1:
+                target = lambda packed_d=packed_d, scales_d=scales_d, biases_d=biases_d, x_d=x_d, bits=bits: tk.base_qgemv(
+                    packed_d, scales_d, biases_d, x_d, bits, group_size, "f16")
+            else:
+                target = lambda packed_d=packed_d, scales_d=scales_d, biases_d=biases_d, x_d=x_d, bits=bits: tk.base_qgemm(
+                    packed_d, scales_d, biases_d, x_d, bits, group_size, "f16")
+            ref = (decoded.astype(np.float64) @ be.to_numpy(x_d).astype(np.float64))
+            yield Case(
+                "base_q", f"{operation}_q{bits}_N{rows}_K{inner}_M{columns}",
+                {"N": rows, "K": inner, "M": columns}, "f16", fmt=f"base_q{bits}",
+                target=target, baselines={"dequant_then_matmul": compose}, ref=ref,
+                weight_bytes=float(packed.nbytes + scales.nbytes + biases.nbytes),
+                flops=float(2 * rows * inner * columns),
+                notes="BaseQN separate-plane asymmetric F16-scale contract",
+            )
+
+
+@register("base_q_fused")
+def base_q_fused_cases(be, preset, formats):
+    """Fused BaseQN consumer kernels versus composing standalone BaseQN GEMVs."""
+    from tk.base_q import dequantize_base_q, pack_base_q_codes
+
+    tk = be.tk()
+    group_size = 32
+    requested = formats or _pick(
+        preset, ["q4"], ["q4"], ["q3", "q4", "q6", "q8"],
+    )
+    bits_values = []
+    for name in requested:
+        normalized = name.lower().replace("base_", "")
+        if normalized.startswith("q") and normalized[1:].isdigit():
+            bits = int(normalized[1:])
+            if bits in (2, 3, 4, 5, 6, 8):
+                bits_values.append(bits)
+
+    qkv_shapes = _pick(
+        preset,
+        [(768, 256, 768)],
+        [(768, 256, 768), (1024, 256, 1024), (1024, 256, 2048),
+         (4096, 1024, 4096)],
+        [(768, 256, 768), (1024, 256, 1024), (1024, 256, 2048),
+         (4096, 1024, 4096), (4096, 512, 4096)],
+    )
+    swiglu_shapes = _pick(
+        preset,
+        [(1152, 768)],
+        [(1152, 768), (11008, 4096)],
+        [(1152, 768), (8192, 4096), (11008, 4096)],
+    )
+    lm_head_shapes = _pick(
+        preset,
+        [(4096, 768, 1)],
+        [(4096, 768, 1), (32000, 4096, 1), (32000, 4096, 2),
+         (32000, 4096, 4)],
+        [(4096, 768, 1), (32000, 4096, 1), (32000, 4096, 2),
+         (32000, 4096, 4),
+         (128256, 4096, 1)],
+    )
+
+    def make_plane(rows, inner, bits, seed, x):
+        rng = np.random.default_rng(seed)
+        codes = rng.integers(0, 1 << bits, size=(rows, inner), dtype=np.uint8)
+        packed = pack_base_q_codes(codes, bits)
+        groups = inner // group_size
+        scales = (0.005 + 0.01 * rng.random((rows, groups))).astype(np.float16)
+        biases = (-0.04 + 0.08 * rng.random((rows, groups))).astype(np.float16)
+        decoded = dequantize_base_q(
+            packed, scales, biases, bits, group_size, "f16",
+        )
+        projection = decoded @ x
+        return (
+            be.raw_array(packed), be.array(scales, "f16"),
+            be.array(biases, "f16"), projection,
+            float(packed.nbytes + scales.nbytes + biases.nbytes),
+        )
+
+    for bits in bits_values:
+        for nq, nkv, inner in qkv_shapes:
+            rng = np.random.default_rng(9000 + bits + inner)
+            x = (0.25 * rng.standard_normal((inner, 1))).astype(np.float16)
+            x_d = be.array(x, "f16")
+            q = make_plane(nq, inner, bits, 100 + bits, x)
+            k = make_plane(nkv, inner, bits, 200 + bits, x)
+            v = make_plane(nkv, inner, bits, 300 + bits, x)
+
+            def qkv_target(q=q, k=k, v=v, x_d=x_d, bits=bits):
+                return tk.base_qgemv_qkv(
+                    q[0], q[1], q[2], k[0], k[1], k[2],
+                    v[0], v[1], v[2], x_d, bits, group_size, "f16",
+                )
+
+            def qkv_composed(q=q, k=k, v=v, x_d=x_d, bits=bits):
+                return tuple(
+                    tk.base_qgemv(p[0], p[1], p[2], x_d, bits, group_size, "f16")
+                    for p in (q, k, v)
+                )
+
+            yield Case(
+                "base_q_fused", f"qkv_q{bits}_Nq{nq}_Nkv{nkv}_K{inner}",
+                {"Nq": nq, "Nkv": nkv, "K": inner, "M": 1}, "f16",
+                fmt=f"base_q{bits}", target=qkv_target,
+                baselines={"base_qgemv x3": qkv_composed},
+                ref=np.concatenate([q[3], k[3], v[3]]),
+                out_to_numpy=lambda out: np.concatenate([be.to_numpy(value) for value in out]),
+                weight_bytes=q[4] + k[4] + v[4],
+                flops=float(2 * (nq + 2 * nkv) * inner),
+                notes=("one-grid BaseQN Q/K/V projection"
+                       if inner <= 1024
+                       else "three direct GEMV operations behind the BaseQN Q/K/V contract")
+                      + "; no graph or engine state",
+            )
+
+        for rows, inner in swiglu_shapes:
+            rng = np.random.default_rng(10000 + bits + inner)
+            x = (0.25 * rng.standard_normal((inner, 1))).astype(np.float16)
+            x_d = be.array(x, "f16")
+            gate = make_plane(rows, inner, bits, 400 + bits, x)
+            up = make_plane(rows, inner, bits, 500 + bits, x)
+            gate_ref = gate[3].astype(np.float32)
+            up_ref = up[3].astype(np.float32)
+            ref = (gate_ref / (1.0 + np.exp(-gate_ref))) * up_ref
+
+            def swiglu_target(gate=gate, up=up, x_d=x_d, bits=bits):
+                return tk.base_qgemv_swiglu(
+                    gate[0], gate[1], gate[2], up[0], up[1], up[2],
+                    x_d, bits, group_size, "f16",
+                )
+
+            if be.name == "mlx":
+                def swiglu_composed(gate=gate, up=up, x_d=x_d, bits=bits):
+                    gate_out = tk.base_qgemv(
+                        gate[0], gate[1], gate[2], x_d, bits, group_size, "f16")
+                    up_out = tk.base_qgemv(
+                        up[0], up[1], up[2], x_d, bits, group_size, "f16")
+                    return gate_out * be.mx.sigmoid(gate_out) * up_out
+            else:
+                def swiglu_composed(gate=gate, up=up, x_d=x_d, bits=bits):
+                    gate_out = tk.base_qgemv(
+                        gate[0], gate[1], gate[2], x_d, bits, group_size, "f16")
+                    up_out = tk.base_qgemv(
+                        up[0], up[1], up[2], x_d, bits, group_size, "f16")
+                    return gate_out * be.torch.sigmoid(gate_out) * up_out
+
+            yield Case(
+                "base_q_fused", f"swiglu_q{bits}_N{rows}_K{inner}",
+                {"N": rows, "K": inner, "M": 1}, "f16",
+                fmt=f"base_q{bits}", target=swiglu_target,
+                baselines={"base_qgemv x2 + silu/mul": swiglu_composed}, ref=ref,
+                weight_bytes=gate[4] + up[4], flops=float(4 * rows * inner),
+                notes="one-launch BaseQN gate/up projection with SwiGLU epilogue",
+            )
+
+        for vocab, inner, batch in lm_head_shapes:
+            rng = np.random.default_rng(11000 + bits + inner + batch)
+            x = (0.25 * rng.standard_normal((inner, batch))).astype(np.float16)
+            x_d = be.array(x, "f16")
+            weights = make_plane(vocab, inner, bits, 600 + bits, x)
+
+            def lm_target(weights=weights, x_d=x_d, bits=bits):
+                return tk.base_qlm_head_argmax(
+                    weights[0], weights[1], weights[2], x_d, bits,
+                    group_size, "f16",
+                )
+
+            if be.name == "mlx":
+                def lm_composed(weights=weights, x_d=x_d, bits=bits):
+                    logits = tk.base_qgemm(
+                        weights[0], weights[1], weights[2], x_d, bits,
+                        group_size, "f16")
+                    return tk.argmax_sample(be.mx.transpose(logits))
+
+                def lm_columnwise(weights=weights, x_d=x_d, bits=bits, batch=batch):
+                    logits = be.mx.concatenate([
+                        tk.base_qgemv(
+                            weights[0], weights[1], weights[2], x_d[:, i:i + 1],
+                            bits, group_size, "f16")
+                        for i in range(batch)
+                    ], axis=1)
+                    return tk.argmax_sample(be.mx.transpose(logits))
+            else:
+                def lm_composed(weights=weights, x_d=x_d, bits=bits):
+                    logits = tk.base_qgemm(
+                        weights[0], weights[1], weights[2], x_d, bits,
+                        group_size, "f16")
+                    return be.torch.argmax(logits, dim=0)
+
+                def lm_columnwise(weights=weights, x_d=x_d, bits=bits, batch=batch):
+                    logits = be.torch.cat([
+                        tk.base_qgemv(
+                            weights[0], weights[1], weights[2], x_d[:, i:i + 1],
+                            bits, group_size, "f16")
+                        for i in range(batch)
+                    ], dim=1)
+                    return be.torch.argmax(logits, dim=0)
+
+            yield Case(
+                "base_q_fused", f"lm_head_argmax_q{bits}_V{vocab}_K{inner}_B{batch}",
+                {"V": vocab, "K": inner, "B": batch}, "f16",
+                fmt=f"base_q{bits}", target=lm_target,
+                baselines={"base_qgemm + argmax": lm_composed,
+                           "columnwise base_qgemv + argmax": lm_columnwise},
+                ref=np.argmax(weights[3].astype(x.dtype), axis=0).astype(np.int32),
+                weight_bytes=weights[4] * batch,
+                flops=float(2 * vocab * inner * batch),
+                notes="measured columnwise direct BaseQN GEMV composition plus argmax",
+            )
+
+
+@register("base_q_moe")
+def base_q_moe_cases(be, preset, formats):
+    """Canonical BaseQN expert stacks on QuixiCore's padded grouped schedule."""
+    from tk.base_q import dequantize_base_q, pack_base_q_codes
+
+    tk = be.tk()
+    group_size = 32
+    requested = formats or _pick(
+        preset, ["q4"], ["q4"], ["q3", "q4", "q6", "q8"],
+    )
+    bits_values = []
+    for name in requested:
+        normalized = name.lower().replace("base_", "")
+        if normalized.startswith("q") and normalized[1:].isdigit():
+            bits = int(normalized[1:])
+            if bits in (2, 3, 4, 5, 6, 8):
+                bits_values.append(bits)
+
+    shapes = _pick(
+        preset,
+        [(4, 128, 1024, 1024)],
+        [(4, 128, 1024, 1024), (8, 256, 2048, 2048)],
+        [(4, 128, 1024, 1024), (8, 256, 2048, 2048),
+         (8, 256, 4096, 4096)],
+    )
+
+    def make_stack(experts, output_rows, inner, bits, seed):
+        rng = np.random.default_rng(seed)
+        lanes = rng.integers(
+            0, 1 << bits, size=(experts, output_rows, inner), dtype=np.uint8)
+        packed = pack_base_q_codes(lanes, bits)
+        groups = inner // group_size
+        scales = (
+            0.002 + 0.004 * rng.random((experts, output_rows, groups))
+        ).astype(np.float16)
+        biases = (
+            -0.02 + 0.04 * rng.random((experts, output_rows, groups))
+        ).astype(np.float16)
+        decoded = dequantize_base_q(
+            packed, scales, biases, bits, group_size, "f16",
+        )
+        return (
+            be.raw_array(packed), be.array(scales, "f16"),
+            be.array(biases, "f16"), decoded,
+            float(packed.nbytes + scales.nbytes + biases.nbytes),
+        )
+
+    for bits in bits_values:
+        for experts, total_rows, inner, output_rows in shapes:
+            rng = np.random.default_rng(
+                16000 + bits + experts + total_rows + inner + output_rows)
+            activations = (
+                0.2 * rng.standard_normal((total_rows, inner))
+            ).astype(np.float32)
+            expert_of_tile = (
+                np.arange(total_rows // 32, dtype=np.int32) % experts
+            )
+            input_d = be.array(activations, "bf16")
+            expert_d = be.raw_array(expert_of_tile)
+            weights = make_stack(
+                experts, output_rows, inner, bits, 17000 + bits + inner)
+
+            def rect_target(weights=weights, input_d=input_d,
+                            expert_d=expert_d, bits=bits):
+                return tk.base_qmoe_gemm(
+                    weights[0], weights[1], weights[2], input_d, expert_d,
+                    bits, group_size, "f16",
+                )
+
+            if be.name == "mlx":
+                def rect_composed(weights=weights, input_d=input_d,
+                                  expert_d=expert_d, experts=experts,
+                                  output_rows=output_rows, inner=inner,
+                                  bits=bits):
+                    dense = tk.base_qdequant(
+                        be.mx.reshape(weights[0], (experts * output_rows, -1)),
+                        be.mx.reshape(weights[1], (experts * output_rows, -1)),
+                        be.mx.reshape(weights[2], (experts * output_rows, -1)),
+                        bits, group_size, "f16", output_dtype="bfloat16",
+                    )
+                    dense = be.mx.transpose(
+                        be.mx.reshape(dense, (experts, output_rows, inner)),
+                        (0, 2, 1),
+                    )
+                    return tk.moe_grouped_gemm_rect(input_d, dense, expert_d)
+            else:
+                def rect_composed(weights=weights, input_d=input_d,
+                                  expert_d=expert_d, experts=experts,
+                                  output_rows=output_rows, inner=inner,
+                                  bits=bits):
+                    dense = tk.base_qdequant(
+                        weights[0].reshape(experts * output_rows, -1),
+                        weights[1].reshape(experts * output_rows, -1),
+                        weights[2].reshape(experts * output_rows, -1),
+                        bits, group_size, "f16", output_dtype="bfloat16",
+                    )
+                    dense = dense.reshape(
+                        experts, output_rows, inner).transpose(1, 2)
+                    return tk.moe_grouped_gemm_rect(input_d, dense, expert_d)
+
+            ref = np.empty((total_rows, output_rows), np.float32)
+            rounded_input = be.to_numpy(input_d).astype(np.float32)
+            for tile, expert in enumerate(expert_of_tile):
+                rows = slice(tile * 32, (tile + 1) * 32)
+                ref[rows] = rounded_input[rows] @ weights[3][expert].T
+
+            yield Case(
+                "base_q_moe",
+                f"rect_q{bits}_E{experts}_R{total_rows}_K{inner}_N{output_rows}",
+                {"E": experts, "R": total_rows, "K": inner, "N": output_rows},
+                "bf16", fmt=f"base_q{bits}", target=rect_target,
+                baselines={"dequant expert stack + dense grouped GEMM": rect_composed},
+                ref=ref, weight_bytes=weights[4],
+                flops=float(2 * total_rows * inner * output_rows),
+                notes="direct BaseQN register-tile decode on the padded expert schedule",
+            )
+
+            swiglu_weights = make_stack(
+                experts, 2 * output_rows, inner, bits,
+                18000 + bits + inner,
+            )
+
+            def swiglu_target(weights=swiglu_weights, input_d=input_d,
+                              expert_d=expert_d, bits=bits):
+                return tk.base_qmoe_swiglu(
+                    weights[0], weights[1], weights[2], input_d, expert_d,
+                    bits, group_size, "f16",
+                )
+
+            if be.name == "mlx":
+                def swiglu_composed(weights=swiglu_weights, input_d=input_d,
+                                    expert_d=expert_d, experts=experts,
+                                    output_rows=output_rows, inner=inner,
+                                    bits=bits):
+                    packed_rows = 2 * output_rows
+                    dense = tk.base_qdequant(
+                        be.mx.reshape(weights[0], (experts * packed_rows, -1)),
+                        be.mx.reshape(weights[1], (experts * packed_rows, -1)),
+                        be.mx.reshape(weights[2], (experts * packed_rows, -1)),
+                        bits, group_size, "f16", output_dtype="bfloat16",
+                    )
+                    dense = be.mx.transpose(
+                        be.mx.reshape(dense, (experts, packed_rows, inner)),
+                        (0, 2, 1),
+                    )
+                    return tk.moe_grouped_gemm_swiglu(input_d, dense, expert_d)
+            else:
+                def swiglu_composed(weights=swiglu_weights, input_d=input_d,
+                                    expert_d=expert_d, experts=experts,
+                                    output_rows=output_rows, inner=inner,
+                                    bits=bits):
+                    packed_rows = 2 * output_rows
+                    dense = tk.base_qdequant(
+                        weights[0].reshape(experts * packed_rows, -1),
+                        weights[1].reshape(experts * packed_rows, -1),
+                        weights[2].reshape(experts * packed_rows, -1),
+                        bits, group_size, "f16", output_dtype="bfloat16",
+                    )
+                    dense = dense.reshape(
+                        experts, packed_rows, inner).transpose(1, 2)
+                    return tk.moe_grouped_gemm_swiglu(input_d, dense, expert_d)
+
+            swiglu_ref = np.empty((total_rows, output_rows), np.float32)
+            for tile, expert in enumerate(expert_of_tile):
+                rows = slice(tile * 32, (tile + 1) * 32)
+                logits = rounded_input[rows] @ swiglu_weights[3][expert].T
+                gate, up = np.split(logits, 2, axis=1)
+                swiglu_ref[rows] = (gate / (1.0 + np.exp(-gate))) * up
+
+            yield Case(
+                "base_q_moe",
+                f"swiglu_q{bits}_E{experts}_R{total_rows}_K{inner}_I{output_rows}",
+                {"E": experts, "R": total_rows, "K": inner, "I": output_rows},
+                "bf16", fmt=f"base_q{bits}", target=swiglu_target,
+                baselines={"dequant expert stack + dense grouped SwiGLU": swiglu_composed},
+                ref=swiglu_ref, weight_bytes=swiglu_weights[4],
+                flops=float(4 * total_rows * inner * output_rows),
+                notes="direct BaseQN gate/up decode with an in-register SwiGLU epilogue",
+            )
+
+
 @register("qgemv")
 def qgemv_cases(be, preset, formats):
     tk = be.tk()
@@ -1593,6 +2170,117 @@ def kv_scatter_fp8_cases(be, preset, formats):
                        bytes_moved=float(2 * T * H * D * 2 + 2 * T * H * D))
 
 
+@register("kv_q8_0")
+def kv_q8_0_cases(be, preset, formats):
+    """QuixiCore Q8_0 codec. Persistent cache bytes are 53.125% of BF16:
+    one int8 code/value plus one FP16 scale per 32 values."""
+    tk = be.tk()
+    rng = np.random.default_rng(740)
+    shapes = _pick(
+        preset, [(512, 8, 64)],
+        [(1, 8, 64), (512, 8, 64), (512, 8, 128)],
+        [(1, 8, 64), (1, 8, 128), (512, 8, 64), (512, 8, 128),
+         (4096, 8, 64), (4096, 8, 128)])
+    for T, H, D in shapes:
+        bs = 16
+        nb = (T + bs - 1) // bs
+        key = (0.3 * rng.standard_normal((T, H, D))).astype(np.float32)
+        value = (0.3 * rng.standard_normal((T, H, D))).astype(np.float32)
+        key_d, value_d = be.array(key, "bf16"), be.array(value, "bf16")
+        slots_d = be.int_array(np.arange(T, dtype=np.int64))
+        q8_planes = tk.kv_cache_scatter_q8_0(key_d, value_d, slots_d, nb, bs)
+        f16_planes = tk.kv_cache_scatter(key_d, value_d, slots_d, nb, bs)
+        scatter_bf16 = lambda key_d=key_d, value_d=value_d, slots_d=slots_d, nb=nb, bs=bs: \
+            tk.kv_cache_scatter(key_d, value_d, slots_d, nb, bs)[0]
+        yield Case(
+            "kv_q8_0", f"scatter_T{T}_H{H}_D{D}", {"T": T, "H": H, "D": D},
+            "bf16", fmt="q8_0_kv",
+            target=lambda key_d=key_d, value_d=value_d, slots_d=slots_d, nb=nb, bs=bs:
+                tk.kv_cache_scatter_q8_0(key_d, value_d, slots_d, nb, bs)[0],
+            baselines={"tk.kv_cache_scatter_bf16": scatter_bf16}, ref=None,
+            bytes_moved=float(T * H * D * (4.0 + 2.0 + 4.0 / 32.0)),
+            notes="safe-fp Q8_0 encode; codes use fp32 delta, stored scale is fp16")
+
+        bt = be.int_array(np.arange(nb, dtype=np.int32).reshape(1, nb))
+        cu = be.int_array(np.array([0, T], np.int32))
+        yield Case(
+            "kv_q8_0", f"gather_T{T}_H{H}_D{D}", {"T": T, "H": H, "D": D},
+            "bf16", fmt="q8_0_kv",
+            target=lambda p=q8_planes, bt=bt, cu=cu, T=T:
+                tk.kv_cache_gather_q8_0(*p, bt, cu, T)[0],
+            baselines={"tk.kv_cache_gather_bf16":
+                       (lambda p=f16_planes, bt=bt, cu=cu, T=T:
+                        tk.kv_cache_gather(*p, bt, cu, T)[0])},
+            ref=None, bytes_moved=float(T * H * D * (2.0 + 4.0 / 32.0 + 4.0)),
+            notes="Q8_0 read+BF16 write; baseline is BF16 read+BF16 write")
+
+
+@register("paged_attn_q8_0")
+def paged_attn_q8_0_cases(be, preset, formats):
+    """Direct Q8_0 paged decode versus BF16 paged decode and an explicitly
+    unfused Q8_0 gather + framework SDPA composition."""
+    tk = be.tk()
+    rng = np.random.default_rng(741)
+    shapes = _pick(
+        preset, [(4, 16, 4, 64, 512)],
+        [(4, 32, 8, 64, 512), (8, 32, 8, 128, 2048)],
+        [(4, 32, 8, 64, 512), (8, 32, 8, 64, 2048),
+         (8, 32, 8, 128, 2048), (16, 32, 8, 128, 4096)])
+    for B, H, H_KV, D, ctx in shapes:
+        bs = 16
+        blocks_per_seq = (ctx + bs - 1) // bs
+        nb = B * blocks_per_seq
+        total = B * ctx
+        key = (0.2 * rng.standard_normal((total, H_KV, D))).astype(np.float32)
+        value = (0.2 * rng.standard_normal((total, H_KV, D))).astype(np.float32)
+        q = (0.2 * rng.standard_normal((B, H, D))).astype(np.float32)
+        key_d, value_d = be.array(key, "bf16"), be.array(value, "bf16")
+        q_d = be.array(q, "bf16")
+        slots = be.int_array(np.arange(total, dtype=np.int64))
+        bt_np = np.arange(nb, dtype=np.int32).reshape(B, blocks_per_seq)
+        bt, cl = be.int_array(bt_np), be.int_array(np.full(B, ctx, np.int32))
+        cu = be.int_array(np.arange(B + 1, dtype=np.int32) * ctx)
+        q8 = tk.kv_cache_scatter_q8_0(key_d, value_d, slots, nb, bs)
+        bf16 = tk.kv_cache_scatter(key_d, value_d, slots, nb, bs)
+        direct = lambda q_d=q_d, q8=q8, bt=bt, cl=cl: \
+            tk.paged_attention_q8_0(q_d, *q8, bt, cl)
+        bf16_decode = lambda q_d=q_d, bf16=bf16, bt=bt, cl=cl: \
+            tk.paged_attention(q_d, *bf16, bt, cl)
+
+        if be.name == "mlx":
+            mx = be.mx
+            def unfused(q8=q8, bt=bt, cu=cu, total=total, B=B, ctx=ctx,
+                        H=H, H_KV=H_KV, D=D, q_d=q_d):
+                kg, vg = tk.kv_cache_gather_q8_0(*q8, bt, cu, total)
+                kg = mx.transpose(mx.reshape(kg, (B, ctx, H_KV, D)), (0, 2, 1, 3))
+                vg = mx.transpose(mx.reshape(vg, (B, ctx, H_KV, D)), (0, 2, 1, 3))
+                kg = mx.repeat(kg, H // H_KV, axis=1)
+                vg = mx.repeat(vg, H // H_KV, axis=1)
+                return mx.fast.scaled_dot_product_attention(
+                    q_d[:, :, None, :], kg, vg, scale=1.0 / math.sqrt(D), mask=None)[:, :, 0, :]
+        else:
+            F = be.torch.nn.functional
+            def unfused(q8=q8, bt=bt, cu=cu, total=total, B=B, ctx=ctx,
+                        H=H, H_KV=H_KV, D=D, q_d=q_d):
+                kg, vg = tk.kv_cache_gather_q8_0(*q8, bt, cu, total)
+                kg = kg.reshape(B, ctx, H_KV, D).permute(0, 2, 1, 3)
+                vg = vg.reshape(B, ctx, H_KV, D).permute(0, 2, 1, 3)
+                kg = kg.repeat_interleave(H // H_KV, dim=1)
+                vg = vg.repeat_interleave(H // H_KV, dim=1)
+                return F.scaled_dot_product_attention(
+                    q_d[:, :, None, :], kg, vg, scale=1.0 / math.sqrt(D))[:, :, 0, :]
+
+        q8_bytes = 2.0 * B * ctx * H_KV * D * (1.0 + 2.0 / 32.0)
+        yield Case(
+            "paged_attn_q8_0", f"B{B}_H{H}_HKV{H_KV}_D{D}_ctx{ctx}",
+            {"B": B, "H": H, "H_KV": H_KV, "D": D, "ctx": ctx},
+            "bf16", fmt="q8_0_kv", target=direct,
+            baselines={"tk.paged_attention_bf16": bf16_decode,
+                       "q8_gather_plus_framework_sdpa": unfused},
+            ref=None, bytes_moved=q8_bytes,
+            notes="direct dequant-on-read; separate code/FP16-scale planes")
+
+
 @register("paged_attn")
 def paged_attn_cases(be, preset, formats):
     tk = be.tk()
@@ -1731,6 +2419,7 @@ def logit_transform_cases(be, preset, formats):
         prev_d, lens_d, brk_d = be.int_array(prev), be.int_array(lens), be.int_array(brk)
         for name, thunk in [
             ("quadratic", lambda x_d=x_d: tk.quadratic_transform(x_d, 0.3, 1.5)),
+            ("softcap", lambda x_d=x_d: tk.logits_softcap(x_d, 30.0)),
             ("nsigma", lambda x_d=x_d: tk.top_nsigma_mask(x_d, 1.5)),
             ("top_a", lambda x_d=x_d: tk.top_a_mask(x_d, 0.2)),
             ("eta", lambda x_d=x_d: tk.eta_cutoff_mask(x_d, 2e-3)),
@@ -2040,6 +2729,194 @@ def gdn_cases(be, preset, formats):
                    flops=2.0 * T * Hv * (2 * Dv * Dk + Dv * Dk))
 
 
+@register("gdn_io")
+def gdn_io_cases(be, preset, formats):
+    """Gated DeltaNet projection preparation and output epilogues.
+
+    The short-convolution comparison isolates the meaningful candidate factor:
+    applying SiLU in the convolution kernel rather than materializing its raw
+    output and launching a framework elementwise expression.
+    """
+    tk = be.tk()
+    rng = np.random.default_rng(133)
+    eps = 1e-6
+
+    conv_shapes = _pick(
+        preset,
+        [([1] * 8, 1024, 4)],
+        [([1] * 64, 8192, 4), ([512] * 2, 8192, 4)],
+        [([1] * 64, 8192, 4), ([512] * 2, 8192, 4), ([2048], 8192, 4)],
+    )
+    for lens, channels, kernel_size in conv_shapes:
+        tokens, requests = sum(lens), len(lens)
+        x = (0.25 * rng.standard_normal((tokens, channels))).astype(np.float32)
+        weight = (0.20 * rng.standard_normal((channels, kernel_size))).astype(np.float32)
+        state = (0.05 * rng.standard_normal(
+            (requests, channels, kernel_size - 1))).astype(np.float32)
+        cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        slots = np.arange(requests, dtype=np.int32)
+        x_d, weight_d = be.array(x, "bf16"), be.array(weight, "bf16")
+        state_d = be.array(state, "f32")
+        cu_d, slots_d = be.int_array(cu), be.int_array(slots)
+
+        if be.name == "mlx":
+            mx = be.mx
+
+            def unfused_conv(x_d=x_d, weight_d=weight_d, state_d=state_d,
+                             cu_d=cu_d, slots_d=slots_d):
+                raw = tk.gdn_short_conv(
+                    x_d, weight_d, state_d, cu_d, slots_d, apply_silu=False)[0]
+                return raw * mx.sigmoid(raw)
+        else:
+            torch = be.torch
+
+            def unfused_conv(x_d=x_d, weight_d=weight_d, state_d=state_d,
+                             cu_d=cu_d, slots_d=slots_d):
+                raw = tk.gdn_short_conv(
+                    x_d, weight_d, state_d, cu_d, slots_d, apply_silu=False)[0]
+                return raw * torch.sigmoid(raw)
+
+        label = f"short_conv_R{requests}_L{lens[0]}_C{channels}_K{kernel_size}"
+        yield Case(
+            "gdn_io", label,
+            {"R": requests, "L": lens[0], "C": channels, "K": kernel_size},
+            "bf16", fmt="short_conv_silu",
+            target=lambda x_d=x_d, weight_d=weight_d, state_d=state_d,
+                          cu_d=cu_d, slots_d=slots_d: tk.gdn_short_conv(
+                              x_d, weight_d, state_d, cu_d, slots_d)[0],
+            baselines={"unfused_conv_then_silu": unfused_conv}, ref=None,
+            bytes_moved=(2 * tokens * channels * 2 + channels * kernel_size * 2 +
+                         2 * requests * channels * (kernel_size - 1) * 4),
+        )
+
+    qkv_shapes = _pick(
+        preset,
+        [(8, 2, 4, 64, 64)],
+        [(64, 16, 32, 128, 128), (1024, 16, 32, 128, 128)],
+        [(64, 16, 32, 128, 128), (1024, 16, 32, 128, 128),
+         (2048, 16, 32, 128, 128)],
+    )
+    for tokens, Hk, Hv, Dk, Dv in qkv_shapes:
+        channels = 2 * Hk * Dk + Hv * Dv
+        mixed = (0.35 * rng.standard_normal((tokens, channels))).astype(np.float32)
+        mixed_d = be.array(mixed, "bf16")
+        q_width = Hk * Dk
+        q_scale, k_scale = 1.0 / Dk, 1.0 / math.sqrt(Dk)
+
+        if be.name == "mlx":
+            mx = be.mx
+
+            def composed_qkv(m=mixed_d, tokens=tokens, Hk=Hk, Hv=Hv, Dk=Dk,
+                             Dv=Dv, q_width=q_width, q_scale=q_scale,
+                             k_scale=k_scale):
+                q0 = m[:, :q_width].reshape(tokens, Hk, Dk)
+                k0 = m[:, q_width:2 * q_width].reshape(tokens, Hk, Dk)
+                v0 = m[:, 2 * q_width:].reshape(tokens, Hv, Dv)
+                q = q0 * mx.rsqrt(mx.mean(q0 * q0, axis=-1, keepdims=True) + eps) * q_scale
+                k = k0 * mx.rsqrt(mx.mean(k0 * k0, axis=-1, keepdims=True) + eps) * k_scale
+                return q, k, v0
+        else:
+            torch = be.torch
+
+            def composed_qkv(m=mixed_d, tokens=tokens, Hk=Hk, Hv=Hv, Dk=Dk,
+                             Dv=Dv, q_width=q_width, q_scale=q_scale,
+                             k_scale=k_scale):
+                q0 = m[:, :q_width].reshape(tokens, Hk, Dk)
+                k0 = m[:, q_width:2 * q_width].reshape(tokens, Hk, Dk)
+                v0 = m[:, 2 * q_width:].reshape(tokens, Hv, Dv)
+                q = q0 * torch.rsqrt(torch.mean(q0 * q0, dim=-1, keepdim=True) + eps) * q_scale
+                k = k0 * torch.rsqrt(torch.mean(k0 * k0, dim=-1, keepdim=True) + eps) * k_scale
+                return q, k, v0
+
+        yield Case(
+            "gdn_io", f"qkv_T{tokens}_Hk{Hk}_Hv{Hv}_D{Dk}",
+            {"T": tokens, "Hk": Hk, "Hv": Hv, "Dk": Dk, "Dv": Dv},
+            "bf16", fmt="qkv_prepare",
+            target=lambda m=mixed_d, Hk=Hk, Hv=Hv, Dk=Dk, Dv=Dv:
+                tk.gdn_qkv_prepare(m, Hk, Hv, Dk, Dv),
+            baselines={"framework_split_rmsnorm": composed_qkv}, ref=None,
+            bytes_moved=2 * tokens * channels * 2,
+        )
+
+    control_shapes = _pick(preset, [(8, 4)], [(64, 32), (1024, 32)],
+                           [(64, 32), (1024, 32), (4096, 32)])
+    for tokens, heads in control_shapes:
+        a = (0.5 * rng.standard_normal((tokens, heads))).astype(np.float32)
+        b = (0.5 * rng.standard_normal((tokens, heads))).astype(np.float32)
+        A_log = rng.uniform(-1.0, 0.5, heads).astype(np.float32)
+        dt_bias = rng.uniform(-0.5, 0.5, heads).astype(np.float32)
+        a_d, b_d = be.array(a, "bf16"), be.array(b, "bf16")
+        A_d, dt_d = be.array(A_log, "f32"), be.array(dt_bias, "f32")
+        if be.name == "mlx":
+            mx = be.mx
+            composed_control = lambda a_d=a_d, b_d=b_d, A_d=A_d, dt_d=dt_d: (
+                mx.exp(-mx.exp(A_d) * mx.logaddexp(a_d.astype(mx.float32) + dt_d, 0.0)),
+                mx.sigmoid(b_d.astype(mx.float32)),
+            )
+        else:
+            torch = be.torch
+            composed_control = lambda a_d=a_d, b_d=b_d, A_d=A_d, dt_d=dt_d: (
+                torch.exp(-torch.exp(A_d) * torch.nn.functional.softplus(a_d.float() + dt_d)),
+                torch.sigmoid(b_d.float()),
+            )
+        yield Case(
+            "gdn_io", f"gate_beta_T{tokens}_H{heads}",
+            {"T": tokens, "H": heads}, "bf16", fmt="gate_beta",
+            target=lambda a_d=a_d, b_d=b_d, A_d=A_d, dt_d=dt_d:
+                tk.gdn_gate_beta(a_d, b_d, A_d, dt_d),
+            baselines={"framework_gate_beta": composed_control}, ref=None,
+            bytes_moved=tokens * heads * (2 * 2 + 2 * 4) + heads * 2 * 4,
+        )
+
+    norm_shapes = _pick(preset, [(8, 4, 64)], [(64, 32, 128), (1024, 32, 128)],
+                        [(64, 32, 128), (1024, 32, 128), (4096, 32, 128)])
+    for tokens, heads, dim in norm_shapes:
+        y = (0.3 * rng.standard_normal((tokens, heads, dim))).astype(np.float32)
+        z = (0.3 * rng.standard_normal((tokens, heads, dim))).astype(np.float32)
+        weight = rng.uniform(0.5, 1.5, dim).astype(np.float32)
+        y_d, z_d, weight_d = (be.array(y, "bf16"), be.array(z, "bf16"),
+                              be.array(weight, "bf16"))
+        if be.name == "mlx":
+            mx = be.mx
+            composed_norm = lambda y_d=y_d, z_d=z_d, weight_d=weight_d: (
+                y_d * mx.rsqrt(mx.mean(y_d * y_d, axis=-1, keepdims=True) + eps) *
+                weight_d * (z_d * mx.sigmoid(z_d)))
+        else:
+            torch = be.torch
+            composed_norm = lambda y_d=y_d, z_d=z_d, weight_d=weight_d: (
+                y_d * torch.rsqrt(torch.mean(y_d * y_d, dim=-1, keepdim=True) + eps) *
+                weight_d * (z_d * torch.sigmoid(z_d)))
+        elems = tokens * heads * dim
+        yield Case(
+            "gdn_io", f"gated_norm_T{tokens}_H{heads}_D{dim}",
+            {"T": tokens, "H": heads, "D": dim}, "bf16", fmt="gated_rmsnorm",
+            target=lambda y_d=y_d, z_d=z_d, weight_d=weight_d:
+                tk.gdn_gated_rmsnorm(y_d, z_d, weight_d),
+            baselines={"framework_rmsnorm_silu_mul": composed_norm}, ref=None,
+            bytes_moved=4 * elems * 2 + dim * 2,
+        )
+
+    gate_shapes = _pick(preset, [(8, 1024)], [(64, 4096), (1024, 4096)],
+                        [(64, 4096), (1024, 4096), (4096, 4096)])
+    for tokens, dim in gate_shapes:
+        gate = (0.4 * rng.standard_normal((tokens, dim))).astype(np.float32)
+        value = (0.4 * rng.standard_normal((tokens, dim))).astype(np.float32)
+        gate_d, value_d = be.array(gate, "bf16"), be.array(value, "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            composed_gate = lambda gate_d=gate_d, value_d=value_d: mx.sigmoid(gate_d) * value_d
+        else:
+            torch = be.torch
+            composed_gate = lambda gate_d=gate_d, value_d=value_d: torch.sigmoid(gate_d) * value_d
+        yield Case(
+            "gdn_io", f"attention_gate_T{tokens}_D{dim}",
+            {"T": tokens, "D": dim}, "bf16", fmt="sigmoid_mul",
+            target=lambda gate_d=gate_d, value_d=value_d: tk.sigmoid_mul(gate_d, value_d),
+            baselines={"framework_sigmoid_mul": composed_gate}, ref=None,
+            bytes_moved=3 * tokens * dim * 2,
+        )
+
+
 @register("selective_scan")
 def selective_scan_cases(be, preset, formats):
     """Mamba-1 S6 scan: sequential-in-time, parallel-over-state. No framework baseline
@@ -2133,6 +3010,116 @@ def qk_norm_rope_cases(be, preset, formats):
                            tk.qk_norm_rope_kv_f16(qkv_d, qw_d, kw_d, c_d, s_d, p_d, hq, hk, hv),
                        baselines={"tk qk_norm_rope + split/cast": kv_composed}, ref=None,
                        bytes_moved=2.0 * T * (hq + hk + hv) * D * 2)
+
+    # Explicit-position partial path: exact table gathers + norm + rotate +
+    # packed reconstruction are the decomposed baseline this fusion removes.
+    ext_shapes = _pick(preset, [(512, 8, 2, 2, 128, 64)],
+                       [(512, 32, 8, 8, 128, 64), (2048, 16, 4, 4, 256, 128)],
+                       [(512, 32, 8, 8, 128, 64), (4096, 32, 8, 8, 128, 64),
+                        (2048, 16, 4, 4, 256, 128)])
+    for T, hq, hk, hv, D, rd in ext_shapes:
+        HT, rp = hq + hk + hv, rd // 2
+        qkv = (0.3 * rng.standard_normal((T, HT * D))).astype(np.float32)
+        qw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+        kw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+        inv = 1.0 / (10000.0 ** (np.arange(rp) / rp))
+        ang = np.outer(np.arange(2 * T + 11), inv)
+        cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+        pos = ((3 * np.arange(T) + 2) % (2 * T + 11)).astype(np.int32)
+        qkv_d = be.array(qkv, "bf16")
+        qw_d, kw_d = be.array(qw, "bf16"), be.array(kw, "bf16")
+        c_d, s_d, p_d = be.array(cos, "bf16"), be.array(sin, "bf16"), be.int_array(pos)
+        if be.name == "mlx":
+            mx = be.mx
+
+            def extended_composed(qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d,
+                                  p_d=p_d, T=T, hq=hq, hk=hk, hv=hv, D=D, rd=rd, rp=rp):
+                x = qkv_d.reshape(T, hq + hk + hv, D)
+                q = mx.fast.rms_norm(x[:, :hq], qw_d, 1e-6)
+                k = mx.fast.rms_norm(x[:, hq:hq + hk], kw_d, 1e-6)
+                cc, ss = c_d[p_d][:, None], s_d[p_d][:, None]
+                def rotate(v):
+                    a, z = v[..., :rp], v[..., rp:rd]
+                    r = mx.concatenate((a * cc - z * ss, a * ss + z * cc), axis=-1)
+                    return mx.concatenate((r, v[..., rd:]), axis=-1)
+                return mx.concatenate((rotate(q), rotate(k), x[:, hq + hk:]), axis=1).reshape(T, -1)
+        else:
+            torch = be.torch
+            F = torch.nn.functional
+
+            def extended_composed(qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d,
+                                  p_d=p_d, T=T, hq=hq, hk=hk, hv=hv, D=D, rd=rd, rp=rp):
+                x = qkv_d.reshape(T, hq + hk + hv, D)
+                q = F.rms_norm(x[:, :hq], (D,), qw_d, 1e-6)
+                k = F.rms_norm(x[:, hq:hq + hk], (D,), kw_d, 1e-6)
+                cc, ss = c_d[p_d.long()][:, None], s_d[p_d.long()][:, None]
+                def rotate(v):
+                    a, z = v[..., :rp], v[..., rp:rd]
+                    r = torch.cat((a * cc - z * ss, a * ss + z * cc), dim=-1)
+                    return torch.cat((r, v[..., rd:]), dim=-1)
+                return torch.cat((rotate(q), rotate(k), x[:, hq + hk:]), dim=1).reshape(T, -1)
+        yield Case(
+            "qk_norm_rope", f"positioned_T{T}_hq{hq}hk{hk}hv{hv}_D{D}R{rd}",
+            {"T": T, "hq": hq, "hk": hk, "D": D, "rotary_dim": rd}, "bf16",
+            fmt="positioned_partial",
+            target=lambda qkv_d=qkv_d, qw_d=qw_d, kw_d=kw_d, c_d=c_d, s_d=s_d,
+                          p_d=p_d, hq=hq, hk=hk, hv=hv, rd=rd:
+                tk.qk_norm_rope_positioned(qkv_d, qw_d, kw_d, c_d, s_d, p_d,
+                                           hq, hk, hv, rotary_dim=rd),
+            baselines={"framework_norm_gather_rotate_pack": extended_composed}, ref=None,
+            bytes_moved=2.0 * T * HT * D * 2)
+
+    # Fused Q/K normalization plus Qwen-style interleaved M-RoPE.
+    T, hq, hk, hv, D = (512, 8, 2, 2, 64) if preset == "smoke" else (2048, 32, 8, 8, 64)
+    HT, rp, sections = hq + hk + hv, D // 2, (11, 11, 10)
+    qkv = (0.3 * rng.standard_normal((T, HT * D))).astype(np.float32)
+    qw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    kw = (1.0 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    inv = 1.0 / (10000.0 ** (np.arange(rp) / rp))
+    ang = np.outer(np.arange(3 * T + 5), inv)
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    ar = np.arange(T, dtype=np.int32)
+    pos = np.stack((ar, 2 * ar + 1, 3 * ar + 2)) % (3 * T + 5)
+    axes = np.arange(rp, dtype=np.int32) % 3
+    selected = pos[axes, :].T
+    pairs = np.broadcast_to(np.arange(rp, dtype=np.int32), (T, rp))
+    qkv_d = be.array(qkv, "bf16")
+    qw_d, kw_d = be.array(qw, "bf16"), be.array(kw, "bf16")
+    c_d, s_d, p_d = be.array(cos, "bf16"), be.array(sin, "bf16"), be.int_array(pos)
+    sel_d, pair_d = be.int_array(selected), be.int_array(pairs)
+    if be.name == "mlx":
+        mx = be.mx
+        def mrope_fused_baseline():
+            x = qkv_d.reshape(T, HT, D)
+            q = mx.fast.rms_norm(x[:, :hq], qw_d, 1e-6)
+            k = mx.fast.rms_norm(x[:, hq:hq + hk], kw_d, 1e-6)
+            cc, ss = c_d[sel_d, pair_d][:, None], s_d[sel_d, pair_d][:, None]
+            def rotate(v):
+                a, z = v[..., :rp], v[..., rp:]
+                return mx.concatenate((a * cc - z * ss, a * ss + z * cc), axis=-1)
+            return mx.concatenate((rotate(q), rotate(k), x[:, hq + hk:]), axis=1).reshape(T, -1)
+    else:
+        torch = be.torch
+        F = torch.nn.functional
+        def mrope_fused_baseline():
+            x = qkv_d.reshape(T, HT, D)
+            q = F.rms_norm(x[:, :hq], (D,), qw_d, 1e-6)
+            k = F.rms_norm(x[:, hq:hq + hk], (D,), kw_d, 1e-6)
+            cc = c_d[sel_d.long(), pair_d.long()][:, None]
+            ss = s_d[sel_d.long(), pair_d.long()][:, None]
+            def rotate(v):
+                a, z = v[..., :rp], v[..., rp:]
+                return torch.cat((a * cc - z * ss, a * ss + z * cc), dim=-1)
+            return torch.cat((rotate(q), rotate(k), x[:, hq + hk:]), dim=1).reshape(T, -1)
+    yield Case(
+        "qk_norm_rope", f"mrope_il_T{T}_hq{hq}hk{hk}hv{hv}_D{D}",
+        {"T": T, "hq": hq, "hk": hk, "D": D, "rotary_dim": D}, "bf16",
+        fmt="mrope_interleaved",
+        target=lambda: tk.qk_norm_rope_positioned(
+            qkv_d, qw_d, kw_d, c_d, s_d, p_d, hq, hk, hv,
+            mrope_sections=sections, section_interleaved=True),
+        baselines={"framework_norm_axis_gather_rotate_pack": mrope_fused_baseline}, ref=None,
+        bytes_moved=2.0 * T * HT * D * 2)
 
 
 @register("attn_fwd_sg")
@@ -2361,6 +3348,635 @@ def quant_rt_cases(be, preset, formats):
                    target=lambda x_d=x_d:
                        tk.quantize_per_group_fp8(x_d, group_size=128, ue8m0=True),
                    baselines={}, ref=None, bytes_moved=3.0 * N * Dm)
+
+
+@register("basert_aux")
+def basert_aux_cases(be, preset, formats):
+    """BaseRT calibration, clipping, and final-logit transform operations."""
+    tk = be.tk()
+    rng = np.random.default_rng(177)
+    calibration_shapes = _pick(
+        preset, [(128, 256)], [(512, 8192), (8192, 4096)],
+        [(512, 8192), (8192, 4096), (32768, 4096)])
+    for tokens, channels in calibration_shapes:
+        x = rng.standard_normal((tokens, channels)).astype(np.float32)
+        x_d = be.array(x, "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d: mx.max(mx.abs(x_d), axis=0)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d: torch.amax(torch.abs(x_d), dim=0).float()
+        yield Case(
+            "basert_aux", f"calibration_T{tokens}_C{channels}",
+            {"T": tokens, "C": channels}, "bf16", fmt="channel_absmax",
+            target=lambda x_d=x_d: tk.calibration_absmax(x_d),
+            baselines={"framework_abs_max_axis0": baseline}, ref=None,
+            bytes_moved=tokens * channels * 2 + channels * 4,
+        )
+
+    clip_shapes = _pick(
+        preset, [(1, 64, 256)], [(1, 1120, 768), (1, 750, 1024)],
+        [(1, 1120, 768), (1, 750, 1024), (4, 4096, 4096)])
+    for batch, tokens, channels in clip_shapes:
+        x = (4.0 * rng.standard_normal((batch, tokens, channels))).astype(np.float32)
+        x_d = be.array(x, "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d: mx.clip(x_d, -3.0, 5.0)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d: torch.clamp(x_d, -3.0, 5.0)
+        yield Case(
+            "basert_aux", f"value_clip_B{batch}_T{tokens}_C{channels}",
+            {"B": batch, "T": tokens, "C": channels}, "bf16",
+            fmt="scalar_bounds_clip",
+            target=lambda x_d=x_d: tk.value_clip(x_d, -3.0, 5.0),
+            baselines={"framework_clip": baseline}, ref=None,
+            bytes_moved=2 * batch * tokens * channels * 2,
+        )
+
+    softcap_shapes = _pick(
+        preset, [(8, 1024)], [(64, 128256), (1024, 32000)],
+        [(64, 128256), (1024, 32000), (2048, 128256)])
+    for tokens, vocab in softcap_shapes:
+        x = (5.0 * rng.standard_normal((tokens, vocab))).astype(np.float32)
+        x_d = be.array(x, "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d: 30.0 * mx.tanh(x_d / 30.0)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d: 30.0 * torch.tanh(x_d / 30.0)
+        yield Case(
+            "basert_aux", f"softcap_T{tokens}_V{vocab}",
+            {"T": tokens, "V": vocab}, "bf16", fmt="final_logit_softcap",
+            target=lambda x_d=x_d: tk.logits_softcap(x_d, 30.0),
+            baselines={"framework_mul_tanh_div": baseline}, ref=None,
+            bytes_moved=2 * tokens * vocab * 2,
+        )
+
+
+@register("lora")
+def lora_cases(be, preset, formats):
+    """Direct F16-adapter LoRA candidate versus two framework F16 matmuls."""
+    tk = be.tk()
+    rng = np.random.default_rng(180)
+    shapes = _pick(
+        preset, [(1, 512, 512, 8)],
+        [(1, 4096, 4096, 16), (4, 4096, 4096, 16),
+         (8, 4096, 4096, 16), (64, 4096, 4096, 16)],
+        [(1, 4096, 4096, 8), (1, 4096, 4096, 16),
+         (1, 4096, 4096, 32), (1, 4096, 4096, 64),
+         (1, 4096, 4096, 128), (4, 4096, 4096, 16),
+         (8, 4096, 4096, 16), (64, 4096, 4096, 16),
+         (64, 4096, 4096, 64), (512, 4096, 4096, 16),
+         (512, 4096, 4096, 64), (4096, 4096, 4096, 16)],
+    )
+    for rows, input_dim, output_dim, rank in shapes:
+        x = (0.15 * rng.standard_normal((rows, input_dim))).astype(np.float32)
+        A = (0.10 * rng.standard_normal((rank, input_dim))).astype(np.float16)
+        B = (0.10 * rng.standard_normal((output_dim, rank))).astype(np.float16)
+        base = (0.20 * rng.standard_normal((rows, output_dim))).astype(np.float32)
+        x_d, base_d = be.array(x, "bf16"), be.array(base, "bf16")
+        A_d, B_d = be.array(A, "f16"), be.array(B, "f16")
+        if be.name == "mlx":
+            mx = be.mx
+
+            def framework_lora(x_d=x_d, A_d=A_d, B_d=B_d, base_d=base_d):
+                low = mx.matmul(x_d.astype(mx.float16), mx.transpose(A_d))
+                delta = mx.matmul(low, mx.transpose(B_d))
+                return (base_d.astype(mx.float32) +
+                        delta.astype(mx.float32) * 0.75).astype(x_d.dtype)
+        else:
+            torch = be.torch
+
+            def framework_lora(x_d=x_d, A_d=A_d, B_d=B_d, base_d=base_d):
+                low = torch.matmul(x_d.to(torch.float16), A_d.transpose(0, 1))
+                delta = torch.matmul(low, B_d.transpose(0, 1))
+                return (base_d.float() + delta.float() * 0.75).to(x_d.dtype)
+
+        yield Case(
+            "lora", f"direct_M{rows}_K{input_dim}_N{output_dim}_R{rank}",
+            {"M": rows, "K": input_dim, "N": output_dim, "R": rank},
+            "bf16", fmt="f16_adapter",
+            target=lambda x_d=x_d, A_d=A_d, B_d=B_d, base_d=base_d:
+                tk.lora_apply_direct(x_d, A_d, B_d, base=base_d, scale=0.75),
+            baselines={"framework_f16_matmul_pair": framework_lora}, ref=None,
+            bytes_moved=(rows * input_dim * 2 + rank * input_dim * 2 +
+                         output_dim * rank * 2 + 2 * rows * output_dim * 2),
+            flops=2.0 * rows * rank * (input_dim + output_dim),
+        )
+
+
+@register("basert_embedding")
+def basert_embedding_cases(be, preset, formats):
+    """BERT two-table preparation and mask-aware terminal pooling."""
+    tk = be.tk()
+    rng = np.random.default_rng(181)
+    embed_shapes = _pick(preset, [(32, 256)], [(128, 768), (512, 768)],
+                         [(32, 256), (128, 768), (512, 768), (2048, 1024)])
+    for tokens, hidden in embed_shapes:
+        token_table = (0.15 * rng.standard_normal((4096, hidden))).astype(np.float32)
+        type_table = (0.15 * rng.standard_normal((4, hidden))).astype(np.float32)
+        token_ids = rng.integers(0, 4096, tokens, dtype=np.int32)
+        type_ids = rng.integers(0, 4, tokens, dtype=np.int32)
+        token_d = be.array(token_table, "bf16"); type_d = be.array(type_table, "bf16")
+        token_ids_d = be.int_array(token_ids); type_ids_d = be.int_array(type_ids)
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda: (mx.take(token_d, token_ids_d, axis=0).astype(mx.float32) * 1.25 +
+                                mx.take(type_d, type_ids_d, axis=0).astype(mx.float32)).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            baseline = lambda: (token_d.index_select(0, token_ids_d.long()).float() * 1.25 +
+                                type_d.index_select(0, type_ids_d.long()).float()).to(torch.bfloat16)
+        yield Case(
+            "basert_embedding", f"types_T{tokens}_D{hidden}",
+            {"T": tokens, "D": hidden}, "bf16", fmt="token_type",
+            target=lambda token_ids_d=token_ids_d, type_ids_d=type_ids_d,
+                          token_d=token_d, type_d=type_d: tk.embedding_lookup_types(
+                token_ids_d, type_ids_d, token_d, type_d, token_scale=1.25),
+            baselines={"framework_two_gather_add": baseline}, ref=None,
+            bytes_moved=3 * tokens * hidden * 2,
+        )
+
+    pool_shapes = _pick(preset, [(2, 32, 256)], [(4, 128, 768), (8, 512, 768)],
+                        [(2, 32, 256), (4, 128, 768), (8, 512, 768), (16, 1024, 1024)])
+    for batch, tokens, hidden in pool_shapes:
+        x = (0.2 * rng.standard_normal((batch, tokens, hidden))).astype(np.float32)
+        mask = (rng.random((batch, tokens)) > 0.2).astype(np.int32)
+        weight = (0.5 + 0.1 * rng.standard_normal(hidden)).astype(np.float32)
+        x_d = be.array(x, "bf16"); mask_d = be.int_array(mask); w_d = be.array(weight, "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(x_d=x_d, mask_d=mask_d, w_d=w_d):
+                mf = mask_d.astype(mx.float32)[:, :, None]
+                p = mx.sum(x_d.astype(mx.float32) * mf, axis=1) / mx.maximum(mx.sum(mf, axis=1), 1.0)
+                n = p * mx.rsqrt(mx.mean(p * p, axis=-1, keepdims=True) + 1e-5) * w_d.astype(mx.float32)
+                return (n * mx.rsqrt(mx.sum(n * n, axis=-1, keepdims=True) + 1e-12)).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            def baseline(x_d=x_d, mask_d=mask_d, w_d=w_d):
+                mf = mask_d.float().unsqueeze(-1)
+                p = (x_d.float() * mf).sum(1) / mf.sum(1).clamp_min(1.0)
+                n = p * torch.rsqrt(p.square().mean(-1, keepdim=True) + 1e-5) * w_d.float()
+                return (n * torch.rsqrt(n.square().sum(-1, keepdim=True) + 1e-12)).to(torch.bfloat16)
+        yield Case(
+            "basert_embedding", f"masked_pool_B{batch}_T{tokens}_D{hidden}",
+            {"B": batch, "T": tokens, "D": hidden}, "bf16", fmt="masked_rms_l2",
+            target=lambda x_d=x_d, mask_d=mask_d, w_d=w_d:
+                tk.masked_mean_pool_rms_l2(x_d, mask_d, w_d),
+            baselines={"framework_pool_rms_l2": baseline}, ref=None,
+            bytes_moved=(batch * tokens * hidden + batch * hidden) * 2,
+        )
+
+
+@register("basert_vision")
+def basert_vision_cases(be, preset, formats):
+    """Tensor-only patch, position, RoPE, and pooling operations."""
+    tk = be.tk(); rng = np.random.default_rng(182)
+    patch_shapes = _pick(preset, [(1, 64, 64, 3, 8)],
+                         [(1, 224, 224, 3, 16), (1, 896, 896, 3, 16)],
+                         [(1, 224, 224, 3, 14), (1, 224, 224, 3, 16),
+                          (1, 896, 896, 3, 16)])
+    for batch, height, width, channels, patch in patch_shapes:
+        x_d = be.array((0.2 * rng.standard_normal((batch, height, width, channels))).astype(np.float32), "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(x_d=x_d, batch=batch, height=height, width=width,
+                         channels=channels, patch=patch):
+                y = mx.reshape(x_d, (batch, height // patch, patch,
+                                     width // patch, patch, channels))
+                return mx.reshape(mx.transpose(y, (0, 1, 3, 2, 4, 5)),
+                                  (batch, (height // patch) * (width // patch),
+                                   patch * patch * channels))
+        else:
+            def baseline(x_d=x_d, batch=batch, height=height, width=width,
+                         channels=channels, patch=patch):
+                y = x_d.reshape(batch, height // patch, patch,
+                                width // patch, patch, channels)
+                return y.permute(0, 1, 3, 2, 4, 5).reshape(
+                    batch, (height // patch) * (width // patch), patch * patch * channels)
+        yield Case(
+            "basert_vision", f"patchify_H{height}_W{width}_P{patch}",
+            {"B": batch, "H": height, "W": width, "C": channels, "P": patch},
+            "bf16", fmt="nhwc_patches",
+            target=lambda x_d=x_d, patch=patch: tk.extract_patches_2d(
+                x_d, patch, patch, patch, patch, use_kernel=True),
+            baselines={"framework_reshape_transpose": baseline}, ref=None,
+            bytes_moved=2 * batch * height * width * channels * 2,
+        )
+
+    patch3d_shapes = _pick(preset, [(1, 2, 64, 64, 3, 2, 8)],
+                           [(1, 2, 224, 224, 3, 2, 14), (1, 8, 224, 224, 3, 2, 14)],
+                           [(1, 2, 64, 64, 3, 2, 8), (1, 2, 224, 224, 3, 2, 14),
+                            (1, 8, 224, 224, 3, 2, 14)])
+    for batch, frames, height, width, channels, temporal, patch in patch3d_shapes:
+        x_d = be.array((0.2 * rng.standard_normal(
+            (batch, frames, height, width, channels))).astype(np.float32), "bf16")
+        ot, oh, ow = frames // temporal, height // patch, width // patch
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(x_d=x_d, batch=batch, frames=frames, height=height, width=width,
+                         channels=channels, temporal=temporal, patch=patch,
+                         ot=ot, oh=oh, ow=ow):
+                y = mx.reshape(x_d, (batch, ot, temporal, oh, patch, ow, patch, channels))
+                return mx.reshape(mx.transpose(y, (0, 1, 3, 5, 2, 4, 6, 7)),
+                                  (batch, ot * oh * ow, temporal * patch * patch * channels))
+        else:
+            def baseline(x_d=x_d, batch=batch, channels=channels, temporal=temporal,
+                         patch=patch, ot=ot, oh=oh, ow=ow):
+                return x_d.reshape(batch, ot, temporal, oh, patch, ow, patch, channels).permute(
+                    0, 1, 3, 5, 2, 4, 6, 7).reshape(
+                    batch, ot * oh * ow, temporal * patch * patch * channels)
+        yield Case(
+            "basert_vision", f"patchify3d_T{frames}_H{height}_W{width}_PT{temporal}_P{patch}",
+            {"B": batch, "T": frames, "H": height, "W": width, "C": channels,
+             "PT": temporal, "P": patch}, "bf16", fmt="nthwc_patches",
+            target=lambda x_d=x_d, temporal=temporal, patch=patch:
+                tk.extract_patches_3d(
+                    x_d, temporal, patch, patch, temporal, patch, patch,
+                    use_kernel=True),
+            baselines={"framework_reshape_transpose": baseline}, ref=None,
+            bytes_moved=2 * batch * frames * height * width * channels * 2,
+        )
+
+    interp_shapes = _pick(preset, [(16, 16, 32, 24, 256)],
+                          [(16, 16, 56, 56, 768), (64, 64, 56, 56, 768)],
+                          [(16, 16, 56, 56, 768), (64, 64, 56, 56, 768),
+                           (32, 32, 64, 48, 1024)])
+    for ih, iw, oh, ow, channels in interp_shapes:
+        table_d = be.array((0.2 * rng.standard_normal((ih, iw, channels))).astype(np.float32), "bf16")
+        fy = np.clip((np.arange(oh) + 0.5) * ih / oh - 0.5, 0, ih - 1)
+        fx = np.clip((np.arange(ow) + 0.5) * iw / ow - 0.5, 0, iw - 1)
+        y0, x0 = np.floor(fy).astype(np.int32), np.floor(fx).astype(np.int32)
+        y1, x1 = np.minimum(y0 + 1, ih - 1), np.minimum(x0 + 1, iw - 1)
+        wy, wx = (fy - y0).astype(np.float32), (fx - x0).astype(np.float32)
+        if be.name == "mlx":
+            mx = be.mx; y0d, y1d = mx.array(y0), mx.array(y1); x0d, x1d = mx.array(x0), mx.array(x1)
+            wyd, wxd = mx.array(wy)[:, None, None], mx.array(wx)[None, :, None]
+            def baseline(table_d=table_d, y0d=y0d, y1d=y1d, x0d=x0d, x1d=x1d,
+                         wyd=wyd, wxd=wxd):
+                a0, a1 = mx.take(table_d, y0d, axis=0), mx.take(table_d, y1d, axis=0)
+                a = mx.take(a0, x0d, axis=1).astype(mx.float32) * (1 - wxd) + mx.take(a0, x1d, axis=1).astype(mx.float32) * wxd
+                b = mx.take(a1, x0d, axis=1).astype(mx.float32) * (1 - wxd) + mx.take(a1, x1d, axis=1).astype(mx.float32) * wxd
+                return (a * (1 - wyd) + b * wyd).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            y0d, y1d = be.int_array(y0).long(), be.int_array(y1).long(); x0d, x1d = be.int_array(x0).long(), be.int_array(x1).long()
+            wyd, wxd = be.array(wy)[:, None, None], be.array(wx)[None, :, None]
+            def baseline(table_d=table_d, y0d=y0d, y1d=y1d, x0d=x0d, x1d=x1d,
+                         wyd=wyd, wxd=wxd):
+                a0, a1 = table_d.index_select(0, y0d), table_d.index_select(0, y1d)
+                a = a0.index_select(1, x0d).float() * (1 - wxd) + a0.index_select(1, x1d).float() * wxd
+                b = a1.index_select(1, x0d).float() * (1 - wxd) + a1.index_select(1, x1d).float() * wxd
+                return (a * (1 - wyd) + b * wyd).to(torch.bfloat16)
+        yield Case(
+            "basert_vision", f"pos_interp_{ih}x{iw}_to_{oh}x{ow}_D{channels}",
+            {"IH": ih, "IW": iw, "OH": oh, "OW": ow, "D": channels},
+            "bf16", fmt="bilinear_half_pixel",
+            target=lambda table_d=table_d, oh=oh, ow=ow:
+                tk.interpolate_position_2d(table_d, oh, ow),
+            baselines={"framework_gather_lerp": baseline}, ref=None,
+            bytes_moved=(ih * iw + oh * ow) * channels * 2,
+        )
+
+    for height, width, channels, kernel in _pick(
+            preset, [(16, 16, 256, 2)], [(56, 56, 768, 4), (64, 64, 1024, 4)],
+            [(16, 16, 256, 2), (56, 56, 768, 4), (64, 64, 1024, 4)]):
+        x_d = be.array((0.2 * rng.standard_normal((1, height, width, channels))).astype(np.float32), "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d, height=height, width=width, channels=channels, kernel=kernel: mx.mean(
+                mx.reshape(x_d.astype(mx.float32), (1, height // kernel, kernel,
+                                                    width // kernel, kernel, channels)),
+                axis=(2, 4)).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d, kernel=kernel: torch.nn.functional.avg_pool2d(
+                x_d.permute(0, 3, 1, 2).float(), kernel, kernel).permute(0, 2, 3, 1).to(torch.bfloat16)
+        yield Case(
+            "basert_vision", f"avg_pool_H{height}_W{width}_K{kernel}_D{channels}",
+            {"H": height, "W": width, "K": kernel, "D": channels}, "bf16",
+            fmt="nhwc_avg", target=lambda x_d=x_d, kernel=kernel:
+                tk.avg_pool2d_tokens(x_d, kernel, kernel),
+            baselines={"framework_avg_pool": baseline}, ref=None,
+            bytes_moved=(height * width + (height // kernel) * (width // kernel)) * channels * 2,
+        )
+
+    factor_shapes = _pick(preset, [(1, 256, 32, 256)],
+                          [(1, 1120, 64, 768)],
+                          [(1, 256, 32, 256), (1, 1120, 64, 768), (4, 1120, 64, 768)])
+    for batch, tokens, positions, channels in factor_shapes:
+        ids = np.empty((batch, tokens, 2), np.int32)
+        ids[..., 0] = np.arange(tokens, dtype=np.int32)[None] % positions
+        ids[..., 1] = (np.arange(tokens, dtype=np.int32)[None] // positions) % positions
+        valid = np.ones((batch, tokens), np.int32)
+        table_d = be.array((0.1 * rng.standard_normal((2, positions, channels))).astype(np.float32), "bf16")
+        ids_d, valid_d = be.int_array(ids), be.int_array(valid)
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda ids_d=ids_d, valid_d=valid_d, table_d=table_d: (
+                mx.take(table_d[0], ids_d[..., 0], axis=0).astype(mx.float32) +
+                mx.take(table_d[1], ids_d[..., 1], axis=0).astype(mx.float32)
+            ).astype(mx.bfloat16) * valid_d[..., None]
+        else:
+            baseline = lambda ids_d=ids_d, valid_d=valid_d, table_d=table_d: (
+                table_d[0].index_select(0, ids_d[..., 0].reshape(-1).long()).reshape(batch, tokens, channels) +
+                table_d[1].index_select(0, ids_d[..., 1].reshape(-1).long()).reshape(batch, tokens, channels)
+            ) * valid_d[..., None]
+        yield Case(
+            "basert_vision", f"factor_pos_B{batch}_N{tokens}_P{positions}_D{channels}",
+            {"B": batch, "N": tokens, "P": positions, "D": channels}, "bf16",
+            fmt="factorized_xy", target=lambda ids_d=ids_d, table_d=table_d, valid_d=valid_d:
+                tk.factorized_position_2d(ids_d, table_d, valid_d),
+            baselines={"framework_two_gathers": baseline}, ref=None,
+            bytes_moved=(2 * positions + batch * tokens) * channels * 2,
+        )
+
+    pool_shapes = _pick(preset, [(1, 256, 256, 2, 16)],
+                        [(1, 1120, 768, 2, 40)],
+                        [(1, 256, 256, 2, 16), (1, 1120, 768, 2, 40)])
+    for batch, tokens, channels, kernel, width in pool_shapes:
+        height = tokens // width; output_length = (width // kernel) * (height // kernel)
+        ids = np.array([[[xx, yy] for yy in range(height) for xx in range(width)]
+                        for _ in range(batch)], np.int32)
+        valid = np.ones((batch, tokens), np.int32)
+        x_d = be.array((0.1 * rng.standard_normal((batch, tokens, channels))).astype(np.float32), "bf16")
+        ids_d, valid_d = be.int_array(ids), be.int_array(valid)
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d, batch=batch, height=height, width=width, channels=channels, kernel=kernel: (
+                mx.mean(mx.reshape(x_d.astype(mx.float32),
+                    (batch, height // kernel, kernel, width // kernel, kernel, channels)),
+                    axis=(2, 4)) * np.sqrt(channels)
+            ).reshape(batch, output_length, channels)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d, kernel=kernel, channels=channels: (
+                torch.nn.functional.avg_pool2d(
+                    x_d.reshape(batch, height, width, channels).permute(0, 3, 1, 2).float(),
+                    kernel, kernel).permute(0, 2, 3, 1).reshape(batch, output_length, channels) *
+                np.sqrt(channels))
+        yield Case(
+            "basert_vision", f"position_pool_B{batch}_N{tokens}_L{output_length}_K{kernel}_D{channels}",
+            {"B": batch, "N": tokens, "L": output_length, "K": kernel, "D": channels},
+            "bf16", fmt="coordinate_pool_fp32",
+            target=lambda x_d=x_d, ids_d=ids_d, valid_d=valid_d,
+                          output_length=output_length, kernel=kernel, width=width:
+                tk.pool_tokens_by_position(x_d, ids_d, valid_d, output_length, kernel, width),
+            baselines={"framework_reshape_avg": baseline}, ref=None,
+            bytes_moved=batch * (tokens + output_length) * channels * 4,
+        )
+
+    rope_shapes = _pick(preset, [(1, 4, 256, 64)], [(1, 8, 1120, 128)],
+                        [(1, 4, 256, 64), (1, 8, 1120, 128)])
+    for batch, heads, tokens, dim in rope_shapes:
+        side = int(np.ceil(np.sqrt(tokens))); positions = max(side, 8)
+        ids = np.empty((batch, tokens, 2), np.int32)
+        ids[..., 0] = np.arange(tokens)[None] % side
+        ids[..., 1] = np.arange(tokens)[None] // side
+        x_d = be.array((0.1 * rng.standard_normal((batch, heads, tokens, dim))).astype(np.float32), "bf16")
+        cos_d = be.array(rng.uniform(-1, 1, (positions, dim // 4)).astype(np.float32), "bf16")
+        sin_d = be.array(rng.uniform(-1, 1, (positions, dim // 4)).astype(np.float32), "bf16")
+        ids_d = be.int_array(ids); pairs = dim // 4
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(x_d=x_d, cos_d=cos_d, sin_d=sin_d, ids_d=ids_d, pairs=pairs):
+                parts = []
+                for axis in range(2):
+                    c = mx.take(cos_d, ids_d[..., axis], axis=0)[:, None]
+                    s = mx.take(sin_d, ids_d[..., axis], axis=0)[:, None]
+                    a = x_d[..., axis * 2 * pairs:axis * 2 * pairs + pairs]
+                    b = x_d[..., axis * 2 * pairs + pairs:(axis + 1) * 2 * pairs]
+                    parts.extend(((a * c - b * s).astype(mx.bfloat16),
+                                  (a * s + b * c).astype(mx.bfloat16)))
+                return mx.concatenate(parts, axis=-1)
+        else:
+            torch = be.torch
+            def baseline(x_d=x_d, cos_d=cos_d, sin_d=sin_d, ids_d=ids_d, pairs=pairs):
+                parts = []
+                for axis in range(2):
+                    c = cos_d[ids_d[..., axis].long()].unsqueeze(1)
+                    s = sin_d[ids_d[..., axis].long()].unsqueeze(1)
+                    a = x_d[..., axis * 2 * pairs:axis * 2 * pairs + pairs]
+                    b = x_d[..., axis * 2 * pairs + pairs:(axis + 1) * 2 * pairs]
+                    parts.extend(((a * c - b * s).to(torch.bfloat16),
+                                  (a * s + b * c).to(torch.bfloat16)))
+                return torch.cat(parts, -1)
+        yield Case(
+            "basert_vision", f"rope2d_B{batch}_H{heads}_N{tokens}_D{dim}",
+            {"B": batch, "H": heads, "N": tokens, "D": dim}, "bf16", fmt="xy_rope",
+            target=lambda x_d=x_d, cos_d=cos_d, sin_d=sin_d, ids_d=ids_d:
+                tk.vision_rope_2d(x_d, cos_d, sin_d, ids_d),
+            baselines={"framework_axis_rotate": baseline}, ref=None,
+            bytes_moved=2 * batch * heads * tokens * dim * 2,
+        )
+        if be.name == "mlx":
+            mx = be.mx
+            def qwen_baseline(x_d=x_d, cos_d=cos_d, sin_d=sin_d,
+                              ids_d=ids_d, pairs=pairs):
+                cx = mx.take(cos_d, ids_d[..., 0], axis=0)[:, None]
+                cy = mx.take(cos_d, ids_d[..., 1], axis=0)[:, None]
+                sx = mx.take(sin_d, ids_d[..., 0], axis=0)[:, None]
+                sy = mx.take(sin_d, ids_d[..., 1], axis=0)[:, None]
+                c = mx.concatenate((cx, cy), axis=-1)
+                s = mx.concatenate((sx, sy), axis=-1)
+                a, b = x_d[..., :2 * pairs], x_d[..., 2 * pairs:]
+                return mx.concatenate(((a * c - b * s).astype(mx.bfloat16),
+                                       (a * s + b * c).astype(mx.bfloat16)), axis=-1)
+        else:
+            torch = be.torch
+            def qwen_baseline(x_d=x_d, cos_d=cos_d, sin_d=sin_d,
+                              ids_d=ids_d, pairs=pairs):
+                cx = cos_d[ids_d[..., 0].long()].unsqueeze(1)
+                cy = cos_d[ids_d[..., 1].long()].unsqueeze(1)
+                sx = sin_d[ids_d[..., 0].long()].unsqueeze(1)
+                sy = sin_d[ids_d[..., 1].long()].unsqueeze(1)
+                c = torch.cat((cx, cy), dim=-1)
+                s = torch.cat((sx, sy), dim=-1)
+                a, b = x_d[..., :2 * pairs], x_d[..., 2 * pairs:]
+                return torch.cat(((a * c - b * s).to(torch.bfloat16),
+                                  (a * s + b * c).to(torch.bfloat16)), dim=-1)
+        yield Case(
+            "basert_vision", f"qwen_rope2d_B{batch}_H{heads}_N{tokens}_D{dim}",
+            {"B": batch, "H": heads, "N": tokens, "D": dim}, "bf16",
+            fmt="xy_global_split_rope",
+            target=lambda x_d=x_d, cos_d=cos_d, sin_d=sin_d, ids_d=ids_d:
+                tk.qwen_vision_rope_2d(x_d, cos_d, sin_d, ids_d),
+            baselines={"framework_global_split_rotate": qwen_baseline}, ref=None,
+            bytes_moved=2 * batch * heads * tokens * dim * 2,
+        )
+
+
+@register("basert_audio")
+def basert_audio_cases(be, preset, formats):
+    """Whisper general conv1d and Conformer LightConv depthwise conv1d."""
+    tk = be.tk(); rng = np.random.default_rng(183)
+    general = _pick(preset, [(1, 128, 32, 64, 3, 1)],
+                    [(1, 1500, 80, 384, 3, 1), (1, 750, 384, 384, 3, 2)],
+                    [(1, 128, 32, 64, 3, 1), (1, 1500, 80, 384, 3, 1),
+                     (1, 750, 384, 384, 3, 2)])
+    for batch, length, cin, cout, kernel, stride in general:
+        x_d = be.array((0.15 * rng.standard_normal((batch, length, cin))).astype(np.float32), "bf16")
+        w_d = be.array((0.08 * rng.standard_normal((cout, kernel, cin))).astype(np.float32), "bf16")
+        b_d = be.array((0.03 * rng.standard_normal(cout)).astype(np.float32), "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            baseline = lambda x_d=x_d, w_d=w_d, b_d=b_d, stride=stride: (
+                mx.conv1d(x_d, w_d, stride=stride, padding=1).astype(mx.float32) + b_d.astype(mx.float32)).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            baseline = lambda x_d=x_d, w_d=w_d, b_d=b_d, stride=stride: torch.nn.functional.conv1d(
+                x_d.permute(0, 2, 1), w_d.permute(0, 2, 1), b_d, stride=stride, padding=1).permute(0, 2, 1)
+        yield Case(
+            "basert_audio", f"conv_B{batch}_T{length}_C{cin}_O{cout}_K{kernel}_S{stride}",
+            {"B": batch, "T": length, "C": cin, "O": cout, "K": kernel, "S": stride},
+            "bf16", fmt="nwc_conv", target=lambda x_d=x_d, w_d=w_d, b_d=b_d,
+            stride=stride: tk.audio_conv1d_direct(x_d, w_d, b_d, stride=stride, padding=1),
+            baselines={"framework_conv1d": baseline}, ref=None,
+            flops=2.0 * batch * ((length + 2 - kernel) // stride + 1) * cout * kernel * cin,
+        )
+    depthwise = _pick(preset, [(1, 128, 256, 5)], [(1, 750, 1024, 5)],
+                      [(1, 128, 256, 5), (1, 750, 1024, 5), (4, 750, 1024, 5)])
+    for batch, length, channels, kernel in depthwise:
+        x_d = be.array((0.15 * rng.standard_normal((batch, length, channels))).astype(np.float32), "bf16")
+        w_d = be.array((0.08 * rng.standard_normal((channels, kernel))).astype(np.float32), "bf16")
+        b_d = be.array((0.03 * rng.standard_normal(channels)).astype(np.float32), "bf16")
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(x_d=x_d, w_d=w_d, b_d=b_d, channels=channels, kernel=kernel):
+                y = mx.conv1d(x_d, mx.reshape(w_d, (channels, kernel, 1)), padding=kernel // 2, groups=channels)
+                y = y.astype(mx.float32) + b_d.astype(mx.float32)
+                return (y / (1 + mx.exp(-y))).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            def baseline(x_d=x_d, w_d=w_d, b_d=b_d, channels=channels, kernel=kernel):
+                y = torch.nn.functional.conv1d(x_d.permute(0, 2, 1), w_d[:, None], b_d,
+                                               padding=kernel // 2, groups=channels).permute(0, 2, 1)
+                return torch.nn.functional.silu(y)
+        yield Case(
+            "basert_audio", f"depthwise_B{batch}_T{length}_C{channels}_K{kernel}",
+            {"B": batch, "T": length, "C": channels, "K": kernel}, "bf16",
+            fmt="lightconv_silu", target=lambda x_d=x_d, w_d=w_d, b_d=b_d, kernel=kernel:
+                tk.audio_depthwise_conv1d(x_d, w_d, b_d, padding=kernel // 2, activation="silu"),
+            baselines={"framework_grouped_conv_silu": baseline}, ref=None,
+            flops=2.0 * batch * length * channels * kernel,
+        )
+        if be.name == "mlx":
+            mx = be.mx
+            def causal_baseline(x_d=x_d, w_d=w_d, b_d=b_d, channels=channels, kernel=kernel):
+                padded = mx.pad(x_d, [(0, 0), (kernel - 1, 0), (0, 0)])
+                y = mx.conv1d(padded, mx.reshape(w_d, (channels, kernel, 1)), groups=channels)
+                return (y.astype(mx.float32) + b_d.astype(mx.float32)).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            def causal_baseline(x_d=x_d, w_d=w_d, b_d=b_d, channels=channels, kernel=kernel):
+                padded = torch.nn.functional.pad(x_d.permute(0, 2, 1), (kernel - 1, 0))
+                return torch.nn.functional.conv1d(
+                    padded, w_d[:, None], b_d, groups=channels).permute(0, 2, 1)
+        yield Case(
+            "basert_audio", f"causal_depthwise_B{batch}_T{length}_C{channels}_K{kernel}",
+            {"B": batch, "T": length, "C": channels, "K": kernel}, "bf16",
+            fmt="lightconv_causal", target=lambda x_d=x_d, w_d=w_d, b_d=b_d:
+                tk.audio_causal_depthwise_conv1d(x_d, w_d, b_d),
+            baselines={"framework_left_pad_grouped_conv": causal_baseline}, ref=None,
+            flops=2.0 * batch * length * channels * kernel,
+        )
+    cross_shapes = _pick(preset, [(1, 4, 2, 2, 64, 64)],
+                         [(1, 16, 16, 1, 1500, 64), (1, 8, 8, 12, 25, 128)],
+                         [(1, 4, 2, 2, 64, 64), (1, 16, 16, 1, 1500, 64),
+                          (1, 8, 8, 12, 25, 128), (4, 16, 4, 1, 1500, 64)])
+    for batch, hq, hkv, tq, tkv, dim in cross_shapes:
+        q_d = be.array((0.15 * rng.standard_normal((batch, hq, tq, dim))).astype(np.float32), "bf16")
+        k_d = be.array((0.15 * rng.standard_normal((batch, hkv, tkv, dim))).astype(np.float32), "bf16")
+        v_d = be.array((0.20 * rng.standard_normal((batch, hkv, tkv, dim))).astype(np.float32), "bf16")
+        lengths_d = be.int_array(np.full(batch, tkv, np.int32))
+        repeats = hq // hkv
+        if be.name == "mlx":
+            mx = be.mx
+            def baseline(q_d=q_d, k_d=k_d, v_d=v_d, repeats=repeats, dim=dim):
+                kk = mx.repeat(k_d, repeats, axis=1).astype(mx.float32)
+                vv = mx.repeat(v_d, repeats, axis=1).astype(mx.float32)
+                scores = q_d.astype(mx.float32) @ mx.swapaxes(kk, -1, -2) * (dim ** -0.5)
+                scores = 50.0 * mx.tanh(scores / 50.0)
+                return (mx.softmax(scores, axis=-1) @ vv).astype(mx.bfloat16)
+        else:
+            torch = be.torch
+            def baseline(q_d=q_d, k_d=k_d, v_d=v_d, repeats=repeats, dim=dim):
+                kk = k_d.repeat_interleave(repeats, 1).float(); vv = v_d.repeat_interleave(repeats, 1).float()
+                scores = q_d.float() @ kk.transpose(-1, -2) * (dim ** -0.5)
+                scores = 50.0 * torch.tanh(scores / 50.0)
+                return (torch.softmax(scores, -1) @ vv).to(torch.bfloat16)
+        yield Case(
+            "basert_audio", f"cross_B{batch}_H{hq}_{hkv}_T{tq}_{tkv}_D{dim}",
+            {"B": batch, "Hq": hq, "Hkv": hkv, "Tq": tq, "Tk": tkv, "D": dim},
+            "bf16", fmt="cross_attention_softcap",
+            target=lambda q_d=q_d, k_d=k_d, v_d=v_d, lengths_d=lengths_d:
+                tk.cross_attention(q_d, k_d, v_d, lengths_d, softcap=50.0, use_kernel=True),
+            baselines={"framework_expand_matmul_softmax": baseline}, ref=None,
+            flops=4.0 * batch * hq * tq * tkv * dim,
+        )
+
+    relative_shapes = _pick(preset, [(1, 64, 4, 64)], [(1, 750, 8, 128)],
+                            [(1, 64, 4, 64), (1, 750, 8, 128)])
+    chunk, left, right, relative_positions = 12, 13, 0, 13
+    for batch, length, heads, dim in relative_shapes:
+        q_d = be.array((0.08 * rng.standard_normal((batch, length, heads, dim))).astype(np.float32), "bf16")
+        k_d = be.array((0.08 * rng.standard_normal((batch, length, heads, dim))).astype(np.float32), "bf16")
+        v_d = be.array((0.2 * rng.standard_normal((batch, length, heads, dim))).astype(np.float32), "bf16")
+        rel_d = be.array((0.08 * rng.standard_normal((relative_positions, heads, dim))).astype(np.float32), "bf16")
+        pd_d = be.array((0.2 * rng.standard_normal(dim)).astype(np.float32), "f32")
+        lengths_d = be.int_array(np.full(batch, length, np.int32))
+        query = np.arange(length, dtype=np.int32)[:, None]
+        key = np.arange(length, dtype=np.int32)[None, :]
+        block_start = (query // chunk) * chunk
+        context_start = block_start - (left - 1)
+        context_length = chunk + left - 1 + right
+        context_mask = (key >= context_start) & (key < context_start + context_length)
+        relative_index = np.clip(key - query + left - 1, 0, relative_positions - 1).astype(np.int32)
+        relative_mask = ((key - query + left - 1) >= 0) & ((key - query + left - 1) < relative_positions)
+        ri_d = be.int_array(relative_index)
+        if be.name == "mlx":
+            mx = be.mx; mask_d = mx.array(context_mask); rmask_d = mx.array(relative_mask)
+            def relative_baseline(q_d=q_d, k_d=k_d, v_d=v_d, rel_d=rel_d,
+                                  pd_d=pd_d, ri_d=ri_d, mask_d=mask_d, rmask_d=rmask_d):
+                qs = q_d.astype(mx.float32) * (dim ** -0.5 / np.log(2.0)) * mx.logaddexp(pd_d, 0.0)
+                qh = mx.transpose(qs, (0, 2, 1, 3)); kh = mx.transpose(k_d.astype(mx.float32), (0, 2, 1, 3))
+                vh = mx.transpose(v_d.astype(mx.float32), (0, 2, 1, 3))
+                scores = (qh @ mx.swapaxes(kh, -1, -2)) / np.log(2.0)
+                rel_scores = qh @ mx.transpose(rel_d.astype(mx.float32), (1, 2, 0))
+                gathered = mx.take_along_axis(rel_scores, ri_d[None, None], axis=-1)
+                scores = scores + mx.where(rmask_d[None, None], gathered, 0.0)
+                scores = 50.0 * mx.tanh(scores / 50.0)
+                scores = mx.where(mask_d[None, None], scores, -1e30)
+                return mx.transpose((mx.softmax(scores, -1) @ vh).astype(mx.bfloat16), (0, 2, 1, 3))
+        else:
+            torch = be.torch; mask_d = torch.as_tensor(context_mask, device="mps"); rmask_d = torch.as_tensor(relative_mask, device="mps")
+            def relative_baseline(q_d=q_d, k_d=k_d, v_d=v_d, rel_d=rel_d,
+                                  pd_d=pd_d, ri_d=ri_d, mask_d=mask_d, rmask_d=rmask_d):
+                qs = q_d.float() * (dim ** -0.5 / np.log(2.0)) * torch.logaddexp(pd_d, torch.zeros_like(pd_d))
+                qh = qs.permute(0, 2, 1, 3); kh = k_d.float().permute(0, 2, 1, 3)
+                vh = v_d.float().permute(0, 2, 1, 3)
+                scores = (qh @ kh.transpose(-1, -2)) / np.log(2.0)
+                rel_scores = qh @ rel_d.float().permute(1, 2, 0)
+                gathered = torch.gather(rel_scores, -1, ri_d[None, None].expand(batch, heads, -1, -1).long())
+                scores = scores + torch.where(rmask_d[None, None], gathered, 0.0)
+                scores = 50.0 * torch.tanh(scores / 50.0)
+                scores = torch.where(mask_d[None, None], scores, -1e30)
+                return (torch.softmax(scores, -1) @ vh).to(torch.bfloat16).permute(0, 2, 1, 3)
+        yield Case(
+            "basert_audio", f"relative_B{batch}_T{length}_H{heads}_D{dim}",
+            {"B": batch, "T": length, "H": heads, "D": dim,
+             "chunk": chunk, "left": left, "right": right}, "bf16",
+            fmt="blocked_relative_softcap", target=lambda q_d=q_d, k_d=k_d, v_d=v_d,
+                rel_d=rel_d, pd_d=pd_d, lengths_d=lengths_d:
+                tk.audio_relative_attention(q_d, k_d, v_d, rel_d, pd_d, lengths_d,
+                                            chunk, left, right, softcap=50.0),
+            baselines={"framework_materialized_scores": relative_baseline}, ref=None,
+            flops=4.0 * batch * length * heads * context_length * dim,
+        )
 
 
 # --------------------------------------------------------------------------- Wave-5 kernels

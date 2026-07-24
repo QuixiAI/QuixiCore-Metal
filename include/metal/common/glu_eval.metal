@@ -2,7 +2,8 @@
  * @file
  * @brief Shared gated-activation forward math (single definition for glu.metal and the fused
  * act->quant epilogues in act_quant.metal). glu_eval modes: 0 reglu, 1 geglu-tanh, 2 swiglu,
- * 3 swiglu_oai (clamped, alpha-scaled sigmoid, (1+up)), 4 geglu-erf, else geglu-quick.
+ * 3 swiglu_oai (clamped, alpha-scaled sigmoid, (1+up)), 4 geglu-erf,
+ * 5 geglu-quick, 6 sigmoid gate.
  * The backward-only derivative helpers stay in kernels/glu/glu.metal.
  */
 
@@ -63,7 +64,10 @@ METAL_FUNC float glu_eval(int mode, float x0, float x1, float alpha, float limit
     if (mode == 4) {
         return glu_gelu_erf(x0) * x1;
     }
-    return (x0 * (1.0f / (1.0f + metal::exp(GLU_GELU_QUICK_COEF * x0)))) * x1;
+    if (mode == 5) {
+        return (x0 * (1.0f / (1.0f + metal::exp(GLU_GELU_QUICK_COEF * x0)))) * x1;
+    }
+    return (1.0f / (1.0f + metal::exp(-x0))) * x1;
 }
 
 } // namespace mittens

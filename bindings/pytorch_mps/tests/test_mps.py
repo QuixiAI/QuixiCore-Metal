@@ -179,6 +179,20 @@ def test_mean_pool_rms_l2(M, D):
     assert _maxdiff(got, exp) < 0.03
 
 
+def test_masked_mean_pool_rms_l2():
+    torch.manual_seed(13)
+    B, T, D = 3, 31, 256
+    x = torch.randn(B, T, D, dtype=torch.bfloat16, device="mps")
+    mask = (torch.rand(B, T, device="mps") > 0.35).to(torch.int32); mask[0] = 0
+    w = torch.randn(D, dtype=torch.bfloat16, device="mps")
+    got = tk_torch.masked_mean_pool_rms_l2(x, mask, w, 1e-6)
+    count = mask.sum(1, keepdim=True).clamp(min=1).float()
+    pooled = (x.float() * mask[:, :, None]).sum(1) / count
+    n = pooled * torch.rsqrt(pooled.square().mean(-1, keepdim=True) + 1e-6) * w.float()
+    exp = (n * torch.rsqrt(n.square().sum(-1, keepdim=True) + 1e-12)).to(torch.bfloat16)
+    assert _maxdiff(got, exp) < 0.03
+
+
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (1, 256, 768), (8, 256)])
 def test_rms_norm_add(shape):
     D = shape[-1]
@@ -278,6 +292,85 @@ def _qk_norm_rope_ref(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps, interleaved, 
             r = np.concatenate([v1 * c - v2 * s, v2 * c + v1 * s], axis=-1)
         out[:, h] = r
     return out.reshape(T, W)  # (T, HT*D)
+
+
+def _qk_norm_rope_positioned_ref(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps,
+                                  rotary_dim, interleaved, weight_offset,
+                                  sections=(), section_interleaved=False):
+    T, W = qkv.shape
+    HT, D = hq + hk + hv, W // (hq + hk + hv)
+    x = qkv.reshape(T, HT, D).astype(np.float64)
+    out = x.copy()
+    rp = rotary_dim // 2
+    boundaries = np.cumsum(sections) if sections else None
+    for h in range(hq + hk):
+        w = (qw if h < hq else kw).astype(np.float64) + weight_offset
+        v = x[:, h]
+        v = v / np.sqrt((v * v).mean(-1, keepdims=True) + eps) * w
+        r = v.copy()
+        for p in range(rp):
+            if sections:
+                axis = p % 3 if section_interleaved else int(
+                    np.searchsorted(boundaries, p, side="right"))
+                pp = pos[axis]
+            else:
+                pp = pos
+            c, s = cos[pp, p], sin[pp, p]
+            i0, i1 = (2 * p, 2 * p + 1) if interleaved else (p, rp + p)
+            r[:, i0] = v[:, i0] * c - v[:, i1] * s
+            r[:, i1] = v[:, i0] * s + v[:, i1] * c
+        out[:, h] = r
+    return out.reshape(T, W)
+
+
+@pytest.mark.parametrize(
+    "D,rotary_dim,interleaved,weight_offset",
+    [(128, 64, False, 0.0), (256, 128, True, 1.0), (512, 192, False, 0.25)],
+)
+def test_qk_norm_rope_positioned(D, rotary_dim, interleaved, weight_offset):
+    hq, hk, hv, T = 3, 1, 1, 13
+    rng = np.random.default_rng(212 + D)
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    kw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    rp = rotary_dim // 2
+    inv = 10000.0 ** (-(np.arange(rp, dtype=np.float32) / rp))
+    ang = np.arange(71, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    pos = ((3 * np.arange(T) + 2) % 71).astype(np.int32)
+    to = lambda a: torch.from_numpy(a).to(torch.bfloat16).to("mps")
+    got = tk_torch.qk_norm_rope_positioned(
+        to(qkv), to(qw), to(kw), to(cos), to(sin), torch.from_numpy(pos).to("mps"),
+        hq, hk, hv, rotary_dim=rotary_dim, interleaved=interleaved,
+        norm_weight_offset=weight_offset)
+    rounded = lambda a: torch.from_numpy(a).to(torch.bfloat16).float().numpy()
+    ref = _qk_norm_rope_positioned_ref(
+        rounded(qkv), rounded(qw), rounded(kw), rounded(cos), rounded(sin), pos,
+        hq, hk, hv, 1e-6, rotary_dim, interleaved, weight_offset)
+    assert np.abs(got.float().cpu().numpy() - ref).max() < 0.04
+
+
+def test_qk_norm_mrope():
+    D, hq, hk, hv, T = 64, 3, 1, 1, 17
+    sections = (11, 11, 10)
+    rng = np.random.default_rng(255)
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = rng.standard_normal(D).astype(np.float32)
+    kw = rng.standard_normal(D).astype(np.float32)
+    inv = 10000.0 ** (-(np.arange(D // 2, dtype=np.float32) / (D // 2)))
+    ang = np.arange(96, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    ar = np.arange(T, dtype=np.int32)
+    pos = np.stack((ar, 2 * ar + 1, 3 * ar + 2)) % 96
+    to = lambda a: torch.from_numpy(a).to(torch.bfloat16).to("mps")
+    got = tk_torch.qk_norm_rope_positioned(
+        to(qkv), to(qw), to(kw), to(cos), to(sin), torch.from_numpy(pos).to("mps"),
+        hq, hk, hv, mrope_sections=sections, section_interleaved=True)
+    rounded = lambda a: torch.from_numpy(a).to(torch.bfloat16).float().numpy()
+    ref = _qk_norm_rope_positioned_ref(
+        rounded(qkv), rounded(qw), rounded(kw), rounded(cos), rounded(sin), pos,
+        hq, hk, hv, 1e-6, D, False, 0.0, sections, True)
+    assert np.abs(got.float().cpu().numpy() - ref).max() < 0.04
 
 
 @pytest.mark.parametrize("D", [64, 128, 256])
@@ -397,6 +490,82 @@ def test_paged_attention_window(window):
     if window >= ctx:  # full context -> equals window=0 exactly
         full = tk_torch.paged_attention(qt, kt, vt, btt, clt, 0.0, 0)
         assert torch.equal(got, full)
+
+
+@pytest.mark.parametrize("D,H,H_KV", [(64, 8, 2), (128, 4, 1)])
+@pytest.mark.parametrize("window", [0, 5])
+def test_q8_0_kv_codec_copy_gather_and_attention(D, H, H_KV, window):
+    rng = np.random.default_rng(780 + D + window)
+    B, num_blocks, block_size = 2, 8, 8
+    total = num_blocks * block_size
+    key_np = (0.25 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    value_np = (0.25 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q_np = (0.25 * rng.normal(size=(B, H, D))).astype(np.float32)
+    key = torch.from_numpy(key_np).to(torch.bfloat16).to("mps")
+    value = torch.from_numpy(value_np).to(torch.bfloat16).to("mps")
+    slots = torch.arange(total, dtype=torch.int64, device="mps")
+    kc, ks, vc, vs = tk_torch.kv_cache_scatter_q8_0(
+        key, value, slots, num_blocks, block_size)
+    assert kc.dtype == torch.int8 and vc.dtype == torch.int8
+    assert ks.dtype == torch.float16 and vs.dtype == torch.float16
+    assert tuple(ks.shape) == (num_blocks, block_size, H_KV, D // 32)
+
+    # Independent Q8_0 code/scale oracle over the BF16-rounded inputs.
+    def quant_ref(x):
+        x = x.float().cpu().numpy().reshape(total, H_KV, D // 32, 32)
+        delta = np.max(np.abs(x), axis=-1).astype(np.float32) / 127.0
+        inv = np.where(delta > 0.0, 1.0 / delta, 0.0).astype(np.float32)
+        z = x * inv[..., None]
+        rounded = np.copysign(np.floor(np.abs(z) + 0.5), z)
+        return (np.clip(rounded, -127, 127).astype(np.int8).reshape(total, H_KV, D),
+                delta.astype(np.float16))
+    kq_ref, ks_ref = quant_ref(key)
+    vq_ref, vs_ref = quant_ref(value)
+    np.testing.assert_array_equal(kc.cpu().numpy().reshape(total, H_KV, D), kq_ref)
+    np.testing.assert_array_equal(vc.cpu().numpy().reshape(total, H_KV, D), vq_ref)
+    np.testing.assert_array_equal(ks.cpu().numpy().reshape(total, H_KV, D // 32), ks_ref)
+    np.testing.assert_array_equal(vs.cpu().numpy().reshape(total, H_KV, D // 32), vs_ref)
+
+    bt_np = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    cu_np = np.array([0, 32, 64], np.int32)
+    bt = torch.from_numpy(bt_np).to("mps")
+    cu = torch.from_numpy(cu_np).to("mps")
+    kg, vg = tk_torch.kv_cache_gather_q8_0(
+        kc, ks, vc, vs, bt, cu, total, output_dtype="float32")
+    kdec = kq_ref.astype(np.float32) * np.repeat(
+        ks_ref.astype(np.float32), 32, axis=-1)
+    vdec = vq_ref.astype(np.float32) * np.repeat(
+        vs_ref.astype(np.float32), 32, axis=-1)
+    np.testing.assert_array_equal(kg.cpu().numpy(), kdec)
+    np.testing.assert_array_equal(vg.cpu().numpy(), vdec)
+
+    mapping = torch.tensor([[0, 7], [1, 6]], dtype=torch.int64, device="mps")
+    kco, kso, vco, vso = tk_torch.kv_cache_copy_blocks_q8_0(kc, ks, vc, vs, mapping)
+    assert torch.equal(kco[7].cpu(), kc[0].cpu()) and torch.equal(kso[7].cpu(), ks[0].cpu())
+    assert torch.equal(vco[6].cpu(), vc[1].cpu()) and torch.equal(vso[6].cpu(), vs[1].cpu())
+
+    cl_np = np.array([23, 31], np.int32)
+    q = torch.from_numpy(q_np).to(torch.bfloat16).to("mps")
+    got = tk_torch.paged_attention_q8_0(
+        q, kc, ks, vc, vs, bt, torch.from_numpy(cl_np).to("mps"), window=window)
+    q_native = q.float().cpu().numpy()
+    ref = np.zeros_like(q_native)
+    group = H // H_KV
+    scale = 1.0 / math.sqrt(D)
+    for b in range(B):
+        start = max(0, int(cl_np[b]) - window) if window > 0 else 0
+        for h in range(H):
+            kvh = h // group
+            K = np.stack([
+                kdec[bt_np[b, t // block_size] * block_size + t % block_size, kvh]
+                for t in range(start, int(cl_np[b]))])
+            V = np.stack([
+                vdec[bt_np[b, t // block_size] * block_size + t % block_size, kvh]
+                for t in range(start, int(cl_np[b]))])
+            score = (q_native[b, h] @ K.T) * scale
+            prob = np.exp(score - score.max()); prob /= prob.sum()
+            ref[b, h] = prob @ V
+    assert _maxdiff(got.float(), torch.from_numpy(ref).to("mps")) < 0.02
 
 
 @pytest.mark.parametrize("D", [64, 128])
@@ -999,6 +1168,48 @@ def test_quantize_per_tensor_fp8(dtype, shape):
     assert np.all(np.abs(deq - xd) <= 0.0625 * np.abs(xd) + 2.0 * ssafe)
 
 
+def test_value_clip_mps_arbitrary_shape():
+    x = torch.tensor([[[-4.0, -1.25, 0.0], [0.75, 2.5, 9.0]]],
+                     device="mps", dtype=torch.bfloat16)
+    got = tk_torch.value_clip(x, -1.25, 2.5)
+    torch.mps.synchronize()
+    np.testing.assert_array_equal(
+        got.float().cpu().numpy(), np.clip(x.float().cpu().numpy(), -1.25, 2.5))
+
+
+def test_calibration_absmax_mps_running_and_nonfinite():
+    import numpy as np
+    rng = np.random.default_rng(77)
+    x = rng.standard_normal((129, 67)).astype(np.float32)
+    x[3, 1] = np.inf
+    x[5, 2] = -np.inf
+    x[7, 3] = np.nan
+    running = rng.random(67).astype(np.float32) * 2.0
+    got = tk_torch.calibration_absmax(
+        torch.from_numpy(x).to("mps"), torch.from_numpy(running).to("mps"))
+    ref = np.maximum(np.max(np.abs(x), axis=0), running)
+    actual = got.cpu().numpy()
+    np.testing.assert_array_equal(actual, ref)
+    assert np.isposinf(actual[1]) and np.isposinf(actual[2]) and np.isnan(actual[3])
+
+
+def test_lora_apply_direct_mps():
+    import numpy as np
+    rng = np.random.default_rng(179)
+    M, K, N, R = 2, 257, 193, 8
+    x = (0.15 * rng.standard_normal((M, K))).astype(np.float32)
+    A = (0.10 * rng.standard_normal((R, K))).astype(np.float16)
+    B = (0.10 * rng.standard_normal((N, R))).astype(np.float16)
+    base = (0.20 * rng.standard_normal((M, N))).astype(np.float32)
+    got = tk_torch.lora_apply_direct(
+        torch.from_numpy(x).to("mps"), torch.from_numpy(A).to("mps"),
+        torch.from_numpy(B).to("mps"), torch.from_numpy(base).to("mps"), scale=0.75)
+    low = (x @ A.astype(np.float32).T).astype(np.float16)
+    delta = (low.astype(np.float32) @ B.astype(np.float32).T).astype(np.float16)
+    ref = base + 0.75 * delta.astype(np.float32)
+    np.testing.assert_allclose(got.cpu().numpy(), ref, atol=8e-3, rtol=8e-3)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(8, 256), (4, 64, 128), (3, 513)])
 def test_quantize_per_token_fp8(dtype, shape):
@@ -1110,6 +1321,69 @@ def test_rotary(shape):
     c, s = cos.float()[None, None], sin.float()[None, None]
     exp = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1).to(torch.bfloat16)
     assert _maxdiff(got, exp) < 0.03
+
+
+@pytest.mark.parametrize(
+    "shape,rotary_dim,interleaved,batched",
+    [((1, 2, 17, 128), 64, False, False),
+     ((2, 2, 11, 256), 128, True, True),
+     ((1, 1, 7, 512), 192, False, False)],
+)
+def test_rotary_positioned(shape, rotary_dim, interleaved, batched):
+    B, _, N, D = shape
+    torch.manual_seed(22 + D)
+    x = torch.randn(shape, dtype=torch.bfloat16, device="mps")
+    max_pos = 3 * N + 2
+    cos, sin = _cos_sin(max_pos, rotary_dim, "mps")
+    pos = (2 * torch.arange(N, dtype=torch.int32) + 1) % max_pos
+    if batched:
+        pos = torch.stack([(pos + b) % max_pos for b in range(B)])
+    pos = pos.to("mps")
+    got = tk_torch.rotary_positioned(
+        x, cos, sin, pos, rotary_dim=rotary_dim, interleaved=interleaved)
+    exp = x.float().clone()
+    for b in range(B):
+        pb = pos if pos.dim() == 1 else pos[b]
+        c, s = cos[pb.long()].float()[None], sin[pb.long()].float()[None]
+        if interleaved:
+            a, z = x[b, ..., :rotary_dim:2].float(), x[b, ..., 1:rotary_dim:2].float()
+            exp[b, ..., :rotary_dim:2] = a * c - z * s
+            exp[b, ..., 1:rotary_dim:2] = a * s + z * c
+        else:
+            rp = rotary_dim // 2
+            a, z = x[b, ..., :rp].float(), x[b, ..., rp:rotary_dim].float()
+            exp[b, ..., :rp] = a * c - z * s
+            exp[b, ..., rp:rotary_dim] = a * s + z * c
+    assert _maxdiff(got, exp.to(torch.bfloat16)) < 0.03
+    assert torch.equal(got[..., rotary_dim:].cpu(), x[..., rotary_dim:].cpu())
+
+
+@pytest.mark.parametrize(
+    "sections,interleaved",
+    [((8, 12, 12), False), ((11, 11, 10), True)],
+)
+def test_mrope(sections, interleaved):
+    B, H, N, D = 2, 2, 13, 64
+    torch.manual_seed(39)
+    x = torch.randn((B, H, N, D), dtype=torch.bfloat16, device="mps")
+    max_pos = 3 * N + 1
+    cos, sin = _cos_sin(max_pos, D, "mps")
+    ar = torch.arange(N, dtype=torch.int32)
+    shared = torch.stack([ar, 2 * ar + 1, 3 * ar + 2]) % max_pos
+    positions = torch.stack([shared, (shared + 2) % max_pos]).to("mps")
+    got = tk_torch.mrope(
+        x, cos, sin, positions, sections, section_interleaved=interleaved)
+    exp = x.float().clone()
+    boundaries = np.cumsum(sections)
+    for b in range(B):
+        for p in range(D // 2):
+            axis = p % 3 if interleaved else int(np.searchsorted(boundaries, p, side="right"))
+            pb = positions[b, axis].long()
+            c, s = cos[pb, p].float()[None], sin[pb, p].float()[None]
+            a, z = x[b, :, :, p].float(), x[b, :, :, D // 2 + p].float()
+            exp[b, :, :, p] = a * c - z * s
+            exp[b, :, :, D // 2 + p] = a * s + z * c
+    assert _maxdiff(got, exp.to(torch.bfloat16)) < 0.03
 
 
 @pytest.mark.parametrize("shape", [(2, 128, 1024), (4, 64, 512), (8, 256)])
@@ -1481,6 +1755,98 @@ def test_embedding_lookup(dtype):
     assert np.allclose(o, ref, atol=1e-4 if dtype == torch.float32 else 3e-2)
 
 
+def test_embedding_lookup_types():
+    rng = np.random.default_rng(22)
+    tokens = np.array([1, -1, 10, 100], np.int32)
+    types = np.array([0, 1, -1, 4], np.int32)
+    token_table = (0.2 * rng.standard_normal((100, 96))).astype(np.float32)
+    type_table = (0.2 * rng.standard_normal((3, 96))).astype(np.float32)
+    got = tk_torch.embedding_lookup_types(
+        torch.from_numpy(tokens).to("mps"), torch.from_numpy(types).to("mps"),
+        torch.from_numpy(token_table).to(torch.bfloat16).to("mps"),
+        torch.from_numpy(type_table).to(torch.bfloat16).to("mps"), 1.25)
+    ref = np.zeros((4, 96), np.float32)
+    for i in range(4):
+        if 0 <= tokens[i] < 100: ref[i] += 1.25 * token_table[tokens[i]]
+        if 0 <= types[i] < 3: ref[i] += type_table[types[i]]
+    assert np.allclose(got.float().cpu().numpy(), ref, atol=3e-2)
+
+
+def test_basert_vision_patch_ops_mps():
+    rng = np.random.default_rng(23)
+    x = torch.from_numpy((0.2 * rng.standard_normal((1, 7, 9, 3))).astype(np.float32)).to(
+        torch.bfloat16).to("mps")
+    patches = tk_torch.extract_patches_2d(x, 3, 2, 2, 2, 1, 0)
+    assert patches.shape == (1, 4 * 4, 18)
+    video = torch.randn(1, 3, 9, 10, 3, dtype=torch.bfloat16, device="mps")
+    patches3d = tk_torch.extract_patches_3d(video, 2, 3, 2, 1, 2, 2, 1, 1, 0)
+    assert patches3d.shape == (1, 4 * 5 * 5, 36)
+    table = torch.randn(4, 5, 32, dtype=torch.bfloat16, device="mps")
+    assert tk_torch.interpolate_position_2d(table, 7, 8).shape == (7, 8, 32)
+    assert tk_torch.avg_pool2d_tokens(x, 3, 2, 2, 2, True).shape == (1, 3, 5, 3)
+    ids = torch.tensor([[[xx, yy] for yy in range(4) for xx in range(4)]],
+                       dtype=torch.int32, device="mps")
+    valid = torch.ones(1, 16, dtype=torch.int32, device="mps"); valid[:, 5] = 0
+    factor_table = torch.randn(2, 8, 32, dtype=torch.bfloat16, device="mps")
+    factor = tk_torch.factorized_position_2d(ids, factor_table, valid)
+    assert factor.shape == (1, 16, 32) and torch.count_nonzero(factor[:, 5]).item() == 0
+    tokens = torch.randn(1, 16, 32, dtype=torch.bfloat16, device="mps")
+    pooled, pooled_mask = tk_torch.pool_tokens_by_position(tokens, ids, valid, 4, 2, 4)
+    assert pooled.shape == (1, 4, 32) and pooled.dtype == torch.float32
+    assert pooled_mask.shape == (1, 4) and pooled_mask.dtype == torch.int32
+    rope_x = torch.randn(1, 2, 16, 128, dtype=torch.bfloat16, device="mps")
+    rope_c = torch.randn(8, 32, dtype=torch.bfloat16, device="mps")
+    rope_s = torch.randn(8, 32, dtype=torch.bfloat16, device="mps")
+    assert tk_torch.vision_rope_2d(rope_x, rope_c, rope_s, ids).shape == rope_x.shape
+    assert tk_torch.vision_rope_2d(
+        rope_x, rope_c, rope_s, ids, global_split=True).shape == rope_x.shape
+
+
+def test_basert_audio_conv_mps():
+    torch.manual_seed(24)
+    x = torch.randn(2, 31, 9, dtype=torch.bfloat16, device="mps")
+    w = torch.randn(13, 5, 9, dtype=torch.bfloat16, device="mps")
+    b = torch.randn(13, dtype=torch.bfloat16, device="mps")
+    got = tk_torch.audio_conv1d_direct(x, w, b, padding=2)
+    ref = torch.nn.functional.conv1d(
+        x.permute(0, 2, 1), w.permute(0, 2, 1), b, padding=2).permute(0, 2, 1)
+    assert _maxdiff(got, ref) < 0.08
+    dw = torch.randn(9, 5, dtype=torch.bfloat16, device="mps")
+    got_dw = tk_torch.audio_depthwise_conv1d(x, dw, padding=2, activation="silu")
+    assert got_dw.shape == x.shape
+    assert tk_torch.audio_causal_depthwise_conv1d(x, dw).shape == x.shape
+
+
+def test_audio_relative_attention_mps():
+    torch.manual_seed(241)
+    q = torch.randn(2, 17, 2, 64, dtype=torch.float32, device="mps") * 0.08
+    k = torch.randn_like(q) * 0.08; v = torch.randn_like(q) * 0.2
+    relative_k = torch.randn(5, 2, 64, dtype=torch.float32, device="mps") * 0.08
+    per_dim = torch.randn(64, dtype=torch.float32, device="mps") * 0.2
+    lengths = torch.tensor([17, 11], dtype=torch.int32, device="mps")
+    got = tk_torch.audio_relative_attention(
+        q, k, v, relative_k, per_dim, lengths, 4, 3, 1, softcap=5.0)
+    assert got.shape == q.shape
+    assert torch.count_nonzero(got[1, 11:]).item() == 0
+
+
+def test_cross_attention_mps():
+    torch.manual_seed(25)
+    q = torch.randn(2, 4, 3, 64, dtype=torch.bfloat16, device="mps") * 0.2
+    k = torch.randn(2, 2, 11, 64, dtype=torch.bfloat16, device="mps") * 0.2
+    v = torch.randn(2, 2, 11, 64, dtype=torch.bfloat16, device="mps") * 0.2
+    lengths = torch.tensor([11, 7], dtype=torch.int32, device="mps")
+    got = tk_torch.cross_attention(q, k, v, lengths, softcap=5.0)
+    ref = torch.zeros_like(q)
+    for b in range(2):
+        length = 11 if b == 0 else 7
+        for h in range(4):
+            scores = q[b, h].float() @ k[b, h // 2, :length].float().T / 8.0
+            scores = 5.0 * torch.tanh(scores / 5.0)
+            ref[b, h] = (torch.softmax(scores, -1) @ v[b, h // 2, :length].float()).to(torch.bfloat16)
+    assert _maxdiff(got, ref) < 0.03
+
+
 @pytest.mark.parametrize("wd", [0.0, 0.05])
 def test_adamw_vs_torch(wd):
     import numpy as np
@@ -1690,7 +2056,7 @@ def test_rms_norm_add_backward(D):
     assert torch.allclose(dresidual, r.grad, atol=2e-3)
 
 
-@pytest.mark.parametrize("mode", ["swiglu", "geglu", "reglu"])
+@pytest.mark.parametrize("mode", ["swiglu", "geglu", "reglu", "sigmoid"])
 def test_glu_backward(mode):
     # tk glu_backward vs torch autograd of the canonical activation (validates the formula).
     import numpy as np
@@ -1701,7 +2067,7 @@ def test_glu_backward(mode):
     x = torch.from_numpy(x_np).to("mps").requires_grad_(True)
     g = torch.from_numpy(g_np).to("mps").requires_grad_(True)
     act = {"swiglu": F.silu, "geglu": lambda t: F.gelu(t, approximate="tanh"),
-           "reglu": F.relu}[mode]
+           "reglu": F.relu, "sigmoid": torch.sigmoid}[mode]
     (act(x) * g * torch.from_numpy(dc_np).to("mps")).sum().backward()
     da, db = tk_torch.glu_backward(torch.from_numpy(x_np).to("mps"),
                                    torch.from_numpy(g_np).to("mps"),
@@ -2521,6 +2887,68 @@ def test_gelu_backward():
     torch.nn.functional.gelu(xt, approximate="tanh").backward(torch.tensor(dy))
     dx = tk.gelu_backward(torch.from_numpy(x).to("mps"), torch.from_numpy(dy).to("mps"))
     assert np.abs(dx.float().cpu().numpy() - xt.grad.numpy()).max() / (np.abs(xt.grad.numpy()).max() + 1e-9) < 1e-4
+
+
+def test_gdn_prepare_output_mps():
+    rng = np.random.default_rng(171)
+    lens, Hk, Hv, Dk, Dv, kernel_size = [3, 2], 2, 4, 64, 64, 4
+    total = sum(lens)
+    channels = 2 * Hk * Dk + Hv * Dv
+    x = (0.4 * rng.standard_normal((total, channels))).astype(np.float32)
+    weight = (0.2 * rng.standard_normal((channels, kernel_size))).astype(np.float32)
+    pool = (0.1 * rng.standard_normal((4, channels, kernel_size - 1))).astype(np.float32)
+    cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    slots = np.array([2, 0], np.int32)
+
+    def ref_short_conv():
+        out = np.zeros_like(x)
+        new_pool = pool.copy()
+        for request, slot in enumerate(slots):
+            history = pool[slot].copy()
+            for token in range(cu[request], cu[request + 1]):
+                values = np.concatenate([history, x[token, :, None]], axis=1)
+                raw = np.sum(values * weight, axis=1, dtype=np.float32)
+                out[token] = raw / (1.0 + np.exp(-raw))
+                history = values[:, 1:]
+            new_pool[slot] = history
+        return out, new_pool
+
+    t = lambda value: torch.from_numpy(value).to("mps")
+    conv, new_pool = tk_torch.gdn_short_conv(t(x), t(weight), t(pool), t(cu), t(slots))
+    ref_conv, ref_pool = ref_short_conv()
+    torch.mps.synchronize()
+    np.testing.assert_allclose(conv.cpu().numpy(), ref_conv, atol=1e-5, rtol=1e-5)
+    np.testing.assert_allclose(new_pool.cpu().numpy(), ref_pool, atol=1e-6, rtol=0)
+
+    q, k, v = tk_torch.gdn_qkv_prepare(conv, Hk, Hv, Dk, Dv)
+    q0 = ref_conv[:, :Hk * Dk].reshape(total, Hk, Dk)
+    k0 = ref_conv[:, Hk * Dk:2 * Hk * Dk].reshape(total, Hk, Dk)
+    v0 = ref_conv[:, 2 * Hk * Dk:].reshape(total, Hv, Dv)
+    qref = q0 / np.sqrt(np.mean(q0 * q0, axis=-1, keepdims=True) + 1e-6) / Dk
+    kref = k0 / np.sqrt(np.mean(k0 * k0, axis=-1, keepdims=True) + 1e-6) / np.sqrt(Dk)
+    np.testing.assert_allclose(q.cpu().numpy(), qref, atol=2e-5, rtol=2e-5)
+    np.testing.assert_allclose(k.cpu().numpy(), kref, atol=2e-5, rtol=2e-5)
+    np.testing.assert_array_equal(
+        v.cpu().numpy(),
+        conv.cpu().numpy()[:, 2 * Hk * Dk:].reshape(total, Hv, Dv),
+    )
+
+    a = (0.5 * rng.standard_normal((total, Hv))).astype(np.float32)
+    b = (0.5 * rng.standard_normal((total, Hv))).astype(np.float32)
+    A_log = rng.uniform(-2.0, 1.0, Hv).astype(np.float32)
+    dt_bias = rng.uniform(-0.5, 0.5, Hv).astype(np.float32)
+    decay, beta = tk_torch.gdn_gate_beta(t(a), t(b), t(A_log), t(dt_bias))
+    decay_ref = np.exp(-np.exp(A_log) * np.logaddexp(0.0, a + dt_bias))
+    beta_ref = 1.0 / (1.0 + np.exp(-b))
+    np.testing.assert_allclose(decay.cpu().numpy(), decay_ref, atol=2e-6, rtol=2e-6)
+    np.testing.assert_allclose(beta.cpu().numpy(), beta_ref, atol=2e-6, rtol=2e-6)
+
+    z = (0.4 * rng.standard_normal((total, Hv, Dv))).astype(np.float32)
+    norm_weight = rng.uniform(0.8, 1.2, Dv).astype(np.float32)
+    normed = tk_torch.gdn_gated_rmsnorm(v, t(z), t(norm_weight))
+    nref = v0 / np.sqrt(np.mean(v0 * v0, axis=-1, keepdims=True) + 1e-6)
+    nref *= norm_weight * (z / (1.0 + np.exp(-z)))
+    np.testing.assert_allclose(normed.cpu().numpy(), nref, atol=2e-5, rtol=2e-5)
 
 
 # --- First-order autograd (Wave-7 #10, torch autograd.Function wrappers) ---

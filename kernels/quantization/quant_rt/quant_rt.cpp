@@ -211,6 +211,44 @@ std::vector<array> quantize_per_tensor_int8(const array& x, StreamOrDevice s) {
   return quantize_per_tensor_impl(x, true, s);
 }
 
+array calibration_absmax(
+    const array& x, const array& running, bool has_running, StreamOrDevice s) {
+  qrt_check(x, "calibration_absmax");
+  if (x.ndim() != 2 || x.shape(0) <= 0 || x.shape(1) <= 0) {
+    throw std::invalid_argument(
+        "calibration_absmax: x must be a non-empty (tokens, channels) tensor");
+  }
+  if (has_running &&
+      (running.ndim() != 1 || running.shape(0) != x.shape(1))) {
+    throw std::invalid_argument(
+        "calibration_absmax: running must be (channels,) when provided");
+  }
+  return array(
+      {x.shape(1)}, float32,
+      std::make_shared<CalibrationAbsmax>(to_stream(s), has_running),
+      {contiguous(x, false, s),
+       contiguous(astype(running, float32, s), false, s)});
+}
+
+void CalibrationAbsmax::eval_cpu(
+    const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("CalibrationAbsmax has no CPU implementation.");
+}
+
+void CalibrationAbsmax::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& x = inputs[0];
+  auto& out = outputs[0];
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  auto& ce = d.get_command_encoder(s.index);
+  MLXEncoder enc(d, ce);
+  tk::launch_calibration_absmax(
+      enc, x, inputs[1], out, x.shape(0), x.shape(1),
+      has_running_ ? 1 : 0, type_to_name(x));
+}
+
 void QuantizePerTensor::eval_cpu(const std::vector<array>&, std::vector<array>&) {
   throw std::runtime_error("QuantizePerTensor has no CPU implementation.");
 }
@@ -257,5 +295,6 @@ TK_QRT_NO_AUTODIFF(QuantizePerTokenInt8Azp, "QuantizePerTokenInt8Azp")
 TK_QRT_NO_AUTODIFF(QuantizePerTokenFp8, "QuantizePerTokenFp8")
 TK_QRT_NO_AUTODIFF(QuantizePerTokenInt8, "QuantizePerTokenInt8")
 TK_QRT_NO_AUTODIFF(QuantizePerTensor, "QuantizePerTensor")
+TK_QRT_NO_AUTODIFF(CalibrationAbsmax, "CalibrationAbsmax")
 
 } // namespace mlx::core

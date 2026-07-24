@@ -7,7 +7,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import (embedding_backward, embedding_lookup, merge_multimodal_spans,
+from tk import (embedding_backward, embedding_lookup, embedding_lookup_types, merge_multimodal_spans,
                 build_multimodal_src)
 
 _MX = {"float32": mx.float32, "float16": mx.float16, "bfloat16": mx.bfloat16}
@@ -38,6 +38,27 @@ def test_embedding_lookup_pos():
     o = np.array(embedding_lookup(mx.array(tok), mx.array(table), pos_table=mx.array(pos), scale=1.0))
     ref = table[tok] + pos
     np.testing.assert_allclose(o, ref, atol=1e-4)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+def test_embedding_lookup_types(dtype):
+    rng = np.random.default_rng(17)
+    token_table = (0.2 * rng.standard_normal((101, 96))).astype(np.float32)
+    type_table = (0.2 * rng.standard_normal((3, 96))).astype(np.float32)
+    token_ids = np.array([4, -1, 100, 7, 101], np.int32)
+    type_ids = np.array([0, 1, -1, 2, 9], np.int32)
+    got = embedding_lookup_types(
+        mx.array(token_ids), mx.array(type_ids),
+        mx.array(token_table).astype(_MX[dtype]),
+        mx.array(type_table).astype(_MX[dtype]), token_scale=1.25)
+    got = np.array(got.astype(mx.float32))
+    ref = np.zeros_like(got)
+    for t in range(token_ids.size):
+        if 0 <= token_ids[t] < token_table.shape[0]:
+            ref[t] += 1.25 * token_table[token_ids[t]]
+        if 0 <= type_ids[t] < type_table.shape[0]:
+            ref[t] += type_table[type_ids[t]]
+    np.testing.assert_allclose(got, ref, atol=1e-4 if dtype == "float32" else 3e-2)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])

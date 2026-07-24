@@ -10,14 +10,18 @@ from tk import (
     beam_remap_block_table,
     beam_reorder_kv,
     kv_cache_copy_blocks,
+    kv_cache_copy_blocks_q8_0,
     kv_cache_gather,
+    kv_cache_gather_q8_0,
     kv_cache_scales,
     kv_cache_scatter,
     kv_cache_scatter_fp8,
+    kv_cache_scatter_q8_0,
     paged_attention,
     paged_attention_alibi,
     paged_attention_block_sparse,
     paged_attention_fp8,
+    paged_attention_q8_0,
     paged_attention_staged,
     paged_attention_xcache,
 )
@@ -38,6 +42,20 @@ def _np(x):
 
 def _cast_np(x, dtype):
     return _np(mx.array(x).astype(_mx_dtype(dtype))).astype(np.float32)
+
+
+def _q8_0_ref(x):
+    """Q8_0: fp32 delta forms codes; the stored fp16 delta reconstructs values."""
+    T, H, D = x.shape
+    blocks = x.reshape(T, H, D // 32, 32)
+    delta = np.max(np.abs(blocks), axis=-1).astype(np.float32) / 127.0
+    inv = np.where(delta > 0.0, 1.0 / delta, 0.0).astype(np.float32)
+    normalized = blocks * inv[..., None]
+    rounded = np.copysign(np.floor(np.abs(normalized) + 0.5), normalized)
+    codes = np.clip(rounded, -127, 127).astype(np.int8)
+    scales = delta.astype(np.float16)
+    decoded = codes.astype(np.float32) * scales.astype(np.float32)[..., None]
+    return codes.reshape(T, H, D), scales, decoded.reshape(T, H, D)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
@@ -119,6 +137,99 @@ def test_kv_cache_copy_blocks(dtype):
 
     np.testing.assert_allclose(_np(got_k).astype(np.float32), ref_k, atol=0.0, rtol=0.0)
     np.testing.assert_allclose(_np(got_v).astype(np.float32), ref_v, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("D", [64, 128])
+def test_q8_0_kv_codec_gather_and_copy(dtype, D):
+    rng = np.random.default_rng(700 + D)
+    T, H, block_size, num_blocks = 11, 3, 4, 4
+    key = mx.array((0.4 * rng.normal(size=(T, H, D))).astype(np.float32)).astype(_mx_dtype(dtype))
+    value = mx.array((0.4 * rng.normal(size=(T, H, D))).astype(np.float32)).astype(_mx_dtype(dtype))
+    slots = np.array([0, 1, 2, -1, 4, 5, 7, 8, 9, 10, 14], np.int64)
+    kc, ks, vc, vs = kv_cache_scatter_q8_0(
+        key, value, mx.array(slots), num_blocks, block_size)
+    mx.eval(kc, ks, vc, vs)
+    assert kc.dtype == mx.int8 and vc.dtype == mx.int8
+    assert ks.dtype == mx.float16 and vs.dtype == mx.float16
+    assert kc.shape == (num_blocks, block_size, H, D)
+    assert ks.shape == (num_blocks, block_size, H, D // 32)
+
+    key_native, value_native = _np(key), _np(value)
+    kq, kscale, kd = _q8_0_ref(key_native)
+    vq, vscale, vd = _q8_0_ref(value_native)
+    ref_kc = np.zeros(kc.shape, np.int8)
+    ref_vc = np.zeros(vc.shape, np.int8)
+    ref_ks = np.zeros(ks.shape, np.float16)
+    ref_vs = np.zeros(vs.shape, np.float16)
+    for t, slot in enumerate(slots):
+        if slot < 0:
+            continue
+        b, o = divmod(int(slot), block_size)
+        ref_kc[b, o], ref_ks[b, o] = kq[t], kscale[t]
+        ref_vc[b, o], ref_vs[b, o] = vq[t], vscale[t]
+    np.testing.assert_array_equal(np.array(kc), ref_kc)
+    np.testing.assert_array_equal(np.array(vc), ref_vc)
+    np.testing.assert_array_equal(np.array(ks), ref_ks)
+    np.testing.assert_array_equal(np.array(vs), ref_vs)
+
+    # Gather a packed sequence whose block table includes an invalid block; invalid reads zero-fill.
+    block_table = np.array([[0, 1, -1]], np.int32)
+    cu = np.array([0, 12], np.int32)
+    ko, vo = kv_cache_gather_q8_0(
+        kc, ks, vc, vs, mx.array(block_table), mx.array(cu), 12,
+        output_dtype="float32")
+    mx.eval(ko, vo)
+    ref_k = np.zeros((12, H, D), np.float32)
+    ref_v = np.zeros_like(ref_k)
+    ref_k[:8] = (ref_kc[:2].astype(np.float32) * np.repeat(
+        ref_ks[:2].astype(np.float32), 32, axis=-1)).reshape(8, H, D)
+    ref_v[:8] = (ref_vc[:2].astype(np.float32) * np.repeat(
+        ref_vs[:2].astype(np.float32), 32, axis=-1)).reshape(8, H, D)
+    np.testing.assert_array_equal(np.array(ko), ref_k)
+    np.testing.assert_array_equal(np.array(vo), ref_v)
+
+    mapping = np.array([[0, 3], [1, 2]], np.int64)
+    kco, kso, vco, vso = kv_cache_copy_blocks_q8_0(kc, ks, vc, vs, mx.array(mapping))
+    mx.eval(kco, kso, vco, vso)
+    for src, dst in mapping:
+        np.testing.assert_array_equal(np.array(kco)[dst], np.array(kc)[src])
+        np.testing.assert_array_equal(np.array(kso)[dst], np.array(ks)[src])
+        np.testing.assert_array_equal(np.array(vco)[dst], np.array(vc)[src])
+        np.testing.assert_array_equal(np.array(vso)[dst], np.array(vs)[src])
+    np.testing.assert_array_equal(np.array(kco)[0], np.array(kc)[0])
+
+
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 1)])
+@pytest.mark.parametrize("window", [0, 5])
+def test_paged_attention_q8_0(D, H, H_KV, window):
+    rng = np.random.default_rng(750 + D + H + window)
+    B, num_blocks, block_size = 2, 8, 8
+    total = num_blocks * block_size
+    key = (0.25 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    value = (0.25 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.25 * rng.normal(size=(B, H, D))).astype(np.float32)
+    slots = np.arange(total, dtype=np.int64)
+    block_table = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    context_lens = np.array([23, 31], np.int32)
+    kc, ks, vc, vs = kv_cache_scatter_q8_0(
+        mx.array(key).astype(mx.bfloat16), mx.array(value).astype(mx.bfloat16),
+        mx.array(slots), num_blocks, block_size)
+    qm = mx.array(q).astype(mx.bfloat16)
+    got = paged_attention_q8_0(
+        qm, kc, ks, vc, vs, mx.array(block_table), mx.array(context_lens), window=window)
+    mx.eval(kc, ks, vc, vs, got)
+    kdec = np.array(kc).astype(np.float32) * np.repeat(
+        np.array(ks).astype(np.float32), 32, axis=-1)
+    vdec = np.array(vc).astype(np.float32) * np.repeat(
+        np.array(vs).astype(np.float32), 32, axis=-1)
+    q_native = np.array(qm.astype(mx.float32))
+    scale = 1.0 / math.sqrt(D)
+    ref = (_paged_ref_gqa(q_native, kdec, vdec, block_table, context_lens, scale)
+           if window == 0 else
+           _paged_ref_window(q_native, kdec, vdec, block_table, context_lens, scale, window))
+    np.testing.assert_allclose(
+        np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=3e-3)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])

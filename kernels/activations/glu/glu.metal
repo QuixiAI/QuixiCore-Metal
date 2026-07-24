@@ -99,10 +99,16 @@ METAL_FUNC void glu_grad(int mode, float a, float b, float dc, float alpha, floa
         da = dc * b * (0.5f * (1.0f + e) + 0.5f * a * de);
         return;
     }
-    // mode 5: geglu_quick: act = a*sigmoid(1.702 a) = a/(1+exp(COEF*a)), COEF=-1.702
-    const float s = 1.0f / (1.0f + metal::exp(GLU_GELU_QUICK_COEF * a));
-    db = dc * (a * s);
-    da = dc * b * (s + a * (-GLU_GELU_QUICK_COEF) * s * (1.0f - s));
+    if (mode == 5) {                       // geglu_quick: act = a*sigmoid(1.702 a)
+        const float s = 1.0f / (1.0f + metal::exp(GLU_GELU_QUICK_COEF * a));
+        db = dc * (a * s);
+        da = dc * b * (s + a * (-GLU_GELU_QUICK_COEF) * s * (1.0f - s));
+        return;
+    }
+    // mode 6: sigmoid gate: out = sigmoid(a) * b
+    const float s = 1.0f / (1.0f + metal::exp(-a));
+    db = dc * s;
+    da = dc * b * s * (1.0f - s);
 }
 
 template <typename T, int MODE>
@@ -166,5 +172,6 @@ instantiate_glu_mode(swiglu, 2)
 instantiate_glu_mode(swiglu_oai, 3)
 instantiate_glu_mode(geglu_erf, 4)
 instantiate_glu_mode(geglu_quick, 5)
+instantiate_glu_mode(sigmoid, 6)
 
 } // namespace mittens
