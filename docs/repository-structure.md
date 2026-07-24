@@ -209,26 +209,70 @@ groups or framework buckets:
 
 ## Operation Layout
 
-Prefer one directory per operation:
+Use one directory per contract operation. The filesystem rule is semantic
+first, target variant second: do not create branch-only, architecture-first, or
+framework-first kernel trees.
 
 ```text
 kernels/<family>/<operation>/
   README.md
-  include/
-  src/
+  common/
+    include/
+    src/
   variants/
     metal_apple_gpu_family_7/
+      include/
+      src/
+      tests/
+      bench/
     metal_apple_gpu_family_8/
+      include/
+      src/
+      tests/
+      bench/
     metal_simdgroup/
+      include/
+      src/
+      tests/
+      bench/
   tests/
   bench/
 ```
 
-For small operations, direct `.metal` or `.mm` files under the family are
-acceptable until there is more than one implementation.
+`common/` is for target-independent operation code only. Anything that depends
+on an Apple GPU family, SIMD-group feature, threadgroup memory assumption,
+pipeline specialization, framework-specific launch path, or shape-specific
+tuning belongs under a variant directory.
+
+For very small operations, direct `.metal` or `.mm` files under the operation
+directory are acceptable only when they are genuinely target-independent. As
+soon as an operation has more than one architecture- or framework-specific
+implementation, move all target-specific source into `variants/`.
 
 Framework glue belongs under `bindings/`, not inside kernel operation
 directories.
+
+Branches are not the architecture boundary. A backend repository should keep
+all supported target variants in `main` side by side, with Xcode targets and
+scripts selecting variants by requested or detected target.
+
+## Target-Specific Internals
+
+Public backend headers remain under `include/quixicore/metal/`, and shared
+native Metal support can remain under `include/metal/`. Low-level implementation
+headers that differ by Apple GPU family or framework integration should use
+explicit internal target directories, for example:
+
+```text
+include/internal/metal/
+  common/
+  apple_gpu_family_7/
+  apple_gpu_family_8/
+  simdgroup/
+```
+
+Operation variants may include these internal headers, but contract-facing
+headers should not expose target-specific implementation layouts.
 
 ## Tests And Benchmarks
 
@@ -275,5 +319,9 @@ bindings deliberately.
 - Keep PyTorch MPS, MLX, Python, Swift, and Objective-C++ glue in `bindings/`.
 - Keep Xcode project state as references to canonical source files.
 - Put Apple GPU family and simdgroup-specific tuning under operation variants.
+- Keep all supported Metal target variants in the repo; do not depend on one
+  branch per architecture or framework target.
+- Build, test, benchmark, and Xcode entrypoints must filter variants by the
+  selected Metal target and must not compile unrelated target variants.
 - If an operation has no meaningful Metal implementation, mark it unsupported in
   metadata rather than adding a stub kernel.
