@@ -222,4 +222,71 @@ operations:
       pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
     tests: tests/correctness/attention/attn_decode
     benchmark: attn_decode_bh
+  attn_fwd_sg_d256:
+    family: attention
+    status: implemented
+    path: kernels/attention/attn_fwd_sg
+    notes: simdgroup_matrix flash attention for head_dim=256, GQA, f32 Q/O, and f16 K/V.
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_attn_fwd_sg_d256
+    benchmark: attn_fwd_sg
+  mean_pool_rms_l2:
+    family: serving
+    status: implemented
+    path: kernels/serving/mean_pool_rms_l2
+    notes: BF16 embedding mean-pool followed by RMS/L2 normalization for D in 256/512/768/1024.
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_mean_pool_rms_l2
+    benchmark: mean_pool_rms_l2
+  rms_norm_residual_next:
+    family: norms
+    status: implemented
+    path: kernels/norms/rms_norm_residual_next
+    notes: Fuses post-RMSNorm residual add with the next-block pre-RMSNorm.
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_rms_norm_residual_next
+    benchmark: rms_norm_residual_next
+  qk_norm_rope_kv_f16:
+    family: norms
+    status: implemented
+    path: kernels/norms/qk_norm_rope
+    notes: qk_norm_rope variant that split-stores Q as BF16 and K/V as FP16.
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_qk_norm_rope_kv_f16
+    benchmark: qk_norm_rope_kv_f16
+  qgemv_q4_0_f32_up_gate_gelu:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/qgemv_fused
+    notes: Fused Q4_0 decode GEMV for gelu_tanh(gate @ x) * (up @ x) with fp32 activation.
+    bindings:
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_qgemv_q4_0_f32_up_gate_gelu
+    benchmark: qgemv_fused
+  qgemv_q4_0_f32_up_gate:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/qgemv_fused
+    notes: Fused Q4_0 decode GEMV producing up and gate projections from one fp32 activation stream.
+    bindings:
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_qgemv_q4_0_f32_up_gate
+    benchmark: qgemv_fused
+  qgemv_q4_0_f32_qkv:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/qgemv_fused
+    notes: Fused Q4_0 decode GEMV for GQA-friendly Q/K/V projections from one fp32 activation stream.
+    bindings:
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: bindings/pytorch_mps/tests/test_mps.py::test_qgemv_q4_0_f32_qkv
+    benchmark: qgemv_fused
 notes: Canonical family manifest with operation-level metadata for specialized composed kernels.
