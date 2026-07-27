@@ -118,6 +118,143 @@ def matmul_custom(x, y):
     return out[:N, :M]
 
 
+def lora_apply_direct(x, A, B, base=None, scale=1.0):
+    """Direct Metal F16-adapter LoRA path for decode/small batches.
+
+    ``A`` is ``(rank,input_dim)`` F16 and ``B`` is
+    ``(output_dim,rank)`` F16. The optional ``base`` is ``(rows,output_dim)``.
+    Both low-rank projection outputs follow the explicit F16 adapter contract.
+    """
+    if _is_torch(x):
+        return _torch().lora_apply_direct(x, A, B, base=base, scale=scale)
+    import mlx.core as mx
+    has_base = base is not None
+    if base is None:
+        base = mx.zeros((1,), dtype=x.dtype)
+    return _mlx().lora_apply_direct(
+        x, A, B, base, float(scale), bool(has_base))
+
+
+def lora_apply(x, A, B, base=None, scale=1.0, use_kernel=None):
+    """Apply a reusable LoRA post-projection delta.
+
+    Decode and batches through four rows at adapter ranks through 16 use the
+    measured direct Metal path; larger batches or ranks use two framework F16
+    matmuls. ``use_kernel`` can force either route for diagnostics. No adapter
+    loading or model graph is implied.
+    """
+    direct = x.shape[0] <= 4 and A.shape[0] <= 16 if use_kernel is None else bool(use_kernel)
+    if direct:
+        return lora_apply_direct(x, A, B, base=base, scale=scale)
+    if _is_torch(x):
+        import torch
+        low = torch.matmul(x.to(torch.float16), A.transpose(0, 1))
+        delta = torch.matmul(low, B.transpose(0, 1))
+        result = delta.float() * float(scale)
+        if base is not None:
+            result = result + base.float()
+        return result.to(x.dtype)
+    import mlx.core as mx
+    low = mx.matmul(x.astype(mx.float16), mx.transpose(A))
+    delta = mx.matmul(low, mx.transpose(B))
+    result = delta.astype(mx.float32) * float(scale)
+    if base is not None:
+        result = result + base.astype(mx.float32)
+    return result.astype(x.dtype)
+
+
+def audio_conv1d_direct(x, weight, bias=None, stride=1, padding=0, dilation=1):
+    """Direct NWC convolution for precomputed audio features.
+
+    ``x`` is ``(B,T,C)``, ``weight`` is ``(O,K,C)``, and accumulation is FP32.
+    This is the tensor kernel used by Whisper-style encoder front ends.
+    """
+    if _is_torch(x):
+        return _torch().audio_conv1d_direct(x, weight, bias, stride, padding, dilation)
+    import mlx.core as mx
+    has_bias = bias is not None
+    b = bias if has_bias else mx.zeros((1,), dtype=x.dtype)
+    return _mlx().audio_conv1d_direct(
+        x, weight, b, int(stride), int(padding), int(dilation), bool(has_bias))
+
+
+def audio_conv1d(x, weight, bias=None, stride=1, padding=0, dilation=1,
+                 use_kernel=None):
+    """Measured general NWC audio convolution route.
+
+    Framework convolution is the default; ``use_kernel=True`` selects the
+    correctness-first direct Metal path for diagnostics or unsupported routing experiments.
+    """
+    if use_kernel:
+        return audio_conv1d_direct(x, weight, bias, stride, padding, dilation)
+    if _is_torch(x):
+        import torch.nn.functional as F
+        return F.conv1d(
+            x.permute(0, 2, 1), weight.permute(0, 2, 1), bias,
+            stride=int(stride), padding=int(padding), dilation=int(dilation)).permute(0, 2, 1)
+    import mlx.core as mx
+    result = mx.conv1d(x, weight, stride=int(stride), padding=int(padding),
+                       dilation=int(dilation))
+    if bias is not None:
+        result = (result.astype(mx.float32) + bias.astype(mx.float32)).astype(x.dtype)
+    return result
+
+
+def audio_depthwise_conv1d(x, weight, bias=None, stride=1, padding=0,
+                           dilation=1, activation="none"):
+    """NWC depthwise convolution for Conformer LightConv-style blocks.
+
+    ``weight`` is ``(C,K)``. ``activation`` is ``none`` or ``silu``.
+    """
+    if activation not in ("none", "silu"):
+        raise ValueError("audio_depthwise_conv1d: activation must be 'none' or 'silu'")
+    if _is_torch(x):
+        return _torch().audio_depthwise_conv1d(
+            x, weight, bias, stride, padding, dilation, activation)
+    import mlx.core as mx
+    has_bias = bias is not None
+    b = bias if has_bias else mx.zeros((1,), dtype=x.dtype)
+    return _mlx().audio_depthwise_conv1d(
+        x, weight, b, int(stride), int(padding), int(dilation), bool(has_bias),
+        1 if activation == "silu" else 0)
+
+
+def audio_causal_depthwise_conv1d(x, weight, bias=None, stride=1,
+                                  dilation=1, activation="none"):
+    """Left-padded NWC depthwise convolution for Conformer LightConv blocks."""
+    if activation not in ("none", "silu"):
+        raise ValueError("audio_causal_depthwise_conv1d: activation must be 'none' or 'silu'")
+    pad_left = int(dilation) * (weight.shape[1] - 1) + 1 - int(stride)
+    if pad_left < 0:
+        raise ValueError("audio_causal_depthwise_conv1d: stride exceeds receptive field")
+    if _is_torch(x):
+        return _torch().audio_causal_depthwise_conv1d(
+            x, weight, bias, stride, dilation, activation)
+    import mlx.core as mx
+    has_bias = bias is not None
+    b = bias if has_bias else mx.zeros((1,), dtype=x.dtype)
+    return _mlx().audio_depthwise_conv1d_asymmetric(
+        x, weight, b, int(stride), pad_left, 0, int(dilation), bool(has_bias),
+        1 if activation == "silu" else 0)
+
+
+def audio_relative_attention(q, k, v, relative_k, per_dim_scale, lengths=None,
+                             chunk_size=12, left_context=13, right_context=0,
+                             q_scale=0.0, k_scale=0.0, softcap=0.0):
+    """Blocked relative-position attention over ``(B,T,H,D)`` audio tensors."""
+    if _is_torch(q):
+        return _torch().audio_relative_attention(
+            q, k, v, relative_k, per_dim_scale, lengths, chunk_size,
+            left_context, right_context, q_scale, k_scale, softcap)
+    import mlx.core as mx
+    if lengths is None:
+        lengths = mx.full((q.shape[0],), q.shape[1], dtype=mx.int32)
+    return _mlx().audio_relative_attention(
+        q, k, v, relative_k, per_dim_scale, lengths, int(chunk_size),
+        int(left_context), int(right_context), float(q_scale), float(k_scale),
+        float(softcap))
+
+
 def attn_fwd(q, k, v, softcap=0.0, sinks=None):
     """Non-causal attention forward. softcap > 0 applies Gemma-style logit soft-capping
     (softcap*tanh(s/softcap)); sinks (H,) adds gpt-oss-style per-head attention-sink logits
@@ -134,6 +271,66 @@ def attn_fwd_sg_d256(q, k, v, scale=0.0, window=0):
     if _is_torch(q):
         return _torch().attn_fwd_sg_d256(q, k, v, scale=scale, window=window)
     return _mlx().attn_fwd_sg_d256(q, k, v, scale=float(scale), window=int(window))
+
+
+def cross_attention_direct(q, k, v, key_lengths=None, bias=None, scale=0.0, softcap=0.0):
+    """Independent-length GQA cross attention for audio/encoder-decoder blocks.
+
+    ``q`` is ``(B,Hq,Tq,D)`` and ``k/v`` are ``(B,Hkv,Tk,D)`` with
+    ``D`` in 64/128/256. ``key_lengths`` masks right padding. Optional FP32
+    ``bias(B,Hq,Tq,Tk)`` can express relative/chunk masks; softcap is applied
+    after scale+bias and before softmax.
+    """
+    if _is_torch(q):
+        return _torch().cross_attention_direct(q, k, v, key_lengths, bias, scale, softcap)
+    import mlx.core as mx
+    lengths = (mx.full((q.shape[0],), k.shape[2], dtype=mx.int32)
+               if key_lengths is None else key_lengths)
+    has_bias = bias is not None
+    b = mx.zeros((1,), dtype=mx.float32) if bias is None else bias
+    return _mlx().cross_attention(
+        q, k, v, lengths, b, float(scale), float(softcap), bool(has_bias))
+
+
+def cross_attention(q, k, v, key_lengths=None, bias=None, scale=0.0, softcap=0.0,
+                    use_kernel=None):
+    """Measured independent-length GQA cross-attention route.
+
+    The direct online Metal kernel is used through 128 keys; longer encoder
+    memories use framework matrix operations. ``use_kernel`` can force a route.
+    """
+    direct = k.shape[2] <= 128 if use_kernel is None else bool(use_kernel)
+    if direct:
+        return cross_attention_direct(q, k, v, key_lengths, bias, scale, softcap)
+    hq, hkv, tkv, dim = q.shape[1], k.shape[1], k.shape[2], q.shape[3]
+    used_scale = float(scale) if scale > 0 else dim ** -0.5
+    if _is_torch(q):
+        import torch
+        lengths = (torch.full((q.shape[0],), tkv, dtype=torch.int32, device=q.device)
+                   if key_lengths is None else key_lengths)
+        kk = k.repeat_interleave(hq // hkv, 1).float()
+        vv = v.repeat_interleave(hq // hkv, 1).float()
+        scores = q.float() @ kk.transpose(-1, -2) * used_scale
+        if bias is not None: scores = scores + bias.float()
+        if softcap > 0: scores = float(softcap) * torch.tanh(scores / float(softcap))
+        valid = torch.arange(tkv, device=q.device)[None, None, None, :] < lengths[:, None, None, None]
+        scores = scores.masked_fill(~valid, -float("inf"))
+        probs = torch.softmax(scores, -1)
+        probs = torch.where(valid.any(-1, keepdim=True), probs, torch.zeros_like(probs))
+        return (probs @ vv).to(q.dtype)
+    import mlx.core as mx
+    lengths = (mx.full((q.shape[0],), tkv, dtype=mx.int32)
+               if key_lengths is None else key_lengths)
+    kk = mx.repeat(k, hq // hkv, axis=1).astype(mx.float32)
+    vv = mx.repeat(v, hq // hkv, axis=1).astype(mx.float32)
+    scores = q.astype(mx.float32) @ mx.swapaxes(kk, -1, -2) * used_scale
+    if bias is not None: scores = scores + bias.astype(mx.float32)
+    if softcap > 0: scores = float(softcap) * mx.tanh(scores / float(softcap))
+    valid = mx.arange(tkv)[None, None, None, :] < lengths[:, None, None, None]
+    scores = mx.where(valid, scores, -float("inf"))
+    probs = mx.softmax(scores, axis=-1)
+    probs = mx.where(mx.any(valid, axis=-1, keepdims=True), probs, mx.zeros_like(probs))
+    return (probs @ vv).astype(q.dtype)
 
 
 def _varlen_worklist(cu_seqlens_q):
@@ -480,6 +677,17 @@ def mean_pool_rms_l2(x, weight, eps=1e-5):
     return _mlx().mean_pool_rms_l2(x, weight, eps=eps)
 
 
+def masked_mean_pool_rms_l2(x, mask, weight, eps=1e-5):
+    """Mask-aware ``(B,T,D)->(B,D)`` mean pool, RMSNorm, and L2 normalize.
+
+    Nonzero mask entries are included; an all-masked batch row emits zero.
+    Inputs/output are BF16 and ``D`` is one of 256, 512, 768, or 1024.
+    """
+    if _is_torch(x):
+        return _torch().masked_mean_pool_rms_l2(x, mask, weight, eps)
+    return _mlx().masked_mean_pool_rms_l2(x, mask, weight, eps=float(eps))
+
+
 def rms_norm_backward(x, weight, dy, eps=1e-5):
     """RMSNorm backward. Returns (dx, dweight): dx has x's shape, dweight (D,) fp32 is summed over all
     rows. x/dy (..., D), weight (D,). Matches torch autograd. A single fused kernel computes rstd
@@ -524,6 +732,56 @@ def rotary(x, cos, sin, interleaved=False):
     if _is_torch(x):
         return _torch().rotary(x, cos, sin, interleaved)
     return _mlx().rotary(x, cos, sin, interleaved)
+
+
+def rotary_positioned(x, cos, sin, positions, rotary_dim=0, interleaved=False):
+    """RoPE with explicit positions and an optional partial rotary prefix.
+
+    ``x`` is ``(B,H,N,D)``; positions is ``(N,)`` or ``(B,N)``; cos/sin are
+    ``(max_pos, rotary_dim/2)``. ``rotary_dim=0`` means the full head.
+    Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().rotary_positioned(
+            x, cos, sin, positions, rotary_dim=rotary_dim, interleaved=interleaved)
+    return _mlx().rotary_positioned(
+        x, cos, sin, positions, rotary_dim, interleaved)
+
+
+def mrope(x, cos, sin, positions, sections, rotary_dim=0,
+          section_interleaved=False):
+    """Three-axis temporal/height/width M-RoPE with split-half pairing.
+
+    ``positions`` is ``(3,N)`` or ``(B,3,N)``. ``sections`` contains three
+    rotary-pair counts. Set ``section_interleaved=True`` for the Qwen
+    ``THWTHW...`` mapping. Accepts mlx.array or torch.Tensor (MPS).
+    """
+    if _is_torch(x):
+        return _torch().mrope(
+            x, cos, sin, positions, sections, rotary_dim=rotary_dim,
+            section_interleaved=section_interleaved)
+    return _mlx().mrope(
+        x, cos, sin, positions, list(sections), rotary_dim,
+        section_interleaved)
+
+
+def vision_rope_2d(x, cos, sin, positions, layout="axis_blocks"):
+    """Two-axis vision RoPE.
+
+    ``axis_blocks`` is Gemma's local split-half layout; ``global_split`` is
+    Qwen's global split-half layout with x/y frequency sections in each half.
+    """
+    if layout not in ("axis_blocks", "global_split"):
+        raise ValueError("vision_rope_2d: layout must be 'axis_blocks' or 'global_split'")
+    global_split = layout == "global_split"
+    if _is_torch(x):
+        return _torch().vision_rope_2d(x, cos, sin, positions, global_split)
+    return _mlx().vision_rope_2d(x, cos, sin, positions, global_split)
+
+
+def qwen_vision_rope_2d(x, cos, sin, positions):
+    """Qwen vision RoPE convenience alias for the global split-half layout."""
+    return vision_rope_2d(x, cos, sin, positions, layout="global_split")
 
 
 def gelu(x):
@@ -587,7 +845,8 @@ def gelu_backward(x, dy):
 
 
 def glu(x, gate, mode="swiglu", alpha=1.0, limit=1.0e20):
-    """GLU-family activation. mode in reglu/geglu/swiglu/swiglu_oai/geglu_erf/geglu_quick."""
+    """GLU-family activation. ``sigmoid`` computes ``sigmoid(x) * gate``; the other modes are
+    reglu/geglu/swiglu/swiglu_oai/geglu_erf/geglu_quick."""
     if _is_torch(x):
         return _torch().glu(x, gate, mode, alpha, limit)
     return _mlx().glu(x, gate, mode=mode, alpha=alpha, limit=limit)
@@ -596,7 +855,8 @@ def glu(x, gate, mode="swiglu", alpha=1.0, limit=1.0e20):
 def glu_backward(x, gate, dc, mode="swiglu", alpha=1.0, limit=1.0e20):
     """GLU-family backward: given the upstream grad dc (wrt out=act(x)*gate), returns (da, db) =
     grads wrt x, gate. da = dc*gate*act'(x), db = dc*act(x). mode in reglu/geglu/swiglu/swiglu_oai/
-    geglu_erf/geglu_quick. Matches the gradient of the tk glu forward. Accepts mlx / torch (MPS)."""
+    geglu_erf/geglu_quick/sigmoid. Matches the gradient of the tk glu forward. Accepts mlx / torch
+    (MPS)."""
     if _is_torch(x):
         return _torch().glu_backward(x, gate, dc, mode, alpha, limit)
     out = _mlx().glu_backward(x, gate, dc, mode=mode, alpha=alpha, limit=limit)
@@ -625,6 +885,11 @@ def geglu_erf(x, gate):
 
 def geglu_quick(x, gate):
     return glu(x, gate, mode="geglu_quick")
+
+
+def sigmoid_mul(x, gate):
+    """Elementwise ``sigmoid(x) * gate``, including the Qwen full-attention output gate."""
+    return glu(x, gate, mode="sigmoid")
 
 
 def hadamard(x, scale=0.0):
@@ -675,6 +940,46 @@ def kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scal
                                             k_scale, v_scale, num_tokens, fmt)
     return _mlx().kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens,
                                       k_scale, v_scale, int(num_tokens), int(fmt))
+
+
+def kv_cache_scatter_q8_0(key, value, slot_mapping, num_blocks, block_size):
+    """Encode and scatter K/V into QuixiCore Q8_0 paged-cache planes.
+
+    Returns ``(key_codes, key_scales, value_codes, value_scales)``. Code planes
+    are int8 ``(num_blocks, block_size, H_KV, D)``; FP16 scale planes are
+    ``(num_blocks, block_size, H_KV, D/32)``. Each scale describes 32
+    consecutive dimensions. Accepts MLX or PyTorch MPS tensors.
+    """
+    if _is_torch(key):
+        return _torch().kv_cache_scatter_q8_0(
+            key, value, slot_mapping, int(num_blocks), int(block_size))
+    return _mlx().kv_cache_scatter_q8_0(
+        key, value, slot_mapping, int(num_blocks), int(block_size))
+
+
+def kv_cache_gather_q8_0(key_codes, key_scales, value_codes, value_scales,
+                         block_table, cu_seq_lens, num_tokens,
+                         output_dtype="bfloat16"):
+    """Gather and decode QuixiCore Q8_0 paged-cache planes."""
+    if output_dtype not in ("float16", "bfloat16", "float32"):
+        raise ValueError("output_dtype must be 'float16', 'bfloat16', or 'float32'")
+    if _is_torch(key_codes):
+        return _torch().kv_cache_gather_q8_0(
+            key_codes, key_scales, value_codes, value_scales,
+            block_table, cu_seq_lens, int(num_tokens), output_dtype)
+    return _mlx().kv_cache_gather_q8_0(
+        key_codes, key_scales, value_codes, value_scales,
+        block_table, cu_seq_lens, int(num_tokens), output_dtype)
+
+
+def kv_cache_copy_blocks_q8_0(key_codes, key_scales, value_codes, value_scales,
+                              block_mapping):
+    """Functionally clone Q8_0 cache planes and apply ``(src, dst)`` block copies."""
+    if _is_torch(key_codes):
+        return _torch().kv_cache_copy_blocks_q8_0(
+            key_codes, key_scales, value_codes, value_scales, block_mapping)
+    return _mlx().kv_cache_copy_blocks_q8_0(
+        key_codes, key_scales, value_codes, value_scales, block_mapping)
 
 
 def kv_cache_scale_update(key, value, old_key_scale, old_value_scale):
@@ -778,6 +1083,23 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                                             k_scale, v_scale, scale, fmt, window)
     return _mlx().paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                                       k_scale, v_scale, scale, _fmt_code(fmt), window=window)
+
+
+def paged_attention_q8_0(q, key_codes, key_scales, value_codes, value_scales,
+                         block_table, context_lens, scale=0.0, window=0):
+    """Paged decode attention with direct Q8_0 K/V dequantization on read.
+
+    ``q`` and the output are ``(B, H_Q, D)`` in the input floating dtype.
+    GQA/MQA are supported; ``D`` is 64 or 128. ``window > 0`` restricts the
+    read to the most recent tokens.
+    """
+    if _is_torch(q):
+        return _torch().paged_attention_q8_0(
+            q, key_codes, key_scales, value_codes, value_scales,
+            block_table, context_lens, float(scale), int(window))
+    return _mlx().paged_attention_q8_0(
+        q, key_codes, key_scales, value_codes, value_scales,
+        block_table, context_lens, float(scale), int(window))
 
 
 def paged_attention_v2(q, key_cache, value_cache, block_table, context_lens,
@@ -1001,6 +1323,28 @@ def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
     if _is_torch(logits):
         return _torch().quadratic_transform(logits, factor, curve, temperature)
     return _mlx().quadratic_transform(logits, float(factor), float(curve), float(temperature))
+
+
+def logits_softcap(logits, cap):
+    """Apply the final-logit transform ``cap * tanh(logits / cap)``.
+
+    This is distinct from the score softcap inside attention kernels. Accepts
+    MLX arrays or PyTorch MPS tensors.
+    """
+    if _is_torch(logits):
+        return _torch().logits_softcap(logits, cap)
+    return _mlx().logits_softcap(logits, float(cap))
+
+
+def value_clip(x, min_value, max_value):
+    """Clamp a float tensor to inclusive scalar bounds.
+
+    This composes around dense or quantized projections to implement Gemma-style
+    clippable linears, and also covers the audio tower's activation clamps.
+    """
+    if _is_torch(x):
+        return _torch().value_clip(x, min_value, max_value)
+    return _mlx().value_clip(x, float(min_value), float(max_value))
 
 
 def top_nsigma_mask(logits, nsigma, temperature=1.0):
@@ -1305,6 +1649,66 @@ def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initi
     return out[0], out[1]
 
 
+def gdn_short_conv(x, weight, state_pool, cu_seqlens, slot_mapping,
+                   load_initial=True, apply_silu=True):
+    """Varlen causal depthwise convolution over projected GDN channels.
+
+    ``x`` is ``(total_tokens, channels)``, ``weight`` is
+    ``(channels, kernel_size)`` ordered oldest-to-current, and ``state_pool`` is
+    fp32 ``(num_slots, channels, kernel_size - 1)``. The state stores raw input
+    history. Returns ``(out, new_state_pool)`` without mutating the input pool.
+    """
+    if _is_torch(x):
+        return _torch().gdn_short_conv(
+            x, weight, state_pool, cu_seqlens, slot_mapping,
+            load_initial=load_initial, apply_silu=apply_silu)
+    out = _mlx().gdn_short_conv(
+        x, weight, state_pool, cu_seqlens, slot_mapping,
+        load_initial, apply_silu)
+    return out[0], out[1]
+
+
+def gdn_qkv_prepare(mixed, num_k_heads, num_v_heads, key_head_dim,
+                    value_head_dim, eps=1e-6, q_scale=None, k_scale=None):
+    """Split activated projected GDN Q/K/V and normalize Q/K per head.
+
+    Scales are explicit mathematical multipliers after RMS normalization. Their
+    defaults match Qwen3.5: ``q_scale=1/key_head_dim`` and
+    ``k_scale=1/sqrt(key_head_dim)``. Returns ``(q, k, v)``.
+    """
+    if q_scale is None:
+        q_scale = 1.0 / key_head_dim
+    if k_scale is None:
+        k_scale = key_head_dim ** -0.5
+    if _is_torch(mixed):
+        return _torch().gdn_qkv_prepare(
+            mixed, num_k_heads, num_v_heads, key_head_dim, value_head_dim,
+            eps=eps, q_scale=q_scale, k_scale=k_scale)
+    out = _mlx().gdn_qkv_prepare(
+        mixed, int(num_k_heads), int(num_v_heads), int(key_head_dim),
+        int(value_head_dim), float(eps), float(q_scale), float(k_scale))
+    return out[0], out[1], out[2]
+
+
+def gdn_gate_beta(a, b, A_log, dt_bias):
+    """Return fp32 GDN recurrence controls ``(decay, beta)``.
+
+    ``decay = exp(-exp(A_log) * softplus(a + dt_bias))`` and
+    ``beta = sigmoid(b)`` for projection logits shaped ``(tokens, heads)``.
+    """
+    if _is_torch(a):
+        return _torch().gdn_gate_beta(a, b, A_log, dt_bias)
+    out = _mlx().gdn_gate_beta(a, b, A_log, dt_bias)
+    return out[0], out[1]
+
+
+def gdn_gated_rmsnorm(y, z, weight, eps=1e-6):
+    """Per-head ``rms_norm(y, weight, eps) * silu(z)`` with fp32 accumulation."""
+    if _is_torch(y):
+        return _torch().gdn_gated_rmsnorm(y, z, weight, eps=eps)
+    return _mlx().gdn_gated_rmsnorm(y, z, weight, float(eps))
+
+
 def selective_scan(u, delta, A, B, C, state, D=None, delta_bias=None, z=None,
                    delta_softplus=True):
     """Mamba-1 (S6) selective scan forward, dense batch. Channel-major layouts:
@@ -1391,6 +1795,32 @@ def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_
                                num_heads_q, num_heads_k, num_heads_v,
                                eps=float(eps), interleaved=bool(interleaved),
                                gemma=bool(gemma))
+
+
+def qk_norm_rope_positioned(
+        qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+        num_heads_v, rotary_dim=0, eps=1e-6, interleaved=False,
+        norm_weight_offset=0.0, mrope_sections=(), section_interleaved=False):
+    """Explicit fused Q/K RMSNorm plus positioned, partial, or multimodal RoPE.
+
+    One-dimensional ``positions`` has shape ``(T,)``. With three
+    ``mrope_sections`` it has shape ``(3,T)`` and uses split-half pairing;
+    ``section_interleaved=True`` selects the Qwen ``THWTHW...`` axis map.
+    ``norm_weight_offset`` directly expresses ``weight + offset``.
+    """
+    if _is_torch(qkv):
+        return _torch().qk_norm_rope_positioned(
+            qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+            num_heads_v, rotary_dim=rotary_dim, eps=eps, interleaved=interleaved,
+            norm_weight_offset=norm_weight_offset, mrope_sections=mrope_sections,
+            section_interleaved=section_interleaved)
+    return _mlx().qk_norm_rope_positioned(
+        qkv, q_weight, k_weight, cos, sin, positions, int(num_heads_q),
+        int(num_heads_k), int(num_heads_v), rotary_dim=int(rotary_dim),
+        eps=float(eps), interleaved=bool(interleaved),
+        norm_weight_offset=float(norm_weight_offset),
+        mrope_sections=list(mrope_sections),
+        section_interleaved=bool(section_interleaved))
 
 
 def qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
@@ -1694,6 +2124,19 @@ def embedding_lookup(token_ids, table, pos_table=None, scale=1.0):
     import mlx.core as mx
     pt = pos_table if pos_table is not None else mx.zeros((1,), dtype=table.dtype)
     return _mlx().embedding_lookup(token_ids, table, pt, float(scale))
+
+
+def embedding_lookup_types(token_ids, type_ids, token_table, type_table, token_scale=1.0):
+    """Fused token and token-type embedding gather/add for BERT-style inputs.
+
+    Returns ``token_scale*token_table[token_ids] + type_table[type_ids]``;
+    each invalid id contributes zero independently.
+    """
+    if _is_torch(token_table):
+        return _torch().embedding_lookup_types(
+            token_ids, type_ids, token_table, type_table, float(token_scale))
+    return _mlx().embedding_lookup_types(
+        token_ids, type_ids, token_table, type_table, float(token_scale))
 
 
 def embedding_backward(token_ids, dY, vocab, scale=1.0, method="atomic"):
@@ -2457,6 +2900,22 @@ def quantize_per_tensor_int8(x):
     return codes, scale
 
 
+def calibration_absmax(x, running=None):
+    """Return FP32 per-channel ``max(abs(x), axis=0)`` for calibration.
+
+    Supplying a prior result as ``running`` performs an exact running maximum,
+    allowing arbitrarily long calibration sets to be processed in chunks.
+    NaN propagates and either infinity becomes positive infinity.
+    """
+    if _is_torch(x):
+        return _torch().calibration_absmax(x, running=running)
+    import mlx.core as mx
+    has_running = running is not None
+    if running is None:
+        running = mx.zeros((x.shape[1],), dtype=mx.float32)
+    return _mlx().calibration_absmax(x, running, bool(has_running))
+
+
 def quantize_per_token_fp8(x):
     """Per-row fp8 e4m3 quant. Returns (codes uint8, scale f32), scale=absmax/448.
 
@@ -2933,6 +3392,151 @@ def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
     return _mlx().patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
 
 
+def extract_patches_2d(x, kernel_h, kernel_w, stride_h, stride_w, pad_h=0, pad_w=0,
+                       use_kernel=None):
+    """Extract padded NHWC patches as ``(B,OH*OW,KH*KW*C)``.
+
+    Canonical non-overlapping divisible patches use the measured reshape/transpose
+    route. Other geometries use the direct Metal gather; ``use_kernel`` can force either.
+    """
+    reshape_ok = (int(pad_h) == 0 and int(pad_w) == 0 and
+                  int(stride_h) == int(kernel_h) and int(stride_w) == int(kernel_w) and
+                  x.shape[1] % int(kernel_h) == 0 and x.shape[2] % int(kernel_w) == 0)
+    direct = not reshape_ok if use_kernel is None else bool(use_kernel)
+    if direct:
+        if _is_torch(x):
+            return _torch().extract_patches_2d(
+                x, kernel_h, kernel_w, stride_h, stride_w, pad_h, pad_w)
+        return _mlx().extract_patches_2d(
+            x, int(kernel_h), int(kernel_w), int(stride_h), int(stride_w),
+            int(pad_h), int(pad_w))
+    if not reshape_ok:
+        raise ValueError("extract_patches_2d: framework route requires non-overlapping divisible patches")
+    b, h, w, c = x.shape
+    oh, ow = h // int(kernel_h), w // int(kernel_w)
+    if _is_torch(x):
+        return x.reshape(b, oh, int(kernel_h), ow, int(kernel_w), c).permute(
+            0, 1, 3, 2, 4, 5).reshape(b, oh * ow, int(kernel_h) * int(kernel_w) * c)
+    import mlx.core as mx
+    y = mx.reshape(x, (b, oh, int(kernel_h), ow, int(kernel_w), c))
+    return mx.reshape(mx.transpose(y, (0, 1, 3, 2, 4, 5)),
+                      (b, oh * ow, int(kernel_h) * int(kernel_w) * c))
+
+
+def extract_patches_3d(x, kernel_t, kernel_h, kernel_w,
+                       stride_t, stride_h, stride_w,
+                       pad_t=0, pad_h=0, pad_w=0, use_kernel=None):
+    """Extract padded NTHWC patches as ``(B,OT*OH*OW,KT*KH*KW*C)``."""
+    kt, kh, kw = int(kernel_t), int(kernel_h), int(kernel_w)
+    st, sh, sw = int(stride_t), int(stride_h), int(stride_w)
+    pt, ph, pw = int(pad_t), int(pad_h), int(pad_w)
+    reshape_ok = (pt == 0 and ph == 0 and pw == 0 and
+                  st == kt and sh == kh and sw == kw and
+                  x.shape[1] % kt == 0 and x.shape[2] % kh == 0 and x.shape[3] % kw == 0)
+    direct = not reshape_ok if use_kernel is None else bool(use_kernel)
+    if direct:
+        if _is_torch(x):
+            return _torch().extract_patches_3d(
+                x, kt, kh, kw, st, sh, sw, pt, ph, pw)
+        return _mlx().extract_patches_3d(
+            x, kt, kh, kw, st, sh, sw, pt, ph, pw)
+    if not reshape_ok:
+        raise ValueError("extract_patches_3d: framework route requires non-overlapping divisible patches")
+    b, t, h, w, c = x.shape; ot, oh, ow = t // kt, h // kh, w // kw
+    if _is_torch(x):
+        return x.reshape(b, ot, kt, oh, kh, ow, kw, c).permute(
+            0, 1, 3, 5, 2, 4, 6, 7).reshape(b, ot * oh * ow, kt * kh * kw * c)
+    import mlx.core as mx
+    y = mx.reshape(x, (b, ot, kt, oh, kh, ow, kw, c))
+    return mx.reshape(mx.transpose(y, (0, 1, 3, 5, 2, 4, 6, 7)),
+                      (b, ot * oh * ow, kt * kh * kw * c))
+
+
+def vision_patch_projection_3d(x, weight, bias=None,
+                               stride_t=None, stride_h=None, stride_w=None,
+                               pad_t=0, pad_h=0, pad_w=0):
+    """Temporal-spatial patch projection for NTHWC input and ``(O,KT,KH,KW,C)`` weights."""
+    kt, kh, kw = weight.shape[1], weight.shape[2], weight.shape[3]
+    stride_t = kt if stride_t is None else stride_t
+    stride_h = kh if stride_h is None else stride_h
+    stride_w = kw if stride_w is None else stride_w
+    patches = extract_patches_3d(
+        x, kt, kh, kw, stride_t, stride_h, stride_w, pad_t, pad_h, pad_w)
+    if _is_torch(x):
+        result = patches.float() @ weight.reshape(weight.shape[0], -1).float().transpose(0, 1)
+        if bias is not None:
+            result = result + bias.float()
+        return result.to(x.dtype)
+    import mlx.core as mx
+    result = patches.astype(mx.float32) @ mx.transpose(
+        mx.reshape(weight, (weight.shape[0], -1)).astype(mx.float32))
+    if bias is not None:
+        result = result + bias.astype(mx.float32)
+    return result.astype(x.dtype)
+
+
+def vision_patch_projection(x, weight, bias=None, stride_h=None, stride_w=None,
+                            pad_h=0, pad_w=0):
+    """Patch/conv projection from NHWC input using extraction plus framework GEMM.
+
+    ``weight`` is ``(O,KH,KW,C)`` and the result is ``(B,OH*OW,O)``. This is
+    a tensor operation only: image decoding and tower orchestration remain out of scope.
+    """
+    kh, kw = weight.shape[1], weight.shape[2]
+    stride_h = kh if stride_h is None else stride_h
+    stride_w = kw if stride_w is None else stride_w
+    patches = extract_patches_2d(x, kh, kw, stride_h, stride_w, pad_h, pad_w)
+    if _is_torch(x):
+        result = patches.float() @ weight.reshape(weight.shape[0], -1).float().transpose(0, 1)
+        if bias is not None:
+            result = result + bias.float()
+        return result.to(x.dtype)
+    import mlx.core as mx
+    result = patches.astype(mx.float32) @ mx.transpose(mx.reshape(weight, (weight.shape[0], -1)).astype(mx.float32))
+    if bias is not None:
+        result = result + bias.astype(mx.float32)
+    return result.astype(x.dtype)
+
+
+def interpolate_position_2d(table, out_h, out_w, align_corners=False):
+    """Bilinearly resize an ``(H,W,D)`` learned position table in FP32 compute."""
+    if _is_torch(table):
+        return _torch().interpolate_position_2d(table, out_h, out_w, align_corners)
+    return _mlx().interpolate_position_2d(
+        table, int(out_h), int(out_w), bool(align_corners))
+
+
+def avg_pool2d_tokens(x, kernel_h, kernel_w, stride_h=None, stride_w=None,
+                      ceil_mode=False):
+    """Spatial average pooling for NHWC vision/audio token maps."""
+    stride_h = kernel_h if stride_h is None else stride_h
+    stride_w = kernel_w if stride_w is None else stride_w
+    if _is_torch(x):
+        return _torch().avg_pool2d_tokens(
+            x, kernel_h, kernel_w, stride_h, stride_w, ceil_mode)
+    return _mlx().avg_pool2d_tokens(
+        x, int(kernel_h), int(kernel_w), int(stride_h), int(stride_w),
+        bool(ceil_mode))
+
+
+def factorized_position_2d(position_ids, table, valid_mask):
+    """Gather ``table[0,x] + table[1,y]`` and zero invalid positions."""
+    if _is_torch(table):
+        return _torch().factorized_position_2d(position_ids, table, valid_mask)
+    return _mlx().factorized_position_2d(position_ids, table, valid_mask)
+
+
+def pool_tokens_by_position(x, position_ids, valid_mask, output_length,
+                            kernel_size, source_width):
+    """Coordinate-bucketed Gemma vision pooler; returns tokens and validity."""
+    if _is_torch(x):
+        return _torch().pool_tokens_by_position(
+            x, position_ids, valid_mask, output_length, kernel_size, source_width)
+    return tuple(_mlx().pool_tokens_by_position(
+        x, position_ids, valid_mask, int(output_length), int(kernel_size),
+        int(source_width)))
+
+
 def space_to_depth_norm_linear(x, norm_weight, projection_weight, height, width,
                                norm_bias=None, projection_bias=None, block_size=2,
                                eps=1e-5, use_kernel=None):
@@ -3287,6 +3891,218 @@ def qgemv(wq, x, format="q8_0"):
     if _is_torch(wq):
         return _torch().qgemv(wq, x, format)
     return _mlx().qgemv(wq, x, format=format)
+
+
+def base_qdequant(codes, scales, biases, bits, group_size, scale_dtype="bf16",
+                  symmetric=False, layout="metal", output_dtype="float16"):
+    """Decode canonical BaseQN separate planes to ``(rows, K)``.
+
+    ``codes`` is uint8 ``(rows, K*bits/8)``. ``scales`` and asymmetric
+    ``biases`` are ``(rows, K/group_size)`` in the declared storage dtype;
+    symmetric tensors pass ``biases=None``. Accepts MLX or PyTorch MPS tensors.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qdequant: biases are required for asymmetric BaseQN")
+        biases = scales  # placeholder buffer; symmetric kernels never read it
+    if _is_torch(codes):
+        return _torch().base_qdequant(
+            codes, scales, biases, bits, group_size, scale_dtype,
+            symmetric, layout, output_dtype)
+    return _mlx().base_qdequant(
+        codes, scales, biases, int(bits), int(group_size),
+        scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout,
+        output_dtype=output_dtype)
+
+
+def base_qgemv(codes, scales, biases, x, bits, group_size,
+               scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Compute ``dequant(BaseQN weights) @ x`` for ``x`` shaped ``(K, 1)``."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qgemv: biases are required for asymmetric BaseQN")
+        biases = scales
+    if _is_torch(codes):
+        return _torch().base_qgemv(
+            codes, scales, biases, x, bits, group_size, scale_dtype,
+            symmetric, layout)
+    return _mlx().base_qgemv(
+        codes, scales, biases, x, int(bits), int(group_size),
+        scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout)
+
+
+def base_qgemm(codes, scales, biases, x, bits, group_size,
+               scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Compute ``dequant(BaseQN weights) @ x`` for ``x`` shaped ``(K, M)``.
+
+    The host route uses the decode GEMV specialization when ``M == 1``.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qgemm: biases are required for asymmetric BaseQN")
+        biases = scales
+    if _is_torch(codes):
+        return _torch().base_qgemm(
+            codes, scales, biases, x, bits, group_size, scale_dtype,
+            symmetric, layout)
+    return _mlx().base_qgemm(
+        codes, scales, biases, x, int(bits), int(group_size),
+        scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout)
+
+
+def base_qgemv_qkv(q_codes, q_scales, q_biases,
+                   k_codes, k_scales, k_biases,
+                   v_codes, v_scales, v_biases, x, bits, group_size,
+                   scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Compute fused BaseQN Q/K/V decode GEMVs over one ``(K, 1)`` input.
+
+    The three packed matrices share one descriptor but may have different row
+    counts. Returns ``(q, k, v)`` without introducing model or engine objects.
+    """
+    planes = [(q_scales, q_biases), (k_scales, k_biases),
+              (v_scales, v_biases)]
+    if not symmetric and any(bias is None for _, bias in planes):
+        raise ValueError("base_qgemv_qkv: biases are required for asymmetric BaseQN")
+    q_biases = q_scales if q_biases is None else q_biases
+    k_biases = k_scales if k_biases is None else k_biases
+    v_biases = v_scales if v_biases is None else v_biases
+    if _is_torch(q_codes):
+        return _torch().base_qgemv_qkv(
+            q_codes, q_scales, q_biases, k_codes, k_scales, k_biases,
+            v_codes, v_scales, v_biases, x, bits, group_size,
+            scale_dtype, symmetric, layout)
+    # The branch-selecting combined grid wins at short inner dimensions but
+    # loses to the direct GEMV pipeline once decode becomes bandwidth-bound.
+    if int(x.shape[0]) > 1024:
+        return tuple(
+            _mlx().base_qgemv(
+                codes, scales, biases, x, int(bits), int(group_size),
+                scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout)
+            for codes, scales, biases in (
+                (q_codes, q_scales, q_biases),
+                (k_codes, k_scales, k_biases),
+                (v_codes, v_scales, v_biases),
+            )
+        )
+    return tuple(_mlx().base_qgemv_qkv(
+        q_codes, q_scales, q_biases, k_codes, k_scales, k_biases,
+        v_codes, v_scales, v_biases, x, int(bits), int(group_size),
+        scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout))
+
+
+def base_qgemv_swiglu(gate_codes, gate_scales, gate_biases,
+                      up_codes, up_scales, up_biases, x, bits, group_size,
+                      scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Compute ``silu(W_gate @ x) * (W_up @ x)`` directly from BaseQN planes."""
+    if not symmetric and (gate_biases is None or up_biases is None):
+        raise ValueError("base_qgemv_swiglu: biases are required for asymmetric BaseQN")
+    gate_biases = gate_scales if gate_biases is None else gate_biases
+    up_biases = up_scales if up_biases is None else up_biases
+    if _is_torch(gate_codes):
+        return _torch().base_qgemv_swiglu(
+            gate_codes, gate_scales, gate_biases, up_codes, up_scales,
+            up_biases, x, bits, group_size, scale_dtype, symmetric, layout)
+    return _mlx().base_qgemv_swiglu(
+        gate_codes, gate_scales, gate_biases, up_codes, up_scales, up_biases,
+        x, int(bits), int(group_size), scale_dtype=scale_dtype,
+        symmetric=bool(symmetric), layout=layout)
+
+
+def base_qembedding(codes, scales, biases, ids, bits, group_size,
+                    scale_dtype="bf16", symmetric=False, layout="metal",
+                    output_dtype="float16"):
+    """Gather BaseQN rows and decode directly to ``ids.shape + (K,)``.
+
+    Out-of-range ids produce zero rows, matching QuixiCore's existing packed
+    embedding contract.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qembedding: biases are required for asymmetric BaseQN")
+        biases = scales
+    if _is_torch(codes):
+        return _torch().base_qembedding(
+            codes, scales, biases, ids, bits, group_size, scale_dtype,
+            symmetric, layout, output_dtype)
+    return _mlx().base_qembedding(
+        codes, scales, biases, ids, int(bits), int(group_size),
+        scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout,
+        output_dtype=output_dtype)
+
+
+def base_qlm_head_argmax(codes, scales, biases, x, bits, group_size,
+                         scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Select greedy token ids directly from a packed BaseQN LM head.
+
+    ``codes`` represents ``(V,K)`` weights and ``x`` is ``(K,batch)``. The
+    result is ``(batch,)`` int32. The measured route composes one direct
+    BaseQN GEMV per activation column with QuixiCore's greedy sampling kernel.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qlm_head_argmax: biases are required for asymmetric BaseQN")
+        biases = scales
+    if x.ndim != 2 or int(x.shape[1]) <= 0:
+        raise ValueError("base_qlm_head_argmax: x must be non-empty (K, batch)")
+    if _is_torch(codes):
+        return _torch().base_qlm_head_argmax(
+            codes, scales, biases, x, bits, group_size, scale_dtype,
+            symmetric, layout)
+    import mlx.core as mx
+    logits = mx.concatenate([
+        _mlx().base_qgemv(
+            codes, scales, biases, x[:, i:i + 1], int(bits), int(group_size),
+            scale_dtype=scale_dtype, symmetric=bool(symmetric), layout=layout)
+        for i in range(int(x.shape[1]))
+    ], axis=1)
+    return _mlx().argmax_sample(mx.transpose(logits))
+
+
+def base_qmoe_gemm(codes, scales, biases, input, expert_of_tile, bits,
+                   group_size, scale_dtype="bf16", symmetric=False,
+                   layout="metal"):
+    """Project padded MoE rows through a canonical BaseQN expert stack.
+
+    ``codes`` is ``(experts, output_rows, K*bits/8)``, ``input`` is
+    ``(total_rows, K)``, and ``expert_of_tile`` maps each 32-row tile to its
+    expert. The result is ``(total_rows, output_rows)``.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qmoe_gemm: biases are required for asymmetric BaseQN")
+        biases = scales
+    if _is_torch(codes):
+        return _torch().base_qmoe_gemm(
+            codes, scales, biases, input, expert_of_tile, bits, group_size,
+            scale_dtype, symmetric, layout)
+    return _mlx().base_qmoe_gemm(
+        codes, scales, biases, input, expert_of_tile, int(bits),
+        int(group_size), scale_dtype=scale_dtype, symmetric=bool(symmetric),
+        layout=layout)
+
+
+def base_qmoe_swiglu(codes, scales, biases, input, expert_of_tile, bits,
+                     group_size, scale_dtype="bf16", symmetric=False,
+                     layout="metal"):
+    """Fused BaseQN grouped expert gate/up projection and SwiGLU.
+
+    The packed output-row axis is ``[gate(intermediate), up(intermediate)]``.
+    """
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qmoe_swiglu: biases are required for asymmetric BaseQN")
+        biases = scales
+    if _is_torch(codes):
+        return _torch().base_qmoe_swiglu(
+            codes, scales, biases, input, expert_of_tile, bits, group_size,
+            scale_dtype, symmetric, layout)
+    return _mlx().base_qmoe_swiglu(
+        codes, scales, biases, input, expert_of_tile, int(bits),
+        int(group_size), scale_dtype=scale_dtype, symmetric=bool(symmetric),
+        layout=layout)
 
 
 def qgemv_q4_0_f32_up_gate_gelu(up, gate, x):

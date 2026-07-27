@@ -782,6 +782,310 @@ instantiate_paged_attention_fp8(e5m2, 1, float16, half, 128)
 instantiate_paged_attention_fp8(e5m2, 1, bfloat16, bf16, 64)
 instantiate_paged_attention_fp8(e5m2, 1, bfloat16, bf16, 128)
 
+// ---------------------------------------------------------------------------
+// Q8_0 KV cache.
+//
+// QuixiCore owns the tensor ABI rather than exposing the packed 34-byte GGML
+// struct: codes are int8 (nb, bs, H, D), scales are fp16
+// (nb, bs, H, D/32).  A logical Q8_0 block is still exactly 32 consecutive
+// head-dimension values with one fp16 delta.  Codes are formed with the fp32
+// delta (amax/127); reads use the stored fp16 delta.
+// ---------------------------------------------------------------------------
+
+kernel void kv_cache_zero_q8_0(device char *key_codes [[buffer(0)]],
+                               device half *key_scales [[buffer(1)]],
+                               device char *value_codes [[buffer(2)]],
+                               device half *value_scales [[buffer(3)]],
+                               constant ulong &code_n [[buffer(4)]],
+                               constant ulong &scale_n [[buffer(5)]],
+                               uint gid [[thread_position_in_grid]]) {
+    const ulong i = (ulong)gid;
+    if (i < code_n) {
+        key_codes[i] = 0;
+        value_codes[i] = 0;
+    }
+    if (i < scale_n) {
+        key_scales[i] = 0.0h;
+        value_scales[i] = 0.0h;
+    }
+}
+
+template <typename T>
+kernel void kv_cache_scatter_q8_0(device const T *key [[buffer(0)]],
+                                  device const T *value [[buffer(1)]],
+                                  device const long *slot_mapping [[buffer(2)]],
+                                  device char *key_codes [[buffer(3)]],
+                                  device half *key_scales [[buffer(4)]],
+                                  device char *value_codes [[buffer(5)]],
+                                  device half *value_scales [[buffer(6)]],
+                                  constant int &num_heads [[buffer(7)]],
+                                  constant int &head_size [[buffer(8)]],
+                                  constant int &block_size [[buffer(9)]],
+                                  uint3 tgid [[threadgroup_position_in_grid]],
+                                  uint lane [[thread_index_in_simdgroup]]) {
+#pragma METAL fp math_mode(safe)
+    const int group = (int)tgid.x;
+    const int head = (int)tgid.y;
+    const int token = (int)tgid.z;
+    const long slot = slot_mapping[token];
+    if (slot < 0) { return; }
+
+    const long block = slot / block_size;
+    const long block_offset = slot % block_size;
+    const int groups_per_head = head_size / 32;
+    const int d = group * 32 + (int)lane;
+    const long src = ((long)token * num_heads + head) * head_size + d;
+    const long dst = ((block * block_size + block_offset) * num_heads + head) * head_size + d;
+    const long scale_dst =
+        ((block * block_size + block_offset) * num_heads + head) * groups_per_head + group;
+
+    const float k = float(key[src]);
+    const float v = float(value[src]);
+    const float kamax = metal::simd_max(metal::fabs(k));
+    const float vamax = metal::simd_max(metal::fabs(v));
+    const float kd = kamax / 127.0f;
+    const float vd = vamax / 127.0f;
+    const float kinv = kd > 0.0f ? 1.0f / kd : 0.0f;
+    const float vinv = vd > 0.0f ? 1.0f / vd : 0.0f;
+    key_codes[dst] = tk_int8_encode(k * kinv);
+    value_codes[dst] = tk_int8_encode(v * vinv);
+    if (lane == 0) {
+        key_scales[scale_dst] = half(kd);
+        value_scales[scale_dst] = half(vd);
+    }
+}
+
+template <typename OUT_T>
+kernel void kv_cache_gather_q8_0(device const char *key_codes [[buffer(0)]],
+                                 device const half *key_scales [[buffer(1)]],
+                                 device const char *value_codes [[buffer(2)]],
+                                 device const half *value_scales [[buffer(3)]],
+                                 device OUT_T *key_out [[buffer(4)]],
+                                 device OUT_T *value_out [[buffer(5)]],
+                                 device const int *block_table [[buffer(6)]],
+                                 device const int *cu_seq_lens [[buffer(7)]],
+                                 constant int &num_tokens [[buffer(8)]],
+                                 constant int &num_seqs [[buffer(9)]],
+                                 constant int &block_size [[buffer(10)]],
+                                 constant int &block_table_stride [[buffer(11)]],
+                                 constant int &num_heads [[buffer(12)]],
+                                 constant int &head_size [[buffer(13)]],
+                                 uint token [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_position_in_threadgroup]],
+                                 uint tptg [[threads_per_threadgroup]]) {
+    if ((int)token >= num_tokens) { return; }
+    int lo = 0, hi = num_seqs;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) / 2;
+        if (cu_seq_lens[mid] <= (int)token) lo = mid; else hi = mid - 1;
+    }
+    const int batch = lo;
+    const int local_token = (int)token - cu_seq_lens[batch];
+    const int block_col = local_token / block_size;
+    const int block_offset = local_token % block_size;
+    const int block = block_table[batch * block_table_stride + block_col];
+    const int row_elems = num_heads * head_size;
+    const int groups_per_head = head_size / 32;
+    const long out_base = (long)token * row_elems;
+    if (block < 0) {
+        for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+            key_out[out_base + i] = OUT_T(0);
+            value_out[out_base + i] = OUT_T(0);
+        }
+        return;
+    }
+    const long code_base = ((long)block * block_size + block_offset) * row_elems;
+    const long scale_base =
+        ((long)block * block_size + block_offset) * num_heads * groups_per_head;
+    for (int i = (int)tid; i < row_elems; i += (int)tptg) {
+        const int head = i / head_size;
+        const int d = i - head * head_size;
+        const long si = scale_base + (long)head * groups_per_head + d / 32;
+        key_out[out_base + i] = OUT_T(float(key_codes[code_base + i]) * float(key_scales[si]));
+        value_out[out_base + i] =
+            OUT_T(float(value_codes[code_base + i]) * float(value_scales[si]));
+    }
+}
+
+kernel void kv_cache_clone_q8_0(device const char *key_codes [[buffer(0)]],
+                                device const half *key_scales [[buffer(1)]],
+                                device const char *value_codes [[buffer(2)]],
+                                device const half *value_scales [[buffer(3)]],
+                                device char *key_codes_out [[buffer(4)]],
+                                device half *key_scales_out [[buffer(5)]],
+                                device char *value_codes_out [[buffer(6)]],
+                                device half *value_scales_out [[buffer(7)]],
+                                constant ulong &code_n [[buffer(8)]],
+                                constant ulong &scale_n [[buffer(9)]],
+                                uint gid [[thread_position_in_grid]]) {
+    const ulong i = (ulong)gid;
+    if (i < code_n) {
+        key_codes_out[i] = key_codes[i];
+        value_codes_out[i] = value_codes[i];
+    }
+    if (i < scale_n) {
+        key_scales_out[i] = key_scales[i];
+        value_scales_out[i] = value_scales[i];
+    }
+}
+
+kernel void kv_cache_copy_blocks_q8_0(
+    device const char *key_codes [[buffer(0)]],
+    device const half *key_scales [[buffer(1)]],
+    device const char *value_codes [[buffer(2)]],
+    device const half *value_scales [[buffer(3)]],
+    device char *key_codes_out [[buffer(4)]],
+    device half *key_scales_out [[buffer(5)]],
+    device char *value_codes_out [[buffer(6)]],
+    device half *value_scales_out [[buffer(7)]],
+    device const long *block_mapping [[buffer(8)]],
+    constant int &codes_per_block [[buffer(9)]],
+    constant int &scales_per_block [[buffer(10)]],
+    uint pair [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tptg [[threads_per_threadgroup]]) {
+    const long src_block = block_mapping[2 * pair];
+    const long dst_block = block_mapping[2 * pair + 1];
+    if (src_block < 0 || dst_block < 0) { return; }
+    const long src_code = src_block * codes_per_block;
+    const long dst_code = dst_block * codes_per_block;
+    for (int i = (int)tid; i < codes_per_block; i += (int)tptg) {
+        key_codes_out[dst_code + i] = key_codes[src_code + i];
+        value_codes_out[dst_code + i] = value_codes[src_code + i];
+    }
+    const long src_scale = src_block * scales_per_block;
+    const long dst_scale = dst_block * scales_per_block;
+    for (int i = (int)tid; i < scales_per_block; i += (int)tptg) {
+        key_scales_out[dst_scale + i] = key_scales[src_scale + i];
+        value_scales_out[dst_scale + i] = value_scales[src_scale + i];
+    }
+}
+
+template <typename T, int D>
+kernel void paged_attention_q8_0(device const T *q [[buffer(0)]],
+                                 device const char *key_codes [[buffer(1)]],
+                                 device const half *key_scales [[buffer(2)]],
+                                 device const char *value_codes [[buffer(3)]],
+                                 device const half *value_scales [[buffer(4)]],
+                                 device const int *block_table [[buffer(5)]],
+                                 device const int *context_lens [[buffer(6)]],
+                                 device T *out [[buffer(7)]],
+                                 constant int &block_size [[buffer(8)]],
+                                 constant int &block_table_stride [[buffer(9)]],
+                                 constant float &scale [[buffer(10)]],
+                                 constant int &num_heads [[buffer(11)]],
+                                 constant int &num_kv_heads [[buffer(12)]],
+                                 constant int &window [[buffer(13)]],
+                                 uint3 tgid [[threadgroup_position_in_grid]],
+                                 uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int VALUES_PER_LANE = D / 32;
+    const int head = (int)tgid.x;
+    const int batch = (int)tgid.y;
+    const int kv_head = head / (num_heads / num_kv_heads);
+    const int context_len = context_lens[batch];
+    const int t_start = window > 0 ? max(0, context_len - window) : 0;
+    const long row_base = ((long)batch * num_heads + head) * D;
+
+    float qv[VALUES_PER_LANE], acc[VALUES_PER_LANE];
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        qv[i] = float(q[row_base + d]);
+        acc[i] = 0.0f;
+    }
+    float m = -3.4028234663852886e38f, l = 0.0f;
+    for (int t = t_start; t < context_len; ++t) {
+        const int block_col = t / block_size;
+        const int block_offset = t - block_col * block_size;
+        const int block = block_table[batch * block_table_stride + block_col];
+        if (block < 0) { continue; }
+        const long code_base =
+            (((long)block * block_size + block_offset) * num_kv_heads + kv_head) * D;
+        const long scale_base =
+            (((long)block * block_size + block_offset) * num_kv_heads + kv_head) * VALUES_PER_LANE;
+        float partial = 0.0f;
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            const float kd = float(key_codes[code_base + d]) * float(key_scales[scale_base + i]);
+            partial += qv[i] * kd;
+        }
+        const float score = simd_sum(partial) * scale;
+        const float new_m = max(m, score);
+        const float alpha = l == 0.0f ? 0.0f : exp(m - new_m);
+        const float beta = exp(score - new_m);
+        for (int i = 0; i < VALUES_PER_LANE; ++i) {
+            const int d = (int)lane + 32 * i;
+            const float vd =
+                float(value_codes[code_base + d]) * float(value_scales[scale_base + i]);
+            acc[i] = acc[i] * alpha + beta * vd;
+        }
+        l = l * alpha + beta;
+        m = new_m;
+    }
+    for (int i = 0; i < VALUES_PER_LANE; ++i) {
+        const int d = (int)lane + 32 * i;
+        out[row_base + d] = l == 0.0f ? T(0) : T(acc[i] / l);
+    }
+}
+
+#define instantiate_kv_cache_q8_0(type_name, T)                                  \
+  template [[host_name("kv_cache_scatter_q8_0_" #type_name)]] [[kernel]] void  \
+  kv_cache_scatter_q8_0<T>(device const T *key [[buffer(0)]],                    \
+                           device const T *value [[buffer(1)]],                  \
+                           device const long *slot_mapping [[buffer(2)]],        \
+                           device char *key_codes [[buffer(3)]],                 \
+                           device half *key_scales [[buffer(4)]],                \
+                           device char *value_codes [[buffer(5)]],               \
+                           device half *value_scales [[buffer(6)]],              \
+                           constant int &num_heads [[buffer(7)]],                \
+                           constant int &head_size [[buffer(8)]],                \
+                           constant int &block_size [[buffer(9)]],               \
+                           uint3 tgid [[threadgroup_position_in_grid]],          \
+                           uint lane [[thread_index_in_simdgroup]]);             \
+  template [[host_name("kv_cache_gather_q8_0_" #type_name)]] [[kernel]] void   \
+  kv_cache_gather_q8_0<T>(device const char *key_codes [[buffer(0)]],            \
+                          device const half *key_scales [[buffer(1)]],           \
+                          device const char *value_codes [[buffer(2)]],          \
+                          device const half *value_scales [[buffer(3)]],         \
+                          device T *key_out [[buffer(4)]],                       \
+                          device T *value_out [[buffer(5)]],                     \
+                          device const int *block_table [[buffer(6)]],           \
+                          device const int *cu_seq_lens [[buffer(7)]],           \
+                          constant int &num_tokens [[buffer(8)]],                \
+                          constant int &num_seqs [[buffer(9)]],                  \
+                          constant int &block_size [[buffer(10)]],               \
+                          constant int &block_table_stride [[buffer(11)]],       \
+                          constant int &num_heads [[buffer(12)]],                \
+                          constant int &head_size [[buffer(13)]],                \
+                          uint token [[threadgroup_position_in_grid]],           \
+                          uint tid [[thread_position_in_threadgroup]],           \
+                          uint tptg [[threads_per_threadgroup]]);
+
+#define instantiate_paged_attention_q8_0(type_name, T, DVAL)                     \
+  template [[host_name("paged_attention_q8_0_" #type_name "_" #DVAL)]]       \
+  [[kernel]] void paged_attention_q8_0<T, DVAL>(                                \
+      device const T *q [[buffer(0)]], device const char *key_codes [[buffer(1)]],\
+      device const half *key_scales [[buffer(2)]],                              \
+      device const char *value_codes [[buffer(3)]],                             \
+      device const half *value_scales [[buffer(4)]],                            \
+      device const int *block_table [[buffer(5)]],                              \
+      device const int *context_lens [[buffer(6)]], device T *out [[buffer(7)]],\
+      constant int &block_size [[buffer(8)]],                                   \
+      constant int &block_table_stride [[buffer(9)]],                           \
+      constant float &scale [[buffer(10)]], constant int &num_heads [[buffer(11)]],\
+      constant int &num_kv_heads [[buffer(12)]], constant int &window [[buffer(13)]],\
+      uint3 tgid [[threadgroup_position_in_grid]],                              \
+      uint lane [[thread_index_in_simdgroup]]);
+
+instantiate_kv_cache_q8_0(float32, float)
+instantiate_kv_cache_q8_0(float16, half)
+instantiate_kv_cache_q8_0(bfloat16, bf16)
+instantiate_paged_attention_q8_0(float32, float, 64)
+instantiate_paged_attention_q8_0(float32, float, 128)
+instantiate_paged_attention_q8_0(float16, half, 64)
+instantiate_paged_attention_q8_0(float16, half, 128)
+instantiate_paged_attention_q8_0(bfloat16, bf16, 64)
+instantiate_paged_attention_q8_0(bfloat16, bf16, 128)
+
 #define instantiate_kv_cache_type(type_name, T)                               \
   template [[host_name("kv_cache_zero_" #type_name)]] [[kernel]] void        \
   kv_cache_zero<T>(device T *key_cache [[buffer(0)]],                         \

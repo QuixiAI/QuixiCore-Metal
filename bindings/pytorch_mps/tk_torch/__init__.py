@@ -28,9 +28,13 @@ def _kernel_source(path: str) -> Path:
 # The shared .metal kernel sources (single source of truth, also used by the MLX build).
 _METAL_SOURCES = [
     _kernel_source("utils/add_rt/add_rt.metal"),
+    _kernel_source("audio/conv1d/conv1d.metal"),
+    _kernel_source("audio/relative_attention/relative_attention.metal"),
     _kernel_source("attention/attn_fwd/attn_fwd.metal"),
     _kernel_source("attention/attn_fwd_sg/attn_fwd_sg.metal"),
+    _kernel_source("attention/cross_attn/cross_attn.metal"),
     _kernel_source("matmul/matmul_custom/matmul_custom.metal"),
+    _kernel_source("matmul/lora/lora.metal"),
     _kernel_source("norms/layernorm/layernorm.metal"),
     _kernel_source("norms/rms_norm/rms_norm.metal"),
     _kernel_source("norms/rms_norm_residual_next/rms_norm_residual_next.metal"),
@@ -89,6 +93,7 @@ _METAL_SOURCES = [
     _kernel_source("quantization/qgemm_bwd/qgemm_bwd.metal"),
     _kernel_source("quantization/qgemm_fused/qgemm_fused.metal"),
     _kernel_source("quantization/qgemv/qgemv.metal"),
+    _kernel_source("quantization/base_q/base_q.metal"),
     _kernel_source("quantization/qgemv_fused/qgemv_fused.metal"),
     _kernel_source("quantization/qflux/qflux.metal"),
     _kernel_source("quantization/qgemv_int/qgemv_int.metal"),
@@ -100,6 +105,7 @@ _METAL_SOURCES = [
     _kernel_source("quantization/dequant_gather/dequant_gather.metal"),
     _kernel_source("vision/edge_mlp/edge_mlp.metal"),
     _kernel_source("vision/patch_merge/patch_merge.metal"),
+    _kernel_source("vision/patch_ops/patch_ops.metal"),
 ]
 
 
@@ -161,6 +167,84 @@ def matmul_custom(x: torch.Tensor, y: torch.Tensor):
     return out[:N, :M].contiguous()
 
 
+def lora_apply_direct(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor,
+                      base=None, scale: float = 1.0):
+    """Direct F16-adapter LoRA path for decode/small batches on MPS."""
+    if base is None:
+        base = torch.zeros(1, dtype=x.dtype, device=x.device)
+        has_base = False
+    else:
+        has_base = True
+    return _ext.lora_apply_direct(x, A, B, base, float(scale), has_base)
+
+
+def lora_apply(x: torch.Tensor, A: torch.Tensor, B: torch.Tensor,
+               base=None, scale: float = 1.0, use_kernel=None):
+    """Measured route: direct for M<=4 and rank<=16, F16 MPS matmuls otherwise."""
+    direct = x.shape[0] <= 4 and A.shape[0] <= 16 if use_kernel is None else bool(use_kernel)
+    if direct:
+        return lora_apply_direct(x, A, B, base=base, scale=scale)
+    low = torch.matmul(x.to(torch.float16), A.transpose(0, 1))
+    delta = torch.matmul(low, B.transpose(0, 1))
+    result = delta.float() * float(scale)
+    if base is not None:
+        result = result + base.float()
+    return result.to(x.dtype)
+
+
+def audio_conv1d_direct(x, weight, bias=None, stride=1, padding=0, dilation=1):
+    if bias is None:
+        bias = torch.zeros(1, dtype=x.dtype, device=x.device)
+        has_bias = False
+    else:
+        has_bias = True
+    return _ext.audio_conv1d_direct(
+        x, weight, bias, int(stride), int(padding), int(dilation), has_bias)
+
+
+def audio_depthwise_conv1d(x, weight, bias=None, stride=1, padding=0,
+                           dilation=1, activation="none"):
+    if activation not in ("none", "silu"):
+        raise ValueError("audio_depthwise_conv1d: activation must be 'none' or 'silu'")
+    if bias is None:
+        bias = torch.zeros(1, dtype=x.dtype, device=x.device)
+        has_bias = False
+    else:
+        has_bias = True
+    return _ext.audio_depthwise_conv1d(
+        x, weight, bias, int(stride), int(padding), int(dilation), has_bias,
+        1 if activation == "silu" else 0)
+
+
+def audio_causal_depthwise_conv1d(x, weight, bias=None, stride=1,
+                                  dilation=1, activation="none"):
+    if activation not in ("none", "silu"):
+        raise ValueError("audio_causal_depthwise_conv1d: activation must be 'none' or 'silu'")
+    if bias is None:
+        bias = torch.zeros(1, dtype=x.dtype, device=x.device)
+        has_bias = False
+    else:
+        has_bias = True
+    pad_left = int(dilation) * (weight.shape[1] - 1) + 1 - int(stride)
+    if pad_left < 0:
+        raise ValueError("audio_causal_depthwise_conv1d: stride exceeds receptive field")
+    return _ext.audio_depthwise_conv1d_asymmetric(
+        x, weight, bias, int(stride), pad_left, 0, int(dilation), has_bias,
+        1 if activation == "silu" else 0)
+
+
+def audio_relative_attention(q, k, v, relative_k, per_dim_scale, lengths=None,
+                             chunk_size=12, left_context=13, right_context=0,
+                             q_scale=0.0, k_scale=0.0, softcap=0.0):
+    if lengths is None:
+        lengths = torch.full(
+            (q.shape[0],), q.shape[1], dtype=torch.int32, device=q.device)
+    return _ext.audio_relative_attention(
+        q, k, v, relative_k, per_dim_scale, lengths, int(chunk_size),
+        int(left_context), int(right_context), float(q_scale), float(k_scale),
+        float(softcap))
+
+
 def attn_fwd(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float = 0.0,
              sinks: torch.Tensor | None = None):
     """Non-causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
@@ -175,6 +259,40 @@ def attn_fwd_sg_d256(q, k, v, scale: float = 0.0, window: int = 0):
     return _ext.attn_fwd_sg_d256(q, k, v, float(scale), int(window))
 
 
+def cross_attention_direct(q, k, v, key_lengths=None, bias=None,
+                           scale: float = 0.0, softcap: float = 0.0):
+    """Independent-length GQA cross attention with padding/bias support."""
+    if key_lengths is None:
+        key_lengths = torch.full(
+            (q.shape[0],), k.shape[2], dtype=torch.int32, device=q.device)
+    if bias is None:
+        bias = torch.zeros(1, dtype=torch.float32, device=q.device)
+        has_bias = False
+    else:
+        has_bias = True
+    return _ext.cross_attention(
+        q, k, v, key_lengths, bias, float(scale), float(softcap), has_bias)
+
+
+def cross_attention(q, k, v, key_lengths=None, bias=None,
+                    scale: float = 0.0, softcap: float = 0.0, use_kernel=None):
+    direct = k.shape[2] <= 128 if use_kernel is None else bool(use_kernel)
+    if direct:
+        return cross_attention_direct(q, k, v, key_lengths, bias, scale, softcap)
+    hq, hkv, tkv, dim = q.shape[1], k.shape[1], k.shape[2], q.shape[3]
+    used_scale = float(scale) if scale > 0 else dim ** -0.5
+    lengths = (torch.full((q.shape[0],), tkv, dtype=torch.int32, device=q.device)
+               if key_lengths is None else key_lengths)
+    kk = k.repeat_interleave(hq // hkv, 1).float(); vv = v.repeat_interleave(hq // hkv, 1).float()
+    scores = q.float() @ kk.transpose(-1, -2) * used_scale
+    if bias is not None: scores = scores + bias.float()
+    if softcap > 0: scores = float(softcap) * torch.tanh(scores / float(softcap))
+    valid = torch.arange(tkv, device=q.device)[None, None, None, :] < lengths[:, None, None, None]
+    scores = scores.masked_fill(~valid, -float("inf")); probs = torch.softmax(scores, -1)
+    probs = torch.where(valid.any(-1, keepdim=True), probs, torch.zeros_like(probs))
+    return (probs @ vv).to(q.dtype)
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     """RMSNorm over the last axis. bf16 MPS tensors; static kernels for D in {256,512,768,1024},
     dynamic kernel for other D multiples of 4."""
@@ -185,6 +303,12 @@ def mean_pool_rms_l2(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5):
     """Mean-pool an (M, D) block of token states into one D embedding, apply RMSNorm(weight),
     then L2-normalize. bf16 MPS tensors; D in {256,512,768,1024}. Returns (D,)."""
     return _ext.mean_pool_rms_l2(x, weight, float(eps))
+
+
+def masked_mean_pool_rms_l2(x: torch.Tensor, mask: torch.Tensor,
+                            weight: torch.Tensor, eps: float = 1e-5):
+    """Mask-aware batched mean-pool + RMSNorm + L2 normalization."""
+    return _ext.masked_mean_pool_rms_l2(x, mask, weight, float(eps))
 
 
 def rms_norm_bwd_dx(x, weight, dy, rstd):
@@ -257,6 +381,28 @@ def rotary(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, interleaved: b
     """RoPE. x bf16 (B,H,N,D); cos/sin bf16 (N,D/2); D in {64,128}.
     interleaved=False: split-half (GPT-NeoX); True: GPT-J adjacent pairs."""
     return _ext.rotary(x, cos, sin, interleaved)
+
+
+def rotary_positioned(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+                      positions: torch.Tensor, rotary_dim: int = 0,
+                      interleaved: bool = False):
+    """RoPE with explicit positions and an optional partial rotary prefix."""
+    return _ext.rotary_positioned(
+        x, cos, sin, positions, int(rotary_dim), bool(interleaved))
+
+
+def mrope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
+          positions: torch.Tensor, sections, rotary_dim: int = 0,
+          section_interleaved: bool = False):
+    """Temporal/height/width M-RoPE; sections count rotary pairs."""
+    return _ext.mrope(
+        x, cos, sin, positions, list(sections), int(rotary_dim),
+        bool(section_interleaved))
+
+
+def vision_rope_2d(x, cos, sin, positions, global_split=False):
+    """Two-axis vision RoPE; global_split selects Qwen channel pairing."""
+    return _ext.vision_rope_2d(x, cos, sin, positions, bool(global_split))
 
 
 def rope_kv_insert(k: torch.Tensor, v: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
@@ -353,7 +499,7 @@ def adamw_masked(param, grad, m, v, lr, beta1, beta2, eps, weight_decay, step,
 
 def glu(x: torch.Tensor, gate: torch.Tensor, mode: str = "swiglu",
         alpha: float = 1.0, limit: float = 1.0e20):
-    """GLU-family activation. mode in reglu/geglu/swiglu/swiglu_oai/geglu_erf/geglu_quick."""
+    """GLU family; ``sigmoid`` computes ``sigmoid(x) * gate``."""
     return _ext.glu(x, gate, mode, float(alpha), float(limit))
 
 
@@ -373,6 +519,11 @@ def geglu(x: torch.Tensor, gate: torch.Tensor):
 
 def swiglu(x: torch.Tensor, gate: torch.Tensor):
     return glu(x, gate, "swiglu")
+
+
+def sigmoid_mul(x: torch.Tensor, gate: torch.Tensor):
+    """Elementwise ``sigmoid(x) * gate`` on MPS."""
+    return glu(x, gate, "sigmoid")
 
 
 def swiglu_oai(x: torch.Tensor, gate: torch.Tensor, alpha: float = 1.0, limit: float = 1.0e20):
@@ -409,6 +560,28 @@ def kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scal
     """fp8 KV gather + upconvert to bf16 (per-kv_head scales). Returns (key_out, value_out). MPS."""
     return _ext.kv_cache_gather_fp8(key_cache, value_cache, block_table, cu_seq_lens, k_scale,
                                     v_scale, int(num_tokens), int(fmt))
+
+
+def kv_cache_scatter_q8_0(key, value, slot_mapping, num_blocks, block_size):
+    """Encode/scatter QuixiCore Q8_0 KV planes. Returns int8 K/V codes and FP16 K/V scales."""
+    return tuple(_ext.kv_cache_scatter_q8_0(
+        key, value, slot_mapping, int(num_blocks), int(block_size)))
+
+
+def kv_cache_gather_q8_0(key_codes, key_scales, value_codes, value_scales,
+                         block_table, cu_seq_lens, num_tokens,
+                         output_dtype="bfloat16"):
+    """Gather and decode QuixiCore Q8_0 KV planes. MPS tensors."""
+    return tuple(_ext.kv_cache_gather_q8_0(
+        key_codes, key_scales, value_codes, value_scales,
+        block_table, cu_seq_lens, int(num_tokens), output_dtype))
+
+
+def kv_cache_copy_blocks_q8_0(key_codes, key_scales, value_codes, value_scales,
+                              block_mapping):
+    """Functionally clone Q8_0 planes and apply ``(src,dst)`` block copies."""
+    return tuple(_ext.kv_cache_copy_blocks_q8_0(
+        key_codes, key_scales, value_codes, value_scales, block_mapping))
 
 
 def kv_cache_scale_update(key, value, old_key_scale, old_value_scale):
@@ -607,6 +780,14 @@ def paged_attention_fp8(q, key_cache, value_cache, block_table, context_lens,
                                     float(scale), _fmt_code(fmt), int(window))
 
 
+def paged_attention_q8_0(q, key_codes, key_scales, value_codes, value_scales,
+                         block_table, context_lens, scale=0.0, window=0):
+    """Paged decode attention with direct Q8_0 K/V dequantization. MPS tensors."""
+    return _ext.paged_attention_q8_0(
+        q, key_codes, key_scales, value_codes, value_scales,
+        block_table, context_lens, float(scale), int(window))
+
+
 def attn_causal(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, softcap: float = 0.0,
                 sinks: torch.Tensor | None = None):
     """Causal attention forward. bf16 (B,H,N,D) MPS tensors; D in {64,128}, N%8==0.
@@ -674,6 +855,45 @@ def swin_attn_d32(qkv, relative_bias, mask, windows_per_image=0):
 def patch_merge_layernorm(x, weight, bias, height, width, eps=1e-5):
     """Fused Swin 2x2 patch gather + LayerNorm."""
     return _ext.patch_merge_layernorm(x, weight, bias, int(height), int(width), float(eps))
+
+
+def extract_patches_2d(x, kernel_h, kernel_w, stride_h, stride_w, pad_h=0, pad_w=0):
+    return _ext.extract_patches_2d(
+        x, int(kernel_h), int(kernel_w), int(stride_h), int(stride_w),
+        int(pad_h), int(pad_w))
+
+
+def extract_patches_3d(x, kernel_t, kernel_h, kernel_w,
+                       stride_t, stride_h, stride_w,
+                       pad_t=0, pad_h=0, pad_w=0):
+    return _ext.extract_patches_3d(
+        x, int(kernel_t), int(kernel_h), int(kernel_w),
+        int(stride_t), int(stride_h), int(stride_w),
+        int(pad_t), int(pad_h), int(pad_w))
+
+
+def interpolate_position_2d(table, out_h, out_w, align_corners=False):
+    return _ext.interpolate_position_2d(
+        table, int(out_h), int(out_w), bool(align_corners))
+
+
+def avg_pool2d_tokens(x, kernel_h, kernel_w, stride_h=None, stride_w=None,
+                      ceil_mode=False):
+    stride_h = kernel_h if stride_h is None else stride_h
+    stride_w = kernel_w if stride_w is None else stride_w
+    return _ext.avg_pool2d_tokens(
+        x, int(kernel_h), int(kernel_w), int(stride_h), int(stride_w), bool(ceil_mode))
+
+
+def factorized_position_2d(position_ids, table, valid_mask):
+    return _ext.factorized_position_2d(position_ids, table, valid_mask)
+
+
+def pool_tokens_by_position(x, position_ids, valid_mask, output_length,
+                            kernel_size, source_width):
+    return tuple(_ext.pool_tokens_by_position(
+        x, position_ids, valid_mask, int(output_length), int(kernel_size),
+        int(source_width)))
 
 
 def space_to_depth_norm_linear(x, norm_weight, norm_bias, projection_weight,
@@ -938,6 +1158,16 @@ def quadratic_transform(logits, factor, curve=1.0, temperature=1.0):
     return _ext.quadratic_transform(logits, float(factor), float(curve), float(temperature))
 
 
+def logits_softcap(logits, cap):
+    """Apply ``cap * tanh(logits / cap)`` to materialized logits on MPS."""
+    return _ext.logits_softcap(logits, float(cap))
+
+
+def value_clip(x, min_value, max_value):
+    """Clamp a float MPS tensor to inclusive scalar bounds."""
+    return _ext.value_clip(x, float(min_value), float(max_value))
+
+
 def top_nsigma_mask(logits, nsigma, temperature=1.0):
     """Top-nsigma: mask logits below max - nsigma*std. MPS."""
     return _ext.top_nsigma_mask(logits, float(nsigma), float(temperature))
@@ -1077,6 +1307,78 @@ def qdequant(wq: torch.Tensor, format: str = "q8_0"):
     return _ext.qdequant(wq, format)
 
 
+def base_qdequant(codes, scales, biases, bits, group_size, scale_dtype="bf16",
+                  symmetric=False, layout="metal", output_dtype="float16"):
+    """Decode canonical BaseQN separate code/scale/bias planes on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qdequant: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qdequant(
+        codes, scales, biases, int(bits), int(group_size), scale_dtype,
+        bool(symmetric), layout, output_dtype)
+
+
+def base_qembedding(codes, scales, biases, ids, bits, group_size,
+                    scale_dtype="bf16", symmetric=False, layout="metal",
+                    output_dtype="float16"):
+    """Gather and decode canonical BaseQN weight rows on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qembedding: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qembedding(
+        codes, scales, biases, ids, int(bits), int(group_size), scale_dtype,
+        bool(symmetric), layout, output_dtype)
+
+
+def base_qlm_head_argmax(codes, scales, biases, x, bits, group_size,
+                         scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Select greedy token ids from a packed BaseQN LM head on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qlm_head_argmax: biases are required for asymmetric BaseQN")
+        biases = scales
+    if x.ndim != 2 or int(x.shape[1]) <= 0:
+        raise ValueError("base_qlm_head_argmax: x must be non-empty (K, batch)")
+    logits = torch.cat([
+        base_qgemv(
+            codes, scales, biases, x[:, i:i + 1], bits, group_size,
+            scale_dtype, symmetric, layout)
+        for i in range(int(x.shape[1]))
+    ], dim=1)
+    return torch.argmax(logits, dim=0).to(torch.int32)
+
+
+def base_qmoe_gemm(codes, scales, biases, input, expert_of_tile, bits,
+                   group_size, scale_dtype="bf16", symmetric=False,
+                   layout="metal"):
+    """Project a padded MPS MoE schedule through a BaseQN expert stack."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qmoe_gemm: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qmoe_gemm(
+        codes, scales, biases, input, expert_of_tile, int(bits),
+        int(group_size), scale_dtype, bool(symmetric), layout)
+
+
+def base_qmoe_swiglu(codes, scales, biases, input, expert_of_tile, bits,
+                     group_size, scale_dtype="bf16", symmetric=False,
+                     layout="metal"):
+    """Fused BaseQN grouped gate/up expert projection and SwiGLU on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError(
+                "base_qmoe_swiglu: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qmoe_swiglu(
+        codes, scales, biases, input, expert_of_tile, int(bits),
+        int(group_size), scale_dtype, bool(symmetric), layout)
+
+
 def dequantize_tq2_0(wq: torch.Tensor):
     """TQ2_0 packed blocks (N, K/256, 66) -> dense fp16 (N,K). MPS."""
     return _ext.qdequant(wq, "tq2_0")
@@ -1128,6 +1430,36 @@ def gdn_recur(q, k, v, g, beta, state_pool, cu_seqlens, slot_mapping, load_initi
                                 load_initial))
 
 
+def gdn_short_conv(x, weight, state_pool, cu_seqlens, slot_mapping,
+                   load_initial=True, apply_silu=True):
+    """Varlen causal depthwise short convolution with a functional fp32 history pool."""
+    return tuple(_ext.gdn_short_conv(
+        x, weight, state_pool, cu_seqlens, slot_mapping,
+        bool(load_initial), bool(apply_silu)))
+
+
+def gdn_qkv_prepare(mixed, num_k_heads, num_v_heads, key_head_dim,
+                    value_head_dim, eps=1e-6, q_scale=None, k_scale=None):
+    """Split activated GDN Q/K/V and normalize Q/K with explicit scales."""
+    if q_scale is None:
+        q_scale = 1.0 / key_head_dim
+    if k_scale is None:
+        k_scale = key_head_dim ** -0.5
+    return tuple(_ext.gdn_qkv_prepare(
+        mixed, int(num_k_heads), int(num_v_heads), int(key_head_dim),
+        int(value_head_dim), float(eps), float(q_scale), float(k_scale)))
+
+
+def gdn_gate_beta(a, b, A_log, dt_bias):
+    """Return fp32 ``(decay, beta)`` recurrence controls from GDN logits."""
+    return tuple(_ext.gdn_gate_beta(a, b, A_log, dt_bias))
+
+
+def gdn_gated_rmsnorm(y, z, weight, eps=1e-6):
+    """Per-head RMSNorm followed by a precise SiLU gate product."""
+    return _ext.gdn_gated_rmsnorm(y, z, weight, float(eps))
+
+
 def selective_scan(u, delta, A, B, C, D=None, delta_bias=None, z=None, state=None,
                    delta_softplus=True):
     """Mamba-1 (S6) selective scan, dense batch (channel-major). Returns (out, new_state). MPS."""
@@ -1169,6 +1501,18 @@ def qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_
     return _ext.qk_norm_rope(qkv, q_weight, k_weight, cos, sin, positions,
                              int(num_heads_q), int(num_heads_k), int(num_heads_v),
                              float(eps), bool(interleaved), bool(gemma))
+
+
+def qk_norm_rope_positioned(
+        qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
+        num_heads_v, rotary_dim=0, eps=1e-6, interleaved=False,
+        norm_weight_offset=0.0, mrope_sections=(), section_interleaved=False):
+    """Explicit fused Q/K RMSNorm plus positioned, partial, or multimodal RoPE."""
+    return _ext.qk_norm_rope_positioned(
+        qkv, q_weight, k_weight, cos, sin, positions, int(num_heads_q),
+        int(num_heads_k), int(num_heads_v), int(rotary_dim), float(eps),
+        bool(interleaved), float(norm_weight_offset), list(mrope_sections),
+        bool(section_interleaved))
 
 
 def qk_norm_rope_kv_f16(qkv, q_weight, k_weight, cos, sin, positions, num_heads_q, num_heads_k,
@@ -1309,6 +1653,13 @@ def embedding_lookup(token_ids, table, pos_table=None, scale: float = 1.0):
     return _ext.embedding_lookup(token_ids, table, pt, float(scale))
 
 
+def embedding_lookup_types(token_ids, type_ids, token_table, type_table,
+                           token_scale: float = 1.0):
+    """Fused token and token-type embedding gather/add."""
+    return _ext.embedding_lookup_types(
+        token_ids, type_ids, token_table, type_table, float(token_scale))
+
+
 def embedding_backward(token_ids, dY, vocab, scale: float = 1.0, method: str = "atomic"):
     """Embedding backward: scatter-add dY (num_tok, D) rows into a (vocab, D) fp32 grad table by
     token id (out[token_ids[t]] += scale*dY[t]); padding/oob ids contribute nothing. MPS.
@@ -1377,6 +1728,11 @@ def quantize_per_tensor_fp8(x: torch.Tensor):
 def quantize_per_tensor_int8(x: torch.Tensor):
     """Per-tensor symmetric int8 quant (global absmax/127). Returns (codes int8, scale scalar). MPS."""
     return _ext.quantize_per_tensor_int8(x)
+
+
+def calibration_absmax(x: torch.Tensor, running=None):
+    """FP32 per-input-channel absmax with optional running merge on MPS."""
+    return _ext.calibration_absmax(x, running)
 
 
 def quantize_per_token_fp8(x: torch.Tensor):
@@ -1531,6 +1887,72 @@ def qgemm_fp8_scaled(wq, xq, w_scale, a_scale):
 def qgemv(wq: torch.Tensor, x: torch.Tensor, format: str = "q8_0"):
     """Quantized GEMV. x is float16, or fp32 for q4_0/q6_K."""
     return _ext.qgemv(wq, x, format)
+
+
+def base_qgemv(codes, scales, biases, x, bits, group_size,
+               scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Canonical BaseQN decode GEMV on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qgemv: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qgemv(
+        codes, scales, biases, x, int(bits), int(group_size), scale_dtype,
+        bool(symmetric), layout)
+
+
+def base_qgemm(codes, scales, biases, x, bits, group_size,
+               scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Canonical BaseQN matrix multiplication on MPS."""
+    if biases is None:
+        if not symmetric:
+            raise ValueError("base_qgemm: biases are required for asymmetric BaseQN")
+        biases = scales
+    return _ext.base_qgemm(
+        codes, scales, biases, x, int(bits), int(group_size), scale_dtype,
+        bool(symmetric), layout)
+
+
+def base_qgemv_qkv(q_codes, q_scales, q_biases,
+                   k_codes, k_scales, k_biases,
+                   v_codes, v_scales, v_biases, x, bits, group_size,
+                   scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Fused canonical BaseQN Q/K/V decode GEMVs on one activation vector."""
+    planes = [(q_scales, q_biases), (k_scales, k_biases),
+              (v_scales, v_biases)]
+    if not symmetric and any(bias is None for _, bias in planes):
+        raise ValueError("base_qgemv_qkv: biases are required for asymmetric BaseQN")
+    q_biases = q_scales if q_biases is None else q_biases
+    k_biases = k_scales if k_biases is None else k_biases
+    v_biases = v_scales if v_biases is None else v_biases
+    if int(x.shape[0]) > 1024:
+        return tuple(
+            base_qgemv(
+                codes, scales, biases, x, bits, group_size, scale_dtype,
+                symmetric, layout)
+            for codes, scales, biases in (
+                (q_codes, q_scales, q_biases),
+                (k_codes, k_scales, k_biases),
+                (v_codes, v_scales, v_biases),
+            )
+        )
+    return tuple(_ext.base_qgemv_qkv(
+        q_codes, q_scales, q_biases, k_codes, k_scales, k_biases,
+        v_codes, v_scales, v_biases, x, int(bits), int(group_size),
+        scale_dtype, bool(symmetric), layout))
+
+
+def base_qgemv_swiglu(gate_codes, gate_scales, gate_biases,
+                      up_codes, up_scales, up_biases, x, bits, group_size,
+                      scale_dtype="bf16", symmetric=False, layout="metal"):
+    """Fused canonical BaseQN gate/up decode GEMVs with a SwiGLU epilogue."""
+    if not symmetric and (gate_biases is None or up_biases is None):
+        raise ValueError("base_qgemv_swiglu: biases are required for asymmetric BaseQN")
+    gate_biases = gate_scales if gate_biases is None else gate_biases
+    up_biases = up_scales if up_biases is None else up_biases
+    return _ext.base_qgemv_swiglu(
+        gate_codes, gate_scales, gate_biases, up_codes, up_scales, up_biases,
+        x, int(bits), int(group_size), scale_dtype, bool(symmetric), layout)
 
 
 def qgemv_q4_0_f32_up_gate_gelu(up, gate, x):

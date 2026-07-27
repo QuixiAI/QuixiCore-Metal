@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include <string>
+#include <utility>
 #include <vector>
 
 #include "mlx/ops.h"
@@ -158,6 +160,32 @@ array paged_attention_fp8(
     int window = 0,
     StreamOrDevice s = {});
 
+/** QuixiCore Q8_0 paged-cache ABI.
+ *
+ * Codes are int8 (num_blocks, block_size, num_kv_heads, head_size). Scales are
+ * float16 (num_blocks, block_size, num_kv_heads, head_size / 32). Each scale
+ * covers 32 consecutive head-dimension values. */
+std::vector<array> kv_cache_scatter_q8_0(
+    const array& key, const array& value, const array& slot_mapping,
+    int num_blocks, int block_size, StreamOrDevice s = {});
+
+std::vector<array> kv_cache_gather_q8_0(
+    const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_table, const array& cu_seq_lens, int num_tokens,
+    const std::string& output_dtype = "bfloat16", StreamOrDevice s = {});
+
+std::vector<array> kv_cache_copy_blocks_q8_0(
+    const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_mapping, StreamOrDevice s = {});
+
+array paged_attention_q8_0(
+    const array& q, const array& key_codes, const array& key_scales,
+    const array& value_codes, const array& value_scales,
+    const array& block_table, const array& context_lens,
+    float scale = 0.0f, int window = 0, StreamOrDevice s = {});
+
 class KvCacheScatter : public Primitive {
  public:
   KvCacheScatter(Stream stream, int block_size)
@@ -186,6 +214,89 @@ class KvCacheScatter : public Primitive {
 
  private:
   int block_size_;
+};
+
+class KvCacheScatterQ8_0 : public Primitive {
+ public:
+  KvCacheScatterQ8_0(Stream stream, int block_size)
+      : Primitive(stream), block_size_(block_size) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "KvCacheScatterQ8_0"; }
+  void print(std::ostream& os) override { os << "KvCacheScatterQ8_0"; }
+  bool is_equivalent(const Primitive& other) const override {
+    return block_size_ == static_cast<const KvCacheScatterQ8_0&>(other).block_size_;
+  }
+ private:
+  int block_size_;
+};
+
+class KvCacheGatherQ8_0 : public Primitive {
+ public:
+  KvCacheGatherQ8_0(Stream stream, int num_tokens, std::string output_dtype)
+      : Primitive(stream), num_tokens_(num_tokens), output_dtype_(std::move(output_dtype)) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "KvCacheGatherQ8_0"; }
+  void print(std::ostream& os) override { os << "KvCacheGatherQ8_0"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const KvCacheGatherQ8_0&>(other);
+    return num_tokens_ == o.num_tokens_ && output_dtype_ == o.output_dtype_;
+  }
+ private:
+  int num_tokens_;
+  std::string output_dtype_;
+};
+
+class KvCacheCopyBlocksQ8_0 : public Primitive {
+ public:
+  explicit KvCacheCopyBlocksQ8_0(Stream stream) : Primitive(stream) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "KvCacheCopyBlocksQ8_0"; }
+  void print(std::ostream& os) override { os << "KvCacheCopyBlocksQ8_0"; }
+  bool is_equivalent(const Primitive&) const override { return true; }
+};
+
+class PagedAttentionQ8_0 : public Primitive {
+ public:
+  PagedAttentionQ8_0(Stream stream, float scale, int window)
+      : Primitive(stream), scale_(scale), window_(window) {}
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override;
+  void eval_gpu(const std::vector<array>&, std::vector<array>&) override;
+  std::vector<array> jvp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&) override;
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&, const std::vector<array>&) override;
+  std::pair<std::vector<array>, std::vector<int>> vmap(
+      const std::vector<array>&, const std::vector<int>&) override;
+  const char* name() const { return "PagedAttentionQ8_0"; }
+  void print(std::ostream& os) override { os << "PagedAttentionQ8_0"; }
+  bool is_equivalent(const Primitive& other) const override {
+    auto& o = static_cast<const PagedAttentionQ8_0&>(other);
+    return scale_ == o.scale_ && window_ == o.window_;
+  }
+ private:
+  float scale_;
+  int window_;
 };
 
 class KvCacheGather : public Primitive {

@@ -58,9 +58,13 @@
 #include <nanobind/stl/optional.h>
 
 #include "add_rt/add_rt.h"
+#include "conv1d/conv1d.h"
+#include "relative_attention/relative_attention.h"
 #include "attn_fwd/attn_fwd.h"
 #include "attn_fwd_sg/attn_fwd_sg.h"
+#include "cross_attn/cross_attn.h"
 #include "matmul_custom/matmul_custom.h"
+#include "lora/lora.h"
 #include "layernorm/layernorm.h"
 #include "rms_norm/rms_norm.h"
 #include "rms_norm_residual_next/rms_norm_residual_next.h"
@@ -118,6 +122,7 @@
 #include "qgemm_bwd/qgemm_bwd.h"
 #include "qgemm_fused/qgemm_fused.h"
 #include "qgemv/qgemv.h"
+#include "base_q/base_q.h"
 #include "qgemv_fused/qgemv_fused.h"
 #include "qflux/qflux.h"
 #include "qgemv_int/qgemv_int.h"
@@ -129,6 +134,7 @@
 #include "dequant_gather/dequant_gather.h"
 #include "edge_mlp/edge_mlp.h"
 #include "patch_merge/patch_merge.h"
+#include "patch_ops/patch_ops.h"
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -180,6 +186,12 @@ NB_MODULE(_ext, m) {
         within window/2 of the query; scale <= 0 defaults to 1/sqrt(256).
       )");
 
+    m.def("cross_attention", &cross_attention,
+          "q"_a, "k"_a, "v"_a, "key_lengths"_a, "bias"_a,
+          "scale"_a, "softcap"_a, "has_bias"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Independent-length GQA cross attention with optional bias and softcap.)");
+
     m.def(
       "matmul_custom",
       &matmul_custom,
@@ -190,6 +202,33 @@ NB_MODULE(_ext, m) {
       R"(
         gemm
       )");
+
+    m.def(
+      "lora_apply_direct", &lora_apply_direct,
+      "x"_a, "A"_a, "B"_a, "base"_a, "scale"_a, "has_base"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Direct F16-adapter LoRA for decode/small batches.)");
+
+    m.def("audio_conv1d_direct", &audio_conv1d_direct,
+          "x"_a, "weight"_a, "bias"_a, "stride"_a, "padding"_a,
+          "dilation"_a, "has_bias"_a, nb::kw_only(), "stream"_a = nb::none(),
+          R"(Direct NWC audio convolution with (O,K,C) weights.)");
+    m.def("audio_depthwise_conv1d", &audio_depthwise_conv1d,
+          "x"_a, "weight"_a, "bias"_a, "stride"_a, "padding"_a,
+          "dilation"_a, "has_bias"_a, "activation"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(NWC depthwise convolution with optional SiLU.)");
+    m.def("audio_depthwise_conv1d_asymmetric", &audio_depthwise_conv1d_asymmetric,
+          "x"_a, "weight"_a, "bias"_a, "stride"_a, "pad_left"_a,
+          "pad_right"_a, "dilation"_a, "has_bias"_a, "activation"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(NWC depthwise convolution with independent left/right padding.)");
+    m.def("audio_relative_attention", &audio_relative_attention,
+          "q"_a, "k"_a, "v"_a, "relative_k"_a, "per_dim_scale"_a,
+          "lengths"_a, "chunk_size"_a, "left_context"_a, "right_context"_a,
+          "q_scale"_a, "k_scale"_a, "softcap"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Blocked relative-position attention for Conformer-style audio encoders.)");
 
     m.def(
       "layernorm",
@@ -254,6 +293,12 @@ NB_MODULE(_ext, m) {
       R"(
         mean-pool an (M, D) block into one (D,) embedding, then RMSNorm(weight) + L2-normalize
       )");
+
+    m.def(
+      "masked_mean_pool_rms_l2", &masked_mean_pool_rms_l2,
+      "x"_a, "mask"_a, "weight"_a, nb::kw_only(), "eps"_a = 1e-5f,
+      "stream"_a = nb::none(),
+      R"(Mask-aware batched mean pool, RMSNorm, and L2 normalization.)");
 
     m.def(
       "rms_norm_bwd_dx",
@@ -677,6 +722,13 @@ NB_MODULE(_ext, m) {
       "logits"_a, "factor"_a, "curve"_a = 1.0f, "temperature"_a = 1.0f,
       nb::kw_only(), "stream"_a = nb::none(),
       R"(quadratic/smoothing logit transform (factor 0 = identity).)");
+    m.def("logits_softcap", &logits_softcap,
+      "logits"_a, "cap"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(Apply Gemma-style final-logit cap * tanh(logits / cap).)");
+    m.def("value_clip", &value_clip,
+      "x"_a, "min_value"_a, "max_value"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Clamp a float tensor to scalar bounds, preserving shape and dtype.)");
     m.def("top_nsigma_mask", &top_nsigma_mask,
       "logits"_a, "nsigma"_a, "temperature"_a = 1.0f,
       nb::kw_only(), "stream"_a = nb::none(),
@@ -821,6 +873,35 @@ NB_MODULE(_ext, m) {
          persistent per-request fp32 state pool. Returns [y, new_state_pool].)");
 
     m.def(
+      "gdn_short_conv", &gdn_short_conv,
+      "x"_a, "weight"_a, "state_pool"_a, "cu_seqlens"_a, "slot_mapping"_a,
+      "load_initial"_a = true, "apply_silu"_a = true,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Varlen causal depthwise short convolution with a functional fp32 history pool.
+         Returns [out, new_state_pool].)");
+
+    m.def(
+      "gdn_qkv_prepare", &gdn_qkv_prepare,
+      "mixed"_a, "num_k_heads"_a, "num_v_heads"_a,
+      "key_head_dim"_a, "value_head_dim"_a, "eps"_a,
+      "q_scale"_a, "k_scale"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Split activated mixed GDN Q/K/V and RMS-normalize Q/K with explicit scales.
+         Returns [q, k, v].)");
+
+    m.def(
+      "gdn_gate_beta", &gdn_gate_beta,
+      "a"_a, "b"_a, "A_log"_a, "dt_bias"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Compute fp32 GDN decay=exp(-exp(A_log)*softplus(a+dt_bias)) and beta=sigmoid(b).)");
+
+    m.def(
+      "gdn_gated_rmsnorm", &gdn_gated_rmsnorm,
+      "y"_a, "z"_a, "weight"_a, "eps"_a = 1.0e-6f,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Per-value-head RMSNorm followed by an fp32 SiLU gate product.)");
+
+    m.def(
       "selective_scan", &selective_scan,
       "u"_a, "delta"_a, "A"_a, "B"_a, "C"_a, "state"_a, "D"_a = nb::none(),
       "delta_bias"_a = nb::none(), "z"_a = nb::none(), "delta_softplus"_a = true,
@@ -857,6 +938,18 @@ NB_MODULE(_ext, m) {
       "stream"_a = nb::none(),
       R"(fused per-head QK-RMSNorm + RoPE over packed QKV (V heads copied through).
          interleaved: False = NeoX split-half, True = GPT-J pairs. Returns the new qkv.)");
+
+    m.def(
+      "qk_norm_rope_positioned", &qk_norm_rope_positioned,
+      "qkv"_a, "q_weight"_a, "k_weight"_a, "cos"_a, "sin"_a, "positions"_a,
+      "num_heads_q"_a, "num_heads_k"_a, "num_heads_v"_a,
+      nb::kw_only(), "rotary_dim"_a = 0, "eps"_a = 1e-6f,
+      "interleaved"_a = false, "norm_weight_offset"_a = 0.0f,
+      "mrope_sections"_a = std::vector<int>{}, "section_interleaved"_a = false,
+      "stream"_a = nb::none(),
+      R"(explicit fused Q/K RMSNorm + positioned/partial/M-RoPE over packed QKV.
+         M-RoPE positions are (3,T); sections count rotary pairs. norm_weight_offset
+         selects weight versus offset+weight without a model-specific flag.)");
 
     m.def(
       "qk_norm_rope_kv_f16", &qk_norm_rope_kv_f16,
@@ -1169,6 +1262,11 @@ NB_MODULE(_ext, m) {
       "quantize_per_tensor_int8", &quantize_per_tensor_int8,
       "x"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(per-tensor symmetric int8 quant (global absmax/127). Returns [codes, scale, scratch].)");
+    m.def(
+      "calibration_absmax", &calibration_absmax,
+      "x"_a, "running"_a, "has_running"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Per-input-channel fp32 absmax over (tokens, channels), optionally merged with running.)");
 
     m.def(
       "quantize_per_token_fp8",
@@ -1213,6 +1311,46 @@ NB_MODULE(_ext, m) {
         rotary positional embedding; x is (B,H,N,D), cos/sin are (N,D/2).
         interleaved=False: split-half (GPT-NeoX); interleaved=True: GPT-J adjacent pairs.
       )");
+
+    m.def(
+      "rotary_positioned",
+      &rotary_positioned,
+      "x"_a,
+      "cos"_a,
+      "sin"_a,
+      "positions"_a,
+      "rotary_dim"_a = 0,
+      "interleaved"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        positioned/partial rotary embedding; positions is (N,) or (B,N),
+        rotary_dim=0 rotates the full head, and the unrotated tail is copied.
+      )");
+
+    m.def(
+      "mrope",
+      &mrope,
+      "x"_a,
+      "cos"_a,
+      "sin"_a,
+      "positions"_a,
+      "sections"_a,
+      "rotary_dim"_a = 0,
+      "section_interleaved"_a = false,
+      nb::kw_only(),
+      "stream"_a = nb::none(),
+      R"(
+        temporal/height/width M-RoPE; sections are rotary-pair counts and
+        section_interleaved selects the Qwen THWTHW... axis map.
+      )");
+
+    m.def(
+      "vision_rope_2d", &vision_rope_2d,
+      "x"_a, "cos"_a, "sin"_a, "positions"_a,
+      "global_split"_a = false,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Two-axis vision RoPE; global_split selects Qwen versus Gemma channel layout.)");
 
     m.def(
       "gelu",
@@ -1315,6 +1453,12 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "embedding_lookup_types", &embedding_lookup_types,
+      "token_ids"_a, "type_ids"_a, "token_table"_a, "type_table"_a,
+      "token_scale"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(Fused token and token-type embedding lookup/add.)");
+
+    m.def(
       "embedding_backward",
       &embedding_backward,
       "token_ids"_a,
@@ -1378,7 +1522,7 @@ NB_MODULE(_ext, m) {
       "limit"_a = 1.0e20f,
       "stream"_a = nb::none(),
       R"(
-        GLU-family activation: reglu, geglu, swiglu, swiglu_oai, geglu_erf, or geglu_quick
+        GLU-family activation: reglu, geglu, swiglu, swiglu_oai, geglu_erf, geglu_quick, or sigmoid
       )");
 
     m.def(
@@ -1442,6 +1586,27 @@ NB_MODULE(_ext, m) {
       nb::kw_only(), "stream"_a = nb::none(),
       R"(fp8 KV gather + upconvert: dequantize e4m3/e5m2 codes to bf16 via per-kv_head scales.
          Returns [key_out, value_out] bf16.)");
+
+    m.def(
+      "kv_cache_scatter_q8_0", &kv_cache_scatter_q8_0,
+      "key"_a, "value"_a, "slot_mapping"_a, "num_blocks"_a, "block_size"_a,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Encode and scatter K/V into QuixiCore Q8_0 cache planes.
+         Returns (key_codes int8, key_scales float16, value_codes int8,
+         value_scales float16); one scale covers 32 consecutive dimensions.)");
+
+    m.def(
+      "kv_cache_gather_q8_0", &kv_cache_gather_q8_0,
+      "key_codes"_a, "key_scales"_a, "value_codes"_a, "value_scales"_a,
+      "block_table"_a, "cu_seq_lens"_a, "num_tokens"_a,
+      "output_dtype"_a = "bfloat16", nb::kw_only(), "stream"_a = nb::none(),
+      R"(Gather and decode QuixiCore Q8_0 paged-cache planes.)");
+
+    m.def(
+      "kv_cache_copy_blocks_q8_0", &kv_cache_copy_blocks_q8_0,
+      "key_codes"_a, "key_scales"_a, "value_codes"_a, "value_scales"_a,
+      "block_mapping"_a, nb::kw_only(), "stream"_a = nb::none(),
+      R"(Functionally clone Q8_0 cache planes and apply (src,dst) block copies.)");
 
     m.def(
       "kv_cache_scale_update", &kv_cache_scale_update,
@@ -1616,6 +1781,14 @@ NB_MODULE(_ext, m) {
         decode paged attention over fp8 (uint8) caches, dequantized on read; fmt 0=e4m3, 1=e5m2. GQA aware.
         window > 0 restricts to the `window` most recent keys.
       )");
+
+    m.def(
+      "paged_attention_q8_0", &paged_attention_q8_0,
+      "q"_a, "key_codes"_a, "key_scales"_a, "value_codes"_a,
+      "value_scales"_a, "block_table"_a, "context_lens"_a,
+      "scale"_a = 0.0f, "window"_a = 0,
+      nb::kw_only(), "stream"_a = nb::none(),
+      R"(Paged decode attention that dequantizes QuixiCore Q8_0 K/V blocks on read.)");
 
     m.def(
       "attn_causal",
@@ -2200,6 +2373,71 @@ NB_MODULE(_ext, m) {
       )");
 
     m.def(
+      "base_qdequant", &base_qdequant,
+      "codes"_a, "scales"_a, "biases"_a, "bits"_a, "group_size"_a,
+      nb::kw_only(), "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "output_dtype"_a = "float16",
+      "stream"_a = nb::none(),
+      R"(Decode canonical BaseQN separate code/scale/bias planes to a dense tensor.)");
+
+    m.def(
+      "base_qgemv", &base_qgemv,
+      "codes"_a, "scales"_a, "biases"_a, "x"_a, "bits"_a, "group_size"_a,
+      nb::kw_only(), "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Canonical BaseQN decode GEMV: dequant(codes, scales, biases) @ x.)");
+
+    m.def(
+      "base_qgemm", &base_qgemm,
+      "codes"_a, "scales"_a, "biases"_a, "x"_a, "bits"_a, "group_size"_a,
+      nb::kw_only(), "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Canonical BaseQN decode matrix multiplication.)");
+
+    m.def(
+      "base_qgemv_qkv", &base_qgemv_qkv,
+      "q_codes"_a, "q_scales"_a, "q_biases"_a,
+      "k_codes"_a, "k_scales"_a, "k_biases"_a,
+      "v_codes"_a, "v_scales"_a, "v_biases"_a, "x"_a,
+      "bits"_a, "group_size"_a, nb::kw_only(),
+      "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Fused canonical BaseQN Q/K/V decode GEMVs over one activation.)");
+
+    m.def(
+      "base_qgemv_swiglu", &base_qgemv_swiglu,
+      "gate_codes"_a, "gate_scales"_a, "gate_biases"_a,
+      "up_codes"_a, "up_scales"_a, "up_biases"_a, "x"_a,
+      "bits"_a, "group_size"_a, nb::kw_only(),
+      "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Fused canonical BaseQN gate/up decode GEMVs with a SwiGLU epilogue.)");
+
+    m.def(
+      "base_qembedding", &base_qembedding,
+      "codes"_a, "scales"_a, "biases"_a, "ids"_a, "bits"_a, "group_size"_a,
+      nb::kw_only(), "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "output_dtype"_a = "float16",
+      "stream"_a = nb::none(),
+      R"(Gather canonical BaseQN rows and decode them directly to the output.)");
+
+    m.def(
+      "base_qmoe_gemm", &base_qmoe_gemm,
+      "codes"_a, "scales"_a, "biases"_a, "input"_a,
+      "expert_of_tile"_a, "bits"_a, "group_size"_a, nb::kw_only(),
+      "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Canonical BaseQN grouped expert projection over a padded MoE schedule.)");
+
+    m.def(
+      "base_qmoe_swiglu", &base_qmoe_swiglu,
+      "codes"_a, "scales"_a, "biases"_a, "input"_a,
+      "expert_of_tile"_a, "bits"_a, "group_size"_a, nb::kw_only(),
+      "scale_dtype"_a = "bf16", "symmetric"_a = false,
+      "layout"_a = "metal", "stream"_a = nb::none(),
+      R"(Canonical BaseQN grouped gate/up expert projection with SwiGLU.)");
+
+    m.def(
       "qgemv_q4_0_up_gate_gelu", &qgemv_q4_0_up_gate_gelu,
       "up"_a, "gate"_a, "x"_a, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused Q4_0 up+gate decode GEMV + gated-GELU: gelu(gate @ x) * (up @ x); x (K,1) fp32)");
@@ -2309,6 +2547,34 @@ NB_MODULE(_ext, m) {
       "input"_a, "weight"_a, "bias"_a, "height"_a, "width"_a,
       "eps"_a = 1e-5f, nb::kw_only(), "stream"_a = nb::none(),
       R"(fused Swin 2x2 patch gather and LayerNorm.)");
+
+    m.def("extract_patches_2d", &extract_patches_2d,
+          "x"_a, "kernel_h"_a, "kernel_w"_a, "stride_h"_a, "stride_w"_a,
+          "pad_h"_a, "pad_w"_a, nb::kw_only(), "stream"_a = nb::none(),
+          R"(Extract padded NHWC patches into (B,OH*OW,KH*KW*C).)");
+    m.def("extract_patches_3d", &extract_patches_3d,
+          "x"_a, "kernel_t"_a, "kernel_h"_a, "kernel_w"_a,
+          "stride_t"_a, "stride_h"_a, "stride_w"_a,
+          "pad_t"_a, "pad_h"_a, "pad_w"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Extract padded NTHWC patches into (B,OT*OH*OW,KT*KH*KW*C).)");
+    m.def("interpolate_position_2d", &interpolate_position_2d,
+          "table"_a, "out_h"_a, "out_w"_a, "align_corners"_a = false,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Bilinearly interpolate an (H,W,D) position table.)");
+    m.def("avg_pool2d_tokens", &avg_pool2d_tokens,
+          "x"_a, "kernel_h"_a, "kernel_w"_a, "stride_h"_a, "stride_w"_a,
+          "ceil_mode"_a = false, nb::kw_only(), "stream"_a = nb::none(),
+          R"(NHWC spatial average pooling.)");
+    m.def("factorized_position_2d", &factorized_position_2d,
+          "position_ids"_a, "table"_a, "valid_mask"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Gather and sum independent x/y learned position embeddings.)");
+    m.def("pool_tokens_by_position", &pool_tokens_by_position,
+          "x"_a, "position_ids"_a, "valid_mask"_a, "output_length"_a,
+          "kernel_size"_a, "source_width"_a,
+          nb::kw_only(), "stream"_a = nb::none(),
+          R"(Coordinate-bucketed vision pooling; returns FP32 tokens and an int32 validity mask.)");
 
     m.def(
       "space_to_depth_norm_linear", &space_to_depth_norm_linear,

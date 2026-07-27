@@ -10,7 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import (quantize_per_token_fp8, quantize_per_token_int8,
+from tk import (calibration_absmax, quantize_per_token_fp8, quantize_per_token_int8,
                 quantize_per_tensor_fp8, quantize_per_tensor_int8)
 from tk.quant import _e4m3_decode_arr
 
@@ -106,6 +106,35 @@ def test_quantize_per_tensor_zero_has_zero_scale_and_codes(quantize):
     mx.eval(codes, scale)
     np.testing.assert_array_equal(np.array(codes), 0)
     np.testing.assert_array_equal(np.array(scale), 0.0)
+
+
+@pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
+@pytest.mark.parametrize("shape", [(1, 33), (257, 96), (4097, 513)])
+def test_calibration_absmax(dtype, shape):
+    rng = np.random.default_rng(74)
+    x = rng.standard_normal(shape).astype(np.float32)
+    xq = mx.array(x).astype(_MX[dtype])
+    got = calibration_absmax(xq)
+    mx.eval(got)
+    rounded = np.array(xq.astype(mx.float32))
+    np.testing.assert_array_equal(np.array(got), np.max(np.abs(rounded), axis=0))
+
+
+def test_calibration_absmax_running_chunk_merge_and_nonfinite():
+    rng = np.random.default_rng(75)
+    x = rng.standard_normal((513, 65)).astype(np.float32)
+    x[7, 2] = np.inf
+    x[11, 3] = -np.inf
+    x[19, 4] = np.nan
+    first = calibration_absmax(mx.array(x[:211]))
+    chunked = calibration_absmax(mx.array(x[211:]), running=first)
+    full = calibration_absmax(mx.array(x))
+    mx.eval(chunked, full)
+    got = np.array(full)
+    np.testing.assert_array_equal(np.array(chunked), got)
+    assert np.isposinf(got[2]) and np.isposinf(got[3]) and np.isnan(got[4])
+    ref = np.max(np.abs(x[:, [0, 1, 5, 64]]), axis=0)
+    np.testing.assert_array_equal(got[[0, 1, 5, 64]], ref)
 
 
 if __name__ == "__main__":

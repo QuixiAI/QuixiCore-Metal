@@ -184,6 +184,64 @@ instantiate_quant_tensor(float32, float)
 instantiate_quant_tensor(float16, half)
 instantiate_quant_tensor(bfloat16, bf16)
 
+// Per-input-channel AWQ-style calibration. One simdgroup covers 32 channels,
+// so every token read is contiguous across lanes. Chunked accumulation is the
+// same operation with the previous fp32 result supplied as running.
+template <typename T>
+kernel void calibration_absmax(
+    device const T *x [[buffer(0)]],
+    device const float *running [[buffer(1)]],
+    device float *out [[buffer(2)]],
+    constant int &tokens [[buffer(3)]],
+    constant int &channels [[buffer(4)]],
+    constant int &has_running [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const int channel = int(group) * 32 + int(lane);
+  threadgroup float partial_max[256];
+  threadgroup uint partial_nan[256];
+  float amax = channel < channels && has_running != 0 ? running[channel] : 0.0f;
+  bool saw_nan = metal::isnan(amax);
+  amax = metal::max(amax, 0.0f);
+  for (int token = int(simd); channel < channels && token < tokens; token += 8) {
+    const float value = float(x[(long)token * channels + channel]);
+    saw_nan = saw_nan || metal::isnan(value);
+    if (!metal::isnan(value)) {
+      amax = metal::max(amax, metal::abs(value));
+    }
+  }
+  partial_max[tid] = amax;
+  partial_nan[tid] = saw_nan ? 1u : 0u;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd == 0 && channel < channels) {
+    float total_max = partial_max[lane];
+    uint total_nan = partial_nan[lane];
+    #pragma clang loop unroll(full)
+    for (int warp = 1; warp < 8; ++warp) {
+      total_max = metal::max(total_max, partial_max[warp * 32 + lane]);
+      total_nan |= partial_nan[warp * 32 + lane];
+    }
+    out[channel] = total_nan != 0 ? NAN : total_max;
+  }
+}
+
+#define instantiate_calibration_absmax(type_name, T)                           \
+  template [[host_name("calibration_absmax_" #type_name)]] [[kernel]] void    \
+  calibration_absmax<T>(device const T *x [[buffer(0)]],                       \
+      device const float *running [[buffer(1)]], device float *out [[buffer(2)]],\
+      constant int &tokens [[buffer(3)]], constant int &channels [[buffer(4)]],\
+      constant int &has_running [[buffer(5)]],                                 \
+      uint group [[threadgroup_position_in_grid]],                             \
+      uint lane [[thread_index_in_simdgroup]],                                 \
+      uint simd [[simdgroup_index_in_threadgroup]],                            \
+      uint tid [[thread_index_in_threadgroup]]);
+
+instantiate_calibration_absmax(float32, float)
+instantiate_calibration_absmax(float16, half)
+instantiate_calibration_absmax(bfloat16, bf16)
+
 #define instantiate_quant_rt(type_name, T)                                     \
   template [[host_name("quantize_per_token_fp8_" #type_name)]] [[kernel]] void \
   quantize_per_token_fp8<T>(device const T *x [[buffer(0)]],                   \

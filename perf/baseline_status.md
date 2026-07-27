@@ -6,7 +6,7 @@ into `perf/optimization_status.md`.
 
 ## Environment
 
-Most recent run date: 2026-07-14.
+Most recent run date: 2026-07-23.
 
 Each real baseline entry should record:
 
@@ -145,6 +145,139 @@ keep/reject analysis is in `perf/optimization_status.md`.
 | Production-only retained state | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/cross-kernel-transfer-final-retained/` |
 | Attention softcap repeat | `376e5e4-dirty` | MLX / quick | 40 / 180 | `perf/results/2026-07-14/attention-softcap-specialization-candidate-repeat/` |
 | MXFP8 decode SwiGLU two-warp | `376e5e4-dirty` | MLX / quick | 50 / 240 | `perf/results/2026-07-14/decode-swiglu-mxfp8-two-warp-candidate/` |
+
+## 2026-07-23 Canonical BaseQN Baseline
+
+These MLX runs use MacBook Pro Mac17,6 (Apple M5 Max, 128 GB), macOS
+26.5.2 (25F84), Xcode 26.6 (17F113), Apple Metal 32023.883 / toolchain
+17.6.109.0, Python 3.12.13, and MLX 0.21.1. They cover the canonical
+separate-plane BaseQN operation contract with F16 scale/bias storage and F16
+activations. Exact correctness error, median, p20/p80, CV, and composition
+baseline fields are in each JSONL; decisions are in
+`perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| GEMV one-value control | `bc968fc-dirty` | MLX / smoke, Q4 | 5 / 30 | `perf/results/2026-07-23/basert-baseq-before/` |
+| GEMV eight-value candidate | `bc968fc-dirty` | MLX / smoke, Q4 | 5 / 30 | `perf/results/2026-07-23/basert-baseq-after/` |
+| Direct GEMM rejection run | `bc968fc-dirty` | MLX / quick, Q4 | 5 / 30 | `perf/results/2026-07-23/basert-baseq-gemm-direct/` |
+| Final Q3/Q4/Q6/Q8 route | `bc968fc-dirty` | MLX / quick | 5 / 30 | `perf/results/2026-07-23/basert-baseq-final/` |
+
+## 2026-07-23 BaseQN Fused Consumer Baseline
+
+Same Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment as the canonical
+BaseQN baseline above. Correctness error, median, p20/p80, CV, and composition
+timings are in the JSONL; the keep/reject record is in
+`perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| QKV all-grid control | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/153250-mlx-quick/` |
+| Decoded-value threshold rejection | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-fused-threshold-final/` |
+| Retained K-bracketed route | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-fused-k-route-final/` |
+
+## 2026-07-23 BaseQN LM-Head Routing
+
+Same Apple M5 Max environment and measurement method as the BaseQN sections
+above. The optimization notebook records why both dedicated reductions were
+removed in favor of columnwise direct GEMV composition.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Eight-simdgroup reduction control | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-lm-head-strong-baseline/` |
+| Serial-simdgroup reduction candidate | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-lm-head-serial-candidate/` |
+| Retained columnwise GEMV route | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-lm-head-retained/` |
+| Retained QuixiCore-argmax route | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-lm-head-retained-argmax-sampling/` |
+
+## 2026-07-23 BaseQN Grouped Expert Baseline
+
+Same Apple M5 Max environment as the BaseQN sections above. Expert stacks use
+the canonical separate code/scale/bias planes and the existing 32-row padded
+MoE schedule. The optimization notebook records the operation-specific
+one-simdgroup versus four-way split-K decision.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| One-simdgroup control | `bc968fc-dirty` | MLX / smoke, Q4 | 5 / 20 | `perf/results/2026-07-23/basert-baseq-moe-one-warp/` |
+| Four-way split-K candidate | `bc968fc-dirty` | MLX / smoke, Q4 | 5 / 20 | `perf/results/2026-07-23/basert-baseq-moe-four-warp/` |
+| Retained geometry quick repeat | `bc968fc-dirty` | MLX / quick, Q4 | 20 / 50 | `perf/results/2026-07-23/basert-baseq-moe-final-repeat/` |
+| Retained Q3/Q4/Q6/Q8 sweep | `bc968fc-dirty` | MLX / smoke | 20 / 50 | `perf/results/2026-07-23/basert-baseq-moe-format-sweep/` |
+
+## 2026-07-23 Extended RoPE Baseline
+
+Same Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment as the BaseQN
+sections above. These runs compare explicit-position partial and three-axis
+M-RoPE kernels, plus fused Q/K RMSNorm variants, against framework table
+gather/rotation/concatenation compositions. Exact error, median, p20/p80, CV,
+and decisions are recorded in the raw JSONL and optimization notebook.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Generic positioned/M-RoPE smoke | `bc968fc-dirty` | MLX / smoke | 3 / 20 | `perf/results/2026-07-23/basert-rope-generic-smoke/` |
+| Generic positioned/M-RoPE retained quick | `bc968fc-dirty` | MLX / quick | 3 / 20 | `perf/results/2026-07-23/basert-rope-generic-quick/` |
+| Fused Q/K positioned/M-RoPE smoke | `bc968fc-dirty` | MLX / smoke | 3 / 20 | `perf/results/2026-07-23/basert-qk-rope-extended-smoke/` |
+| Fused Q/K positioned/M-RoPE retained quick | `bc968fc-dirty` | MLX / quick | 3 / 20 | `perf/results/2026-07-23/basert-qk-rope-extended-quick/` |
+
+## 2026-07-23 Q8_0 KV Baseline
+
+Same Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment as the BaseQN
+sections above. The codec runs compare Q8_0 encode/decode with equivalent BF16
+cache copies. The attention runs compare direct Q8_0 paged reads with both
+direct BF16 paged reads and Q8_0 gather followed by framework SDPA. The quick
+runs request 10 warmups and 40 synchronized samples in addition to the
+harness's 50 ms clock warmup and adaptive batching. Exact median, p20/p80, CV,
+shape, and control fields are in the JSONL.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Codec smoke | `bc968fc-dirty` | MLX / smoke | 3 / 10 | `perf/results/2026-07-23/basert-q8-kv-codec-smoke/` |
+| Paged-read smoke | `bc968fc-dirty` | MLX / smoke | 3 / 10 | `perf/results/2026-07-23/basert-q8-kv-attn-smoke/` |
+| Codec quick | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-23/basert-q8-kv-codec-quick/` |
+| Paged-read retained quick | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-23/basert-q8-kv-attn-quick/` |
+
+## 2026-07-23 Gated DeltaNet I/O Baseline
+
+Same Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment as the BaseQN
+sections above. This run compares fused GDN short-convolution SiLU, QKV
+split/normalization, decay/beta, gated RMSNorm, and the reusable sigmoid output
+gate with equivalent unfused or framework compositions. Exact median,
+p20/p80, CV, shape, and speedup fields are in the JSONL; decisions are in
+`perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Preparation/output smoke | `bc968fc-dirty` | MLX / smoke | 2 / 3 | `perf/results/2026-07-23/basert-gdn-io-smoke/` |
+| Preparation/output retained quick | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-23/basert-gdn-io-quick/` |
+
+## 2026-07-23 BaseRT Completion Kernel Baselines
+
+These runs use the Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment
+recorded above. They cover calibration/output transforms, fused LoRA routing,
+and BERT embedding/pooling tensor primitives. Exact medians, p20/p80, CV,
+shapes, and framework controls are in each JSONL; keep/reject decisions are in
+`perf/optimization_status.md`.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Calibration absmax and logit softcap | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-23/basert-aux-optimized-quick/` |
+| Fused LoRA route sweep | `bc968fc-dirty` | MLX / comprehensive | 10 / 60 | `perf/results/2026-07-23/basert-lora-fused-routing/` |
+| BERT token/type embedding and masked pooling | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-23/basert-embedding-quick/` |
+
+## 2026-07-24 BaseRT Vision and Audio Kernel Baselines
+
+Same Apple M5 Max environment. Vision compares general patch extraction,
+position interpolation, and pooling with framework compositions. Audio
+compares general/depthwise convolution and short/long-memory cross-attention
+routes. The notebook records which direct candidates were retained or rejected.
+
+| Run | Working tree | Backend / preset | Warmups / iterations | Raw results |
+| --- | --- | --- | ---: | --- |
+| Vision patch/position/pooling route | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-vision-quick/` |
+| Audio convolution and cross-attention route | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-audio-cross-quick/` |
+| Strict BaseRT vision/audio contract audit | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-contract-quick/` |
+| Qwen temporal/spatial patch route | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-qwen3d-routing/` |
+| Gemma scalar value-clip route | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-value-clip-routing/` |
+| Qwen global-split vision RoPE | `bc968fc-dirty` | MLX / quick | 10 / 40 | `perf/results/2026-07-24/basert-qwen-vision-rope/` |
 
 ## Migration Tasks
 

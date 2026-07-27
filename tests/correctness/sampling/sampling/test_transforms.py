@@ -44,6 +44,48 @@ def test_quadratic_transform():
     np.testing.assert_allclose(np.array(got0), x, atol=1e-6)
 
 
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_logits_softcap(dtype):
+    rng = np.random.default_rng(41)
+    x = (8.0 * rng.standard_normal((7, 513))).astype(np.float32)
+    xd = mx.array(x).astype(dtype)
+    got = tk.logits_softcap(xd, 30.0)
+    mx.eval(got)
+    rounded = np.array(xd.astype(mx.float32))
+    ref = (30.0 * np.tanh(rounded / 30.0)).astype(
+        np.float32 if dtype == mx.float32 else np.float16)
+    tol = 2e-2 if dtype == mx.bfloat16 else 2e-3
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref.astype(np.float32),
+                               atol=tol, rtol=tol)
+
+
+def test_logits_softcap_rejects_invalid_cap():
+    with pytest.raises(ValueError):
+        tk.logits_softcap(mx.zeros((2, 4)), 0.0)
+
+
+@pytest.mark.parametrize("dtype", [mx.float32, mx.float16, mx.bfloat16])
+def test_value_clip_arbitrary_shape_and_dtype(dtype):
+    x = np.array([[[-4.0, -1.25, 0.0], [0.75, 2.5, 9.0]]], dtype=np.float32)
+    xd = mx.array(x).astype(dtype)
+    got = tk.value_clip(xd, -1.25, 2.5)
+    mx.eval(got)
+    assert got.shape == xd.shape
+    assert got.dtype == dtype
+    rounded = np.array(xd.astype(mx.float32))
+    np.testing.assert_array_equal(
+        np.array(got.astype(mx.float32)), np.clip(rounded, -1.25, 2.5))
+
+
+def test_value_clip_infinite_bounds_and_validation():
+    x = mx.array([[-2.0, 1.0]], dtype=mx.float32)
+    np.testing.assert_array_equal(np.array(tk.value_clip(x, -np.inf, np.inf)), np.array(x))
+    with pytest.raises(ValueError):
+        tk.value_clip(x, 2.0, -2.0)
+    with pytest.raises(ValueError):
+        tk.value_clip(x, np.nan, 2.0)
+
+
 def test_top_nsigma_exact_set():
     rng = np.random.default_rng(1)
     x = _grid_logits(rng, 16, 400)

@@ -14,6 +14,7 @@ set(METAL_INCLUDE_ROOT "${REPO_ROOT}/include/metal")
 
 set(KERNEL_FAMILY_INCLUDE_DIRS
     "${KERNELS_ROOT}/activations"
+    "${KERNELS_ROOT}/audio"
     "${KERNELS_ROOT}/attention"
     "${KERNELS_ROOT}/common"
     "${KERNELS_ROOT}/linear_attention"
@@ -30,9 +31,13 @@ set(KERNEL_FAMILY_INCLUDE_DIRS
 
 set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.cpp"
+    "${KERNELS_ROOT}/audio/conv1d/conv1d.cpp"
+    "${KERNELS_ROOT}/audio/relative_attention/relative_attention.cpp"
     "${KERNELS_ROOT}/attention/attn_fwd/attn_fwd.cpp"
     "${KERNELS_ROOT}/attention/attn_fwd_sg/attn_fwd_sg.cpp"
+    "${KERNELS_ROOT}/attention/cross_attn/cross_attn.cpp"
     "${KERNELS_ROOT}/matmul/matmul_custom/matmul_custom.cpp"
+    "${KERNELS_ROOT}/matmul/lora/lora.cpp"
     "${KERNELS_ROOT}/norms/layernorm/layernorm.cpp"
     "${KERNELS_ROOT}/norms/rms_norm/rms_norm.cpp"
     "${KERNELS_ROOT}/norms/rms_norm_residual_next/rms_norm_residual_next.cpp"
@@ -91,6 +96,7 @@ set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/quantization/qgemm_bwd/qgemm_bwd.cpp"
     "${KERNELS_ROOT}/quantization/qgemm_fused/qgemm_fused.cpp"
     "${KERNELS_ROOT}/quantization/qgemv/qgemv.cpp"
+    "${KERNELS_ROOT}/quantization/base_q/base_q.cpp"
     "${KERNELS_ROOT}/quantization/qgemv_fused/qgemv_fused.cpp"
     "${KERNELS_ROOT}/quantization/qflux/qflux.cpp"
     "${KERNELS_ROOT}/quantization/qgemv_int/qgemv_int.cpp"
@@ -101,13 +107,18 @@ set(KERNEL_CPP_SOURCES
     "${KERNELS_ROOT}/matmul/decode_linear/decode_linear.cpp"
     "${KERNELS_ROOT}/quantization/dequant_gather/dequant_gather.cpp"
     "${KERNELS_ROOT}/vision/edge_mlp/edge_mlp.cpp"
-    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.cpp")
+    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.cpp"
+    "${KERNELS_ROOT}/vision/patch_ops/patch_ops.cpp")
 
 set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/utils/add_rt/add_rt.metal"
+    "${KERNELS_ROOT}/audio/conv1d/conv1d.metal"
+    "${KERNELS_ROOT}/audio/relative_attention/relative_attention.metal"
     "${KERNELS_ROOT}/attention/attn_fwd/attn_fwd.metal"
     "${KERNELS_ROOT}/attention/attn_fwd_sg/attn_fwd_sg.metal"
+    "${KERNELS_ROOT}/attention/cross_attn/cross_attn.metal"
     "${KERNELS_ROOT}/matmul/matmul_custom/matmul_custom.metal"
+    "${KERNELS_ROOT}/matmul/lora/lora.metal"
     "${KERNELS_ROOT}/norms/layernorm/layernorm.metal"
     "${KERNELS_ROOT}/norms/rms_norm/rms_norm.metal"
     "${KERNELS_ROOT}/norms/rms_norm_residual_next/rms_norm_residual_next.metal"
@@ -166,6 +177,7 @@ set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/quantization/qgemm_bwd/qgemm_bwd.metal"
     "${KERNELS_ROOT}/quantization/qgemm_fused/qgemm_fused.metal"
     "${KERNELS_ROOT}/quantization/qgemv/qgemv.metal"
+    "${KERNELS_ROOT}/quantization/base_q/base_q.metal"
     "${KERNELS_ROOT}/quantization/qgemv_fused/qgemv_fused.metal"
     "${KERNELS_ROOT}/quantization/qflux/qflux.metal"
     "${KERNELS_ROOT}/quantization/qgemv_int/qgemv_int.metal"
@@ -176,7 +188,8 @@ set(KERNEL_METAL_SOURCES
     "${KERNELS_ROOT}/matmul/decode_linear/decode_linear.metal"
     "${KERNELS_ROOT}/quantization/dequant_gather/dequant_gather.metal"
     "${KERNELS_ROOT}/vision/edge_mlp/edge_mlp.metal"
-    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.metal")
+    "${KERNELS_ROOT}/vision/patch_merge/patch_merge.metal"
+    "${KERNELS_ROOT}/vision/patch_ops/patch_ops.metal")
 
 # mlx_build_metallib only tracks explicitly listed dependencies. Every kernel
 # includes tk.metal, so header-only kernel changes must also invalidate the

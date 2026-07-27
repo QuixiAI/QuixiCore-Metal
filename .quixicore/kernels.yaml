@@ -39,6 +39,7 @@ families:
       - kernels/attention/rotary
       - kernels/attention/rope_kv
       - kernels/attention/swin_attn
+      - kernels/attention/cross_attn
   linear_attention:
     status: implemented
     paths:
@@ -63,6 +64,7 @@ families:
       - kernels/matmul/cmplx_matmul
       - kernels/matmul/flux
       - kernels/matmul/decode_linear
+      - kernels/matmul/lora
   quantization:
     status: implemented
     paths:
@@ -73,6 +75,7 @@ families:
       - kernels/quantization/quantize_tq2_0
       - kernels/quantization/weight_quant_ternary
       - kernels/quantization/ternary_stats
+      - kernels/quantization/base_q
       - kernels/quantization/qgemm
       - kernels/quantization/qgemm_bwd
       - kernels/quantization/qgemm_fused
@@ -89,6 +92,12 @@ families:
     paths:
       - kernels/vision/patch_merge
       - kernels/vision/edge_mlp
+      - kernels/vision/patch_ops
+  audio:
+    status: implemented
+    paths:
+      - kernels/audio/conv1d
+      - kernels/audio/relative_attention
   moe:
     status: implemented
     paths:
@@ -123,6 +132,438 @@ families:
       - kernels/utils/dropout
       - kernels/utils/cross_entropy
 operations:
+  rotary_positioned:
+    family: attention
+    status: implemented
+    path: kernels/attention/rotary
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/attention/rotary
+    benchmark: rotary_extended
+    notes: Explicit shared or per-batch positions, partial rotary prefixes, split-half or adjacent-pair layout, BF16 heads D=64/128/256/512, and bit-identical tail copy. Frequency scaling is expressed entirely by the supplied tables.
+  mrope:
+    family: attention
+    status: implemented
+    path: kernels/attention/rotary
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/attention/rotary
+    benchmark: rotary_extended
+    notes: Three-axis temporal/height/width positions with contiguous sections or the Qwen THWTHW axis map; sections count rotary pairs and frequency indices do not reset at axis transitions.
+  qk_norm_rope_positioned:
+    family: norms
+    status: implemented
+    path: kernels/norms/qk_norm_rope
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/norms/qk_norm_rope
+    benchmark: qk_norm_rope
+    notes: Fuses per-head Q/K RMSNorm with explicit positioned, partial, or three-axis M-RoPE over packed QKV; supports D=64/128/256/512 and an explicit norm_weight_offset instead of model flags.
+  kv_cache_scatter_q8_0:
+    family: serving
+    status: implemented
+    path: kernels/serving/kv_cache
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/kv_cache
+    benchmark: kv_q8_0
+    notes: Quantizes F32/F16/BF16 K and V into independent int8 code and F16 scale planes in the QuixiCore q8_0_kv ABI; inactive slot -1 is ignored.
+  kv_cache_gather_q8_0:
+    family: serving
+    status: implemented
+    path: kernels/serving/kv_cache
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/kv_cache
+    benchmark: kv_q8_0
+    notes: Decodes arbitrary logical slots to F16/BF16/F32; invalid logical slots produce zero rows.
+  kv_cache_copy_blocks_q8_0:
+    family: serving
+    status: implemented
+    path: kernels/serving/kv_cache
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/kv_cache
+    benchmark: null
+    notes: Functional block copy clones all four K/V code/scale planes before applying source-to-destination mappings, preserving the input cache.
+  paged_attention_q8_0:
+    family: attention
+    status: implemented
+    path: kernels/serving/kv_cache
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/kv_cache
+    benchmark: paged_attn_q8_0
+    notes: Direct dequant-on-read paged attention for D64/D128, MHA/GQA/MQA, causal decode, and optional sliding windows. Scores, online softmax, and value accumulation use FP32; output follows the query dtype.
+  gdn_recur:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gdn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/linear_attention/gdn
+    benchmark: gdn
+    notes: Varlen sequential Gated DeltaNet recurrence with explicit functional FP32 state pool, slot mapping, fresh-prefill/continuation control, Dk 64/128, and MQA/GQA head mapping.
+  gdn_short_conv:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gdn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/linear_attention/gdn
+    benchmark: gdn_io
+    notes: Varlen causal depthwise convolution with kernel sizes 2 through 8, oldest-to-current weights, an explicit functional FP32 history pool, and an optional measured SiLU epilogue.
+  gdn_qkv_prepare:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gdn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/linear_attention/gdn
+    benchmark: gdn_io
+    notes: Splits activated mixed Q/K/V projections and applies per-head FP32-accumulated RMS normalization with explicit Q/K scales; supports Dk/Dv 64 or 128 and MQA/GQA layouts.
+  gdn_gate_beta:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gdn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/linear_attention/gdn
+    benchmark: gdn_io
+    notes: Produces FP32 decay exp(-exp(A_log)*softplus(a+dt_bias)) and beta sigmoid(b) from per-token/per-value-head projection logits.
+  gdn_gated_rmsnorm:
+    family: linear_attention
+    status: implemented
+    path: kernels/linear_attention/gdn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/linear_attention/gdn
+    benchmark: gdn_io
+    notes: Fused per-value-head RMSNorm and SiLU gate product with FP32 accumulation for D 64/128.
+  sigmoid_mul:
+    family: activations
+    status: implemented
+    path: kernels/activations/glu
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/activations/glu
+    benchmark: gdn_io
+    notes: GLU mode and convenience wrapper computing sigmoid(gate_logits) times values, including the Qwen3.5/3.6 full-attention output gate; analytic backward is implemented.
+  lora_apply:
+    family: matmul
+    status: implemented
+    path: kernels/matmul/lora
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/matmul/lora
+    benchmark: lora
+    notes: Applies an F16 low-rank A/B projection, scale, and optional base add. The measured route uses a row-owned direct Metal threadgroup for M<=4 and rank<=16, and framework F16 matmuls otherwise; the direct diagnostic supports ranks 1 through 256.
+  calibration_absmax:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/quant_rt
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/quant_rt
+    benchmark: basert_aux
+    notes: Deterministic FP32 per-input-channel absmax for F32/F16/BF16 token matrices, with optional exact running-max merge, NaN propagation, and positive-infinity handling.
+  logits_softcap:
+    family: sampling
+    status: implemented
+    path: kernels/sampling/sampling
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/sampling/sampling
+    benchmark: basert_aux
+    notes: Applies cap*tanh(logits/cap) elementwise with finite positive cap validation and output dtype preservation.
+  value_clip:
+    family: activations
+    status: implemented
+    path: kernels/sampling/sampling
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/sampling/sampling
+    benchmark: basert_aux
+    notes: Direct scalar-bounds clamp over arbitrary non-empty F32/F16/BF16 tensor shapes. Composes before and after dense or BaseQN projections for Gemma clippable-linear semantics and covers audio activation stabilization.
+  embedding_lookup_types:
+    family: serving
+    status: implemented
+    path: kernels/serving/embedding
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/embedding
+    benchmark: basert_embedding
+    notes: Fused BERT-style scaled token and token-type gather/add; invalid ids contribute zero independently.
+  masked_mean_pool_rms_l2:
+    family: serving
+    status: implemented
+    path: kernels/serving/mean_pool_rms_l2
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/serving/mean_pool_rms_l2
+    benchmark: basert_embedding
+    notes: BF16 batched masked mean pooling followed by FP32-accumulated RMSNorm and L2 normalization for D=256/512/768/1024; all-masked rows emit exact zero.
+  extract_patches_2d:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Extracts arbitrary padded/overlapping NHWC patches. The measured public route uses reshape/transpose for divisible non-overlapping patches and direct Metal for general geometry.
+  extract_patches_3d:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Extracts arbitrary padded or overlapping NTHWC temporal/spatial patches. The measured public route uses reshape/transpose for divisible non-overlapping patches and direct Metal for general geometry.
+  vision_patch_projection:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/tk/__init__.py
+      pytorch_mps: bindings/python/tk/__init__.py
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Composes measured patch extraction with FP32 framework GEMM and optional bias for O-by-KH-by-KW-by-C weights; no tower or image decoder is included.
+  vision_patch_projection_3d:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/tk/__init__.py
+      pytorch_mps: bindings/python/tk/__init__.py
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Composes temporal/spatial patch extraction with FP32 framework GEMM and optional bias for O-by-KT-by-KH-by-KW-by-C weights, covering Qwen-VL Conv3D patch projection without a vision tower graph.
+  interpolate_position_2d:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: FP32-compute bilinear resize of H-by-W-by-D learned position tables with explicit align_corners semantics.
+  avg_pool2d_tokens:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: NHWC spatial average pooling with explicit kernel/stride and floor or ceil output geometry; ceil-mode edge windows average only valid elements.
+  factorized_position_2d:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Gathers and sums independent learned x/y position tables for ids(B,N,2); invalid tokens emit zero.
+  pool_tokens_by_position:
+    family: vision
+    status: implemented
+    path: kernels/vision/patch_ops
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/vision/patch_ops
+    benchmark: basert_vision
+    notes: Atomic FP32 coordinate scatter implements padded or arbitrarily ordered Gemma vision pooling with fixed 1/K^2 weights, sqrt(D) output scale, and an int32 output-validity mask. Dense regular grids should retain the measured reshape/average composition.
+  vision_rope_2d:
+    family: attention
+    status: implemented
+    path: kernels/attention/rotary
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/attention/rotary
+    benchmark: basert_vision
+    notes: Two-axis BF16 vision RoPE for (B,H,N,D), D=64/128/256/512. axis_blocks implements Gemma local split-half pairing inside separate x/y D/2 blocks; global_split implements Qwen global split-half pairing with repeated x/y frequency sections.
+  qwen_vision_rope_2d:
+    family: attention
+    status: implemented
+    path: kernels/attention/rotary
+    bindings:
+      mlx: bindings/python/tk/__init__.py
+      pytorch_mps: bindings/python/tk/__init__.py
+    tests: tests/correctness/attention/rotary
+    benchmark: basert_vision
+    notes: Convenience operation selecting vision_rope_2d global_split layout, matching Qwen3-VL vision rotate-half semantics without requiring duplicated M-RoPE tables.
+  audio_conv1d:
+    family: audio
+    status: implemented
+    path: kernels/audio/conv1d
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/audio/conv1d
+    benchmark: basert_audio
+    notes: NWC convolution with O-by-K-by-C weights, optional bias, stride/padding/dilation, and FP32 accumulation. The measured public route uses framework convolution; direct Metal remains forceable for diagnostics and general kernel coverage.
+  audio_depthwise_conv1d:
+    family: audio
+    status: implemented
+    path: kernels/audio/conv1d
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/audio/conv1d
+    benchmark: basert_audio
+    notes: Direct NWC depthwise convolution with C-by-K weights, optional bias, stride/padding/dilation, FP32 accumulation, and optional fused SiLU for Conformer/LightConv-style blocks.
+  audio_causal_depthwise_conv1d:
+    family: audio
+    status: implemented
+    path: kernels/audio/conv1d
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/audio/conv1d
+    benchmark: basert_audio
+    notes: Reuses the asymmetric depthwise primitive with left padding dilation*(K-1)+1-stride and zero right padding, matching Conformer LightConv causal geometry.
+  audio_relative_attention:
+    family: attention
+    status: implemented
+    path: kernels/audio/relative_attention
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/audio/relative_attention
+    benchmark: basert_audio
+    notes: Online two-pass blocked relative-position attention over (B,T,H,D), D=64/128/256, with learned per-dimension query scale, relative-shift mapping, independent lengths, left/right block context, and optional softcap.
+  cross_attention:
+    family: attention
+    status: implemented
+    path: kernels/attention/cross_attn
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/attention/cross_attn
+    benchmark: basert_audio
+    notes: Independent-length head-major GQA cross-attention with right-padding lengths, optional exact FP32 bias, explicit/automatic scale, optional softcap, and D=64/128/256. The measured route uses direct online Metal through Tk=128 and framework matrix operations for longer encoder memory.
+  base_q_dequant:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q
+  base_q_gemv:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q
+  base_q_gemm:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q
+    notes: M=1 routes to direct decode GEMV; M>1 routes to standalone dequant plus framework GEMM after the direct candidate lost at M=2 and M=8.
+  base_q_embedding:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: null
+  base_q_qkv:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q_fused
+    notes: A measured crossover uses one combined Q/K/V grid through K=1024 and composes three direct BaseQN GEMVs for longer bandwidth-bound projections.
+  base_q_swiglu:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q_fused
+    notes: Direct gate/up decode GEMVs share activation loads and apply the SiLU/product epilogue in one Metal launch.
+  base_q_lm_head_argmax:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q_fused
+    notes: Uses one direct BaseQN GEMV per batch column plus argmax. Two dedicated packed-reduction candidates were rejected after losing to this composition; ties choose the lower token id.
+  base_q_moe_gemm:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q_moe
+    notes: Direct 32x32 register-tile decode over the existing padded expert schedule; one simdgroup per output tile won over four-way split-K for the rectangular projection.
+  base_q_moe_swiglu:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    bindings:
+      mlx: bindings/python/bindings.cpp
+      pytorch_mps: bindings/pytorch_mps/tk_torch/torch_kernels.mm
+    tests: tests/correctness/quantization/base_q
+    benchmark: base_q_moe
+    notes: Four-way split-K decodes fused gate/up expert rows and applies SwiGLU before store; the split-K candidate was retained only for this operation.
+  base_q_fused_consumers:
+    family: quantization
+    status: implemented
+    path: kernels/quantization/base_q
+    notes: QKV, gate/up SwiGLU, greedy LM-head selection, and grouped expert projection/SwiGLU are implemented. Down/output and shared-expert projections reuse the measured BaseQN core operations.
   quantized_embedding:
     family: quantization
     status: implemented

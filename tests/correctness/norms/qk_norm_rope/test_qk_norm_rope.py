@@ -10,7 +10,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from tk import qk_norm_rope
+from tk import qk_norm_rope, qk_norm_rope_positioned
 
 def _rope_tables(max_pos, half, base=10000.0):
     inv = 1.0 / (base ** (np.arange(half) / half))
@@ -41,6 +41,34 @@ def _ref(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps, interleaved, gemma):
             half = D // 2
             v1, v2 = v[:, :half], v[:, half:]
             r = np.concatenate([v1 * c - v2 * s, v2 * c + v1 * s], axis=-1)
+        out[:, h] = r
+    return out.reshape(T, W)
+
+
+def _ref_positioned(qkv, qw, kw, cos, sin, pos, hq, hk, hv, eps, rotary_dim,
+                    interleaved, weight_offset, sections=(), section_interleaved=False):
+    T, W = qkv.shape
+    HT, D = hq + hk + hv, W // (hq + hk + hv)
+    x = qkv.reshape(T, HT, D).astype(np.float64)
+    out = x.copy()
+    rp = rotary_dim // 2
+    boundaries = np.cumsum(sections) if sections else None
+    for h in range(hq + hk):
+        w = (qw if h < hq else kw).astype(np.float64) + weight_offset
+        v = x[:, h]
+        v = v / np.sqrt((v * v).mean(-1, keepdims=True) + eps) * w
+        r = v.copy()
+        for p in range(rp):
+            if sections:
+                axis = p % 3 if section_interleaved else int(
+                    np.searchsorted(boundaries, p, side="right"))
+                pp = pos[axis]
+            else:
+                pp = pos
+            c, s = cos[pp, p].astype(np.float64), sin[pp, p].astype(np.float64)
+            i0, i1 = (2 * p, 2 * p + 1) if interleaved else (p, rp + p)
+            r[:, i0] = v[:, i0] * c - v[:, i1] * s
+            r[:, i1] = v[:, i0] * s + v[:, i1] * c
         out[:, h] = r
     return out.reshape(T, W)
 
@@ -104,3 +132,64 @@ def test_matches_unfused_chain():
                np.array(mx.array(sin).astype(mx.bfloat16).astype(mx.float32)),
                pos, hq, hk, hv, 1e-6, False, False)
     np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize(
+    "D,rotary_dim,interleaved,weight_offset",
+    [(128, 64, False, 0.0), (256, 128, True, 1.0),
+     (512, 192, False, 0.25)],
+)
+def test_qk_norm_rope_positioned_partial(D, rotary_dim, interleaved, weight_offset):
+    hq, hk, hv, T = 4, 2, 1, 13
+    rng = np.random.default_rng(90 + D)
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    kw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    cos, sin = _rope_tables(97, rotary_dim // 2)
+    pos = ((3 * np.arange(T) + 2) % 97).astype(np.int32)
+    qb = mx.array(qkv).astype(mx.bfloat16)
+    qwb, kwb = mx.array(qw).astype(mx.bfloat16), mx.array(kw).astype(mx.bfloat16)
+    cb, sb = mx.array(cos).astype(mx.bfloat16), mx.array(sin).astype(mx.bfloat16)
+    got = qk_norm_rope_positioned(
+        qb, qwb, kwb, cb, sb, mx.array(pos), hq, hk, hv,
+        rotary_dim=rotary_dim, interleaved=interleaved,
+        norm_weight_offset=weight_offset)
+    mx.eval(got)
+    ref = _ref_positioned(
+        np.array(qb.astype(mx.float32)), np.array(qwb.astype(mx.float32)),
+        np.array(kwb.astype(mx.float32)), np.array(cb.astype(mx.float32)),
+        np.array(sb.astype(mx.float32)), pos, hq, hk, hv, 1e-6, rotary_dim,
+        interleaved, weight_offset)
+    gn = np.array(got.astype(mx.float32))
+    np.testing.assert_allclose(gn, ref, atol=3e-2, rtol=2e-2)
+    np.testing.assert_array_equal(
+        gn.reshape(T, hq + hk + hv, D)[:, hq + hk:],
+        np.array(qb.astype(mx.float32)).reshape(T, hq + hk + hv, D)[:, hq + hk:])
+
+
+@pytest.mark.parametrize(
+    "sections,section_interleaved",
+    [((8, 12, 12), False), ((11, 11, 10), True)],
+)
+def test_qk_norm_mrope(sections, section_interleaved):
+    D, hq, hk, hv, T = 64, 3, 1, 1, 17
+    rng = np.random.default_rng(144)
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = (0.8 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    kw = (0.8 + 0.1 * rng.standard_normal(D)).astype(np.float32)
+    cos, sin = _rope_tables(128, D // 2)
+    ar = np.arange(T, dtype=np.int32)
+    pos = np.stack((ar, 2 * ar + 1, 3 * ar + 2)) % 128
+    qb = mx.array(qkv).astype(mx.bfloat16)
+    qwb, kwb = mx.array(qw).astype(mx.bfloat16), mx.array(kw).astype(mx.bfloat16)
+    cb, sb = mx.array(cos).astype(mx.bfloat16), mx.array(sin).astype(mx.bfloat16)
+    got = qk_norm_rope_positioned(
+        qb, qwb, kwb, cb, sb, mx.array(pos), hq, hk, hv,
+        mrope_sections=sections, section_interleaved=section_interleaved)
+    mx.eval(got)
+    ref = _ref_positioned(
+        np.array(qb.astype(mx.float32)), np.array(qwb.astype(mx.float32)),
+        np.array(kwb.astype(mx.float32)), np.array(cb.astype(mx.float32)),
+        np.array(sb.astype(mx.float32)), pos, hq, hk, hv, 1e-6, D, False, 0.0,
+        sections, section_interleaved)
+    np.testing.assert_allclose(np.array(got.astype(mx.float32)), ref, atol=3e-2, rtol=2e-2)

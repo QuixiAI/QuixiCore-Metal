@@ -47,6 +47,28 @@ array quadratic_transform(const array& logits, float factor, float curve, float 
   return st_make(logits, 0, factor, curve, st_invtemp(temperature), 0, 0, 0, 0, 0, 0, {}, s);
 }
 
+array logits_softcap(const array& logits, float cap, StreamOrDevice s) {
+  st_check(logits, "logits_softcap");
+  if (!(cap > 0.0f) || !std::isfinite(cap)) {
+    throw std::invalid_argument("logits_softcap: cap must be finite and > 0");
+  }
+  return st_make(logits, 11, cap, 0, 0, 0, 0, 0, 0, 0, 0, {}, s);
+}
+
+array value_clip(const array& x, float min_value, float max_value,
+                 StreamOrDevice s) {
+  if (x.size() == 0 ||
+      !(x.dtype() == float32 || x.dtype() == float16 || x.dtype() == bfloat16)) {
+    throw std::invalid_argument(
+        "value_clip: input must be a non-empty f32/f16/bf16 tensor");
+  }
+  if (std::isnan(min_value) || std::isnan(max_value) || min_value > max_value) {
+    throw std::invalid_argument(
+        "value_clip: bounds must not be NaN and min_value <= max_value");
+  }
+  return st_make(x, 12, min_value, max_value, 0, 0, 0, 0, 0, 0, 0, {}, s);
+}
+
 array top_nsigma_mask(const array& logits, float nsigma, float temperature, StreamOrDevice s) {
   st_check(logits, "top_nsigma_mask");
   return st_make(logits, 1, nsigma, st_invtemp(temperature), 0, 0, 0, 0, 0, 0, 0, {}, s);
@@ -141,8 +163,8 @@ void SamplerTransform::eval_gpu(const std::vector<array>& inputs, std::vector<ar
   auto& s = stream();
   auto& d = metal::device(s.device);
   out.set_data(allocator::malloc_or_wait(out.nbytes()));
-  const int rows = x.shape(0);
-  const int V = x.shape(1);
+  const int rows = x.ndim() > 0 ? x.shape(0) : 1;
+  const int V = x.ndim() > 1 ? x.shape(1) : static_cast<int>(x.size());
   auto& ce = d.get_command_encoder(s.index);
   MLXEncoder enc(d, ce);
   const std::string tn = type_to_name(x);
@@ -182,6 +204,14 @@ void SamplerTransform::eval_gpu(const std::vector<array>& inputs, std::vector<ar
       tk::launch_dry_penalty(enc, x, inputs[1], inputs[2], inputs[3], out, rows, V,
                              inputs[1].shape(1), inputs[3].shape(0), f0_, f1_, i0_, i1_, i2_,
                              i3_, static_cast<int>(seed_), f2_, tn);
+      break;
+    case 11:
+      tk::launch_logits_softcap(
+          enc, x, out, static_cast<uint32_t>(x.size()), f0_, tn);
+      break;
+    case 12:
+      tk::launch_value_clip(
+          enc, x, out, static_cast<uint32_t>(x.size()), f0_, f1_, tn);
       break;
     default:
       throw std::runtime_error("SamplerTransform: unknown kind");

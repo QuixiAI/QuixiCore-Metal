@@ -15,6 +15,58 @@ using namespace mittens;
 constant float SMPT_NEG_INF = -3.4028234663852886e38f;
 constant int SMPT_MAX_K = 64;
 
+// Gemma-style final-logit softcap. This is deliberately separate from the
+// attention score softcap because it operates on materialized LM-head logits.
+template <typename T>
+kernel void logits_softcap(device const T *logits [[buffer(0)]],
+                           device T *out [[buffer(1)]],
+                           constant uint &n [[buffer(2)]],
+                           constant float &cap [[buffer(3)]],
+                           uint tid [[thread_position_in_grid]]) {
+    using T4 = metal::vec<T, 4>;
+    const uint base = tid * 4;
+    if (base + 4 <= n) {
+        const float4 value = float4(((device const T4*)(logits + base))[0]);
+        float4 result;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) {
+            result[i] = cap * metal::tanh(value[i] / cap);
+        }
+        ((device T4*)(out + base))[0] = T4(result);
+    } else {
+        for (uint i = base; i < n; ++i) {
+            const float value = float(logits[i]);
+            out[i] = T(cap * metal::tanh(value / cap));
+        }
+    }
+}
+
+// Reusable scalar-bounds clamp for clippable projections and activation
+// stabilization. Bounds may be infinite, matching framework clamp semantics.
+template <typename T>
+kernel void value_clip(device const T *x [[buffer(0)]],
+                       device T *out [[buffer(1)]],
+                       constant uint &n [[buffer(2)]],
+                       constant float &min_value [[buffer(3)]],
+                       constant float &max_value [[buffer(4)]],
+                       uint tid [[thread_position_in_grid]]) {
+    using T4 = metal::vec<T, 4>;
+    const uint base = tid * 4;
+    if (base + 4 <= n) {
+        const float4 value = float4(((device const T4*)(x + base))[0]);
+        float4 result;
+        #pragma clang loop unroll(full)
+        for (int i = 0; i < 4; ++i) {
+            result[i] = metal::clamp(value[i], min_value, max_value);
+        }
+        ((device T4*)(out + base))[0] = T4(result);
+    } else {
+        for (uint i = base; i < n; ++i) {
+            out[i] = T(metal::clamp(float(x[i]), min_value, max_value));
+        }
+    }
+}
+
 // quadratic / smoothing sampling: diff = ls - max; diff -= diff^2 (s*diff - k);
 // out = ls - diff' with k = factor(3-curve)/2, s = factor(curve-1)/2. factor == 0 -> copy.
 template <typename T>
@@ -433,6 +485,15 @@ kernel void dry_penalty(device const T *logits  [[buffer(0)]],
 }
 
 #define instantiate_transforms(type_name, T)                                              \
+  template [[host_name("logits_softcap_" #type_name)]] [[kernel]] void                   \
+  logits_softcap<T>(device const T *logits [[buffer(0)]], device T *out [[buffer(1)]],    \
+      constant uint &n [[buffer(2)]], constant float &cap [[buffer(3)]],                   \
+      uint tid [[thread_position_in_grid]]);                                               \
+  template [[host_name("value_clip_" #type_name)]] [[kernel]] void                       \
+  value_clip<T>(device const T *x [[buffer(0)]], device T *out [[buffer(1)]],              \
+      constant uint &n [[buffer(2)]], constant float &min_value [[buffer(3)]],             \
+      constant float &max_value [[buffer(4)]],                                             \
+      uint tid [[thread_position_in_grid]]);                                               \
   template [[host_name("quadratic_transform_" #type_name)]] [[kernel]] void               \
   quadratic_transform<T>(device const T *logits [[buffer(0)]], device T *out [[buffer(1)]],\
       constant int &V [[buffer(2)]], constant float &factor [[buffer(3)]],                \

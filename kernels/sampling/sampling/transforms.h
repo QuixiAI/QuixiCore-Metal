@@ -13,6 +13,9 @@ namespace mlx::core {
 
 array quadratic_transform(const array& logits, float factor, float curve = 1.0f,
                           float temperature = 1.0f, StreamOrDevice s = {});
+array logits_softcap(const array& logits, float cap, StreamOrDevice s = {});
+array value_clip(const array& x, float min_value, float max_value,
+                 StreamOrDevice s = {});
 array top_nsigma_mask(const array& logits, float nsigma, float temperature = 1.0f,
                       StreamOrDevice s = {});
 array top_a_mask(const array& logits, float top_a, float temperature = 1.0f,
@@ -37,7 +40,8 @@ array dry_penalty(const array& logits, const array& prev_tokens, const array& le
 class SamplerTransform : public Primitive {
  public:
   // kind: 0 quadratic, 1 nsigma, 2 top_a, 3 eps, 4 eta, 5 xtc, 6 skew, 7 topk_renorm,
-  // 8 topp_renorm, 9 ngram, 10 dry. f0..f3 / i0..i3 / seed are kind-specific params.
+  // 8 topp_renorm, 9 ngram, 10 dry, 11 final-logit softcap, 12 generic value clip.
+  // f0..f3 / i0..i3 / seed are kind-specific params.
   SamplerTransform(Stream stream, int kind, float f0, float f1, float f2, float f3,
                    int i0, int i1, int i2, int i3, uint32_t seed)
       : Primitive(stream), kind_(kind), f0_(f0), f1_(f1), f2_(f2), f3_(f3),

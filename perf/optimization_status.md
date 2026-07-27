@@ -2714,3 +2714,1011 @@ Keep decision: 1.7-2.5x over torch SDPA at the D=256 GQA f16-KV shape, which the
 attn_fwd path (D in {64,128}) does not cover. Additive; nothing regresses.
 
 Results: perf/results/2026-07-22/010655-torch-comprehensive/
+
+## 2026-07-23: canonical BaseQN dequant, GEMV, and GEMM routing
+
+Status: kept for the direct decode-GEMV and M>1 framework-GEMM route; rejected
+the direct decode-GEMM candidate for M>1.
+
+Current implementation and public route:
+
+- Canonical separate-plane Q2/Q3/Q4/Q5/Q6/Q8 codes, scales, and optional
+  biases are decoded by shared Metal source for MLX and PyTorch MPS.
+- BF16/F16/E8M0 scales are supported for every width; E4M3 is q8-only.
+  Group sizes are 32/64/128 and reconstruction may be asymmetric or symmetric.
+- M=1 uses a direct decode-GEMV. One simdgroup owns one row and each lane
+  consumes an aligned span of eight values, loading its scale/bias once.
+- M>1 materializes the F16/BF16/F32 weight with the standalone dequant kernel
+  and calls the framework GEMM. The direct decode-GEMM remains an internal
+  correctness baseline, not the public route.
+
+References inspected: the public Apache-2.0 canonical quantization spec and
+converter packers under `.reference/baseRT/base-convert/`. No proprietary
+BaseRT engine source or binary-derived implementation details were used.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`.
+- Integration path: MLX Python extension, asymmetric BaseQN with F16 scales,
+  F16 activations/output. The benchmark performs a one-second GPU clock ramp,
+  at least five calls and 50 ms of warmup per thunk, adaptive batching to at
+  least 2 ms, 30 synchronized samples, and reports median, p20/p80, and CV.
+- Correctness: all 64 targeted layout, MLX, PyTorch-MPS, and cross-backend
+  tests passed after routing. The quick benchmark's maximum relative error
+  against a float64 dequant-matmul oracle was 5.40e-4.
+
+Commands:
+
+```bash
+PYTHONPATH=bindings/python:bindings/pytorch_mps .venv/bin/python \
+  perf/bench_kernels.py --backend mlx --preset smoke --kernel base_q \
+  --formats q4 --warmup 5 --iters 30 \
+  --out-dir perf/results/2026-07-23/basert-baseq-before
+
+PYTHONPATH=bindings/python:bindings/pytorch_mps .venv/bin/python \
+  perf/bench_kernels.py --backend mlx --preset smoke --kernel base_q \
+  --formats q4 --warmup 5 --iters 30 \
+  --out-dir perf/results/2026-07-23/basert-baseq-after
+
+PYTHONPATH=bindings/python:bindings/pytorch_mps .venv/bin/python \
+  perf/bench_kernels.py --backend mlx --preset quick --kernel base_q \
+  --formats q3,q4,q6,q8 --warmup 5 --iters 30 \
+  --out-dir perf/results/2026-07-23/basert-baseq-final
+```
+
+Scale/bias amortization experiment, Q4 N4096 K4096 M1:
+
+| variant | median ms | p20/p80 ms | CV | decode-then-matmul ms | decision |
+|---|---:|---:|---:|---:|---|
+| lane-strided one value/scale load | 0.2088 | 0.2012/0.2367 | .1314 | 0.8766 | replace |
+| eight adjacent values/scale load | 0.1115 | 0.1062/0.1202 | .2068 | 0.8555 | keep; 1.87x kernel improvement and 7.67x over composition |
+
+The retained quick sweep measured direct GEMV at 0.1081–0.1222 ms for
+N4096/K4096 and 0.2589–0.2825 ms for N11008/K4096 across Q3/Q4/Q6/Q8,
+versus 0.8331–0.8585 ms and 2.4636–2.5657 ms for dequant-then-matmul. Final
+Q4 medians were 0.1222 ms (p20/p80 0.1188/0.1498, CV .1557) at N4096 and
+0.2609 ms (0.2557/0.3075, CV .1642) at N11008.
+
+The direct decode-GEMM candidate was rejected. At Q4 N4096 K4096 it took
+6.2012 ms for M=2 (p20/p80 5.9932/6.4610, CV .0309) and 6.2361 ms for M=8
+(6.0193/6.4723, CV .0361), while materialize-then-GEMM took 0.8903 and
+0.8932 ms respectively. The measured public route therefore selects framework
+GEMM for every M>1; the final quick sweep is approximately identical to its
+composition baseline, as intended.
+
+Decision: keep the eight-value GEMV schedule and the measured M=1/M>1 route.
+Reject direct decode-GEMM for M>1. Raw records are under
+`perf/results/2026-07-23/basert-baseq-{before,after,gemm-direct,final}`.
+Final verification: MLX extension build and PyTorch-MPS package build passed;
+`scripts/test correctness -q` passed 2212 tests, `scripts/test parity -q`
+passed 435, `scripts/test mps -q` passed 541, and the Xcode build-for-testing
+gate passed (only pre-existing compiler warnings).
+
+## 2026-07-23: BaseQN QKV and SwiGLU consumer fusion
+
+Status: keep the short-K QKV grid and fused SwiGLU kernel; reject the combined
+QKV grid for long K and route that public operation to the three direct BaseQN
+GEMVs.
+
+Hypothesis and changed factors:
+
+- A Q/K/V operation can remove two fixed launch boundaries by putting three
+  independent packed planes in one row grid. The plane selector is expected to
+  pay off only while fixed dispatch cost dominates decode bandwidth.
+- A gate/up kernel can share each activation load between two decode dot
+  products and apply SiLU/product before output rounding.
+- The first QKV candidate used one grid at every shape. A second, separate
+  routing experiment moved long-K fallback into the thin public binding after
+  the combined grid lost at K=4096. K=1024 and K=2048 bracket the retained
+  crossover.
+
+Implementation and provenance:
+
+- Shared Metal source, launch helpers, MLX primitives, and PyTorch-MPS bindings
+  implement explicit tensor operations only. There is no model graph, loader,
+  cache manager, scheduler, tokenizer, or other inference-engine component.
+- The scheduling is a clean-room design informed by QuixiCore's existing
+  `qgemv_fused` kernels and general dequant/GEMV patterns in the local
+  MIT-licensed `~/llama.cpp` checkout at revision `2beefef68`.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`.
+- Integration path: MLX Python extension, asymmetric BaseQ4 with F16
+  scales/biases and F16 activation/output. Warmup request 20 plus the harness's
+  50 ms time-based clock warmup, adaptive batching to at least 2 ms, and 50
+  synchronized samples. The table reports median, p20/p80, and CV.
+- Correctness before the full gates: 53 BaseQN MLX/NumPy tests, 24 PyTorch-MPS
+  tests, and three cross-backend parameter sets passed. QKV covers unequal
+  Q/K/V row counts; both fused operations cover Q3/Q4/Q6/Q8 and symmetric and
+  asymmetric reconstruction. Final-run maximum relative error was 3.87e-4.
+
+Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_fused --formats q4 --warmup 20 --iters 50
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_fused --formats q4 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-fused-k-route-final
+```
+
+The first command's one-grid control at QKV Nq4096/Nkv1024/K4096 measured
+0.1558 ms (p20/p80 0.1527/0.1838, CV .1510), versus 0.1517 ms for three
+direct operations: a 2.6% loss, so that route was rejected. Retained final
+results:
+
+| operation/shape | route | target median ms | p20/p80 ms | CV | composition ms | ratio | decision |
+|---|---|---:|---:|---:|---:|---:|---|
+| QKV Nq768/Nkv256/K768 | combined grid | 0.0251 | 0.0236/0.0278 | .3352 | 0.0309 | 1.23x | keep |
+| QKV Nq1024/Nkv256/K1024 | combined grid | 0.0379 | 0.0330/0.0495 | .3319 | 0.0428 | 1.13x | keep boundary |
+| QKV Nq1024/Nkv256/K2048 | direct GEMV composition | 0.0365 | 0.0339/0.0515 | .3795 | 0.0343 | 0.94x | fallback; intervals overlap and operation is the baseline composition |
+| QKV Nq4096/Nkv1024/K4096 | direct GEMV composition | 0.1496 | 0.1460/0.1743 | .2144 | 0.1507 | 1.01x | keep fallback |
+| SwiGLU N1152/K768 | fused gate/up | 0.0201 | 0.0192/0.0230 | .4039 | 0.0339 | 1.69x | keep |
+| SwiGLU N11008/K4096 | fused gate/up | 0.3643 | 0.3560/0.4726 | .1482 | 0.4918 | 1.35x | keep |
+
+Decision: retain the SwiGLU fusion and the measured QKV K<=1024 fusion. For
+longer K, preserve the operation-level API but compose the established direct
+GEMV kernel; no large-shape QKV fusion speedup is claimed. Raw control and
+threshold experiments are in timestamped `153250-mlx-quick`,
+`basert-baseq-fused-threshold-final`, and the retained
+`basert-baseq-fused-k-route-final` result directories.
+
+Final verification: MLX extension and Xcode build-for-testing passed;
+`scripts/test correctness -q` passed 2220 tests, `scripts/test parity -q`
+passed 435, and `scripts/test mps -q` passed 549. The first unqualified
+`scripts/test correctness` invocation selected Homebrew Python 3.14 without
+pytest; rerunning with `PYTHON=$PWD/.venv/bin/python` produced the recorded
+passing gate.
+
+## 2026-07-23: BaseQN greedy LM-head routing
+
+Status: operation kept via columnwise direct GEMV composition; both dedicated
+packed-reduction kernels rejected and removed.
+
+Hypothesis and experiments:
+
+- A two-pass packed LM-head reduction could avoid materializing `(batch,V)`
+  logits. The first candidate assigned eight vocabulary rows to eight
+  simdgroups in one 256-thread group. The second changed only launch geometry:
+  one 32-thread simdgroup streamed eight rows sequentially.
+- Correctness compares F16-rounded logits, returns one int32 id per activation
+  column, and resolves exact ties toward the lower vocabulary id.
+- The initial comparison against `base_qgemm + argmax` looked favorable at
+  batch 2+, but that is not the strongest baseline: M>1 BaseQN GEMM currently
+  materializes weights. The decisive baseline is one established direct GEMV
+  per column followed by argmax.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`; MLX integration; asymmetric BaseQ4,
+  F16 scale/bias and F16 activation/logit rounding. Warmup request 20 plus the
+  harness time-based clock warmup, adaptive batching, 50 synchronized samples;
+  median, p20/p80, and CV are in JSONL.
+- 113 focused MLX, PyTorch-MPS, and cross-backend tests passed. Coverage spans
+  Q3/Q4/Q6/Q8, symmetric/asymmetric reconstruction, batch 1/3, and exact ties.
+
+Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_fused --formats q4 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-lm-head-strong-baseline
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_fused --formats q4 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-lm-head-serial-candidate
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_fused --formats q4 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-lm-head-retained
+```
+
+Dedicated candidate comparison at V=32000/K=4096:
+
+| batch | 8-simdgroup candidate ms | serial-simdgroup candidate ms | columnwise GEMV baseline ms | best candidate ratio | decision |
+|---:|---:|---:|---:|---:|---|
+| 1 | 0.7666 | 0.7241 | 0.7233 | 1.00x | reject specialization; compose |
+| 2 | 1.8081 | 1.8925 | 1.4174 | 0.81x | reject both |
+| 4 | 3.5344 | 3.4708 | 2.7881 | 0.80x | reject both |
+
+The retained public operation is the columnwise baseline. At the realistic
+shape it measured 0.7231 ms for batch 1 (p20/p80 0.7076/0.9971, CV .1559),
+1.4408 ms for batch 2 (1.3871/1.8312, CV .1273), and 2.8265 ms for batch 4
+(2.7550/3.6828, CV .1383). It is equivalent to the strongest baseline within
+measurement noise and is still 5.70x/2.91x faster than the current M>1
+materialize-weight GEMM route at batch 2/4.
+
+Decision: expose `base_qlm_head_argmax` as a reusable operation composed from
+the retained BaseQN GEMV and argmax kernels. Do not retain either slower Metal
+specialization and make no fused-kernel speedup claim.
+
+The retained MLX composition now calls QuixiCore's `argmax_sample` on the
+transposed columnwise logits. Using MLX's internal FP16 argmax in the same
+process exposed a pipeline-cache name collision with the pre-existing
+QuixiCore sampling kernel. The operation-level route avoids that collision
+without changing the sampling kernel. A focused repeat under
+`basert-baseq-lm-head-retained-argmax-sampling` measured 0.7892, 1.5216, and
+3.0190 ms at batch 1/2/4; the identical columnwise baseline measured 0.8037,
+1.6009, and 2.9103 ms, with overlapping distributions. Correctness then
+passed 2,237 tests, parity 435, MPS 565, and Xcode build-for-testing.
+
+## 2026-07-23: BaseQN grouped expert projection and SwiGLU
+
+Status: keep direct register-tile expert decode; keep one simdgroup for the
+rectangular projection and four-way split-K only for fused expert SwiGLU.
+
+Hypothesis and changed factor:
+
+- BaseQN expert planes add an ordinary leading expert dimension to the
+  canonical `(output,K)` storage. Decoding the selected expert's 32x32 weight
+  tile directly into the `mma_ABt` register fragment should avoid
+  materializing and transposing the complete expert stack.
+- The control used one simdgroup per 32-row by 32-output tile for both
+  operations. The candidate changed only K scheduling: four simdgroups split
+  the K tiles, stage three FP32 partial tiles, and reduce once. Rectangular and
+  gate/up paths were measured independently.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`. MLX integration used asymmetric
+  BaseQN, F16 scale/bias planes, BF16 activations/output, and the existing
+  32-row padded `expert_of_tile` schedule. Warmup requests were 5/20 plus the
+  harness time-based clock ramp; runs used adaptive batching and 20/50
+  synchronized samples with median, p20/p80, and CV.
+- Correctness covers Q2/Q3/Q4/Q5/Q6/Q8, symmetric/asymmetric reconstruction,
+  F16/BF16/F32 activations, BF16/F16/E8M0/E4M3 scale paths, fused gate/up
+  ordering, MLX, PyTorch MPS, and cross-backend parity. The retained Q4 quick
+  run's maximum relative error was 3.89e-3.
+
+Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset smoke \
+  --kernel base_q_moe --formats q4 --warmup 5 --iters 20 \
+  --out-dir perf/results/2026-07-23/basert-baseq-moe-one-warp
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset smoke \
+  --kernel base_q_moe --formats q4 --warmup 5 --iters 20 \
+  --out-dir perf/results/2026-07-23/basert-baseq-moe-four-warp
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel base_q_moe --formats q4 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-moe-final-repeat
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset smoke \
+  --kernel base_q_moe --formats q3,q4,q6,q8 --warmup 20 --iters 50 \
+  --out-dir perf/results/2026-07-23/basert-baseq-moe-format-sweep
+```
+
+Split-K experiment at E4/R128/K1024/output 1024:
+
+| operation | one simdgroup ms | four-way split-K ms | candidate effect | decision |
+|---|---:|---:|---:|---|
+| rectangular projection | 0.2489 | 0.2766 | 0.90x | reject split-K; keep one simdgroup |
+| fused expert SwiGLU | 0.6889 | 0.2981 | 2.31x | keep split-K |
+
+Retained Q4 quick repeat:
+
+| operation/shape | target median ms | p20/p80 ms | CV | dequant+dense ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| rect E4/R128/K1024/N1024 | 0.2571 | 0.2487/0.2678 | .0417 | 0.2806 | 1.09x | keep |
+| SwiGLU E4/R128/K1024/I1024 | 0.2708 | 0.2648/0.2761 | .0400 | 0.6201 | 2.29x | keep |
+| rect E8/R256/K2048/N2048 | 1.1306 | 1.1098/1.1585 | .0301 | 2.2541 | 1.99x | keep |
+| SwiGLU E8/R256/K2048/I2048 | 1.8430 | 1.8103/1.8935 | .0265 | 4.5207 | 2.45x | keep |
+
+The Q3/Q4/Q6/Q8 smoke sweep retained the same schedule: rectangular speedups
+were 1.05x-1.12x and fused SwiGLU speedups were 2.16x-2.23x. Decision: keep
+the operation-specific launch geometry. No routing, alignment, scheduler,
+model graph, or inference-engine behavior is included in these kernels.
+
+Final verification: the MLX extension, PyTorch-MPS package, standalone Metal
+compile, and Xcode build-for-testing passed. `scripts/test correctness -q`
+passed 2,261 tests, `scripts/test parity -q` passed 441, and
+`scripts/test mps -q` passed 580. The first combined MPS gate exposed and then
+removed a test-fixture return regression; the recorded 580-test rerun is the
+clean final gate.
+
+## 2026-07-23: Positioned, partial, and multimodal RoPE
+
+Status: keep the generic single-pass positioned/M-RoPE kernels and the fused
+Q/K RMSNorm variant.
+
+Hypothesis and design:
+
+- Explicit positions and partial rotary prefixes require a table gather and
+  tail handling that the original implicit full-RoPE specialization cannot
+  express. A four-pair-per-thread flat kernel should fuse arbitrary position
+  gather, rotation, and bit-identical tail copy in one pass.
+- Three-axis M-RoPE should select temporal/height/width positions per rotary
+  pair without materializing a selected table. Sectioned axes use cumulative
+  pair counts; Qwen interleaving uses `pair % 3`, with validated counts such as
+  `[11,11,10]`. The frequency index does not reset at an axis transition.
+- Packed QKV preparation should fuse full-head Q/K RMSNorm with the same
+  positioned/partial/M-RoPE semantics. One simdgroup owns one token/head,
+  reduces RMS in FP32, rotates Q/K, and copies V in the same dispatch.
+- Llama-3 piecewise scaling, uniform linear scaling, and local/global theta
+  remain table-generation policy. Metal consumes validated BF16 cosine/sine
+  tables; focused tests exercise both scaled-table families.
+
+Provenance and scope:
+
+- BaseRT public metadata in `.reference/baseRT/include/baseRT/types.h` defines
+  three pair-count sections and the `THWTHW...TT` interleaving contract.
+- `~/llama.cpp/ggml/include/ggml.h` documents that sections count cosine/sine
+  pairs and that M-RoPE uses NeoX ordering; its Metal/CPU implementations were
+  used as semantic and scheduling references. The implementation is
+  clean-room QuixiCore code and exposes tensor operations only—no model flags,
+  position builder, graph, cache manager, or inference engine.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`. MLX integration, BF16 input/tables and
+  BF16 output. The harness requested 3 warmups and 20 synchronized samples,
+  used its 50 ms time-based clock warmup and adaptive batching to at least
+  2 ms, and reports median, p20/p80, and CV.
+- Independent NumPy oracles cover D=64/128/256/512, partial/full boundaries,
+  shared/per-batch positions, split-half and adjacent pairs, sectioned and
+  interleaved M-RoPE, explicit norm-weight offsets, scaled tables, and exact V
+  and unrotated-tail copies. Standalone quick-run max absolute/relative errors
+  were 0.00782/0.00300. Focused fused checks observed max absolute 0.01559
+  (partial) and 0.00781 (M-RoPE), with max relative error 0.00389 using a
+  1e-5 denominator floor; test tolerance is atol 0.03, rtol 0.02.
+
+Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel rotary_extended \
+  --out-dir perf/results/2026-07-23/basert-rope-generic-quick
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qk_norm_rope \
+  --out-dir perf/results/2026-07-23/basert-qk-rope-extended-quick
+```
+
+Standalone retained results:
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| positioned B1/H32/N2048/D128/R64 split | 0.0691 | 0.0682/0.0713 | .5262 | 0.2206 | 3.19x | keep |
+| positioned B1/H16/N1024/D256/R128 split | 0.0381 | 0.0367/0.0404 | .5102 | 0.1204 | 3.17x | keep |
+| positioned B1/H8/N512/D512/R128 adjacent | 0.0250 | 0.0240/0.0278 | .3957 | 0.0747 | 2.99x | keep |
+| interleaved M-RoPE B1/H32/N2048/D64 | 0.1102 | 0.1050/0.1192 | .0718 | 0.1651 | 1.50x | keep |
+
+Fused Q/K normalization retained results:
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| positioned T512/Hq32/Hk8/Hv8/D128/R64 | 0.0352 | 0.0339/0.0364 | .5085 | 0.1707 | 4.85x | keep |
+| positioned T2048/Hq16/Hk4/Hv4/D256/R128 | 0.1171 | 0.1122/0.1266 | .5211 | 0.5408 | 4.62x | keep |
+| interleaved M-RoPE T2048/Hq32/Hk8/Hv8/D64 | 0.0914 | 0.0898/0.0961 | .4095 | 0.3717 | 4.07x | keep |
+
+The high CV on sub-0.12-ms rows reflects the submit/sync timing floor; the
+p20/p80 intervals remain clearly separated from the decomposed baselines.
+Decision: retain all three reusable operations (`rotary_positioned`, `mrope`,
+and `qk_norm_rope_positioned`). Preserve the older full-RoPE specialization
+for its existing contract; no routing threshold between the APIs is needed.
+
+Final verification: standalone Metal compilation, MLX extension build,
+PyTorch-MPS package rebuild, and Xcode build-for-testing passed.
+`scripts/test correctness -q` passed 2,285 tests, `scripts/test parity -q`
+passed 450, and `scripts/test mps -q` passed 589.
+
+## 2026-07-23: QuixiCore Q8_0 KV codec and direct paged read
+
+Status: keep the separate-plane storage ABI, exact safe-FP encoder, and direct
+dequant-on-read paged attention. The standalone codec is required format
+semantics; no codec speedup over BF16 copy operations is claimed.
+
+Hypothesis and design:
+
+- An exposed packed 34-byte Q8_0 block would impose unaligned block strides and
+  couple a KV tensor contract to a weight-serialization ABI. Independent int8
+  code and F16 scale planes retain the same 32-value quantization semantics
+  while keeping each plane naturally indexable by Metal and both frameworks.
+- Directly dequantizing K/V fragments inside paged attention should avoid a
+  full dense cache read/write and intermediate tensor materialization. It
+  should also reduce persistent cache traffic from 2 bytes/value for BF16 to
+  `1 + 2/32 = 1.0625` bytes/value, or 53.125% of BF16 storage (46.875% less).
+- The tensor-only operations are scatter, gather, functional block copy, and
+  paged attention. No allocator, cache manager, scheduler, request state, model
+  graph, or inference engine is included.
+
+Contract and provenance:
+
+- K and V each use an int8 code plane shaped
+  `(num_blocks, block_size, H_KV, D)` and an F16 scale plane shaped
+  `(num_blocks, block_size, H_KV, D/32)`. One scale covers 32 consecutive head
+  dimensions. K/V planes are independent.
+- Encoding computes FP32 `absmax/127`, stores F16 delta, rounds half away from
+  zero, clamps to `[-127,127]`, and emits zero scale/codes for zero groups.
+  Decode uses the stored F16 delta. Attention accumulates scores, online
+  softmax, and values in FP32 and converts output to the query dtype.
+- This is a clean-room QuixiCore ABI. llama.cpp's public `block_q8_0` definition
+  in `ggml/src/ggml-common.h`, reference encoder in `ggml/src/ggml-quants.c`,
+  and safe-FP Q8/quantized-attention patterns in
+  `ggml/src/ggml-metal/ggml-metal.metal` were used as mathematical and
+  scheduling references; neither its source nor packed structure was copied.
+  Existing QuixiCore `kv_cache` and `quant_rt` kernels supplied the integration
+  and launch conventions.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label: `bc968fc-dirty`. MLX integration, BF16 benchmark inputs,
+  Q8_0 int8 code/F16 scale planes, block size 32, D64/D128, and MHA/GQA/MQA
+  correctness coverage. The quick runs requested 10 warmups and 40
+  synchronized samples, plus the harness's 50 ms clock warmup and adaptive
+  batching. Tables report median, p20/p80, and CV.
+- Focused correctness passed 12 MLX tests (154 deselected), 3 cross-backend
+  parity tests (441 deselected), and 4 direct MPS tests (514 deselected).
+  Independent oracles require exact int8 codes and F16 scale bits for
+  F32/F16/BF16 scatter at D64/D128, exact gather/copy planes, source
+  preservation, invalid-slot zero fill, and Q8 attention parity across
+  MHA/GQA/MQA and windows 0/5.
+
+Commands:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel kv_q8_0 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-23/basert-q8-kv-codec-quick
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel paged_attn_q8_0 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-23/basert-q8-kv-attn-quick
+```
+
+Codec measurements versus equivalent BF16 cache operations:
+
+| operation/shape | Q8_0 median ms | p20/p80 ms | CV | BF16 ms | ratio | decision |
+|---|---:|---:|---:|---:|---:|---|
+| scatter T1/H8/D64 | 0.01946 | 0.01802/0.02330 | .3080 | 0.01594 | 0.82x | keep format operation; no speed claim |
+| gather T1/H8/D64 | 0.01677 | 0.01564/0.01823 | .1888 | 0.01891 | 1.13x | keep |
+| scatter T512/H8/D64 | 0.02320 | 0.02205/0.02553 | .3938 | 0.01751 | 0.75x | keep format operation; no speed claim |
+| gather T512/H8/D64 | 0.02426 | 0.02257/0.02789 | .2761 | 0.01672 | 0.69x | keep format operation; no speed claim |
+| scatter T512/H8/D128 | 0.03333 | 0.03210/0.03692 | .3558 | 0.02303 | 0.69x | keep format operation; no speed claim |
+| gather T512/H8/D128 | 0.02360 | 0.02257/0.02543 | .3701 | 0.01712 | 0.73x | keep format operation; no speed claim |
+
+Direct paged-attention measurements:
+
+| shape | Q8_0 direct ms | p20/p80 ms | CV | BF16 paged ms | vs BF16 | Q8 gather+SDPA ms | vs unfused | decision |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| B4/H32/HKV8/D64/ctx512 | 0.06397 | 0.06090/0.06854 | .1516 | 0.09365 | 1.46x | 0.17140 | 2.68x | keep |
+| B8/H32/HKV8/D128/ctx2048 | 0.53849 | 0.51287/0.56123 | .0516 | 1.56467 | 2.91x | 2.10254 | 3.90x | keep |
+
+Candidate decision: retain direct Q8_0 paged reads, which measured 1.46-2.91x
+over BF16 paged reads and 2.68-3.90x over Q8 gather plus framework SDPA at the
+tested shapes. Retain the codec for its exact storage contract despite bulk
+scatter/gather being slower than dense BF16 copies. The high CV on sub-0.04-ms
+codec rows reflects submit/sync timing noise; p20/p80 and the lack of a codec
+speed claim are recorded explicitly.
+
+The original fast-FP encoder candidate was rejected: reciprocal-sensitive BF16
+half ties produced 3-7 one-code mismatches per 8192 tested values. Applying
+Metal safe FP mode only to the encoder made all code and scale planes exact
+against the independent oracle. Keep safe FP mode; do not trade serialized
+cache determinism for an unmeasured arithmetic shortcut.
+
+Final verification: the MLX extension, PyTorch-MPS package, standalone Metal
+compilation through both integrations, and Xcode build-for-testing passed.
+`scripts/test correctness -q` passed 2,300 tests, `scripts/test parity -q`
+passed 453, and `scripts/test mps -q` passed 593.
+
+## 2026-07-23: Gated DeltaNet preparation/output and sigmoid attention gate
+
+Status: keep all four GDN preparation/output kernels and the reusable GLU
+sigmoid-product mode. This is tensor-kernel coverage only; no model graph,
+layer scheduler, projection owner, state manager, or inference engine is part
+of the change.
+
+Hypothesis and design:
+
+- Fusing SiLU into the depthwise short-convolution dispatch should eliminate
+  one full activation read/write and one framework launch while preserving the
+  raw-input history state required for continuation.
+- Direct split plus per-head Q/K RMSNorm should avoid framework slice/reshape,
+  reduction, scale, and concatenation/materialization work. The input contract
+  is the already-activated mixed QKV projection, so SiLU is applied exactly
+  once by the short-convolution stage.
+- Decay/beta and gated RMSNorm each contain multiple transcendental/reduction
+  operations with small intermediate tensors; a single dispatch should reduce
+  launch and intermediate-memory costs.
+- The full-attention output gate is a general elementwise
+  `sigmoid(gate_logits) * values` GLU mode. It includes an analytic backward
+  and is not tied to Qwen model orchestration.
+
+Contract and provenance:
+
+- `gdn_short_conv` consumes packed varlen rows, oldest-to-current depthwise
+  weights with kernel size 2-8, an FP32 `(slots,C,K-1)` raw-input history pool,
+  cumulative sequence lengths, and slot mapping. It functionally clones the
+  pool and supports fresh-prefill or continuation semantics.
+- `gdn_qkv_prepare` supports Dk/Dv 64 or 128, splits Q/K/V, copies V, and
+  performs FP32-accumulated Q/K RMSNorm with explicit multipliers. Defaults in
+  the public wrapper are Qwen3.5's `1/Dk` and `1/sqrt(Dk)`.
+- `gdn_gate_beta` emits FP32
+  `exp(-exp(A_log)*softplus(a+dt_bias))` and `sigmoid(b)`;
+  `gdn_gated_rmsnorm` computes `rms_norm(y,weight)*silu(z)` per value head.
+- Public Qwen converter metadata in `.reference/baseRT/base-convert/crates/
+  base-arch/src/qwen.rs`, public tensor semantics in MLX-LM's
+  `qwen3_5.py`/`qwen3_next.py`, and the graph decomposition in
+  `~/llama.cpp/src/models/qwen35.cpp` and `qwen3next.cpp` were used as semantic
+  references. Existing QuixiCore GDN state-pool and GLU launch conventions
+  supplied the implementation substrate. The Metal/C++ is clean-room
+  QuixiCore code.
+
+Correctness before timing:
+
+- 21 focused MLX oracle cases passed across F32/F16/BF16, D64/D128,
+  SiLU-on/off convolution, fresh/continuation history, Q/K normalization,
+  decay/beta, gated RMSNorm, and functional untouched-slot behavior.
+- 2 combined MLX/PyTorch parity cases and 1 direct MPS preparation/output
+  oracle passed. The sigmoid GLU addition passed 70 focused MLX forward and
+  finite-difference cases, 7 cross-backend backward-parity cases, and 5 direct
+  MPS backward cases.
+
+Environment and method:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; working-tree label `bc968fc-dirty`.
+- MLX integration, BF16 activations/weights and FP32 state/control parameters.
+  The run requested 10 warmups and 40 synchronized samples, in addition to the
+  harness's 50 ms clock warmup and adaptive batching to at least 2 ms. The
+  table reports median, p20/p80, and CV.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel gdn_io --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-23/basert-gdn-io-quick
+```
+
+Retained measurements:
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework/unfused ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| fused short conv R64/L1/C8192/K4 | 0.05809 | 0.05369/0.06386 | .4713 | 0.06796 | 1.17x | keep |
+| fused short conv R2/L512/C8192/K4 | 0.27587 | 0.26812/0.31861 | .1533 | 0.47091 | 1.71x | keep |
+| QKV prep T64/Hk16/Hv32/D128 | 0.01376 | 0.01263/0.01779 | .6933 | 0.08512 | 6.18x | keep |
+| QKV prep T1024/Hk16/Hv32/D128 | 0.06734 | 0.06482/0.07427 | .7074 | 0.12888 | 1.91x | keep |
+| decay/beta T64/H32 | 0.01468 | 0.01337/0.01711 | .5237 | 0.03779 | 2.57x | keep |
+| decay/beta T1024/H32 | 0.01474 | 0.01354/0.01772 | .3453 | 0.03382 | 2.30x | keep |
+| gated RMSNorm T64/H32/D128 | 0.01501 | 0.01403/0.01663 | .4573 | 0.04498 | 3.00x | keep |
+| gated RMSNorm T1024/H32/D128 | 0.04021 | 0.03855/0.04723 | .5591 | 0.24338 | 6.05x | keep |
+| sigmoid gate T64/D4096 | 0.01543 | 0.01426/0.02115 | .2832 | 0.01732 | 1.12x | keep |
+| sigmoid gate T1024/D4096 | 0.04031 | 0.03795/0.04474 | .5605 | 0.07871 | 1.95x | keep |
+
+The sub-0.07-ms rows have high CV because submit/sync noise is a large share
+of each adaptively batched sample; their p20/p80 intervals and the larger-shape
+rows still support the same decisions. No routing threshold is introduced:
+these public operations directly express the required semantics, and every
+priority shape is at least 1.12x faster than the corresponding composition.
+The sequential `gdn_recur` remains the correctness baseline; chunk-parallel
+prefill is still a separate experiment and has no unmeasured route.
+
+## 2026-07-23: calibration reduction and final-logit softcap
+
+Status: keep both direct kernels. They complete reusable calibration and
+output-transform semantics; neither operation introduces a model graph,
+calibration dataset manager, sampler policy, or inference engine.
+
+Hypothesis and design:
+
+- One thread per input channel can scan token rows in FP32 without the
+  transpose/intermediate reduction work of a framework axis-0 absmax. An
+  optional FP32 running vector makes long calibration sets exact across host
+  chunks. NaN propagates deliberately and either signed infinity becomes
+  positive infinity.
+- Final-logit softcap is a bandwidth-bound elementwise transform. Combining
+  divide, tanh, and multiply in one dispatch should remove two intermediate
+  tensors and framework launches.
+- The implementations are clean-room QuixiCore kernels derived from the public
+  tensor equations and existing repository launch conventions. No BaseRT
+  engine implementation or binary inspection was used.
+
+Environment and method for this and the following BaseRT completion runs:
+
+- MacBook Pro Mac17,6, Apple M5 Max, 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / Metal toolchain 17.6.109.0; Python
+  3.12.13; MLX 0.21.1; PyTorch 2.13.0 MPS.
+- Working-tree label `bc968fc-dirty`. The harness used its 50 ms clock warmup
+  and adaptive batching to at least 2 ms. Quick runs requested 10 warmups and
+  40 synchronized measurements; the LoRA comprehensive run requested 10/60 as
+  shown below. Tables report median, p20/p80, and coefficient of variation
+  (CV).
+- The measured integration is MLX. Benchmark inputs/outputs are BF16; LoRA
+  adapter matrices are F16, while calibration reductions, interpolation,
+  convolution, pooling, and attention use the FP32 accumulation semantics
+  stated by their contracts. Each raw JSONL records the exact operation format
+  and tensor shape.
+- Independent NumPy/framework tests cover F32/F16/BF16, chunked running merge,
+  zero, NaN, infinity, invalid cap rejection, MLX/PyTorch MPS parity, and output
+  dtype preservation.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_aux --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-23/basert-aux-optimized-quick
+```
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| calibration T512/C8192 | 0.02395 | 0.02188/0.03444 | .4081 | 0.08808 | 3.68x | keep |
+| calibration T8192/C4096 | 0.16212 | 0.15433/0.17240 | .2409 | 0.46491 | 2.87x | keep |
+| softcap T64/V128256 | 0.07760 | 0.07089/0.09905 | .4888 | 0.28218 | 3.64x | keep |
+| softcap T1024/V32000 | 0.30394 | 0.28549/0.36120 | .3428 | 1.01557 | 3.34x | keep |
+
+Decision: retain both kernels. The short rows have timing-floor noise, but the
+p20/p80 intervals remain separated and the realistic larger cases confirm the
+same 2.87-3.34x conclusion.
+
+## 2026-07-23: fused low-rank adapter application and routing
+
+Status: keep the fused direct decode/small-batch kernel and the conservative
+measured route; use framework F16 matmuls outside that route.
+
+Hypothesis and design:
+
+- A row-owned threadgroup can compute `x @ A.T`, retain the rank-sized F16
+  intermediate in threadgroup memory, compute `low @ B.T`, and apply scale plus
+  optional base in one dispatch. This removes the global low-rank scratch
+  tensor and a second command.
+- The direct diagnostic supports ranks 1 through 256, but the default route is
+  deliberately limited to `M<=4 && rank<=16`. The comprehensive sweep showed
+  strong rank sensitivity and non-monotonic isolated wins at larger M; those
+  points do not define a safe general threshold.
+- The operation is adapter math only. Loading adapters, choosing projections,
+  mutating model weights, or scheduling requests remains runtime work.
+
+Correctness covers base/no-base, scale, F16/BF16/F32 activation/output dtypes,
+ranks through 256, invalid shapes, MLX/PyTorch MPS parity, and equivalence to
+the explicitly rounded pair of F16 framework matmuls.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset comprehensive \
+  --kernel lora --warmup 10 --iters 60 \
+  --out-dir perf/results/2026-07-23/basert-lora-fused-routing
+```
+
+| shape | direct median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| M1/K4096/N4096/R8 | 0.01741 | 0.01594/0.01891 | .1281 | 0.03614 | 2.08x | direct |
+| M1/K4096/N4096/R16 | 0.03167 | 0.02833/0.03397 | .1327 | 0.03338 | 1.05x | direct boundary |
+| M1/K4096/N4096/R32 | 0.04211 | 0.03947/0.04598 | .1331 | 0.04021 | 0.95x | framework |
+| M1/K4096/N4096/R64 | 0.08394 | 0.08064/0.09073 | .0772 | 0.03982 | 0.47x | framework |
+| M4/K4096/N4096/R16 | 0.03395 | 0.02683/0.04227 | .3745 | 0.06159 | 1.81x | direct |
+| M8/K4096/N4096/R16 | 0.02260 | 0.02036/0.02471 | .1876 | 0.03901 | 1.73x | measured win; exclude from conservative route |
+| M64/K4096/N4096/R16 | 0.04315 | 0.04046/0.04860 | .2325 | 0.03769 | 0.87x | framework |
+| M64/K4096/N4096/R64 | 0.10959 | 0.10649/0.12493 | .1691 | 0.04612 | 0.42x | framework |
+
+Additional M512/M4096 rows and their variability are retained in the raw
+JSONL. Decision: use the contiguous, low-risk `M<=4 && rank<=16` direct region;
+keep the larger-rank direct implementation only as an explicit diagnostic
+route until a broader monotonic crossover is established.
+
+## 2026-07-23: BERT token/type embedding and masked normalized pooling
+
+Status: keep both direct kernels.
+
+The fused embedding operation independently bounds-checks token and type ids
+and computes `token_scale*token_table[id] + type_table[type_id]` in one pass.
+The pooling kernel computes batched masked mean, RMSNorm, and L2 normalization
+with FP32 sums for D=256/512/768/1024; an all-masked row emits exact zero.
+These operations cover the Nomic/BERT-specific tensor gaps while LayerNorm,
+QKV, bidirectional attention, and SwiGLU reuse existing QuixiCore kernels.
+
+Focused correctness passed 40 MLX cases plus MLX/PyTorch parity and two direct
+MPS cases, including independent invalid ids, scale, arbitrary masks, padding,
+and all-masked rows.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_embedding --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-23/basert-embedding-quick
+```
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| token/type T128/D768 | 0.01749 | 0.01606/0.02319 | .3945 | 0.04770 | 2.73x | keep |
+| token/type T512/D768 | 0.02322 | 0.01920/0.03486 | .3871 | 0.05962 | 2.57x | keep |
+| masked pool B4/T128/D768 | 0.03254 | 0.03020/0.03647 | .1745 | 0.09176 | 2.82x | keep |
+| masked pool B8/T512/D768 | 0.03327 | 0.03156/0.04016 | .2594 | 0.21679 | 6.52x | keep |
+
+## 2026-07-24: reusable vision patch, position, and pooling operations
+
+Status: keep interpolation and pooling direct. Keep the general direct patch
+gather for padded/overlapping semantics, but route canonical divisible,
+non-overlapping patchification through reshape/transpose because it won both
+measured shapes. Patch projection composes that route with FP32 GEMM and bias.
+
+The clean-room contract uses NHWC tensors, explicit kernel/stride/padding,
+bilinear `align_corners`, and floor/ceil pool geometry. It covers reusable
+SigLIP/Gemma/Qwen-VL tensor needs without image decoding, feature ownership,
+transformer tower graphs, or text splice orchestration. Focused correctness
+passed 11 MLX cases, one cross-backend parity case, and one direct MPS case,
+including odd/padded/overlapping geometry and truncated ceil-mode windows.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_vision --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-vision-quick
+```
+
+| operation/shape | direct median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| patchify H224/W224/P16 | 0.08605 | 0.07852/0.09563 | .6871 | 0.01784 | 0.21x | framework canonical route |
+| patchify H896/W896/P16 | 0.04080 | 0.03858/0.04555 | .3046 | 0.03626 | 0.89x | framework canonical route |
+| position 16x16 to 56x56/D768 | 0.03786 | 0.03620/0.04063 | .3268 | 0.84094 | 22.21x | keep direct |
+| position 64x64 to 56x56/D768 | 0.03595 | 0.03501/0.04091 | .3170 | 0.89722 | 24.96x | keep direct |
+| avg pool H56/W56/K4/D768 | 0.02111 | 0.01991/0.02572 | .2902 | 0.05883 | 2.79x | keep direct |
+| avg pool H64/W64/K4/D1024 | 0.03051 | 0.02943/0.03253 | .3269 | 0.09699 | 3.18x | keep direct |
+
+Patchify H224 has high CV at the timing floor, but the direct p20 is still
+more than four times the framework p80, so the rejection is unambiguous.
+
+## 2026-07-24: audio convolution and cross-attention routes
+
+Status: retain general convolution semantics but use framework convolution by
+default; keep direct depthwise convolution with fused SiLU; use direct online
+cross-attention for `Tk<=128` and framework matrix operations for longer
+encoder memories.
+
+Design and correctness:
+
+- `audio_conv1d` uses NWC input, O/K/C weights, optional bias, and explicit
+  stride/padding/dilation with FP32 accumulation. The direct implementation is
+  forceable and tested, but not the measured public default.
+- `audio_depthwise_conv1d` uses C/K weights and optionally fuses SiLU, covering
+  LightConv/Conformer tensor semantics without a Conformer graph.
+- `cross_attention` accepts independent head-major q and k/v lengths, GQA head
+  mapping, right-padding lengths, optional exact FP32 bias, explicit/automatic
+  scale, optional post-bias softcap, and D=64/128/256. Empty key rows emit exact
+  zero. The online direct kernel recomputes scores in two FP32 passes to avoid
+  score/probability materialization.
+- Focused correctness passed 14 audio-convolution MLX cases, 19 direct
+  cross-attention MLX cases, and one long-route test, plus focused parity and
+  direct MPS tests. The cross-backend BF16 tolerance is `1e-5` after FP32
+  conversion; the observed maximum backend difference was
+  `7.62939453125e-6`.
+
+Command:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_audio --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-audio-cross-quick
+```
+
+| operation/shape | direct median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| conv B1/T1500/C80/O384/K3/S1 | 0.37579 | 0.36653/0.42050 | .1286 | 0.06769 | 0.18x | framework route |
+| conv B1/T750/C384/O384/K3/S2 | 0.44741 | 0.43672/0.52027 | .0811 | 0.10107 | 0.23x | framework route |
+| depthwise B1/T750/C1024/K5 + SiLU | 0.04148 | 0.03993/0.04372 | .2951 | 0.28610 | 6.90x | keep direct |
+| cross B1/H16/Tq1/Tk1500/D64 | 1.83835 | 1.73788/2.25375 | .1470 | 0.08212 | 0.04x | framework long-memory route |
+| cross B1/H8/Tq12/Tk25/D128 | 0.02570 | 0.02492/0.02917 | .2360 | 0.04637 | 1.80x | keep direct short-memory route |
+
+The `Tk=128` boundary is conservative relative to the two bracketing workload
+classes: it keeps the demonstrated short/chunk path and excludes Whisper-scale
+memory. A correctness test explicitly exercises `Tk=257` through the framework
+route. No audio encoder, decoder, cache manager, timestamp logic, or inference
+engine is introduced.
+
+Final verification for the completion tranche: MLX extension build,
+PyTorch-MPS package build, and Xcode build-for-testing passed.
+`scripts/test correctness -q` passed 2,434 tests, `scripts/test parity -q`
+passed 464, `scripts/test mps -q` passed 604, and `scripts/test python -q`
+passed 44. The kernel registry parsed successfully and `git diff --check`
+reported no whitespace errors.
+
+## 2026-07-24: strict BaseRT vision/audio contract audit
+
+Status: keep factorized position, two-axis vision RoPE, causal depthwise, and
+blocked relative-attention kernels. Keep coordinate pooling as the general
+padded/arbitrary-order implementation, but reject it as the dense regular-grid
+route; callers with a known dense grid should use the existing reshape/average
+composition or `avg_pool2d_tokens`.
+
+Hypothesis and design:
+
+- The earlier generic position/pooling/M-RoPE inventory did not reproduce
+  Gemma's factorized learned x/y position table, coordinate-bucket pooler, or
+  split-half pairing local to each spatial half of a vision attention head.
+- Symmetric depthwise padding and generic cross-attention did not reproduce the
+  Conformer/Gemma left-only LightConv geometry or relative-shifted blocked
+  self-attention.
+- The direct candidates should win by avoiding two position-table gathers,
+  multiple axis-rotation expressions, an explicit left-pad tensor, and a
+  materialized T-by-T attention score matrix. Coordinate pooling must use an
+  atomic scatter to preserve arbitrary order/padding, so it may lose to a
+  reshape on the strictly regular subset.
+
+References inspected: BaseRT public architecture/config mappings under
+`.reference/baseRT/include/baseRT/types.h` and
+`.reference/baseRT/base-convert/crates/base-arch/src/gemma.rs`; the public
+Hugging Face Gemma4 equations in `modeling_gemma4.py`; existing QuixiCore
+rotary, convolution, and online cross-attention kernels; and licensed
+`~/llama.cpp` Metal scheduling patterns. No implementation source was copied.
+
+Correctness:
+
+- Focused MLX test set passed 46/46, including exact BF16 factorized-position
+  and two-axis-RoPE comparisons, shuffled/padded coordinate pooling, dilated
+  causal convolution, relative-shift mapping, block boundaries, right context,
+  length masking, and zero padded-query output.
+- New-operation tolerances are exact for factorized position/RoPE, `2e-6` for
+  atomic FP32 coordinate pooling, `1e-6` for FP32 causal convolution, and
+  `2e-5` for FP32 blocked relative attention.
+- Focused PyTorch MPS tests passed 3/3. Focused MLX/PyTorch public-route parity
+  passed after allowing `1e-7` only for blocked relative attention; the
+  observed maximum backend difference was `5.960464477539063e-8` after FP32
+  conversion. Other new direct paths are exact across backends.
+
+Environment and command:
+
+- MacBook Pro Mac17,6; Apple M5 Max; 128 GB; macOS 26.5.2 (25F84); Xcode
+  26.6 (17F113); Apple Metal 32023.883 / toolchain 17.6.109.0; Python 3.12.13;
+  MLX 0.21.1; working tree `bc968fc-dirty`.
+- MLX Python extension; BF16 inputs except the FP32 learned scale and pool
+  output; shapes shown below. The harness performs its clock warmup, adaptive
+  per-sample batching, synchronized timing, and reports median, p20/p80, and
+  coefficient of variation.
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_vision,basert_audio --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-contract-quick
+```
+
+| operation/shape | target median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| factorized pos B1/N1120/P64/D768 | 0.05109 | 0.04881/0.05433 | .2476 | 0.11944 | 2.34x | keep direct |
+| coordinate pool B1/N1120/L280/K2/D768 | 0.05200 | 0.05005/0.05486 | .3250 | 0.03283 regular-only | 0.63x | keep general kernel; reject for known dense grid |
+| 2-D RoPE B1/H8/N1120/D128 | 0.01682 | 0.01608/0.02056 | .5165 | 0.17005 | 10.11x | keep direct |
+| causal depthwise B1/T750/C1024/K5 | 0.04115 | 0.03572/0.05789 | .3204 | 0.25243 | 6.13x | keep direct |
+| relative attention B1/T750/H8/D128, C12/L13/R0 | 0.20803 | 0.20255/0.23037 | .1113 | 1.10499 | 5.31x | keep direct |
+
+The RoPE shape sits near the synchronized timing floor, but its target p80 is
+still far below the framework p20. The coordinate-pool control deliberately
+measures the subset where positions are a dense ordered grid and every token is
+valid; it cannot implement the public arbitrary-coordinate/padding contract.
+
+Raw results:
+`perf/results/2026-07-24/basert-contract-quick/`.
+
+## 2026-07-24: Qwen temporal patch and Gemma value-clip closure
+
+Status: keep the general direct NTHWC patch extractor, but route canonical
+divisible non-overlapping temporal/spatial patchification through framework
+reshape/transpose. Keep the direct scalar-bounds value-clip kernel.
+
+Hypothesis and design:
+
+- Qwen3-VL/Qwen3.5-VL patch embedding is a temporal-spatial Conv3D, so a 2-D
+  image patch operation does not cover its temporal kernel dimension.
+  `extract_patches_3d` therefore exposes general kernel/stride/padding over
+  NTHWC input, and `vision_patch_projection_3d` composes it with FP32 GEMM and
+  optional bias for O/KT/KH/KW/C weights.
+- Gemma 4's public vision/audio equations clamp inputs and outputs around
+  clippable projections and clamp several audio residual paths. `value_clip`
+  supplies the reusable scalar-bounds operation and composes with either dense
+  or BaseQN projection kernels; no model-specific linear or tower is added.
+- Canonical patch extraction is only a data permutation, so the framework view
+  composition was expected to remain competitive. A four-element vectorized
+  Metal clamp was expected to reduce overhead relative to a generic framework
+  expression at tower activation shapes.
+
+Correctness:
+
+- Focused MLX patch tests passed 15/15, including padded/overlapping 3-D
+  extraction and Conv3D-equivalent projection. Focused direct PyTorch MPS and
+  MLX/PyTorch parity tests passed.
+- The scalar-bounds clip tests passed F32/F16/BF16, arbitrary rank, infinite
+  bounds, and invalid-bound validation. Focused direct MPS and parity tests
+  passed exactly.
+- Sources were clean-room public equations: BaseRT's public `vision_temporal_patch`
+  and clippable-linear metadata, plus Hugging Face's public Qwen3-VL Conv3D and
+  Gemma 4 clamp equations. No BaseRT engine implementation source was available
+  or copied.
+
+Environment is the same Apple M5 Max/macOS/Xcode/Metal/Python/MLX environment
+recorded in the strict contract audit immediately above. Both commands used 10
+warmups, 40 synchronized samples, adaptive per-sample batching, and report
+median, p20/p80, and coefficient of variation.
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_vision --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-qwen3d-routing
+
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_aux --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-value-clip-routing
+```
+
+| operation/shape | direct median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| 3-D patch T2/H224/W224/PT2/P14 | 0.01487 | 0.01419/0.01701 | .2685 | 0.01477 | 0.99x | framework canonical route |
+| 3-D patch T8/H224/W224/PT2/P14 | 0.03240 | 0.03018/0.03899 | .2595 | 0.02772 | 0.86x | framework canonical route |
+| clip B1/T1120/C768 | 0.01795 | 0.01669/0.02183 | .4167 | 0.02390 | 1.33x | keep direct |
+| clip B1/T750/C1024 | 0.01844 | 0.01733/0.02042 | .6182 | 0.03620 | 1.96x | keep direct |
+
+Both clip shapes are near the synchronized timing floor, but each direct p80
+is below the corresponding framework p20. The 3-D direct kernel remains the
+required route for general padded/overlapping geometry that the canonical
+reshape baseline cannot express; `use_kernel=True` keeps it forceable for
+diagnostics and future tuning.
+
+Raw results:
+`perf/results/2026-07-24/basert-qwen3d-routing/` and
+`perf/results/2026-07-24/basert-value-clip-routing/`.
+
+## 2026-07-24: explicit Qwen vision RoPE layout
+
+Status: keep the direct global-split mode in `vision_rope_2d` and expose it as
+`qwen_vision_rope_2d`.
+
+Hypothesis and design: the Gemma vision path partitions channels into x/y
+blocks and performs split-half pairing locally inside each block. Qwen3-VL
+instead builds `[x_freq, y_freq, x_freq, y_freq]` and applies one global
+rotate-half. The earlier generic M-RoPE could emulate that only by constructing
+a three-axis position tensor and duplicating frequency-table sections. An
+explicit mode avoids those extra tensors and makes the public contract
+unambiguous. The same D=64/128/256/512 Metal kernel selects the channel mapping
+with one uniform flag.
+
+Correctness: the new focused oracle transcribes Qwen's global rotate-half
+equation with independent x/y positions and passes exactly after BF16
+rounding. The existing Gemma local-axis oracle remains exact. Focused
+MLX/PyTorch parity and direct MPS coverage pass for both modes.
+
+Environment is the same recorded Apple M5 Max environment. Command: 10
+warmups, 40 synchronized samples, adaptive batching, median/p20/p80/CV.
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel basert_vision --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-24/basert-qwen-vision-rope
+```
+
+| operation/shape | direct median ms | p20/p80 ms | CV | framework ms | speedup | decision |
+|---|---:|---:|---:|---:|---:|---|
+| Qwen 2-D RoPE B1/H8/N1120/D128 | 0.04493 | 0.03192/0.10189 | .6198 | 0.24532 | 5.46x | keep direct |
+
+The shape is timing-floor sensitive, but direct p80 remains below framework
+p20. Raw results: `perf/results/2026-07-24/basert-qwen-vision-rope/`.
+
+Final repository verification after the strict audit and follow-on gap closure:
+MLX and PyTorch-MPS builds passed; correctness passed 2,434 tests, cross-backend
+parity passed 464, direct MPS passed 604, Python package tests passed 44, and
+Xcode build-for-testing succeeded. Metadata parsing and `git diff --check`
+passed.

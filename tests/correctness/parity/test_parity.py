@@ -24,10 +24,12 @@ def _mk(arr, fw, dtype="bf16"):
     """Build a matched input on each framework from one numpy fp32 array."""
     if fw == "torch":
         t = torch.from_numpy(arr)
-        t = t.to(torch.bfloat16) if dtype == "bf16" else t.to(torch.float32)
+        t = {"bf16": t.to(torch.bfloat16), "f16": t.to(torch.float16),
+             "f32": t.to(torch.float32)}[dtype]
         return t.to("mps")
     a = mx.array(arr)
-    return a.astype(mx.bfloat16) if dtype == "bf16" else a.astype(mx.float32)
+    return {"bf16": a.astype(mx.bfloat16), "f16": a.astype(mx.float16),
+            "f32": a.astype(mx.float32)}[dtype]
 
 
 def _np(x):
@@ -231,6 +233,168 @@ def test_embedding_lookup_parity():
     _assert_parity(om, ot, atol=0)
 
 
+def test_embedding_lookup_types_parity():
+    rng = np.random.default_rng(18)
+    tokens = rng.integers(-1, 101, size=23, dtype=np.int32)
+    types = rng.integers(-1, 4, size=23, dtype=np.int32)
+    token_table = (0.2 * rng.standard_normal((100, 128))).astype(np.float32)
+    type_table = (0.2 * rng.standard_normal((3, 128))).astype(np.float32)
+    om = tk.embedding_lookup_types(
+        mx.array(tokens), mx.array(types), _mk(token_table, "mlx", "bf16"),
+        _mk(type_table, "mlx", "bf16"), token_scale=1.25)
+    ot = tk.embedding_lookup_types(
+        torch.from_numpy(tokens).to("mps"), torch.from_numpy(types).to("mps"),
+        _mk(token_table, "torch", "bf16"), _mk(type_table, "torch", "bf16"),
+        token_scale=1.25)
+    _assert_parity(om, ot, atol=0)
+
+
+def test_masked_mean_pool_rms_l2_parity():
+    rng = np.random.default_rng(19)
+    x = (0.2 * rng.standard_normal((3, 17, 256))).astype(np.float32)
+    mask = (rng.random((3, 17)) > 0.3).astype(np.int32); mask[0] = 0
+    weight = (0.5 + 0.2 * rng.standard_normal(256)).astype(np.float32)
+    om = tk.masked_mean_pool_rms_l2(
+        _mk(x, "mlx", "bf16"), mx.array(mask), _mk(weight, "mlx", "bf16"))
+    ot = tk.masked_mean_pool_rms_l2(
+        _mk(x, "torch", "bf16"), torch.from_numpy(mask).to("mps"),
+        _mk(weight, "torch", "bf16"))
+    _assert_parity(om, ot, atol=0)
+
+
+def test_basert_vision_ops_parity():
+    rng = np.random.default_rng(20)
+    x = (0.2 * rng.standard_normal((2, 7, 9, 3))).astype(np.float32)
+    om = tk.extract_patches_2d(_mk(x, "mlx", "bf16"), 3, 2, 2, 2, 1, 0,
+                               use_kernel=True)
+    ot = tk.extract_patches_2d(_mk(x, "torch", "bf16"), 3, 2, 2, 2, 1, 0,
+                               use_kernel=True)
+    _assert_parity(om, ot, atol=0)
+    video = (0.2 * rng.standard_normal((1, 3, 9, 10, 3))).astype(np.float32)
+    _assert_parity(
+        tk.extract_patches_3d(
+            _mk(video, "mlx", "bf16"), 2, 3, 2, 1, 2, 2, 1, 1, 0,
+            use_kernel=True),
+        tk.extract_patches_3d(
+            _mk(video, "torch", "bf16"), 2, 3, 2, 1, 2, 2, 1, 1, 0,
+            use_kernel=True), atol=0)
+    table = (0.2 * rng.standard_normal((4, 5, 64))).astype(np.float32)
+    _assert_parity(
+        tk.interpolate_position_2d(_mk(table, "mlx", "bf16"), 7, 8),
+        tk.interpolate_position_2d(_mk(table, "torch", "bf16"), 7, 8), atol=2e-3)
+    _assert_parity(
+        tk.avg_pool2d_tokens(_mk(x, "mlx", "bf16"), 3, 2, 2, 2, ceil_mode=True),
+        tk.avg_pool2d_tokens(_mk(x, "torch", "bf16"), 3, 2, 2, 2, ceil_mode=True), atol=0)
+    image = (0.2 * rng.standard_normal((1, 8, 8, 3))).astype(np.float32)
+    weight = (0.1 * rng.standard_normal((16, 4, 4, 3))).astype(np.float32)
+    bias = (0.05 * rng.standard_normal(16)).astype(np.float32)
+    _assert_parity(
+        tk.vision_patch_projection(
+            _mk(image, "mlx", "bf16"), _mk(weight, "mlx", "bf16"),
+            _mk(bias, "mlx", "bf16")),
+        tk.vision_patch_projection(
+            _mk(image, "torch", "bf16"), _mk(weight, "torch", "bf16"),
+            _mk(bias, "torch", "bf16")), atol=2e-3)
+    ids = np.array([[[0, 0], [1, 0], [2, 0], [3, 0],
+                     [0, 1], [1, 1], [2, 1], [3, 1],
+                     [0, 2], [1, 2], [2, 2], [3, 2],
+                     [0, 3], [1, 3], [2, 3], [3, 3]]], np.int32)
+    valid = np.ones((1, 16), np.int32); valid[0, 5] = 0
+    factor_table = (0.1 * rng.standard_normal((2, 8, 64))).astype(np.float32)
+    _assert_parity(
+        tk.factorized_position_2d(mx.array(ids), _mk(factor_table, "mlx", "bf16"),
+                                  mx.array(valid)),
+        tk.factorized_position_2d(torch.from_numpy(ids).to("mps"),
+                                  _mk(factor_table, "torch", "bf16"),
+                                  torch.from_numpy(valid).to("mps")), atol=0)
+    tokens = (0.1 * rng.standard_normal((1, 16, 64))).astype(np.float32)
+    pm, mm = tk.pool_tokens_by_position(
+        _mk(tokens, "mlx", "bf16"), mx.array(ids), mx.array(valid), 4, 2, 4)
+    pt, mt = tk.pool_tokens_by_position(
+        _mk(tokens, "torch", "bf16"), torch.from_numpy(ids).to("mps"),
+        torch.from_numpy(valid).to("mps"), 4, 2, 4)
+    _assert_parity(pm, pt, atol=2e-6); _assert_parity(mm, mt, atol=0)
+    rope_x = (0.1 * rng.standard_normal((1, 2, 16, 128))).astype(np.float32)
+    rope_c = rng.uniform(-1, 1, (8, 32)).astype(np.float32)
+    rope_s = rng.uniform(-1, 1, (8, 32)).astype(np.float32)
+    _assert_parity(
+        tk.vision_rope_2d(_mk(rope_x, "mlx", "bf16"), _mk(rope_c, "mlx", "bf16"),
+                          _mk(rope_s, "mlx", "bf16"), mx.array(ids)),
+        tk.vision_rope_2d(_mk(rope_x, "torch", "bf16"), _mk(rope_c, "torch", "bf16"),
+                          _mk(rope_s, "torch", "bf16"), torch.from_numpy(ids).to("mps")), atol=0)
+    _assert_parity(
+        tk.qwen_vision_rope_2d(_mk(rope_x, "mlx", "bf16"), _mk(rope_c, "mlx", "bf16"),
+                               _mk(rope_s, "mlx", "bf16"), mx.array(ids)),
+        tk.qwen_vision_rope_2d(_mk(rope_x, "torch", "bf16"), _mk(rope_c, "torch", "bf16"),
+                               _mk(rope_s, "torch", "bf16"),
+                               torch.from_numpy(ids).to("mps")), atol=0)
+
+
+def test_basert_audio_conv_parity():
+    rng = np.random.default_rng(21)
+    x = (0.2 * rng.standard_normal((2, 31, 9))).astype(np.float32)
+    w = (0.2 * rng.standard_normal((13, 5, 9))).astype(np.float32)
+    b = (0.1 * rng.standard_normal(13)).astype(np.float32)
+    _assert_parity(
+        tk.audio_conv1d_direct(_mk(x, "mlx", "bf16"), _mk(w, "mlx", "bf16"),
+                               _mk(b, "mlx", "bf16"), padding=2),
+        tk.audio_conv1d_direct(_mk(x, "torch", "bf16"), _mk(w, "torch", "bf16"),
+                               _mk(b, "torch", "bf16"), padding=2), atol=0)
+    _assert_parity(
+        tk.audio_conv1d(_mk(x, "mlx", "bf16"), _mk(w, "mlx", "bf16"),
+                        _mk(b, "mlx", "bf16"), padding=2),
+        tk.audio_conv1d(_mk(x, "torch", "bf16"), _mk(w, "torch", "bf16"),
+                        _mk(b, "torch", "bf16"), padding=2), atol=3e-2)
+    dw = (0.2 * rng.standard_normal((9, 5))).astype(np.float32)
+    db = (0.1 * rng.standard_normal(9)).astype(np.float32)
+    _assert_parity(
+        tk.audio_depthwise_conv1d(_mk(x, "mlx", "bf16"), _mk(dw, "mlx", "bf16"),
+                                  _mk(db, "mlx", "bf16"), padding=2, activation="silu"),
+        tk.audio_depthwise_conv1d(_mk(x, "torch", "bf16"), _mk(dw, "torch", "bf16"),
+                                  _mk(db, "torch", "bf16"), padding=2, activation="silu"), atol=0)
+    _assert_parity(
+        tk.audio_causal_depthwise_conv1d(
+            _mk(x, "mlx", "bf16"), _mk(dw, "mlx", "bf16"), _mk(db, "mlx", "bf16")),
+        tk.audio_causal_depthwise_conv1d(
+            _mk(x, "torch", "bf16"), _mk(dw, "torch", "bf16"), _mk(db, "torch", "bf16")),
+        atol=0)
+
+
+def test_cross_attention_parity():
+    rng = np.random.default_rng(22)
+    q = (0.15 * rng.standard_normal((2, 4, 3, 64))).astype(np.float32)
+    k = (0.15 * rng.standard_normal((2, 2, 9, 64))).astype(np.float32)
+    v = (0.20 * rng.standard_normal((2, 2, 9, 64))).astype(np.float32)
+    bias = (0.03 * rng.standard_normal((2, 4, 3, 9))).astype(np.float32)
+    lengths = np.array([9, 6], np.int32)
+    om = tk.cross_attention(
+        _mk(q, "mlx", "bf16"), _mk(k, "mlx", "bf16"), _mk(v, "mlx", "bf16"),
+        mx.array(lengths), mx.array(bias), softcap=4.0)
+    ot = tk.cross_attention(
+        _mk(q, "torch", "bf16"), _mk(k, "torch", "bf16"), _mk(v, "torch", "bf16"),
+        torch.from_numpy(lengths).to("mps"), torch.from_numpy(bias).to("mps"), softcap=4.0)
+    _assert_parity(om, ot, atol=1e-5)
+
+
+def test_audio_relative_attention_parity():
+    rng = np.random.default_rng(220)
+    q = (0.08 * rng.standard_normal((2, 17, 2, 64))).astype(np.float32)
+    k = (0.08 * rng.standard_normal(q.shape)).astype(np.float32)
+    v = (0.2 * rng.standard_normal(q.shape)).astype(np.float32)
+    rel = (0.08 * rng.standard_normal((5, 2, 64))).astype(np.float32)
+    scale = (0.2 * rng.standard_normal(64)).astype(np.float32)
+    lengths = np.array([17, 11], np.int32)
+    om = tk.audio_relative_attention(
+        _mk(q, "mlx", "bf16"), _mk(k, "mlx", "bf16"), _mk(v, "mlx", "bf16"),
+        _mk(rel, "mlx", "bf16"), _mk(scale, "mlx", "f32"), mx.array(lengths),
+        4, 3, 1, softcap=5.0)
+    ot = tk.audio_relative_attention(
+        _mk(q, "torch", "bf16"), _mk(k, "torch", "bf16"), _mk(v, "torch", "bf16"),
+        _mk(rel, "torch", "bf16"), _mk(scale, "torch", "f32"),
+        torch.from_numpy(lengths).to("mps"), 4, 3, 1, softcap=5.0)
+    _assert_parity(om, ot, atol=1e-7)
+
+
 def test_adamw_parity():
     rng = np.random.default_rng(23)
     D = 1024
@@ -264,7 +428,7 @@ def test_dropout_parity(p):
 
 
 @pytest.mark.parametrize("mode", ["reglu", "geglu", "swiglu", "swiglu_oai", "geglu_erf",
-                                  "geglu_quick"])
+                                  "geglu_quick", "sigmoid"])
 def test_glu_backward_parity(mode):
     rng = np.random.default_rng(31)
     # scale = 3 so swiglu_oai's clamp (limit 2.5) is active on both backends, not just the smooth region
@@ -754,6 +918,11 @@ def test_sampler_transforms_parity():
         # last-ulp fast-math reassociation differs between the two metallib compilers on
         # O(10) logit values; a masked-set flip would show as ~1e30, not 1e-4
         _assert_parity(fn(mx.array(x), *args), fn(t(x), *args), atol=1e-4)
+    _assert_parity(tk.logits_softcap(mx.array(x), 30.0),
+                   tk.logits_softcap(t(x), 30.0), atol=1e-5)
+    clip_x = x.reshape(2, 4, 300)
+    _assert_parity(tk.value_clip(mx.array(clip_x), -1.25, 2.5),
+                   tk.value_clip(t(clip_x), -1.25, 2.5), atol=0)
     _assert_parity(tk.xtc_mask(mx.array(x), 0.1, 1.0, seed=7),
                    tk.xtc_mask(t(x), 0.1, 1.0, seed=7), atol=1e-4)
     p = rng.random((8, 300)).astype(np.float32)
@@ -855,6 +1024,45 @@ def test_gdn_recur_parity():
     _assert_parity(pm, pt, atol=1e-5)
 
 
+def test_gdn_prepare_output_parity():
+    rng = np.random.default_rng(158)
+    lens, Hk, Hv, Dk, Dv, kernel_size = [4, 2], 2, 4, 64, 64, 4
+    total = sum(lens)
+    channels = 2 * Hk * Dk + Hv * Dv
+    x = (0.4 * rng.standard_normal((total, channels))).astype(np.float32)
+    weight = (0.2 * rng.standard_normal((channels, kernel_size))).astype(np.float32)
+    pool = (0.1 * rng.standard_normal((4, channels, kernel_size - 1))).astype(np.float32)
+    cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+    slots = np.array([2, 0], np.int32)
+    a = (0.5 * rng.standard_normal((total, Hv))).astype(np.float32)
+    b = (0.5 * rng.standard_normal((total, Hv))).astype(np.float32)
+    A_log = rng.uniform(-2.0, 1.0, Hv).astype(np.float32)
+    dt_bias = rng.uniform(-0.5, 0.5, Hv).astype(np.float32)
+    z = (0.4 * rng.standard_normal((total, Hv, Dv))).astype(np.float32)
+    norm_weight = rng.uniform(0.8, 1.2, Dv).astype(np.float32)
+
+    t = lambda value: torch.from_numpy(value).to("mps")
+    cm, spm = tk.gdn_short_conv(
+        mx.array(x), mx.array(weight), mx.array(pool), mx.array(cu), mx.array(slots))
+    ct, spt = tk.gdn_short_conv(t(x), t(weight), t(pool), t(cu), t(slots))
+    _assert_parity(cm, ct, atol=1e-5)
+    _assert_parity(spm, spt, atol=1e-6)
+
+    qm, km, vm = tk.gdn_qkv_prepare(cm, Hk, Hv, Dk, Dv)
+    qt, kt, vt = tk.gdn_qkv_prepare(ct, Hk, Hv, Dk, Dv)
+    for lhs, rhs in [(qm, qt), (km, kt), (vm, vt)]:
+        _assert_parity(lhs, rhs, atol=1e-5)
+
+    gm, bm = tk.gdn_gate_beta(mx.array(a), mx.array(b), mx.array(A_log), mx.array(dt_bias))
+    gt, bt = tk.gdn_gate_beta(t(a), t(b), t(A_log), t(dt_bias))
+    _assert_parity(gm, gt, atol=2e-6)
+    _assert_parity(bm, bt, atol=2e-6)
+
+    nm = tk.gdn_gated_rmsnorm(vm, mx.array(z), mx.array(norm_weight))
+    nt = tk.gdn_gated_rmsnorm(vt, t(z), t(norm_weight))
+    _assert_parity(nm, nt, atol=1e-5)
+
+
 def test_selective_scan_parity():
     rng = np.random.default_rng(57)
     b, d, L, G, N = 2, 32, 12, 2, 16
@@ -893,6 +1101,56 @@ def test_qk_norm_rope_parity(interleaved):
                          tt(kw, torch.bfloat16), tt(cos, torch.bfloat16),
                          tt(sin, torch.bfloat16), torch.from_numpy(pos).to("mps"),
                          hq, hk, hv, interleaved=interleaved)
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "D,rotary_dim,interleaved,weight_offset",
+    [(128, 64, False, 0.0), (256, 128, True, 1.0), (512, 192, False, 0.25)],
+)
+def test_qk_norm_rope_positioned_parity(D, rotary_dim, interleaved, weight_offset):
+    rng = np.random.default_rng(156 + D)
+    hq, hk, hv, T = 4, 2, 1, 11
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    kw = (0.2 * rng.standard_normal(D)).astype(np.float32)
+    rp = rotary_dim // 2
+    inv = 10000.0 ** (-(np.arange(rp, dtype=np.float32) / rp))
+    ang = np.arange(67, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    pos = ((3 * np.arange(T) + 1) % 67).astype(np.int32)
+    om = tk.qk_norm_rope_positioned(
+        _mk(qkv, "mlx"), _mk(qw, "mlx"), _mk(kw, "mlx"), _mk(cos, "mlx"),
+        _mk(sin, "mlx"), mx.array(pos), hq, hk, hv, rotary_dim=rotary_dim,
+        interleaved=interleaved, norm_weight_offset=weight_offset)
+    ot = tk.qk_norm_rope_positioned(
+        _mk(qkv, "torch"), _mk(qw, "torch"), _mk(kw, "torch"), _mk(cos, "torch"),
+        _mk(sin, "torch"), torch.from_numpy(pos).to("mps"), hq, hk, hv,
+        rotary_dim=rotary_dim, interleaved=interleaved,
+        norm_weight_offset=weight_offset)
+    _assert_parity(om, ot, atol=1e-2)
+
+
+def test_qk_norm_mrope_parity():
+    rng = np.random.default_rng(187)
+    D, hq, hk, hv, T = 64, 3, 1, 1, 13
+    sections = (11, 11, 10)
+    qkv = rng.standard_normal((T, (hq + hk + hv) * D)).astype(np.float32)
+    qw = rng.standard_normal(D).astype(np.float32)
+    kw = rng.standard_normal(D).astype(np.float32)
+    inv = 10000.0 ** (-(np.arange(D // 2, dtype=np.float32) / (D // 2)))
+    ang = np.arange(80, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    ar = np.arange(T, dtype=np.int32)
+    pos = np.stack((ar, 2 * ar + 1, 3 * ar + 2)) % 80
+    om = tk.qk_norm_rope_positioned(
+        _mk(qkv, "mlx"), _mk(qw, "mlx"), _mk(kw, "mlx"), _mk(cos, "mlx"),
+        _mk(sin, "mlx"), mx.array(pos), hq, hk, hv,
+        mrope_sections=sections, section_interleaved=True)
+    ot = tk.qk_norm_rope_positioned(
+        _mk(qkv, "torch"), _mk(qw, "torch"), _mk(kw, "torch"), _mk(cos, "torch"),
+        _mk(sin, "torch"), torch.from_numpy(pos).to("mps"), hq, hk, hv,
+        mrope_sections=sections, section_interleaved=True)
     _assert_parity(om, ot, atol=1e-2)
 
 
@@ -1066,6 +1324,33 @@ def test_quantize_per_tensor_fp8_parity(shape):
     _assert_parity(sm, st, atol=1e-6)
 
 
+def test_calibration_absmax_parity_and_running():
+    rng = np.random.default_rng(76)
+    x = rng.standard_normal((257, 97)).astype(np.float32)
+    running = rng.random(97).astype(np.float32) * 3.0
+    _assert_parity(
+        tk.calibration_absmax(_mk(x, "mlx", "bf16"), mx.array(running)),
+        tk.calibration_absmax(
+            _mk(x, "torch", "bf16"), torch.from_numpy(running).to("mps")),
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("rows", [2, 8])
+def test_lora_apply_parity(rows):
+    rng = np.random.default_rng(178 + rows)
+    K, N, R = 384, 320, 12
+    x = (0.2 * rng.standard_normal((rows, K))).astype(np.float32)
+    A = (0.1 * rng.standard_normal((R, K))).astype(np.float16)
+    B = (0.1 * rng.standard_normal((N, R))).astype(np.float16)
+    base = (0.2 * rng.standard_normal((rows, N))).astype(np.float32)
+    om = tk.lora_apply(_mk(x, "mlx", "bf16"), _mk(A, "mlx", "f16"),
+                       _mk(B, "mlx", "f16"), _mk(base, "mlx", "bf16"), scale=0.75)
+    ot = tk.lora_apply(_mk(x, "torch", "bf16"), _mk(A, "torch", "f16"),
+                       _mk(B, "torch", "f16"), _mk(base, "torch", "bf16"), scale=0.75)
+    _assert_parity(om, ot, atol=3e-2)
+
+
 @pytest.mark.parametrize("shape", [(8, 256), (3, 513)])
 def test_quantize_per_token_fp8_parity(shape):
     rng = np.random.default_rng(0)
@@ -1156,6 +1441,50 @@ def test_paged_attention_fp8_window_parity(window):
     ot = tk.paged_attention_fp8(_mk(q, "torch"), kct, vct, torch.from_numpy(bt).to("mps"),
                                 torch.from_numpy(cl).to("mps"), ks, vs, window=window)
     _assert_parity(om, ot, atol=2e-2)
+
+
+@pytest.mark.parametrize("D,H,H_KV", [(64, 4, 4), (64, 8, 2), (128, 4, 1)])
+def test_q8_0_kv_codec_copy_gather_and_attention_parity(D, H, H_KV):
+    rng = np.random.default_rng(740 + D + H)
+    B, num_blocks, block_size = 2, 8, 8
+    total = num_blocks * block_size
+    K = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    V = (0.3 * rng.normal(size=(total, H_KV, D))).astype(np.float32)
+    q = (0.3 * rng.normal(size=(B, H, D))).astype(np.float32)
+    slot = np.arange(total, dtype=np.int64)
+    bt = np.arange(num_blocks, dtype=np.int32).reshape(B, num_blocks // B)
+    cl = np.array([23, 31], np.int32)
+    cu = np.array([0, 32, 64], np.int32)
+
+    mplanes = tk.kv_cache_scatter_q8_0(
+        _mk(K, "mlx", "f32"), _mk(V, "mlx", "f32"), mx.array(slot), num_blocks, block_size)
+    tplanes = tk.kv_cache_scatter_q8_0(
+        _mk(K, "torch", "f32"), _mk(V, "torch", "f32"), torch.from_numpy(slot).to("mps"),
+        num_blocks, block_size)
+    for m, t in zip(mplanes, tplanes):
+        _assert_parity(m, t, atol=0.0)
+
+    mg = tk.kv_cache_gather_q8_0(
+        *mplanes, mx.array(bt), mx.array(cu), total, output_dtype="float32")
+    tg = tk.kv_cache_gather_q8_0(
+        *tplanes, torch.from_numpy(bt).to("mps"), torch.from_numpy(cu).to("mps"),
+        total, output_dtype="float32")
+    for m, t in zip(mg, tg):
+        _assert_parity(m, t, atol=0.0)
+
+    mapping = np.array([[0, 7], [1, 6]], np.int64)
+    mc = tk.kv_cache_copy_blocks_q8_0(*mplanes, mx.array(mapping))
+    tc = tk.kv_cache_copy_blocks_q8_0(
+        *tplanes, torch.from_numpy(mapping).to("mps"))
+    for m, t in zip(mc, tc):
+        _assert_parity(m, t, atol=0.0)
+
+    om = tk.paged_attention_q8_0(
+        _mk(q, "mlx", "f32"), *mplanes, mx.array(bt), mx.array(cl), window=5)
+    ot = tk.paged_attention_q8_0(
+        _mk(q, "torch", "f32"), *tplanes, torch.from_numpy(bt).to("mps"),
+        torch.from_numpy(cl).to("mps"), window=5)
+    _assert_parity(om, ot, atol=1e-7)
 
 
 @pytest.mark.parametrize("window,fp8", [(1, False), (5, False), (16, True)])
@@ -1619,6 +1948,60 @@ def test_rotary_interleaved_parity(shape):
     x = rng.standard_normal((B, H, N, D)).astype(np.float32)
     om = tk.rotary(_mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"), interleaved=True)
     ot = tk.rotary(_mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"), interleaved=True)
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "shape,rotary_dim,interleaved,batched",
+    [((1, 2, 17, 128), 64, False, False),
+     ((2, 2, 11, 256), 128, True, True),
+     ((1, 1, 7, 512), 192, False, False)],
+)
+def test_rotary_positioned_parity(shape, rotary_dim, interleaved, batched):
+    B, _, N, _ = shape
+    rng = np.random.default_rng(61 + rotary_dim)
+    max_pos = 3 * N + 1
+    inv = 10000.0 ** (-(np.arange(rotary_dim // 2, dtype=np.float32) * 2 / rotary_dim))
+    ang = np.arange(max_pos, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    pos = (2 * np.arange(N, dtype=np.int32) + 1) % max_pos
+    if batched:
+        pos = np.stack([(pos + b) % max_pos for b in range(B)])
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.rotary_positioned(
+        _mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"), mx.array(pos),
+        rotary_dim=rotary_dim, interleaved=interleaved)
+    ot = tk.rotary_positioned(
+        _mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+        torch.from_numpy(pos).to("mps"), rotary_dim=rotary_dim,
+        interleaved=interleaved)
+    _assert_parity(om, ot, atol=1e-2)
+
+
+@pytest.mark.parametrize(
+    "shape,sections,interleaved,batched",
+    [((1, 2, 17, 64), (8, 12, 12), False, False),
+     ((2, 2, 11, 64), (11, 11, 10), True, True)],
+)
+def test_mrope_parity(shape, sections, interleaved, batched):
+    B, _, N, D = shape
+    rng = np.random.default_rng(73 + D)
+    rp = D // 2
+    max_pos = 3 * N + 2
+    inv = 10000.0 ** (-(np.arange(rp, dtype=np.float32) * 2 / D))
+    ang = np.arange(max_pos, dtype=np.float32)[:, None] * inv[None, :]
+    cos, sin = np.cos(ang).astype(np.float32), np.sin(ang).astype(np.float32)
+    p = np.stack([np.arange(N), 2 * np.arange(N) + 1, 3 * np.arange(N) + 2])
+    p = (p % max_pos).astype(np.int32)
+    positions = p if not batched else np.stack([p, (p + 1) % max_pos])[:B]
+    x = rng.standard_normal(shape).astype(np.float32)
+    om = tk.mrope(
+        _mk(x, "mlx"), _mk(cos, "mlx"), _mk(sin, "mlx"), mx.array(positions),
+        sections, section_interleaved=interleaved)
+    ot = tk.mrope(
+        _mk(x, "torch"), _mk(cos, "torch"), _mk(sin, "torch"),
+        torch.from_numpy(positions).to("mps"), sections,
+        section_interleaved=interleaved)
     _assert_parity(om, ot, atol=1e-2)
 
 

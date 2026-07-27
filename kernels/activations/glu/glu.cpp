@@ -22,7 +22,7 @@ namespace mlx::core {
 static bool valid_glu_mode(const std::string& mode) {
   return mode == "reglu" || mode == "geglu" || mode == "swiglu" ||
          mode == "swiglu_oai" || mode == "geglu_erf" ||
-         mode == "geglu_quick";
+         mode == "geglu_quick" || mode == "sigmoid";
 }
 
 array glu(
@@ -35,7 +35,8 @@ array glu(
   if (!valid_glu_mode(mode)) {
     std::ostringstream msg;
     msg << "glu: unsupported mode '" << mode
-        << "'; expected reglu, geglu, swiglu, swiglu_oai, geglu_erf, or geglu_quick";
+        << "'; expected reglu, geglu, swiglu, swiglu_oai, geglu_erf, "
+           "geglu_quick, or sigmoid";
     throw std::invalid_argument(msg.str());
   }
   if (x.shape() != gate.shape()) {

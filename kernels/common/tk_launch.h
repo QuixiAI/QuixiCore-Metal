@@ -18,8 +18,12 @@
 // Pure C++: depends on neither MLX nor Metal, so it compiles in both .cpp and .mm.
 
 #pragma once
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <string>
+
+#include "base_q_descriptor.h"
 
 namespace tk {
 
@@ -64,6 +68,9 @@ inline std::string moe_grouped_gemm_rect_kernel_name(const std::string& t) { ret
 inline std::string moe_grouped_gemm_swiglu_kernel_name(const std::string& t) { return "moe_grouped_gemm_swiglu_" + t; }
 inline std::string moe_route_grouped_kernel_name(const std::string& t) { return "moe_route_grouped_" + t; }
 inline std::string qk_norm_rope_kernel_name(int D) { return "qk_norm_rope_" + std::to_string(D); }
+inline std::string qk_norm_rope_positioned_kernel_name(int D) {
+  return "qk_norm_rope_positioned_" + std::to_string(D);
+}
 inline std::string qk_norm_rope_kv_f16_kernel_name(int D) {
   return "qk_norm_rope_kv_f16_" + std::to_string(D);
 }
@@ -72,6 +79,20 @@ inline std::string selective_scan_kernel_name(const std::string& variant, const 
 }
 inline std::string gdn_recur_kernel_name(const std::string& t, int Dk) {
   return "gdn_recur_" + t + "_d" + std::to_string(Dk);
+}
+inline std::string gdn_short_conv_kernel_name(const std::string& t) {
+  return "gdn_short_conv_" + t;
+}
+inline std::string gdn_qkv_prepare_kernel_name(
+    const std::string& t, int Dk, int Dv) {
+  return "gdn_qkv_prepare_" + t + "_dk" + std::to_string(Dk) +
+         "_dv" + std::to_string(Dv);
+}
+inline std::string gdn_gate_beta_kernel_name(const std::string& t) {
+  return "gdn_gate_beta_" + t;
+}
+inline std::string gdn_gated_rmsnorm_kernel_name(const std::string& t, int D) {
+  return "gdn_gated_rmsnorm_" + t + "_d" + std::to_string(D);
 }
 inline std::string moe_grouped_gemm_rect_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_rect_q_" + fmt; }
 inline std::string moe_grouped_gemm_swiglu_q_kernel_name(const std::string& fmt) { return "moe_grouped_gemm_swiglu_q_" + fmt; }
@@ -88,6 +109,12 @@ inline std::string weight_quant_ternary_kernel_name(const std::string& t) { retu
 inline std::string softmax_kernel_name(int D) { return "softmax_" + std::to_string(D); }
 inline std::string rotary_kernel_name(int D) { return "rotary_" + std::to_string(D); }
 inline std::string rotary_interleaved_kernel_name(int D) { return "rotary_interleaved_" + std::to_string(D); }
+inline std::string rotary_positioned_kernel_name(int D) {
+  return "rotary_positioned_" + std::to_string(D);
+}
+inline std::string mrope_positioned_kernel_name(int D) {
+  return "mrope_positioned_" + std::to_string(D);
+}
 inline std::string mla_q_norm_rope_kernel_name(int D) { return "mla_q_norm_rope_" + std::to_string(D); }
 inline std::string mla_kv_insert_kernel_name(int L) { return "mla_kv_insert_" + std::to_string(L); }
 inline std::string mla_decode_kernel_name(int L, int R) {
@@ -148,6 +175,10 @@ inline std::string qgemv_kernel_name(const std::string& fmt) { return "qgemv_" +
 inline std::string qflux_gelu_kernel_name(const std::string& fmt) { return "qflux_gelu_" + fmt; }
 inline std::string qgemm_frag_kernel_name(const std::string& fmt) { return "qgemm_frag_" + fmt; }
 inline std::string qgemm_actorder_kernel_name(const std::string& fmt) { return "qgemm_actorder_" + fmt; }
+inline std::string base_q_kernel_name(
+    const std::string& operation, const std::string& type_name) {
+  return "base_q" + operation + "_" + type_name;
+}
 
 // ----- LayerNorm: x@0 w@1 b@2 -> o@3 ; M@4(u32) eps@5(f32) ; grid (M,1,1) group (32,1,1) -----
 template <class E>
@@ -483,6 +514,15 @@ void launch_mean_pool_rms_l2(E& e, typename E::in_t x, typename E::in_t w,
   e.bytes(M, 3); e.bytes(eps, 4);
   e.dispatch(1, 1, 1, 32, 1, 1);
 }
+template <class E>
+void launch_masked_mean_pool_rms_l2(
+    E& e, typename E::in_t x, typename E::in_t mask, typename E::in_t w,
+    typename E::out_t o, uint32_t B, uint32_t T, int D, float eps) {
+  e.pipeline("masked_mean_pool_rms_l2_" + std::to_string(D));
+  e.in(x, 0); e.in(mask, 1); e.in(w, 2); e.out(o, 3);
+  e.bytes(T, 4); e.bytes(eps, 5);
+  e.dispatch(B, 1, 1, 32, 1, 1);
+}
 
 // ----- rms_norm_residual_next: x@0 post_w@1 residual@2 next_w@3 -> res_out@4 next_out@5 ;
 //        M@6(u32) eps@7(f32) ; grid (M,1,1) group (32,1,1). Post-norm x, add to residual,
@@ -757,6 +797,59 @@ void launch_gdn_recur(E& e, typename E::in_t q, typename E::in_t k, typename E::
   e.out(state_pool, 5); e.in(cu_seqlens, 6); e.in(slot_mapping, 7); e.out(y, 8);
   e.bytes(R, 9); e.bytes(Hk, 10); e.bytes(Hv, 11); e.bytes(Dv, 12); e.bytes(load_initial, 13);
   e.dispatch(Dv, 1, R * Hv, 32, 1, 1);
+}
+
+// ----- GDN preparation/output substrate. Short convolution uses one thread per channel
+//        and one threadgroup row per request; QKV preparation and gated RMSNorm use one
+//        simdgroup per logical head row. Gate/beta is flat elementwise fp32 output. -----
+template <class E>
+void launch_gdn_short_conv(
+    E& e, typename E::in_t x, typename E::in_t weight,
+    typename E::out_t state_pool, typename E::in_t cu_seqlens,
+    typename E::in_t slot_mapping, typename E::out_t out,
+    int R, int channels, int kernel_size, int load_initial, int apply_silu,
+    const std::string& type_name) {
+  e.pipeline(gdn_short_conv_kernel_name(type_name));
+  e.in(x, 0); e.in(weight, 1); e.out(state_pool, 2); e.in(cu_seqlens, 3);
+  e.in(slot_mapping, 4); e.out(out, 5); e.bytes(R, 6); e.bytes(channels, 7);
+  e.bytes(kernel_size, 8); e.bytes(load_initial, 9); e.bytes(apply_silu, 10);
+  constexpr int threads = 256;
+  e.dispatch((channels + threads - 1) / threads, R, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_gdn_qkv_prepare(
+    E& e, typename E::in_t mixed, typename E::out_t q, typename E::out_t k,
+    typename E::out_t v, int tokens, int Hk, int Hv, int Dk, int Dv,
+    float eps, float q_scale, float k_scale, const std::string& type_name) {
+  e.pipeline(gdn_qkv_prepare_kernel_name(type_name, Dk, Dv));
+  e.in(mixed, 0); e.out(q, 1); e.out(k, 2); e.out(v, 3);
+  e.bytes(tokens, 4); e.bytes(Hk, 5); e.bytes(Hv, 6); e.bytes(eps, 7);
+  e.bytes(q_scale, 8); e.bytes(k_scale, 9);
+  e.dispatch(tokens * (2 * Hk + Hv), 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_gdn_gate_beta(
+    E& e, typename E::in_t a, typename E::in_t b, typename E::in_t A_log,
+    typename E::in_t dt_bias, typename E::out_t decay, typename E::out_t beta,
+    uint32_t n, int heads, const std::string& type_name) {
+  e.pipeline(gdn_gate_beta_kernel_name(type_name));
+  e.in(a, 0); e.in(b, 1); e.in(A_log, 2); e.in(dt_bias, 3);
+  e.out(decay, 4); e.out(beta, 5); e.bytes(n, 6); e.bytes(heads, 7);
+  constexpr int threads = 256;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_gdn_gated_rmsnorm(
+    E& e, typename E::in_t y, typename E::in_t z, typename E::in_t weight,
+    typename E::out_t out, int rows, int dim, float eps,
+    const std::string& type_name) {
+  e.pipeline(gdn_gated_rmsnorm_kernel_name(type_name, dim));
+  e.in(y, 0); e.in(z, 1); e.in(weight, 2); e.out(out, 3);
+  e.bytes(rows, 4); e.bytes(eps, 5);
+  e.dispatch(rows, 1, 1, 32, 1, 1);
 }
 
 // ----- Mamba-1 (S6) selective scan. Layouts channel-major (seqlen/total_tokens LAST);
@@ -1232,6 +1325,18 @@ void launch_embedding_lookup(E& e, typename E::in_t token_ids, typename E::in_t 
   e.bytes(D, 4); e.bytes(vocab, 5); e.bytes(n_tok, 6); e.bytes(scale, 7); e.bytes(use_pos, 8);
   e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
 }
+template <class E>
+void launch_embedding_lookup_types(
+    E& e, typename E::in_t token_ids, typename E::in_t type_ids,
+    typename E::in_t token_table, typename E::in_t type_table,
+    typename E::out_t out, int D, int token_vocab, int type_vocab,
+    int n_tok, float token_scale, const std::string& type_name) {
+  e.pipeline("embedding_lookup_types_" + type_name);
+  e.in(token_ids, 0); e.in(type_ids, 1); e.in(token_table, 2); e.in(type_table, 3);
+  e.out(out, 4); e.bytes(D, 5); e.bytes(token_vocab, 6); e.bytes(type_vocab, 7);
+  e.bytes(token_scale, 8);
+  e.dispatch(n_tok, 1, 1, tk_embed_threads(D), 1, 1);
+}
 // build the multimodal src map on-device (one thread per token, scans the spans).
 template <class E>
 void launch_build_multimodal_src(E& e, typename E::in_t span_offsets, typename E::in_t span_lengths,
@@ -1325,6 +1430,17 @@ void launch_quant_tensor_encode(E& e, typename E::in_t x, typename E::in_t scale
   e.in(x, 0); e.in(scale_u, 1); e.out(codes, 2); e.out(scale_out, 3); e.bytes(n, 4);
   const int t4 = (n + 3) / 4;                          // 4 elements per thread
   e.dispatch((t4 + 255) / 256, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_calibration_absmax(
+    E& e, typename E::in_t x, typename E::in_t running,
+    typename E::out_t out, int tokens, int channels, int has_running,
+    const std::string& type_name) {
+  e.pipeline("calibration_absmax_" + type_name);
+  e.in(x, 0); e.in(running, 1); e.out(out, 2);
+  e.bytes(tokens, 3); e.bytes(channels, 4); e.bytes(has_running, 5);
+  e.dispatch((channels + 31) / 32, 1, 1, 256, 1, 1);
 }
 
 // ----- quantize_per_token_fp8: x@0 -> codes@1(uint8) scale@2(f32) ; D@3(i32) ; grid (rows,1,1).
@@ -1626,6 +1742,73 @@ void launch_rotary(E& e, typename E::in_t x, typename E::in_t cos, typename E::i
   e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
 }
 
+// ----- positioned/partial RoPE: x@0 cos@1 sin@2 positions@3 -> o@4;
+//       M@5 N@6 H@7 rotary_dim@8 position_batch_stride@9 interleaved@10.
+template <class E>
+void launch_rotary_positioned(
+    E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
+    typename E::in_t positions, typename E::out_t o, uint32_t M, uint32_t N,
+    uint32_t heads, int D, uint32_t rotary_dim, uint32_t pos_bstride,
+    uint32_t interleaved) {
+  e.pipeline(rotary_positioned_kernel_name(D));
+  e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.out(o, 4);
+  e.bytes(M, 5); e.bytes(N, 6); e.bytes(heads, 7); e.bytes(rotary_dim, 8);
+  e.bytes(pos_bstride, 9); e.bytes(interleaved, 10);
+  const uint32_t total = M * static_cast<uint32_t>(D / 8);
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// ----- 3-axis M-RoPE: same common bindings, section pair counts@10..12 and
+//       THW-interleaving flag@13. Pairing is always split-half/NeoX.
+template <class E>
+void launch_mrope(
+    E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
+    typename E::in_t positions, typename E::out_t o, uint32_t M, uint32_t N,
+    uint32_t heads, int D, uint32_t rotary_dim, uint32_t pos_bstride,
+    uint32_t section_t, uint32_t section_h, uint32_t section_w,
+    uint32_t section_interleaved) {
+  e.pipeline(mrope_positioned_kernel_name(D));
+  e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.out(o, 4);
+  e.bytes(M, 5); e.bytes(N, 6); e.bytes(heads, 7); e.bytes(rotary_dim, 8);
+  e.bytes(pos_bstride, 9); e.bytes(section_t, 10); e.bytes(section_h, 11);
+  e.bytes(section_w, 12); e.bytes(section_interleaved, 13);
+  const uint32_t total = M * static_cast<uint32_t>(D / 8);
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_vision_rope_2d(
+    E& e, typename E::in_t x, typename E::in_t cos, typename E::in_t sin,
+    typename E::in_t positions, typename E::out_t out,
+    uint32_t B, uint32_t H, uint32_t N, int D, uint32_t max_position,
+    uint32_t global_split) {
+  e.pipeline("vision_rope_2d_D" + std::to_string(D));
+  e.in(x, 0); e.in(cos, 1); e.in(sin, 2); e.in(positions, 3); e.out(out, 4);
+  const uint32_t rows = B * H * N;
+  e.bytes(rows, 5); e.bytes(N, 6); e.bytes(H, 7); e.bytes(max_position, 8);
+  e.bytes(global_split, 9);
+  const uint32_t total = rows * static_cast<uint32_t>(D / 16);
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// ----- explicit fused Q/K RMSNorm + positioned/partial/M-RoPE over packed QKV.
+template <class E>
+void launch_qk_norm_rope_positioned(
+    E& e, typename E::in_t qkv, typename E::in_t qw, typename E::in_t kw,
+    typename E::in_t cos, typename E::in_t sin, typename E::in_t positions,
+    typename E::out_t out, int T, int hq, int hk, int hv, int D, float eps,
+    int rotary_dim, int interleaved, float weight_offset, int position_mode,
+    int section_t, int section_h, int section_w) {
+  e.pipeline(qk_norm_rope_positioned_kernel_name(D));
+  e.in(qkv, 0); e.in(qw, 1); e.in(kw, 2); e.in(cos, 3); e.in(sin, 4);
+  e.in(positions, 5); e.out(out, 6);
+  e.bytes(hq, 7); e.bytes(hk, 8); e.bytes(hv, 9); e.bytes(eps, 10);
+  e.bytes(rotary_dim, 11); e.bytes(interleaved, 12); e.bytes(weight_offset, 13);
+  e.bytes(position_mode, 14); e.bytes(section_t, 15); e.bytes(section_h, 16);
+  e.bytes(section_w, 17); e.bytes(T, 18);
+  e.dispatch(hq + hk + hv, T, 1, 32, 1, 1);
+}
+
 // ----- MLA Q-path: q@0 cos@1 sin@2 positions@3 -> out@4 ; num_heads@5 nope@6 rope@7 norm_mode@8
 //        eps@9 ; norm_weight@10 (read iff mode 2) ; grid (M=tokens*heads,1,1) group (32,1,1). -----
 template <class E>
@@ -1871,6 +2054,176 @@ void launch_glu_bwd(E& e, typename E::in_t x, typename E::in_t gate, typename E:
   constexpr int threads = 256;
   const uint32_t nthreads = (n + 3) / 4;
   e.dispatch(static_cast<int>((nthreads + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+// ----- LoRA decode/small-batch path: both F16 adapter projections and the
+// final scale/base add in one row-owned threadgroup. A is (R,K), B is (N,R). -----
+template <class E>
+void launch_lora_apply_direct(
+    E& e, typename E::in_t x, typename E::in_t A, typename E::in_t B,
+    typename E::in_t base, typename E::out_t out,
+    int M, int K, int N, int R, float scale, int has_base,
+    const std::string& type_name) {
+  e.pipeline("lora_apply_direct_f16_" + type_name);
+  e.in(x, 0); e.in(A, 1); e.in(B, 2); e.in(base, 3); e.out(out, 4);
+  e.bytes(K, 5); e.bytes(N, 6); e.bytes(R, 7); e.bytes(scale, 8);
+  e.bytes(has_base, 9);
+  e.dispatch(M, 1, 1, 256, 1, 1);
+}
+
+// ----- reusable vision/audio 2-D tensor preparation. -----
+template <class E>
+void launch_extract_patches_2d(
+    E& e, typename E::in_t x, typename E::out_t out,
+    int B, int H, int W, int C, int KH, int KW, int SH, int SW, int PH, int PW,
+    const std::string& type_name) {
+  const int OH = (H + 2 * PH - KH) / SH + 1;
+  const int OW = (W + 2 * PW - KW) / SW + 1;
+  e.pipeline("extract_patches_2d_" + type_name);
+  e.in(x, 0); e.out(out, 1); e.bytes(H, 2); e.bytes(W, 3); e.bytes(C, 4);
+  e.bytes(OH, 5); e.bytes(OW, 6); e.bytes(KH, 7); e.bytes(KW, 8);
+  e.bytes(SH, 9); e.bytes(SW, 10); e.bytes(PH, 11); e.bytes(PW, 12);
+  e.dispatch(B * OH * OW, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_extract_patches_3d(
+    E& e, typename E::in_t x, typename E::out_t out,
+    int B, int T, int H, int W, int C, int KT, int KH, int KW,
+    int ST, int SH, int SW, int PT, int PH, int PW,
+    const std::string& type_name) {
+  const int OT = (T + 2 * PT - KT) / ST + 1;
+  const int OH = (H + 2 * PH - KH) / SH + 1;
+  const int OW = (W + 2 * PW - KW) / SW + 1;
+  e.pipeline("extract_patches_3d_" + type_name);
+  e.in(x, 0); e.out(out, 1); e.bytes(T, 2); e.bytes(H, 3); e.bytes(W, 4);
+  e.bytes(C, 5); e.bytes(OT, 6); e.bytes(OH, 7); e.bytes(OW, 8);
+  e.bytes(KT, 9); e.bytes(KH, 10); e.bytes(KW, 11);
+  e.bytes(ST, 12); e.bytes(SH, 13); e.bytes(SW, 14);
+  e.bytes(PT, 15); e.bytes(PH, 16); e.bytes(PW, 17);
+  e.dispatch(B * OT * OH * OW, 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_interpolate_position_2d(
+    E& e, typename E::in_t table, typename E::out_t out,
+    int IH, int IW, int OH, int OW, int C, int align_corners,
+    const std::string& type_name) {
+  e.pipeline("interpolate_position_2d_" + type_name);
+  e.in(table, 0); e.out(out, 1); e.bytes(IH, 2); e.bytes(IW, 3);
+  e.bytes(OH, 4); e.bytes(OW, 5); e.bytes(C, 6); e.bytes(align_corners, 7);
+  e.dispatch(OH * OW, 1, 1, tk_embed_threads(C), 1, 1);
+}
+template <class E>
+void launch_avg_pool2d_tokens(
+    E& e, typename E::in_t x, typename E::out_t out,
+    int B, int H, int W, int C, int KH, int KW, int SH, int SW, bool ceil_mode,
+    const std::string& type_name) {
+  const int OH = ceil_mode ? (H - KH + SH - 1) / SH + 1 : (H - KH) / SH + 1;
+  const int OW = ceil_mode ? (W - KW + SW - 1) / SW + 1 : (W - KW) / SW + 1;
+  e.pipeline("avg_pool2d_tokens_" + type_name);
+  e.in(x, 0); e.out(out, 1); e.bytes(H, 2); e.bytes(W, 3); e.bytes(C, 4);
+  e.bytes(OH, 5); e.bytes(OW, 6); e.bytes(KH, 7); e.bytes(KW, 8);
+  e.bytes(SH, 9); e.bytes(SW, 10);
+  e.dispatch(B * OH * OW, 1, 1, tk_embed_threads(C), 1, 1);
+}
+template <class E>
+void launch_factorized_position_2d(
+    E& e, typename E::in_t position_ids, typename E::in_t table,
+    typename E::in_t valid_mask, typename E::out_t out,
+    int B, int N, int P, int D, const std::string& type_name) {
+  e.pipeline("factorized_position_2d_" + type_name);
+  e.in(position_ids, 0); e.in(table, 1); e.in(valid_mask, 2); e.out(out, 3);
+  const int tokens = B * N;
+  e.bytes(tokens, 4); e.bytes(P, 5); e.bytes(D, 6);
+  const uint64_t total = static_cast<uint64_t>(tokens) * D;
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_pool_tokens_by_position(
+    E& e, typename E::in_t x, typename E::in_t position_ids,
+    typename E::in_t valid_mask, typename E::out_t out,
+    typename E::out_t out_mask, int B, int N, int D, int output_length,
+    int kernel_size, int source_width, const std::string& type_name) {
+  const int64_t output_values = static_cast<int64_t>(B) * output_length * D;
+  const int64_t output_tokens = static_cast<int64_t>(B) * output_length;
+  e.pipeline("pool_tokens_by_position_zero");
+  e.out(out, 0); e.out(out_mask, 1); e.bytes(output_values, 2); e.bytes(output_tokens, 3);
+  const int64_t zero_values = std::max(output_values, output_tokens);
+  e.dispatch(static_cast<int>((zero_values + 255) / 256), 1, 1, 256, 1, 1);
+
+  e.pipeline("pool_tokens_by_position_scatter_" + type_name);
+  e.in(x, 0); e.in(position_ids, 1); e.in(valid_mask, 2); e.out(out, 3); e.out(out_mask, 4);
+  e.bytes(B, 5); e.bytes(N, 6); e.bytes(D, 7); e.bytes(output_length, 8);
+  e.bytes(kernel_size, 9); e.bytes(source_width, 10);
+  const float scale = std::sqrt(static_cast<float>(D)) /
+                      static_cast<float>(kernel_size * kernel_size);
+  e.bytes(scale, 11);
+  const uint64_t total = static_cast<uint64_t>(B) * N * D;
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// ----- audio/sequence convolution. x is NWC; general weights O,K,C and
+// depthwise weights C,K. FP32 accumulate, input-dtype output. -----
+template <class E>
+void launch_audio_conv1d(
+    E& e, typename E::in_t x, typename E::in_t weight, typename E::in_t bias,
+    typename E::out_t out, int B, int T, int C, int OT, int O, int K,
+    int stride, int padding, int dilation, int has_bias,
+    const std::string& type_name) {
+  e.pipeline("audio_conv1d_" + type_name);
+  e.in(x, 0); e.in(weight, 1); e.in(bias, 2); e.out(out, 3);
+  e.bytes(T, 4); e.bytes(C, 5); e.bytes(OT, 6); e.bytes(O, 7); e.bytes(K, 8);
+  e.bytes(stride, 9); e.bytes(padding, 10); e.bytes(dilation, 11); e.bytes(has_bias, 12);
+  e.bytes(B, 13);
+  const uint64_t n = static_cast<uint64_t>(B) * OT * O;
+  e.dispatch(static_cast<int>((n + 255) / 256), 1, 1, 256, 1, 1);
+}
+template <class E>
+void launch_audio_depthwise_conv1d(
+    E& e, typename E::in_t x, typename E::in_t weight, typename E::in_t bias,
+    typename E::out_t out, int B, int T, int C, int OT, int K,
+    int stride, int padding, int dilation, int has_bias, int activation,
+    const std::string& type_name) {
+  e.pipeline("audio_depthwise_conv1d_" + type_name);
+  e.in(x, 0); e.in(weight, 1); e.in(bias, 2); e.out(out, 3);
+  e.bytes(T, 4); e.bytes(C, 5); e.bytes(OT, 6); e.bytes(K, 7); e.bytes(stride, 8);
+  e.bytes(padding, 9); e.bytes(dilation, 10); e.bytes(has_bias, 11); e.bytes(activation, 12);
+  e.bytes(B, 13);
+  const uint64_t n = static_cast<uint64_t>(B) * OT * C;
+  e.dispatch(static_cast<int>((n + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// ----- independent-length GQA cross attention. q/out (B,Hq,Tq,D),
+// k/v (B,Hkv,Tk,D), one simdgroup per query row. -----
+template <class E>
+void launch_cross_attention(
+    E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+    typename E::in_t key_lengths, typename E::in_t bias, typename E::out_t out,
+    int B, int Hq, int Tq, int Hkv, int Tk, int D, float scale, float softcap,
+    int has_bias, const std::string& type_name) {
+  e.pipeline("cross_attention_D" + std::to_string(D) + "_" + type_name);
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(key_lengths, 3); e.in(bias, 4); e.out(out, 5);
+  e.bytes(Tq, 6); e.bytes(Tk, 7); e.bytes(Hq, 8); e.bytes(Hkv, 9);
+  e.bytes(scale, 10); e.bytes(softcap, 11); e.bytes(has_bias, 12);
+  e.dispatch(Tq, Hq, B, 32, 1, 1);
+}
+
+// ----- blocked relative-position attention for Conformer/Gemma audio.
+// q/k/v/out are (B,T,H,D), relative_k is (P,H,D). -----
+template <class E>
+void launch_audio_relative_attention(
+    E& e, typename E::in_t q, typename E::in_t k, typename E::in_t v,
+    typename E::in_t relative_k, typename E::in_t per_dim_scale,
+    typename E::in_t lengths, typename E::out_t out,
+    int B, int T, int H, int D, int P, int chunk_size,
+    int left_context, int right_context, float q_scale, float k_scale,
+    float softcap, const std::string& type_name) {
+  e.pipeline("audio_relative_attention_D" + std::to_string(D) + "_" + type_name);
+  e.in(q, 0); e.in(k, 1); e.in(v, 2); e.in(relative_k, 3);
+  e.in(per_dim_scale, 4); e.in(lengths, 5); e.out(out, 6);
+  e.bytes(T, 7); e.bytes(H, 8); e.bytes(P, 9); e.bytes(chunk_size, 10);
+  e.bytes(left_context, 11); e.bytes(right_context, 12); e.bytes(q_scale, 13);
+  e.bytes(k_scale, 14); e.bytes(softcap, 15);
+  e.dispatch(T, H, B, 32, 1, 1);
 }
 
 // ----- Hadamard/FWHT over the final axis: x@0 -> out@1 ; scale@2 nrows@3. D in {64,128,256,512}.
@@ -2207,6 +2560,99 @@ void launch_paged_attention_fp8(E& e, typename E::in_t q, typename E::in_t key_c
   e.bytes(block_size, 6); e.bytes(block_table_stride, 7); e.bytes(scale, 8);
   e.bytes(num_heads, 9); e.bytes(num_kv_heads, 10);
   e.in(k_scale, 11); e.in(v_scale, 12); e.bytes(fmt, 13); e.bytes(window, 14);
+  e.dispatch(num_heads, batch, 1, 32, 1, 1);
+}
+
+// ----- QuixiCore Q8_0 KV ABI: int8 code planes (nb,bs,H,D) plus fp16 scale
+//       planes (nb,bs,H,D/32). -----
+template <class E>
+void launch_kv_cache_zero_q8_0(
+    E& e, typename E::out_t key_codes, typename E::out_t key_scales,
+    typename E::out_t value_codes, typename E::out_t value_scales,
+    uint64_t code_n, uint64_t scale_n) {
+  e.pipeline("kv_cache_zero_q8_0");
+  e.out(key_codes, 0); e.out(key_scales, 1); e.out(value_codes, 2); e.out(value_scales, 3);
+  e.bytes(code_n, 4); e.bytes(scale_n, 5);
+  constexpr int threads = 256;
+  const uint64_t n = code_n > scale_n ? code_n : scale_n;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_kv_cache_scatter_q8_0(
+    E& e, typename E::in_t key, typename E::in_t value, typename E::in_t slot_mapping,
+    typename E::out_t key_codes, typename E::out_t key_scales,
+    typename E::out_t value_codes, typename E::out_t value_scales,
+    int num_tokens, int num_heads, int head_size, int block_size,
+    const std::string& type_name) {
+  e.pipeline("kv_cache_scatter_q8_0_" + type_name);
+  e.in(key, 0); e.in(value, 1); e.in(slot_mapping, 2);
+  e.out(key_codes, 3); e.out(key_scales, 4); e.out(value_codes, 5); e.out(value_scales, 6);
+  e.bytes(num_heads, 7); e.bytes(head_size, 8); e.bytes(block_size, 9);
+  e.dispatch(head_size / 32, num_heads, num_tokens, 32, 1, 1);
+}
+
+template <class E>
+void launch_kv_cache_gather_q8_0(
+    E& e, typename E::in_t key_codes, typename E::in_t key_scales,
+    typename E::in_t value_codes, typename E::in_t value_scales,
+    typename E::out_t key_out, typename E::out_t value_out,
+    typename E::in_t block_table, typename E::in_t cu_seq_lens,
+    int num_tokens, int num_seqs, int block_size, int block_table_stride,
+    int num_heads, int head_size, const std::string& out_type_name) {
+  e.pipeline("kv_cache_gather_q8_0_" + out_type_name);
+  e.in(key_codes, 0); e.in(key_scales, 1); e.in(value_codes, 2); e.in(value_scales, 3);
+  e.out(key_out, 4); e.out(value_out, 5); e.in(block_table, 6); e.in(cu_seq_lens, 7);
+  e.bytes(num_tokens, 8); e.bytes(num_seqs, 9); e.bytes(block_size, 10);
+  e.bytes(block_table_stride, 11); e.bytes(num_heads, 12); e.bytes(head_size, 13);
+  e.dispatch(num_tokens, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_kv_cache_clone_q8_0(
+    E& e, typename E::in_t key_codes, typename E::in_t key_scales,
+    typename E::in_t value_codes, typename E::in_t value_scales,
+    typename E::out_t key_codes_out, typename E::out_t key_scales_out,
+    typename E::out_t value_codes_out, typename E::out_t value_scales_out,
+    uint64_t code_n, uint64_t scale_n) {
+  e.pipeline("kv_cache_clone_q8_0");
+  e.in(key_codes, 0); e.in(key_scales, 1); e.in(value_codes, 2); e.in(value_scales, 3);
+  e.out(key_codes_out, 4); e.out(key_scales_out, 5);
+  e.out(value_codes_out, 6); e.out(value_scales_out, 7);
+  e.bytes(code_n, 8); e.bytes(scale_n, 9);
+  constexpr int threads = 256;
+  const uint64_t n = code_n > scale_n ? code_n : scale_n;
+  e.dispatch(static_cast<int>((n + threads - 1) / threads), 1, 1, threads, 1, 1);
+}
+
+template <class E>
+void launch_kv_cache_copy_blocks_q8_0(
+    E& e, typename E::in_t key_codes, typename E::in_t key_scales,
+    typename E::in_t value_codes, typename E::in_t value_scales,
+    typename E::out_t key_codes_out, typename E::out_t key_scales_out,
+    typename E::out_t value_codes_out, typename E::out_t value_scales_out,
+    typename E::in_t block_mapping, int num_pairs, int codes_per_block,
+    int scales_per_block) {
+  e.pipeline("kv_cache_copy_blocks_q8_0");
+  e.in(key_codes, 0); e.in(key_scales, 1); e.in(value_codes, 2); e.in(value_scales, 3);
+  e.out(key_codes_out, 4); e.out(key_scales_out, 5);
+  e.out(value_codes_out, 6); e.out(value_scales_out, 7); e.in(block_mapping, 8);
+  e.bytes(codes_per_block, 9); e.bytes(scales_per_block, 10);
+  e.dispatch(num_pairs, 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_paged_attention_q8_0(
+    E& e, typename E::in_t q, typename E::in_t key_codes, typename E::in_t key_scales,
+    typename E::in_t value_codes, typename E::in_t value_scales,
+    typename E::in_t block_table, typename E::in_t context_lens, typename E::out_t out,
+    int batch, int num_heads, int num_kv_heads, int head_size, int block_size,
+    int block_table_stride, float scale, int window, const std::string& type_name) {
+  e.pipeline("paged_attention_q8_0_" + type_name + "_" + std::to_string(head_size));
+  e.in(q, 0); e.in(key_codes, 1); e.in(key_scales, 2);
+  e.in(value_codes, 3); e.in(value_scales, 4); e.in(block_table, 5); e.in(context_lens, 6);
+  e.out(out, 7); e.bytes(block_size, 8); e.bytes(block_table_stride, 9); e.bytes(scale, 10);
+  e.bytes(num_heads, 11); e.bytes(num_kv_heads, 12); e.bytes(window, 13);
   e.dispatch(num_heads, batch, 1, 32, 1, 1);
 }
 
@@ -3016,6 +3462,141 @@ void launch_qdequant_fp16(E& e, typename E::out_t w, typename E::in_t wq,
   e.dispatch(static_cast<int>((threads + 255) / 256), 1, 1, 256, 1, 1);
 }
 
+// ----- canonical BaseQN separate-plane contract. Codes are (N,K*bits/8) u8;
+// scales/biases are (N,K/group_size); X is (K,M). The same descriptor drives
+// MLX and PyTorch MPS, including symmetric no-bias tensors (bias buffer ignored).
+template <class E>
+void launch_base_qdequant(
+    E& e, typename E::out_t output, typename E::in_t codes,
+    typename E::in_t scales, typename E::in_t biases, int N, int K,
+    const BaseQDescriptor& descriptor, const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("dequant", type_name));
+  e.out(output, 0); e.in(codes, 1); e.in(scales, 2); e.in(biases, 3);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(N, 4); e.bytes(K, 5); e.bytes(descriptor.group_size, 6);
+  e.bytes(descriptor.bits, 7); e.bytes(scale_type, 8); e.bytes(symmetric, 9);
+  const long total = static_cast<long>(N) * K;
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+template <class E>
+void launch_base_qmatmul(
+    E& e, typename E::out_t output, typename E::in_t codes,
+    typename E::in_t scales, typename E::in_t biases, typename E::in_t x,
+    int N, int K, int M, const BaseQDescriptor& descriptor,
+    const std::string& type_name) {
+  e.pipeline(base_q_kernel_name(M == 1 ? "gemv" : "gemm", type_name));
+  e.out(output, 0); e.in(codes, 1); e.in(scales, 2); e.in(biases, 3); e.in(x, 4);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(N, 5); e.bytes(K, 6); e.bytes(M, 7);
+  e.bytes(descriptor.group_size, 8); e.bytes(descriptor.bits, 9);
+  e.bytes(scale_type, 10); e.bytes(symmetric, 11);
+  if (M == 1) {
+    e.dispatch(N, 1, 1, 32, 1, 1);
+  } else {
+    e.dispatch((M + 31) / 32, N, 1, 32, 1, 1);
+  }
+}
+
+template <class E>
+void launch_base_qgemv_qkv(
+    E& e, typename E::out_t q_output, typename E::out_t k_output,
+    typename E::out_t v_output, typename E::in_t q_codes,
+    typename E::in_t q_scales, typename E::in_t q_biases,
+    typename E::in_t k_codes, typename E::in_t k_scales,
+    typename E::in_t k_biases, typename E::in_t v_codes,
+    typename E::in_t v_scales, typename E::in_t v_biases,
+    typename E::in_t x, int q_rows, int k_rows, int v_rows, int K,
+    const BaseQDescriptor& descriptor, const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("gemv_qkv", type_name));
+  e.out(q_output, 0); e.out(k_output, 1); e.out(v_output, 2);
+  e.in(q_codes, 3); e.in(q_scales, 4); e.in(q_biases, 5);
+  e.in(k_codes, 6); e.in(k_scales, 7); e.in(k_biases, 8);
+  e.in(v_codes, 9); e.in(v_scales, 10); e.in(v_biases, 11); e.in(x, 12);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(q_rows, 13); e.bytes(k_rows, 14); e.bytes(v_rows, 15);
+  e.bytes(K, 16); e.bytes(descriptor.group_size, 17);
+  e.bytes(descriptor.bits, 18); e.bytes(scale_type, 19); e.bytes(symmetric, 20);
+  e.dispatch(q_rows + k_rows + v_rows, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_base_qgemv_swiglu(
+    E& e, typename E::out_t output, typename E::in_t gate_codes,
+    typename E::in_t gate_scales, typename E::in_t gate_biases,
+    typename E::in_t up_codes, typename E::in_t up_scales,
+    typename E::in_t up_biases, typename E::in_t x, int N, int K,
+    const BaseQDescriptor& descriptor, const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("gemv_swiglu", type_name));
+  e.out(output, 0);
+  e.in(gate_codes, 1); e.in(gate_scales, 2); e.in(gate_biases, 3);
+  e.in(up_codes, 4); e.in(up_scales, 5); e.in(up_biases, 6); e.in(x, 7);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(N, 8); e.bytes(K, 9); e.bytes(descriptor.group_size, 10);
+  e.bytes(descriptor.bits, 11); e.bytes(scale_type, 12); e.bytes(symmetric, 13);
+  e.dispatch(N, 1, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_base_qembedding(
+    E& e, typename E::out_t output, typename E::in_t codes,
+    typename E::in_t scales, typename E::in_t biases, typename E::in_t ids,
+    int rows, int columns, int tokens, const BaseQDescriptor& descriptor,
+    const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("embedding", type_name));
+  e.out(output, 0); e.in(codes, 1); e.in(scales, 2); e.in(biases, 3); e.in(ids, 4);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(rows, 5); e.bytes(columns, 6); e.bytes(tokens, 7);
+  e.bytes(descriptor.group_size, 8); e.bytes(descriptor.bits, 9);
+  e.bytes(scale_type, 10); e.bytes(symmetric, 11);
+  const long total = static_cast<long>(tokens) * columns;
+  e.dispatch(static_cast<int>((total + 255) / 256), 1, 1, 256, 1, 1);
+}
+
+// ----- canonical BaseQN grouped expert projections. Expert stacks add a
+// leading E dimension to the ordinary separate planes; expert_of_tile uses
+// the existing padded QuixiCore MoE schedule (one expert per 32-row tile).
+template <class E>
+void launch_base_qmoe_gemm(
+    E& e, typename E::out_t output, typename E::in_t input,
+    typename E::in_t codes, typename E::in_t scales,
+    typename E::in_t biases, typename E::in_t expert_of_tile,
+    int total_rows, int inner, int output_rows,
+    const BaseQDescriptor& descriptor, const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("moe_gemm", type_name));
+  e.out(output, 0); e.in(input, 1); e.in(codes, 2); e.in(scales, 3);
+  e.in(biases, 4); e.in(expert_of_tile, 5);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(total_rows, 6); e.bytes(inner, 7); e.bytes(output_rows, 8);
+  e.bytes(descriptor.group_size, 9); e.bytes(descriptor.bits, 10);
+  e.bytes(scale_type, 11); e.bytes(symmetric, 12);
+  e.dispatch(output_rows / 32, total_rows / 32, 1, 32, 1, 1);
+}
+
+template <class E>
+void launch_base_qmoe_swiglu(
+    E& e, typename E::out_t output, typename E::in_t input,
+    typename E::in_t codes, typename E::in_t scales,
+    typename E::in_t biases, typename E::in_t expert_of_tile,
+    int total_rows, int inner, int intermediate,
+    const BaseQDescriptor& descriptor, const std::string& type_name) {
+  e.pipeline(base_q_kernel_name("moe_swiglu", type_name));
+  e.out(output, 0); e.in(input, 1); e.in(codes, 2); e.in(scales, 3);
+  e.in(biases, 4); e.in(expert_of_tile, 5);
+  const int scale_type = base_q_scale_type_code(descriptor);
+  const int symmetric = descriptor.symmetric ? 1 : 0;
+  e.bytes(total_rows, 6); e.bytes(inner, 7); e.bytes(intermediate, 8);
+  e.bytes(descriptor.group_size, 9); e.bytes(descriptor.bits, 10);
+  e.bytes(scale_type, 11); e.bytes(symmetric, 12);
+  e.dispatch(intermediate / 32, total_rows / 32, 1, 128, 1, 1);
+}
+
 // ----- qgemv (quantized GEMV, batch-1 decode): D@0 Wq@1 X@2 ; N@3 K@4 (i32) ;
 //        grid (N,1,1), 32 threads (1 simdgroup) per output row. d = W @ x, x (K,1) half. -----
 template <class E>
@@ -3313,6 +3894,28 @@ void launch_prob_transform1(E& e, const std::string& kernel, typename E::in_t x,
   e.pipeline(kernel);
   e.in(x, 0); e.out(out, 1); e.bytes(V, 2); e.bytes(p0, 3);
   e.dispatch(rows, 1, 1, 32, 1, 1);
+}
+template <class E>
+void launch_logits_softcap(E& e, typename E::in_t x, typename E::out_t out,
+                           uint32_t n, float cap, const std::string& tn) {
+  e.pipeline("logits_softcap_" + tn);
+  e.in(x, 0); e.out(out, 1); e.bytes(n, 2); e.bytes(cap, 3);
+  constexpr int threads = 256;
+  const uint32_t nthreads = (n + 3) / 4;
+  e.dispatch(static_cast<int>((nthreads + threads - 1) / threads),
+             1, 1, threads, 1, 1);
+}
+template <class E>
+void launch_value_clip(E& e, typename E::in_t x, typename E::out_t out,
+                       uint32_t n, float min_value, float max_value,
+                       const std::string& tn) {
+  e.pipeline("value_clip_" + tn);
+  e.in(x, 0); e.out(out, 1); e.bytes(n, 2);
+  e.bytes(min_value, 3); e.bytes(max_value, 4);
+  constexpr int threads = 256;
+  const uint32_t nthreads = (n + 3) / 4;
+  e.dispatch(static_cast<int>((nthreads + threads - 1) / threads),
+             1, 1, threads, 1, 1);
 }
 template <class E>
 void launch_top_k_renorm(E& e, typename E::in_t x, typename E::out_t out, int rows, int V,

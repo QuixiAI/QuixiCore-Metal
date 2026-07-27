@@ -68,6 +68,43 @@ void EmbeddingLookup::eval_gpu(const std::vector<array>& inputs, std::vector<arr
                               use_pos_ ? 1 : 0, type_to_name(table));
 }
 
+array embedding_lookup_types(
+    const array& token_ids, const array& type_ids,
+    const array& token_table, const array& type_table,
+    float token_scale, StreamOrDevice s) {
+  if (token_ids.ndim() != 1 || type_ids.shape() != token_ids.shape()) {
+    throw std::invalid_argument("embedding_lookup_types: token_ids/type_ids must be equal 1-D arrays");
+  }
+  if (token_table.ndim() != 2 || type_table.ndim() != 2 ||
+      !emb_is_float(token_table.dtype()) || type_table.dtype() != token_table.dtype() ||
+      type_table.shape(1) != token_table.shape(1)) {
+    throw std::invalid_argument("embedding_lookup_types: tables must be same-dtype (vocab,D) float tensors");
+  }
+  const int n_tok = token_ids.shape(0), D = token_table.shape(1);
+  return array(
+      {n_tok, D}, token_table.dtype(),
+      std::make_shared<EmbeddingLookupTypes>(to_stream(s), token_scale),
+      {contiguous(astype(token_ids, int32, s), false, s),
+       contiguous(astype(type_ids, int32, s), false, s),
+       contiguous(token_table, false, s), contiguous(type_table, false, s)});
+}
+
+void EmbeddingLookupTypes::eval_cpu(const std::vector<array>&, std::vector<array>&) {
+  throw std::runtime_error("EmbeddingLookupTypes has no CPU implementation.");
+}
+void EmbeddingLookupTypes::eval_gpu(
+    const std::vector<array>& inputs, std::vector<array>& outputs) {
+  auto& token_ids = inputs[0]; auto& type_ids = inputs[1];
+  auto& token_table = inputs[2]; auto& type_table = inputs[3]; auto& out = outputs[0];
+  auto& s = stream(); auto& d = metal::device(s.device);
+  out.set_data(allocator::malloc_or_wait(out.nbytes()));
+  auto& ce = d.get_command_encoder(s.index); MLXEncoder enc(d, ce);
+  tk::launch_embedding_lookup_types(
+      enc, token_ids, type_ids, token_table, type_table, out,
+      token_table.shape(1), token_table.shape(0), type_table.shape(0),
+      token_ids.shape(0), token_scale_, type_to_name(token_table));
+}
+
 array embedding_backward(
     const array& token_ids,
     const array& dY,
@@ -244,6 +281,7 @@ void MergeMultimodalSpans::eval_gpu(const std::vector<array>& inputs, std::vecto
   }
 
 TK_EMB_NO_AUTODIFF(EmbeddingLookup, "EmbeddingLookup")
+TK_EMB_NO_AUTODIFF(EmbeddingLookupTypes, "EmbeddingLookupTypes")
 TK_EMB_NO_AUTODIFF(EmbeddingBackward, "EmbeddingBackward")
 TK_EMB_NO_AUTODIFF(EmbeddingBackwardSorted, "EmbeddingBackwardSorted")
 TK_EMB_NO_AUTODIFF(BuildMultimodalSrc, "BuildMultimodalSrc")
