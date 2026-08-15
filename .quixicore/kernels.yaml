@@ -102,6 +102,7 @@ families:
     status: implemented
     paths:
       - kernels/moe/moe
+      - kernels/moe/moe_mm_id
   sampling:
     status: implemented
     paths:
@@ -114,6 +115,11 @@ families:
       - kernels/serving/minference
       - kernels/serving/embedding
       - kernels/serving/mean_pool_rms_l2
+      - kernels/serving/dsv4_mhc
+      - kernels/serving/dsv4_router
+      - kernels/serving/moe_finalize
+      - kernels/serving/rms_norm
+      - kernels/serving/swiglu
   optimizers:
     status: implemented
     paths:
