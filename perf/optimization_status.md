@@ -41,64 +41,64 @@ re-reading their evidence, never by guessing.
 | date | entry | verdict | line |
 |---|---|---|---:|
 | 2026-07-01 | Baseline classification (2026-07-01, quick preset) | RECORDED | 104 |
-| 2026-07-01 | Pass 2 (2026-07-01, commits e00a76d..): structural rewrites | UNLABELED | 289 |
-| 2026-07-01 | Pass 3 (2026-07-01, mop-up): the five catalogued gaps | UNLABELED | 378 |
-| 2026-07-02 | Wave 3/4 — serving + training families | UNLABELED | 424 |
-| 2026-07-02 | Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips) | REJECTED | 524 |
-| 2026-07-02 | Wave-6 close-out | UNLABELED | 554 |
-| 2026-07-03 | Wave-7 close-out | UNLABELED | 589 |
-| 2026-07-03 | Wave-8 — optimization pass over the Wave-6/7 kernels | UNLABELED | 655 |
-| 2026-07-05 | Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs | MIXED | 699 |
-| 2026-07-05 | Wave-9 — gap port, kernel 2: attention softcap + sinks | UNLABELED | 747 |
-| 2026-07-05 | Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing | UNLABELED | 763 |
-| 2026-07-05 | Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE | UNLABELED | 780 |
-| 2026-07-05 | Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen | UNLABELED | 794 |
-| 2026-07-05 | Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention | UNLABELED | 814 |
-| 2026-07-05 | Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant | UNLABELED | 831 |
-| 2026-07-05 | Wave-9 — gap port, kernel 8: fused act->quant epilogues | UNLABELED | 843 |
-| 2026-07-05 | Wave-9 — gap port, kernel 9: the sampler zoo | UNLABELED | 862 |
-| 2026-07-05 | Wave-9 — gap port, kernel 10: MInference block-mask builder | UNLABELED | 882 |
-| 2026-07-05 | Wave-9 — gap port, kernel 11: TurboQuant KV codec | UNLABELED | 900 |
-| 2026-07-05 | Wave-9 — gap port, kernel 12: marginal layout/bit utilities | UNLABELED | 925 |
-| 2026-07-05 | Wave-9 — follow-up: selective_scan varlen_apc | UNLABELED | 947 |
-| 2026-07-05 | Wave-9 — optimization pass over the gap-port kernels | UNLABELED | 966 |
-| 2026-07-05 | Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion | UNLABELED | 1000 |
-| 2026-07-05 | Wave-10 K2: fp8 KV gather+upconvert + incremental scale update | UNLABELED | 1020 |
-| 2026-07-05 | Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache | UNLABELED | 1040 |
-| 2026-07-05 | Wave-10 K4: vLLM v1 ragged rejection samplers | UNLABELED | 1060 |
-| 2026-07-05 | Wave-10 K5: EAGLE spec-decode input-prep builders | UNLABELED | 1077 |
-| 2026-07-07 | BitNet training kernel port | KEPT | 1097 |
-| 2026-07-07 | BitNet remaining kernel parity port | KEPT | 1176 |
-| 2026-07-13 | Fused and specialized kernel integration pass | UNLABELED | 1227 |
-| 2026-07-13 | Packed embedding, decode, sparse projection, spatial, and cache-attention pass | CANDIDATE | 1288 |
-| 2026-07-13 | New-kernel second optimization pass | UNLABELED | 1455 |
-| 2026-07-13 | Cross-kernel follow-ups and optimization pass | UNLABELED | 1618 |
-| 2026-07-13 | NVFP4 inference decode and output-projection pass | KEPT | 1783 |
-| 2026-07-13 | MXFP4 inference coverage and hot-path pass | KEPT | 1941 |
-| 2026-07-14 | MXFP8 inference coverage completion | UNLABELED | 2079 |
-| 2026-07-14 | MXFP8 inference hot-path experiments | KEPT | 2177 |
-| 2026-07-14 | FP8 inference hot-path experiments | KEPT | 2323 |
-| 2026-07-14 | Cross-kernel FP8 transfer experiments | KEPT | 2495 |
-| 2026-07-22 | mean_pool_rms_l2 — new embedding-pooling serving kernel | UNLABELED | 2610 |
-| 2026-07-22 | qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV) | UNLABELED | 2639 |
-| 2026-07-22 | rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add) | UNLABELED | 2687 |
-| 2026-07-22 | qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store | UNLABELED | 2723 |
-| 2026-07-22 | attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV) | UNLABELED | 2757 |
-| 2026-07-23 | canonical BaseQN dequant, GEMV, and GEMM routing | KEPT | 2792 |
-| 2026-07-23 | BaseQN QKV and SwiGLU consumer fusion | KEPT | 2874 |
-| 2026-07-23 | BaseQN greedy LM-head routing | UNLABELED | 2955 |
-| 2026-07-23 | BaseQN grouped expert projection and SwiGLU | UNLABELED | 3030 |
-| 2026-07-23 | Positioned, partial, and multimodal RoPE | KEPT | 3109 |
-| 2026-07-23 | QuixiCore Q8_0 KV codec and direct paged read | UNLABELED | 3198 |
-| 2026-07-23 | Gated DeltaNet preparation/output and sigmoid attention gate | UNLABELED | 3301 |
-| 2026-07-23 | calibration reduction and final-logit softcap | KEPT | 3395 |
-| 2026-07-23 | fused low-rank adapter application and routing | UNLABELED | 3453 |
-| 2026-07-23 | BERT token/type embedding and masked normalized pooling | UNLABELED | 3499 |
-| 2026-07-24 | reusable vision patch, position, and pooling operations | UNLABELED | 3529 |
-| 2026-07-24 | audio convolution and cross-attention routes | UNLABELED | 3563 |
-| 2026-07-24 | strict BaseRT vision/audio contract audit | UNLABELED | 3617 |
-| 2026-07-24 | Qwen temporal patch and Gemma value-clip closure | UNLABELED | 3692 |
-| 2026-07-24 | explicit Qwen vision RoPE layout | UNLABELED | 3759 |
+| 2026-07-01 | Pass 2 (2026-07-01, commits e00a76d..): structural rewrites | UNLABELED | 291 |
+| 2026-07-01 | Pass 3 (2026-07-01, mop-up): the five catalogued gaps | UNLABELED | 380 |
+| 2026-07-02 | Wave 3/4 — serving + training families | UNLABELED | 426 |
+| 2026-07-02 | Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips) | REJECTED | 526 |
+| 2026-07-02 | Wave-6 close-out | UNLABELED | 556 |
+| 2026-07-03 | Wave-7 close-out | UNLABELED | 591 |
+| 2026-07-03 | Wave-8 — optimization pass over the Wave-6/7 kernels | UNLABELED | 657 |
+| 2026-07-05 | Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs | MIXED | 701 |
+| 2026-07-05 | Wave-9 — gap port, kernel 2: attention softcap + sinks | UNLABELED | 749 |
+| 2026-07-05 | Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing | UNLABELED | 765 |
+| 2026-07-05 | Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE | UNLABELED | 782 |
+| 2026-07-05 | Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen | UNLABELED | 796 |
+| 2026-07-05 | Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention | UNLABELED | 816 |
+| 2026-07-05 | Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant | UNLABELED | 833 |
+| 2026-07-05 | Wave-9 — gap port, kernel 8: fused act->quant epilogues | UNLABELED | 845 |
+| 2026-07-05 | Wave-9 — gap port, kernel 9: the sampler zoo | UNLABELED | 864 |
+| 2026-07-05 | Wave-9 — gap port, kernel 10: MInference block-mask builder | UNLABELED | 884 |
+| 2026-07-05 | Wave-9 — gap port, kernel 11: TurboQuant KV codec | UNLABELED | 902 |
+| 2026-07-05 | Wave-9 — gap port, kernel 12: marginal layout/bit utilities | UNLABELED | 927 |
+| 2026-07-05 | Wave-9 — follow-up: selective_scan varlen_apc | UNLABELED | 949 |
+| 2026-07-05 | Wave-9 — optimization pass over the gap-port kernels | UNLABELED | 968 |
+| 2026-07-05 | Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion | UNLABELED | 1002 |
+| 2026-07-05 | Wave-10 K2: fp8 KV gather+upconvert + incremental scale update | UNLABELED | 1022 |
+| 2026-07-05 | Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache | UNLABELED | 1042 |
+| 2026-07-05 | Wave-10 K4: vLLM v1 ragged rejection samplers | UNLABELED | 1062 |
+| 2026-07-05 | Wave-10 K5: EAGLE spec-decode input-prep builders | UNLABELED | 1079 |
+| 2026-07-07 | BitNet training kernel port | KEPT | 1099 |
+| 2026-07-07 | BitNet remaining kernel parity port | KEPT | 1178 |
+| 2026-07-13 | Fused and specialized kernel integration pass | UNLABELED | 1229 |
+| 2026-07-13 | Packed embedding, decode, sparse projection, spatial, and cache-attention pass | CANDIDATE | 1290 |
+| 2026-07-13 | New-kernel second optimization pass | UNLABELED | 1457 |
+| 2026-07-13 | Cross-kernel follow-ups and optimization pass | UNLABELED | 1620 |
+| 2026-07-13 | NVFP4 inference decode and output-projection pass | KEPT | 1785 |
+| 2026-07-13 | MXFP4 inference coverage and hot-path pass | KEPT | 1943 |
+| 2026-07-14 | MXFP8 inference coverage completion | UNLABELED | 2081 |
+| 2026-07-14 | MXFP8 inference hot-path experiments | KEPT | 2179 |
+| 2026-07-14 | FP8 inference hot-path experiments | KEPT | 2325 |
+| 2026-07-14 | Cross-kernel FP8 transfer experiments | KEPT | 2497 |
+| 2026-07-22 | mean_pool_rms_l2 — new embedding-pooling serving kernel | UNLABELED | 2612 |
+| 2026-07-22 | qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV) | UNLABELED | 2641 |
+| 2026-07-22 | rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add) | UNLABELED | 2689 |
+| 2026-07-22 | qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store | UNLABELED | 2725 |
+| 2026-07-22 | attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV) | UNLABELED | 2759 |
+| 2026-07-23 | canonical BaseQN dequant, GEMV, and GEMM routing | KEPT | 2794 |
+| 2026-07-23 | BaseQN QKV and SwiGLU consumer fusion | KEPT | 2876 |
+| 2026-07-23 | BaseQN greedy LM-head routing | UNLABELED | 2957 |
+| 2026-07-23 | BaseQN grouped expert projection and SwiGLU | UNLABELED | 3032 |
+| 2026-07-23 | Positioned, partial, and multimodal RoPE | KEPT | 3111 |
+| 2026-07-23 | QuixiCore Q8_0 KV codec and direct paged read | UNLABELED | 3200 |
+| 2026-07-23 | Gated DeltaNet preparation/output and sigmoid attention gate | UNLABELED | 3303 |
+| 2026-07-23 | calibration reduction and final-logit softcap | KEPT | 3397 |
+| 2026-07-23 | fused low-rank adapter application and routing | UNLABELED | 3455 |
+| 2026-07-23 | BERT token/type embedding and masked normalized pooling | UNLABELED | 3501 |
+| 2026-07-24 | reusable vision patch, position, and pooling operations | UNLABELED | 3531 |
+| 2026-07-24 | audio convolution and cross-attention routes | UNLABELED | 3565 |
+| 2026-07-24 | strict BaseRT vision/audio contract audit | UNLABELED | 3619 |
+| 2026-07-24 | Qwen temporal patch and Gemma value-clip closure | UNLABELED | 3694 |
+| 2026-07-24 | explicit Qwen vision RoPE layout | UNLABELED | 3761 |
 <!-- qx:index:end -->
 
 ## 2026-07-01: Baseline classification (2026-07-01, quick preset) — RECORDED
@@ -140,6 +140,8 @@ Speedup = best-baseline ms / tk ms (>1 means tk wins).
 | 12 | attn_fwd D=64 | 1×8×1024×64 | 0.238 | sdpa | 0.77 | D=64 tile geometry |
 | 13 | quantize_per_tensor_fp8 | 16384×1024 | 1.529 | (per_token: 0.274) | — | 33 GB/s; global atomic-max pass dominates |
 | 14 | flux gelu @1024³ | 1024³ | 0.348 | matmul+gelu | 0.65 | small-shape only (2048³ is 1.09) — low priority |
+
+> Superseded as a queue by perf/backlog.md (2026-08-15); kept as history.
 
 ### Serving decode re-measurement (supersedes the 2026-06 table)
 With pipelined timing at 8×32×2048×128: v1 1.837 ms, **staged 0.981 ms (1.80×
