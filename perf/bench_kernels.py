@@ -238,6 +238,12 @@ def _git_label():
 
 def _env_meta(backend_name):
     meta = {
+        # schema-1 run.json fields (umbrella docs/benchmarking.md)
+        "schema": SCHEMA_VERSION,
+        "repo": "QuixiAI/QuixiCore-Metal",
+        "contract": "v0.1",
+        "os": platform.system() + " " + platform.release(),
+        "arch": platform.machine(),
         "git": _git_label(),
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -266,7 +272,7 @@ def write_outputs(rows, meta, out_dir):
             f.write(json.dumps(r) + "\n")
     # summary table
     lines = ["# QuixiCore Metal kernel benchmarks", ""]
-    lines.append(f"- `{meta['git']}` · {meta.get('device','?')} · backend `{meta['backend']}` · "
+    lines.append(f"- `{meta['git']}` · {meta.get('device','?')} · backend `{meta['backend']}/{meta.get('framework','?')}` · "
                  f"preset `{meta['preset']}` · warmup/iters {meta['warmup']}/{meta['iters']}")
     lines.append("")
     lines.append("| kernel | variant | shape | tk ms | best baseline | base ms | speedup | GB/s | W-GB/s | GFLOP/s | rel err |")
@@ -5378,8 +5384,9 @@ def main():
         return 1
 
     meta = _env_meta(args.backend)
-    meta.update(backend=args.backend, preset=args.preset, warmup=args.warmup,
-                iters=args.iters, kernels=names, formats=formats)
+    meta.update(backend="metal", framework=args.backend, preset=args.preset,
+                warmup=args.warmup, iters=args.iters, kernels=names,
+                formats=formats)
 
     # Spin the GPU clocks up before any measurement (the first-timed case otherwise
     # reads 1.5-5x slow while the GPU ramps from idle frequency).
