@@ -8,7 +8,7 @@ Raw output belongs under `perf/results/`; stable conclusions belong here.
 Use this structure for every kernel family or optimization pass:
 
 ```text
-## YYYY-MM-DD: <kernel or pass name>
+## YYYY-MM-DD: <kernel or pass name> — VERDICT
 
 Status: not started | baselining | experimenting | candidate | landed | deferred.
 Current implementation:
@@ -27,976 +27,81 @@ Xcode/Metal toolchain version, integration path, command, git commit or
 working-tree label, dtype, shape, quant format, warmups, iterations, median,
 variance, correctness tolerance, and observed error.
 
-## 2026-07-13: MXFP4 inference coverage and hot-path pass
-
-Status: candidate; retained implementations have passed focused benchmarks,
-repository-wide correctness/parity validation, both backend builds, and the
-Xcode test build.
-
-Current implementation:
-
-- MXFP4 is available in fused decode epilogue/SwiGLU, LM-head
-  argmax/categorical/top-k/top-p sampling, packed-mask and CSR-candidate output
-  projection, and exact beam advance on MLX and PyTorch MPS.
-- QGEMV has an MXFP4 whole-block kernel: one lane consumes the 32 weights behind
-  one E8M0 scale instead of invoking four 8-value span decoders per block.
-- Decode/SwiGLU and LM-head sequential dots likewise consume complete 32-value
-  blocks. Decode and sparse projection keep scale/code products in fp32 where
-  their public contract requires one final rounding; the sampler preserves its
-  established half-rounded dequant contract.
-- `tk_e8m0_decode_f32` reconstructs E8M0 powers of two directly from IEEE-754
-  exponent bits, including the code-zero subnormal and code-255 infinity cases.
-  The float 8-value decoder used by packed embedding lookup and the retained
-  complete-block paths use it instead of a transcendental `exp2`.
-- Generic half fragment decode remains unchanged for QGEMM/QFlux. The
-  four-column MoE decoder also retains native half `exp2`; controlled variants
-  did not improve their full priority shape sets.
-
-Current public route:
-
-- Packed decode and LM-head operations dispatch directly to their MXFP4 Metal
-  instantiations. Beam advance uses row-wise no-logits fusion for at most four
-  rows and the existing packed QGEMM route above four rows when the vocabulary
-  is matrix-tile aligned.
-- MXFP4 QGEMV dispatches to the complete-block kernel. QGEMM, QFlux, and
-  quantized MoE retain their previous launch geometry and generic decoders.
-
-References inspected: the repository's existing MXFP4
-`{E8M0 scale, 16 packed E2M1 bytes}` contract, q4_0 complete-block kernels, and
-the preceding NVFP4 inference pass. No external implementation code was
-imported.
-
-Environment and method:
-
-- Hardware/toolchain: MacBook Pro Mac16,5, Apple M4 Max, 128 GB; macOS 26.5.1
-  (25F80); Xcode 26.6 (17F113); Metal 32023.883 / Metal toolchain 17.6.109.0;
-  Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1 MPS.
-- Working-tree label: `3cab797-dirty`.
-- Performance integration path: MLX Python extension, format `mxfp4`, fp16
-  QGEMV/QGEMM/QFlux/MoE and embedding inputs, and fp32 fused decode/LM-head
-  inputs. The harness performs its clock ramp and at least 50 ms of per-thunk
-  warmup, adaptively batches calls to at least 2 ms per sample, synchronizes
-  each sample, and reports per-call median, p20/p80, and CV.
-- All focused runs requested 10 warmups and 40 measured samples. The initial
-  and final commands were:
-
-```bash
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel qgemv,qgemm,qflux,moe_q --formats mxfp4 \
-  --warmup 10 --iters 40 \
-  --out-dir perf/results/2026-07-13/mxfp4-inference-baseline
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel qgemv,qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam,quantized_embedding \
-  --formats mxfp4 --warmup 10 --iters 40 \
-  --out-dir perf/results/2026-07-13/mxfp4-inference-final
-```
-
-Correctness and validation:
-
-- `scripts/build kernels` and `scripts/build pytorch_mps` passed.
-- `scripts/test correctness -q`: 2110 passed.
-- `scripts/test parity -q`: 420 passed, including MXFP4 decode, sampling,
-  top-p, sparse projection, and beam parity.
-- `scripts/test mps -q`: 472 passed.
-- `scripts/test xcode`: test build succeeded for the shared primitive target.
-- The final benchmark observed relative errors of `8.23e-7` and `8.94e-5`
-  for QGEMV, `2.32e-7` for decode epilogue, `2.07e-7` for SwiGLU, and zero
-  selected-id error for masked/candidate projection. Structured sampling and
-  beam outputs are covered by exact-id tests.
-
-Retained QGEMV results compare the original generic 8-value-span kernel with
-the final whole-block route. Times are milliseconds; brackets contain p20/p80,
-followed by CV.
-
-| Shape | Original | Final | Change | Final packed-weight GB/s |
-|---|---:|---:|---:|---:|
-| N4096 K4096 | 0.0331 [0.0325/0.0340], .0621 | 0.0269 [0.0261/0.0284], .0777 | -18.7% | 331 |
-| N11008 K4096 | 0.0786 [0.0775/0.0857], .0567 | 0.0539 [0.0515/0.0570], .0831 | -31.4% | 444 |
-
-The new fused-operation controls used the simplest correct generic MXFP4
-integration before complete-block specialization. Final values include the
-retained complete-block and E8M0 bit-reconstruction changes.
-
-| Path / shape | Generic control ms | Final ms [p20/p80], CV | Change | Error / check |
-|---|---:|---:|---:|---:|
-| Decode epilogue B1 K1536 N4096 | 0.0240 | 0.0191 [0.0187/0.0195], .0736 | -20.4% | 2.32e-7 rel |
-| Decode SwiGLU B1 K1536 N4096 | 0.0373 | 0.0292 [0.0279/0.0341], .1261 | -21.9% | 2.07e-7 rel |
-| LM-head top-k T1 V32000 K4096 | 0.5141 | 0.2754 [0.2722/0.2807], .0348 | -46.4% | exact selected ids |
-| LM-head top-k T8 V32000 K4096 | 2.1984 | 1.2691 [1.2586/1.2952], .0198 | -42.3% | exact selected ids |
-| Masked T1 V8192 K1024 legal256 | 0.0834 | 0.0313 [0.0303/0.0340], .0969 | -62.4% | exact ids/log-probs |
-| Masked T8 V8192 K1024 legal64 | 0.0564 | 0.0429 [0.0398/0.0462], .0946 | -24.0% | exact ids/log-probs |
-| Candidates T1 V8192 K1024 C256 | 0.0574 | 0.0366 [0.0356/0.0379], .0901 | -36.3% | exact ids/log-probs |
-| Candidates T8 V8192 K1024 C64 | 0.0185 | 0.0162 [0.0160/0.0169], .1085 | -12.3% | exact ids/log-probs |
-| Beam B1 BM4 V32000 K4096 | 1.2039 | 0.7713 [0.7674/0.7852], .0215 | -35.9% | exact token/parent |
-| Beam B4 BM4 V32000 K4096 | 0.9835 | 0.9739 [0.9655/0.9906], .0162 | flat | exact token/parent |
-
-Controlled experiments and decisions:
-
-| Factor | Priority control | Candidate / repeat | Decision |
-|---|---:|---:|---|
-| Packed embedding E8M0 `exp2` -> bit reconstruction, T1/T256 R8192 D1024 | 0.01169 / 0.02205 ms | 0.00959 / 0.02182 ms | Keep; T1 improves 17.9%, T256 is flat, outputs exact. Candidate p20/p80 were 0.00934/0.01032 and 0.02112/0.02263 ms. |
-| LM-head generic spans -> whole 32-value block, top-k T1/T8 | 0.5141 / 2.1984 ms | 0.3558 / 1.2619 ms | Keep; 30.8% / 42.6%. |
-| E8M0 bit reconstruction after whole-block LM-head, top-k T1/T8 | 0.3558 / 1.2619 ms | 0.2618 / 1.2811 ms | Keep for decode-priority T1 and shared paths; T8 movement is within the central bands. |
-| MXFP4 row-fragment specialization, QGEMM M32/M128/M512 | 0.0998 / 0.3611 / 1.3302 ms | first 0.1058 / 0.3524 / 1.3102; repeat 0.1207 / 0.3588 / 1.3193 ms | Reject; M32 regressed and larger shapes were below the 3% keep threshold. Generic compiler CSE already amortizes the scale. |
-| Same row fragment, QFlux M128 | 0.3540 ms | 0.3557; repeat 0.3680 ms | Reject and restore generic decoder. |
-| Bit reconstruction in generic MMA decoder, QGEMM M32/M128/M512 | 0.0999 / 0.3527 / 1.2935 ms | 0.0976 / 0.3531 / 1.3034 ms | Reject; mixed/noisy and M512 regressed. Restore native half `exp2`. |
-| Bit reconstruction in four-column MoE decoder, rect rows32 / SwiGLU rows512 | 0.1089 / 1.9034 ms | repeat 0.1433 / 1.7532 ms | Reject global change: the 7.9% large-SwiGLU win does not justify the repeatable 31.6% decode-shape regression. Restore native half `exp2`. |
-
-Decision: keep the new MXFP4 inference coverage, complete-block QGEMV and
-sequential fused decoders, and exact E8M0 reconstruction in fp32 span/complete-
-block paths. Reject row-fragment specialization and generic MMA/MoE E8M0 bit
-reconstruction. Matrix and MoE paths remain intentionally unchanged.
-
-Open questions: a future matrix-path pass needs a genuinely different MXFP4
-execution strategy rather than more fragment temporaries. The large-row MoE
-SwiGLU bit-decoder result may justify a separately routed prefill kernel only
-if a shape-aware implementation can preserve the small-row decode path.
-
-Raw results:
-
-- Baseline/control/final: `mxfp4-inference-baseline`,
-  `mxfp4-coverage-generic`, and `mxfp4-inference-final` under
-  `perf/results/2026-07-13/`.
-- Retained variants: `mxfp4-coverage-whole-block`,
-  `mxfp4-decode-whole-block-repeat`, `mxfp4-coverage-e8m0-bits`,
-  `mxfp4-e8m0-bits`, `mxfp4-e8m0-bits-repeat`,
-  `mxfp4-embedding-e8m0-bits`, and `mxfp4-embedding-exp2`.
-- Rejected variants: `mxfp4-hotpaths-candidate`,
-  `mxfp4-row-fragment-repeat`, `mxfp4-pre-e8m0-bits`, and
-  `mxfp4-moe-column-exp2-restored`.
-
-## 2026-07-13: NVFP4 inference decode and output-projection pass
-
-Status: landed; retained implementations have passed focused performance and
-repository-wide correctness/parity validation.
-
-Current implementation:
-
-- `dequant_into_register` uses an NVFP4-specific row-fragment decoder for the
-  `{c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}` register layout. It reads the two E4M3
-  scales and four packed bytes needed by the fragment once, preserving the
-  established half-rounded tile contract.
-- `dequant_into_register_col` uses an NVFP4 two-block decoder for the
-  `{c,c+8,c+16,c+24}` column fragment used by rectangular MoE kernels.
-- Fused decode epilogue and SwiGLU kernels consume a complete 16-value NVFP4
-  block per lane. Their decoder keeps scale/code products in fp32 to match the
-  public one-final-rounding contract.
-- Quantized LM-head sampling uses a whole-block half-rounded decoder, while
-  masked and CSR-candidate projection use a whole-block fp32 decoder. NVFP4 is
-  exposed for argmax/categorical/top-k/top-p sampling, masked/candidate output
-  projection, and exact beam advance in MLX and PyTorch MPS.
-- The MLX CMake target now tracks every `include/metal/*.metal` file as a
-  metallib dependency. This prevents header-only decoder changes from leaving
-  a stale incremental-build metallib, which was observed during this pass.
-
-Current public route:
-
-- QGEMM/QFlux keep their existing direct launch geometry and use the new
-  row-fragment decoder. Rectangular MoE keeps four warps and uses the new
-  column-fragment decoder.
-- Decode epilogue/SwiGLU and sequential LM-head row dots use complete-block
-  NVFP4 decode.
-- Beam advance keeps row-wise no-logits fusion for at most four rows and routes
-  larger row batches through packed QGEMM, matching the existing q4_0 policy.
-
-References inspected: existing repository q4_0 whole-block decoders and the
-local NVFP4 `{E4M3 scale, 8 packed E2M1 bytes}` format contract. No external
-implementation code was imported.
-
-Correctness:
-
-- Hardware/toolchain: MacBook Pro (Mac16,5), Apple M4 Max, 128 GB; macOS 26.5.1
-  (25F80); Xcode 26.6 (17F113); Metal 32023.883; Python 3.12.9; MLX 0.21.1.
-- Working-tree label: `c880769-dirty`.
-- QGEMM/QFlux focused suite: 174 passed after the row-fragment change.
-- Quantized MoE focused suite: 18 passed for each tested warp topology and the
-  retained column decoder.
-- `pytest tests/correctness/matmul/decode_linear/test_decode_linear.py -q`:
-  47 passed.
-- `pytest tests/correctness/quantization/lm_head/test_lm_head.py -q`:
-  90 passed before beam coverage was added; subsequent NVFP4 sampling, sparse,
-  and beam subsets passed 9, 1, and 4 cases respectively.
-- Final builds: `scripts/build kernels` and `scripts/build pytorch_mps` passed.
-  Touching `dequant.metal` then rerunning the incremental MLX build emitted
-  `Building mlx_ext.metallib`, validating the new header dependency tracking.
-- Final suites: `scripts/test correctness -q` passed 2085 tests;
-  `scripts/test parity -q` passed 412; `scripts/test mps -q` passed 472.
-- Final benchmark reference errors were `2.29e-7` relative for decode epilogue,
-  `2.39e-7` for SwiGLU, and zero selected-id error for masked/candidate paths.
-
-Focused commands (MLX integration path, `--warmup 10 --iters 40`):
-
-```bash
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel qgemm,qflux,moe_q --formats nvfp4 --warmup 10 --iters 40 \
-  --out-dir perf/results/2026-07-13/nvfp4-experiments-baseline
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel decode_linear_epilogue,decode_swiglu --formats nvfp4 \
-  --warmup 10 --iters 40 --out-dir <variant-directory>
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
-  --formats nvfp4 --warmup 10 --iters 40 --out-dir <variant-directory>
-.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
-  --kernel qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
-  --formats nvfp4 --warmup 10 --iters 40 \
-  --out-dir perf/results/2026-07-13/nvfp4-experiments-final
-```
-
-Fragment decoder results (median milliseconds; brackets are p20/p80, followed
-by coefficient of variation):
-
-| Path / shape | Baseline | Candidate | Change | Decision |
-|---|---:|---:|---:|---|
-| QGEMM N4096 K4096 M32 | 0.1291 [0.1235/0.1398], CV .1009 | 0.1151 [0.1132/0.1234], CV .0758 | -10.9% | keep row decoder |
-| QGEMM N4096 K4096 M128 | 0.4307 [0.4160/0.4566], CV .0495 | 0.3745 [0.3623/0.4050], CV .0577 | -13.1% | keep row decoder |
-| QGEMM N4096 K4096 M512 | 1.5207 [1.4695/1.5748], CV .0374 | 1.3976 [1.3577/1.4745], CV .0412 | -8.1% | keep row decoder |
-| QFlux N4096 K4096 M128 | 0.4050 [0.3951/0.4333], CV .0600 | 0.3686 [0.3619/0.3950], CV .0545 | -9.0% | keep row decoder |
-| MoE E4 K2880 N2880 rows32 | 0.1782 [0.1584/0.2629], CV .2714 | 0.1779 [0.1554/0.2601], CV .3496 | flat | keep for larger shape |
-| MoE E4 K2880 N2880 rows512 | 0.8255 [0.7734/0.8970], CV .0680 | 0.7269 [0.7096/0.8144], CV .0672 | -11.9% | keep column decoder |
-
-Whole-block fused results compare the un-specialized generic NVFP4 integration
-against the complete-block decoder:
-
-| Path / shape | Generic median ms | Whole-block median ms | Change | Candidate p20/p80, CV | Decision |
-|---|---:|---:|---:|---:|---|
-| Decode epilogue B1 K1536 N4096 | 0.0752 | 0.0223 | -70.3% | 0.0194/0.0277, .7636 | keep; repeat 0.0170 ms |
-| Decode SwiGLU B1 K1536 N4096 | 0.1589 | 0.0244 | -84.6% | 0.0238/0.0257, .2510 | keep; repeat 0.0300 ms |
-| LM-head top-k T1 V32000 K4096 | 0.4008 | 0.2967 | -26.0% | 0.2867/0.3211, .0999 | keep; repeat 0.2926 ms |
-| LM-head top-k T8 V32000 K4096 | 1.4058 | 1.3460 | -4.2% | 1.3157/1.4519, .0528 | keep; repeat 1.3486 ms |
-| Masked T1 V8192 K1024 legal256 | 0.1051 | 0.0406 | -61.4% | 0.0379/0.0512, .2151 | keep; repeat 0.0457 ms |
-| Masked T8 V8192 K1024 legal64 | 0.0569 | 0.0425 | -25.4% | 0.0414/0.0498, .2100 | keep; repeat 0.0425 ms |
-| Candidates T1 V8192 K1024 C256 | 0.0778 | 0.0400 | -48.6% | 0.0389/0.0443, .0988 | keep; repeat 0.0404 ms |
-| Candidates T8 V8192 K1024 C64 | 0.0327 | 0.0169 | -48.5% | 0.0163/0.0213, .2786 | keep; repeat 0.0164 ms |
-| Beam B1 BM4 V32000 K4096 | 0.8477 | 0.8152 | -3.8% | 0.8065/0.8289, .0284 | keep shared decoder |
-| Beam B4 BM4 V32000 K4096 | 0.9823 | 0.9831 | flat | 0.9714/1.0088, .0221 | keep QGEMM route |
-
-Final retained run medians were 0.1121/0.3582/1.3264 ms for QGEMM M32/M128/M512,
-0.3581 ms for QFlux M128, 0.1360/0.6980 ms for MoE rows32/rows512,
-0.0187/0.0246 ms for decode epilogue/SwiGLU, 0.2854/1.3310 ms for LM-head
-top-k T1/T8, 0.0329/0.0422 ms for masked T1/T8, 0.0346/0.0163 ms for
-candidate T1/T8, and 0.8216/0.9794 ms for beam B1/B4. Per-case p20/p80,
-CV, bandwidth, and baseline data are in the final JSONL.
-
-Rejected experiments:
-
-- Two-warp, 64-row decoded-weight reuse: M128 was 0.3686 versus 0.3602 ms
-  direct (+2.3%); M512 was 1.3667 versus 1.3630 ms (flat). Reject the extra
-  barriers and routing.
-- Four-warp, 128-row decoded-weight reuse: repeat medians were 0.3589 versus
-  0.3643 ms direct at M128 and 1.3566 versus 1.3692 ms at M512 (only 1.5% and
-  0.9%). It still trails resident fp16 matmul and does not justify a second
-  pipeline or synchronization cost. Reject.
-- Rectangular MoE at two warps: rows32 improved only 1.7% (0.1748 versus
-  0.1779 ms) while rows512 was flat/slightly worse (0.7281 versus 0.7269 ms).
-  One warp regressed rows32 to 0.3136 ms and rows512 to 0.7347 ms. Keep four.
-- Forcing 16 NVFP4 beam rows through serial row fusion regressed 0.9831 to
-  2.6393 ms. Keep the packed-QGEMM route above four rows.
-
-Decision: keep both fragment decoders, all three whole-block decoder uses, and
-the new NVFP4 fused inference coverage. Reject decoded-weight sharing, reduced
-MoE warp counts, and the larger-row beam routing change. The main remaining
-QGEMM opportunity is a different matrix execution strategy; small launch or
-barrier variations did not pay for their complexity.
-
-Open questions: profile instruction mix/register pressure for the complete-block
-decode at larger hidden sizes; revisit T8 LM-head sampling only with a design
-that shares packed weights across rows without materializing logits.
-
-Raw results:
-
-- Baseline/fragment runs: `nvfp4-experiments-baseline`,
-  `nvfp4-experiments-row-fragment`, `nvfp4-experiments-column-fragment`.
-- Rejected launch runs: `nvfp4-experiments-reuse-m64-controlled`,
-  `nvfp4-experiments-reuse-m128-controlled`,
-  `nvfp4-experiments-reuse-m128-repeat`, `nvfp4-experiments-moe-w1`,
-  `nvfp4-experiments-moe-w2`, `nvfp4-experiments-lm-head-beam-force-row`.
-- Fused decoder runs: `nvfp4-experiments-decode-generic`,
-  `nvfp4-experiments-decode-whole-block`,
-  `nvfp4-experiments-decode-whole-block-repeat`,
-  `nvfp4-experiments-lm-head-generic`,
-  `nvfp4-experiments-lm-head-whole-block`,
-  `nvfp4-experiments-lm-head-whole-block-repeat`,
-  `nvfp4-experiments-lm-head-sparse-generic`,
-  `nvfp4-experiments-lm-head-sparse-whole-block`,
-  `nvfp4-experiments-lm-head-sparse-whole-block-repeat`,
-  `nvfp4-experiments-lm-head-beam-generic`, and
-  `nvfp4-experiments-lm-head-beam-whole-block`.
-- Final retained run: `perf/results/2026-07-13/nvfp4-experiments-final/`.
-
-## 2026-07-07: BitNet remaining kernel parity port
-
-Status: landed as parity/coverage; no performance claim.
-
-Current implementation: ported the remaining first-party BitNet Metal kernels that were absent
-from QuixiCore Metal: `attn_decode`, `fake_quant_fp8`, `kd_kl_dense`, `qgemm_bwd`,
-`qgemm_w2a8_fused`, `quantize_tq2_0`, `ternary_stats`, and `gemm_v3`. Also added
-`tq2_0` dequant/GEMM/GEMV/MoE format support, `qgemv_w2a8_v2`, dynamic-width `rms_norm`,
-and MoE backward helpers.
-
-Current public route: MLX and PyTorch MPS bindings expose the new kernels through `tk` and
-`tk_torch`; manifests include the new paths and `tq2_0` format metadata.
-
-References inspected:
-- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/torch_kernels.mm`
-- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/__init__.py`
-- `/Users/eric/BitNet/bitnet_train/metal/kernels/`
-
-Correctness:
-- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Metal 32023.883,
-  Python 3.12.9.
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
-  passed.
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build pytorch_mps`
-  passed.
-- `PYTHONPATH=/Users/eric/QuixiCore/QuixiCore-Metal/bindings/pytorch_mps
-  /Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python -c 'import tk_torch; ...'`
-  compiled/imported the PyTorch metallib and ObjC++ extension; all checked new symbols were present.
-- Targeted correctness command:
-  `.venv/bin/python -m pytest -q tests/correctness/quantization/quantize_tq2_0
-  tests/correctness/quantization/ternary_stats tests/correctness/utils/kd_kl_dense
-  tests/correctness/attention/attn_decode tests/correctness/quantization/qgemv_int/test_qgemv_int.py`
-  passed: 14 passed.
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test mps -q`
-  passed: 452 passed.
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test python -q`
-  passed: 44 passed.
-- Direct PyTorch MPS smoke checked `quantize_tq2_0`, dense KD-KL fwd/bwd, and `attn_decode`
-  against CPU references; passed.
-
-Baseline: not run for this parity port.
-
-Experiments: none. This was a source/API parity port, not a focused optimization pass.
-
-Decision: keep the ported kernels as coverage and interoperability surface. The previous
-performance decision for `qgemm_bwd` and `gemm_v3` still stands: do not present them as Metal
-speedups without a new focused benchmark showing a win on priority shapes.
-
-Open questions: run a focused benchmark before any future speedup claim or routing preference
-change for these kernels.
-
-## 2026-07-07: BitNet training kernel port
-
-Status: landed.
-
-Current implementation: ported the production BitNet training kernels that were missing from
-QuixiCore Metal:
-`weight_quant_ternary` / `weight_quant_ternary_pt`, `fake_quant_int8`,
-`silu_mul_fake_quant_int8`, `kd_kl_topk_fwd` / `kd_kl_topk_bwd`, and `adamw_masked`.
-Added MLX primitives, PyTorch MPS wrappers, Metal source registration, manifest paths,
-correctness tests, MPS tests, and benchmark cases.
-
-Current public route: `tk.weight_quant_ternary`, `tk.weight_quant_ternary_pt`,
-`tk.fake_quant_int8`, `tk.silu_mul_fake_quant_int8`, `tk.kd_kl_topk_fwd`,
-`tk.kd_kl_topk_bwd`, and `tk.adamw_masked`; all auto-route to MLX or `tk_torch`
-based on tensor type.
-
-References inspected:
-- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/weight_quant_ternary.metal`
-- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/fake_quant.metal`
-- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/kd_kl_topk.metal`
-- `/Users/eric/BitNet/bitnet_train/metal/kernels/optimizers/optim/adamw.metal`
-- `/Users/eric/BitNet/bitnet_train/metal/perf/bitnet_training_kernels.md`
-- Rejected after inspection: `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/qgemm_bwd.metal`
-  and `/Users/eric/BitNet/bitnet_train/metal/kernels/matmul/gemm_v3/gemm_v3.metal`.
-  BitNet's notebook records `qgemm_bwd` losing to `torch.matmul` on every measured shape and
-  `gemm_v3` reaching 94-99% of MPS without beating it, so neither is a QuixiCore win to expose.
-
-Correctness:
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
-  passed.
-- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test correctness -q
-  tests/correctness/quantization/weight_quant_ternary
-  tests/correctness/quantization/fake_quant tests/correctness/utils/kd_kl_topk
-  tests/correctness/optimizers/optim/test_adamw.py` ran the correctness suite and passed:
-  1420 passed, 27 skipped.
-- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/build pytorch_mps` passed.
-- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/test mps -q` passed:
-  452 passed.
-
-Focused perf run:
-- Integration path: MLX Python extension.
-- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Xcode 26.6
-  (17F113), Metal 32023.883, Python 3.12.9, MLX 0.21.1.
-- Working-tree label: `e484dc7-dirty`.
-- Command: `/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python perf/bench_kernels.py
-  --backend mlx --preset quick --kernel fake_quant,weight_quant_ternary,kd_kl_topk,adamw_masked
-  --warmup 5 --iters 20 --out-dir perf/results/2026-07-07/bitnet-port-quick`
-- Raw results: `perf/results/2026-07-07/bitnet-port-quick/`.
-
-| kernel | dtype/path | shape | median ms | p20/p80 ms | CV | baseline | speedup | rel err | decision |
-|---|---|---:|---:|---:|---:|---|---:|---:|---|
-| fake_quant plain | bf16 MLX | T512 D2880 | 0.0200 | 0.0195/0.0216 | 0.5619 | quantize_then_dequant 0.0438 | 2.19 | 6.45e-03 | keep |
-| fake_quant swiglu | bf16 MLX | T512 D2880 | 0.0320 | 0.0304/0.0415 | 0.3738 | swiglu_then_quant_dequant 0.0631 | 1.97 | 3.46e-03 | keep |
-| fake_quant plain | bf16 MLX | T4096 D2880 | 0.1383 | 0.1351/0.1953 | 0.5535 | quantize_then_dequant 0.3286 | 2.38 | 5.95e-03 | keep |
-| fake_quant swiglu | bf16 MLX | T4096 D2880 | 0.2851 | 0.2766/0.3211 | 0.2518 | swiglu_then_quant_dequant 0.5296 | 1.86 | 3.39e-03 | keep |
-| weight_quant_ternary | bf16 MLX | N512 K2880 G32 | 0.0443 | 0.0441/0.0452 | 0.1691 | framework_deq_only 0.1323 | 2.99 | 2.88e-03 | keep |
-| weight_quant_ternary | bf16 MLX | N4096 K2880 G32 | 0.2877 | 0.2855/0.2943 | 0.1763 | framework_deq_only 0.9898 | 3.44 | 3.48e-03 | keep |
-| weight_quant_ternary_pt | bf16 MLX | E2 N512 K2880 | 0.0805 | 0.0793/0.0886 | 0.2181 | framework_deq_only 0.2986 | 3.71 | 2.30e-03 | keep |
-| kd_kl_topk tail0 | f32 MLX | T256 V32000 K32 | 0.5136 | 0.5023/0.5583 | 0.0539 | none | n/a | 1.66e-07 | keep |
-| kd_kl_topk tail1 | f32 MLX | T256 V32000 K32 | 0.4775 | 0.4701/0.4949 | 0.0584 | none | n/a | 8.30e-08 | keep |
-| kd_kl_topk tail0 | f32 MLX | T1024 V32000 K32 | 0.7561 | 0.7454/0.7716 | 0.2550 | none | n/a | 1.28e-07 | keep |
-| kd_kl_topk tail1 | f32 MLX | T1024 V32000 K32 | 0.7493 | 0.7386/0.7636 | 0.2480 | none | n/a | 6.38e-08 | keep |
-| adamw_masked mode0 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3177 | 0.3141/0.3283 | 0.3174 | unmasked_adamw 0.2981 | 0.94 | 5.38e-08 | keep as semantic path |
-| adamw_masked mode1 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3435 | 0.3385/0.3496 | 0.1060 | unmasked_adamw 0.2914 | 0.85 | 5.38e-08 | keep as semantic path |
-| adamw_masked mode0 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.2584 | 1.1901/1.6126 | 0.1472 | unmasked_adamw 1.1074 | 0.88 | 5.33e-08 | keep as semantic path |
-| adamw_masked mode1 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.0982 | 1.0900/1.1216 | 0.1075 | unmasked_adamw 1.1169 | 1.02 | 5.32e-08 | keep as semantic path |
-
-Decision: keep the production BitNet kernels. `fake_quant*` and `weight_quant_ternary*`
-are clear wins over decomposed framework paths. `kd_kl_topk` has no useful decomposed baseline
-because its value is avoiding dense teacher materialization, but the sparse fwd+bwd path passed
-dense-reference checks and is fast enough for the intended training route. `adamw_masked` is
-not a speedup over unmasked AdamW and should not be marketed as one; it is kept for the segment
-mask semantics. Reject `qgemm_bwd` and `gemm_v3` for this port because the source project's own
-measurements do not show a Metal win.
-
-Open questions: add a future dense-teacher KD baseline if a training harness exposes the exact
-end-to-end loss path; revisit `adamw_masked` only if segment sparsity is high enough to justify
-a compacted-index variant.
-
-## Wave-10 K5: EAGLE spec-decode input-prep builders (2026-07-05)
-
-Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with
-EAGLE's draft-input plumbing (zero prior TM coverage): eagle_prepare_inputs_padded (rejected =
-num_draft>0 ? num_draft+1-valid : 0; token_indices_to_sample, num_rejected),
-eagle_prepare_next_token_padded (next seed = last valid sampled or backup),
-eagle_step_slot_mapping_metadata (new_pos = min(pos+1, max_len); block-table -> paged slot;
-advance seq_lens; pad beyond the real batch), eagle_expand_int32 (broadcast a per-request scalar
-across its ragged token span with a replace substitution). Integer, one thread/request; TM int32;
-cu_* (B+1,) leading-0. One EagleMeta primitive (kind selector). Completes TM's spec-decode
-surface (verify + rejection + EAGLE prep).
-
-- Tests: each builder vs a direct python transcription (exact int32, incl. padded input_batch
-  and exceed-max-len paths); 5 green + parity atol=0. Overhead-bound integer kernels — no bench.
-- Deferred (documented): copy_and_expand_eagle_inputs (the full padded-batch layout builder) —
-  the four builders above cover the metadata a draft step needs.
-
-Wave-10 COMPLETE: K1 norm->quant matrix, K2 fp8 KV gather+scale-update, K3 DeepSeek indexer,
-K4 rejection samplers, K5 EAGLE prep. All credited to AlpinDale / metal-forge.
-
-## Wave-10 K4: vLLM v1 ragged rejection samplers (2026-07-05)
-
-Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with the
-vLLM v1 ragged rejection pipeline TM's dense spec_verify_linear didn't cover:
-rejection_greedy_sample (argmax-match verify, no probs — no prior TM analogue),
-rejection_random_sample (stochastic u <= p_target/q_draft, recovered token a precomputed input),
-sample_recovered_tokens (argmax of max(0, p_t - q_d) * inv_q via a 32-lane simd reduction with
-smaller-id tie-break). Variable drafts/request via cu_num_draft_tokens (B+1,) with a leading 0;
-TM int32 ids; external-noise buffers (uniform_probs, inv_q) match the vLLM contract (host-
-generated, seed-reproducible). Output (B, max_draft+1) cleared to -1. One RejectionSampler
-primitive (kind selector). is_greedy per-request gate; no_draft_probs -> q=1.
-
-- Tests: each kernel vs a direct python transcription of the reference loop (exact int ids),
-  incl. the two-kernel pipeline (sample_recovered -> rejection_random); 6 green + parity atol=0.
-- Overhead-bound integer kernels (like the existing spec_verify_* / build_dynamic_tree) — no
-  bench entry.
-
-## Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache (2026-07-05)
-
-New kernels/indexer/ (metal-forge indexer_k_quant_and_cache; credit AlpinDale). Quantizes the
-DSA/NSA indexer K per quant_block_size (canonical 128) into a low-precision e4m3 cache the
-sparse-attention top-k selector reads cheaply — pairs with the MInference block masks to give
-TM a real sparse-attention SELECTION path, not just a mask consumer. TM-native layout: SEPARATE
-code cache (uchar, num_slots x head_dim) + fp32 scale cache (num_slots x head_dim/qbs) indexed
-directly by slot_mapping (like the TurboQuant codec), not the reference's interleaved paged
-single-buffer. One simdgroup per (token, qblock), simd_max absmax (no threadgroup scratch);
-use_ue8m0 rounds the fp32 scale to a power of two. indexer_k_gather dequantizes back to bf16 for
-a slot list. Functional (clone-then-insert; untouched slots preserved).
-
-- Tests: fp32 scales bit-exact vs numpy (plain) / power-of-two + coverage (ue8m0); e4m3 codes
-  reconstruction-bounded (round-to-nearest-even ties differ from a numpy argmin — the repo's
-  fp8 contract); round-trip + slot<0 skip + untouched-slot preservation; 19 green + parity
-  (codes off-by-one across the two metallibs, scales 1e-4).
-- Perf: bandwidth-bound (reads bf16 K, writes u8 codes), 16384x128 0.062 ms; near-optimal
-  one-simdgroup/qblock. No further opt.
-- Deferred (documented): fused DSA sparse decode over the indexer cache (the consumer).
-
-## Wave-10 K2: fp8 KV gather+upconvert + incremental scale update (2026-07-05)
-
-Extended kernels/kv_cache/ (metal-forge cache/gather_kv_cache.metal + kv_scale_update.metal,
-credit AlpinDale) to close the fp8 KV loop. kv_cache_gather_fp8<OUT_T>: the READ path for a
-paged fp8 prefix cache — reads e4m3/e5m2 code bytes and dequantizes to bf16 via
-code * scale[kv_head] (per-kv_head scales, round-trips exactly with kv_cache_scatter_fp8),
-same worklist as kv_cache_gather (one TG/token, cu_seq_lens binary search, block<0 zero-fill),
-fmt runtime scalar. kv_cache_scale_update: incremental per-tensor running-max (new = max(old,
-absmax/240)) — the streaming-decode analogue of the one-shot kv_cache_scales; single 256-thread
-threadgroup, no atomics needed for the scalar (grid-stride reduction seeds from the old value).
-
-- Tests: scatter_fp8 -> gather_fp8 round-trip (== decode(code)*scale exactly, within fp8
-  relative precision of the original K, e4m3 + e5m2); scale_update vs numpy running-max
-  (only-raises verified); 154 kv_cache green + parity (bf16 rows 2e-2, scales 1e-5).
-- Perf: bandwidth-bound read path, reads 1-byte codes vs the bf16 gather's 2-byte (halved
-  cache read bandwidth); nb256 gather 0.104 ms. Same near-optimal one-TG/token coalesced
-  structure as kv_cache_gather — no further opt.
-- Deferred (documented): per-tensor (vs per-kv_head) fp8 gather variant; the MLA-cache
-  upconvert-gather (cp_gather_upconvert_fp8_mla — different 656-byte cache layout).
-
-## Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion (2026-07-05)
-
-Completed the fused-add-norm quant matrix in kernels/add_norm/ (metal-forge
-normalization/layer_norm_quant.metal): layernorm_add_int8_dyn (the one-off int8 LayerNorm gap)
-plus per-128-block fp8/int8 for BOTH rms_add and layernorm_add. The per-block variant emits
-(rows, D/128) group scales directly, so its codes feed the block-quant expert GEMMs
-(moe_grouped_gemm_*_q) with no separate quantize_per_group pass. Novel piece: the per-128-block
-amax in the rv_fl<D> register layout — with G=128 (compile-time, canonical) each lane's w-th
-element lives in block w/4 independent of lane, so per-block absmax is a simd_max over WPB=4
-consecutive w (register-resident, no threadgroup scratch, unlike the reference's group_max[256]).
-Extended the AddNormFp8 primitive with group_size_/ue8m0_; fp8 gets the ue8m0 power-of-two option.
-
-- Tests: int8 codes off-by-one vs a numpy twin (fp32 rsqrt/weight chain flips borderline codes;
-  res_out bit-exact); fp8 half-ulp reconstruction + power-of-two/coverage; 41 add_norm green +
-  parity (codes atol=1 across the two metallibs, scales 1e-4).
-- Perf: the fusion IS the optimization (register-resident single-simdgroup). Fused per-block int8
-  = 1.6x the unfused rms_norm_add -> quantize_per_group chain (16384x1024: 0.287 vs 0.456 ms;
-  65536x768: 0.839 vs 1.396 ms) — eliminates the (N,D) bf16 round-trip. No further opt needed.
-- Deferred (documented): standalone non-add norm-quant, scale_ub clamp, block sizes != 128.
-
-## Wave-9 — optimization pass over the gap-port kernels (2026-07-05)
-
-Measure-first sweep over the 12 new kernel families. The clean finding: the **bf16-I/O**
-kernels win from manual vec4 (scalar bf16 loads waste bandwidth — the same lesson as
-gelu_bwd/dropout in Wave-8), while the **f32** kernels do NOT (their scalar strided loads are
-already coalesced and compiler-vectorized, so manual vec4 only adds overhead at scale).
-
-WINS (kept):
-- **gdn_recur** vec4 k/q loads (lanes already own contiguous Dk slices; k now read once/step
-  instead of twice) — prefill 2x2048 1.56 -> 1.50 ms (~7%), decode R64 0.45 -> 0.43 ms (~5%).
-- **act_quant** silu_mul_quant_{fp8,int8,fp8_group} vec4 (quant_rt float4-chunk pattern on
-  both the amax and encode passes) — int8 T4096xD2880 0.30 -> 0.22 ms (~27%), T512 0.038 ->
-  0.027 ms (~30%). Confirms scalar bf16 load, not the silu exp, was the ceiling.
-
-REJECTS (measured, reverted):
-- **quadratic_transform** (and by extension the f32 sampler zoo) vec4: WON at T256 (0.31 ->
-  0.16) but REGRESSED at T1024 (0.70 -> 0.80, repeatable 3x) — the throughput-bound regime
-  that matters more. f32 strided loads are already optimal; reverted. Applies to the whole
-  logit-transform family (all f32) -> left scalar.
-
-LEFT AS-IS (assessed, at/near floor):
-- **selective_scan** N128 5.09 ms — sequential Mamba scan with a per-timestep threadgroup
-  reduce barrier; B/C are strided by total_tokens (not vec4-able) and the recurrence is
-  serial. Only the chunked/Blelloch rewrite (recorded, high-risk) would move it — not an
-  opt-pass change.
-- **moe_grouped_gemm_swiglu_q** swiglu_oai 512-row 1.93 ms vs 1.27 dense (1.52x) — already
-  5-variant-tuned in the port; the two-pass reduce fits the 28 KB threadgroup budget and the
-  gap is dequant + epilogue. Closing it needs the documented deep candidates (K-step 64, fold
-  moe_gather into the A load) that risk correctness for a kernel already reading ~8x fewer
-  bytes than dense. Deferred with spec.
-- **turboquant** (fp16 chain kept verbatim for bit-exactness), **qk_norm_rope** (2.6x already,
-  substrate rv_fl vector loads), **quant_rt** (already float4), tiny utilities
-  (tau_tail/permute_cols/packbits/minference/moe_route, bandwidth/latency-bound) — no change.
-
-## Wave-9 — follow-up: selective_scan varlen_apc (2026-07-05)
-
-Completes D1.1 (selective scan): the varlen + automatic-prefix-caching (APC) variant.
-Same S6 recurrence as varlen but the running state is checkpointed into PAGED state blocks
-at chunk boundaries (last chunk -> block_idx_last_scheduled_token) and the initial state is
-read from a possibly-cached prefix block (initial_state_idx). Buffer table transcribed 1:1
-from metal-forge's selective_scan_fwd_varlen_apc_state_float32_typed (block_idx_first/last
-scheduled token, initial_state_idx, cu_chunk_seqlen, last_chunk_indices, block_size,
-cache_indices_stride, use_chunk_metadata). New SelectiveScanApc primitive (dedicated, not
-overloaded onto SelectiveScan) with the functional pool-clone prepass; use_chunk_metadata=0
-falls back to fixed block_size chunking. Gated behind its own test per the plan (highest-risk
-chunk metadata).
-
-- Tests: 4 fp64-oracle cases (uniform-chunk f32/bf16, prefix-cache-initial-state from a
-  non-zero block, multi-chunk intermediate checkpoints, untouched-slot preservation) +
-  fp32 parity; 16 selective_scan tests green total. The chunk-metadata (cu_chunk_seqlen)
-  path is implemented and exercised via use_chunk_metadata=False fallback in these tests;
-  the full logical-chunk scheduler metadata is a vLLM-runtime input (recorded).
-
-## Wave-9 — gap port, kernel 12: marginal layout/bit utilities (2026-07-05)
-
-New kernels/marginal/ (one dir, four ops via a small kind-dispatched primitive):
-- tau_tail: scale the Q and V slices of a packed (T, 3*q_dim) QKV by tanh(tok_qv_lin)+
-  tau_pos_table[pos, head] (K slice passes through); functional via the shared byte-clone
-  prepass. Flat-grid elementwise v1 (any head_dim); the float2 _d64 variant is a bench-gated
-  follow-up. int32 positions (TM convention; ref int64).
-- packbits / segment_packbits: bool/uint8 -> bits, big/little order (np.packbits). Segment
-  variant binary-searches output_indptr (host cumsum of ceil(len/8)); total_output_bytes is
-  a caller-provided int (MLX's lazy graph can't read output_indptr[-1] at build time).
-- permute_cols: dtype-agnostic 16-bit column gather x[:, perm] (Marlin act-order reperm).
-
-- Tests: packbits/segment_packbits exact vs np.packbits (both bit orders, ragged rows);
-  permute_cols exact vs x[:, perm] (uint16 + bf16); tau_tail vs numpy transcription with
-  K-slice-untouched check; 6 green + parity atol=0 (ints/codes) / 1e-5 (tau_tail).
-- Trivial bandwidth-bound ops; no bench entries.
-
-DESIGNATED CUT (per plan): moe_lora_align — vLLM's LoRA-alignment metadata format has no
-ThunderMittens consumer (moe_grouped_gemm* take the existing route/permute/pad output), so
-porting it would ship dead code. Recorded here as the plan's explicit scope-tightening cut,
-not an oversight; revisit if/when a multi-LoRA MoE serving path lands.
-
-## Wave-9 — gap port, kernel 11: TurboQuant KV codec (2026-07-05)
-
-New kernels/turboquant/ (arXiv 2502): tq_encode + tq_decode. K = asymmetric-uniform
-per-32-element fp16 scale+zp (2-8 bits, signed q8_0 or unsigned sub-8-bit); V = random-sign
-FWHT rotation -> per-32 fp16 RMS scale -> Lloyd-Max nearest-centroid (searchsorted against
-midpoint boundaries, 2/3/4/8 bits, sub-8-bit byte-packed). The fp16 arithmetic chain is
-transcribed VERBATIM from metal-forge so the numpy oracle reproduces K codes bit-for-bit.
-One threadgroup per (token, kv_head), HEAD_SIZE threads, one simdgroup == one 32-elem scale
-group (min/max/RMS are simd_* reductions); FWHT stages 0-4 are register shuffles, 5+ go
-through threadgroup memory. head_size in {64,128,256}. TM divergences from the reference:
-signs (tq_signs) + Lloyd-Max centroids (lloyd_max_centroids) are BUFFERS not baked tables;
-k_bits/k_signed/v_bits are runtime scalars; slot_mapping int32. Functional 5-cache-array
-return via a byte-clone prepass (untouched slots preserved). Attention integration (rotated-
-domain V accumulate + one deferred inverse FWHT per head, exploiting FWHT linearity) is
-spec'd in the reference and DEFERRED — this cache format already supports it.
-
-- Tests: K codes/scale/zp bit-exact vs the fp16 oracle (8-bit signed + 4-bit unsigned +
-  sub-8-bit byte-straddle); V codes >= 95% exact with off-by-one only at fp16-borderline
-  boundaries; round-trip SNR floors (K 8-bit > 30 dB, V 4-bit > 18 dB); decode-vs-oracle;
-  functional untouched-slot preservation (slot -1 skip). Parity: V codes + all scales
-  atol=0, K codes off-by-one (borderline fp16 rint across separately compiled metallibs).
-- No standalone bench entry (codec throughput dominated by the paged scatter it replaces;
-  the win is the sub-4-bit cache footprint — recorded, revisit with the deferred attention
-  integration).
-
-## Wave-9 — gap port, kernel 10: MInference block-mask builder (2026-07-05)
-
-New kernels/minference/: minference_build_block_mask converts per-head vertical column
-indexes + slash diagonal offsets ((B, H, nnz) i32, -1 pad) into the per-head KV block mask
-(B, H, max_blocks) that paged_attention_block_sparse now consumes directly — the consumer
-gained a mask_heads scalar (buffer 16; 1 = legacy per-batch (B, max_blocks) unchanged,
-H = per-head) so MInference's per-head selectivity is preserved instead of unioned away.
-vertical_topk/slash_topk caps give the _mergehead budget without a second kernel;
-last_n_blocks keeps the local window. The reference's serial two-pointer CSR merge is
-deliberately skipped (deferred until a prefill block-sparse consumer exists) — for decode
-the block mask IS the consumer format.
-
-- Tests: exact int equality vs the numpy marking rule (+topk-cap case), end-to-end per-head
-  mask -> block-sparse attention vs dense numpy restricted to kept blocks, legacy 2-D mask
-  regression, full kv_cache suite (152 green), torch paged subset (24), parity atol=0.
-- Trivial-cost builder (one 32-lane simdgroup per (head, batch)); no bench entry — the win
-  is the KV blocks the consumer skips.
-
-## Wave-9 — gap port, kernel 9: the sampler zoo (2026-07-05)
-
-New kernels/sampling/sampling_transforms.metal (+ transforms.cpp/.h): 11 transforms on the
-one-simdgroup-per-row substrate — quadratic/smoothing, top-nsigma, top-A (log-space exact),
-epsilon-cutoff, eta-cutoff (typical_p's S1 entropy trick, one fewer pass than the reference),
-XTC (on-device coin at a non-token RNG counter; e-domain comparisons, no division), skew
-(index-order CDF pow via simd_prefix_exclusive_sum — verified metal-forge contract, no sort;
-exllamav2 sorted-CDF variant deferred), top-k renorm (masked_topk, ties -> smaller id),
-top-p renorm (32-iter bisection, deliberately tighter than the reference's 5), no-repeat-
-ngram (per-lane history starts, benign -inf scatters), and DRY (faithful reference loop with
-the O(max_ngram) inner unwind parallelized via first-violation simd_min; shared breakers
-list + launch-uniform scalars per TM convention).
-
-- Tests: exact-SET oracles on margin-safe 1/64-grid logits + property tests; DRY/ngram vs
-  direct python transcriptions of the reference loops; 11 new + 87-test sampling regression
-  green. Parity: 1e-4 on O(10) logit values (last-ulp fast-math between the two metallib
-  compilers; set flips would read ~1e30), probs-domain 1e-6.
-- Perf: bandwidth-bound as expected — quadratic/nsigma ~0.32 ms at (256, 32000) (~206 GB/s,
-  2 passes), top_a/eta ~0.60 (3 passes), xtc 0.75 (4 passes), DRY 0.18 (copy + uniform scan).
-
-## Wave-9 — gap port, kernel 8: fused act->quant epilogues (2026-07-05)
-
-New kernels/act_quant/ + two substrate additions: tk_e2m1_encode (fp4 nearest-of-16, tie
-behavior matching the host packer's argmin — unblocks device fp4 epilogues later) and the
-glu_eval lift into include/common/glu_eval.metal (one activation definition shared by
-kernels/glu and act_quant; glu suite re-run green). Kernels: silu_mul_quant_{fp8,int8}
-(per-token dynamic, feeding qgemm_fp8_scaled / qgemm_w8a8), silu_mul_quant_fp8_group
-(per-group-128 + ue8m0, feeding block-quant GEMMs), each with mode 0 swiglu / 1 gpt-oss
-swiglu_oai via the shared glu_eval; plus rms_norm_add_int8_dyn (int8 sibling of the fp8
-residual-stream epilogue). Two-pass amax+encode, activation recomputed (memory-bound).
-
-- Tests: reconstruction-bound oracles (exp() between input and code makes bit-exact-vs-numpy
-  the wrong contract), power-of-two/coverage checks for ue8m0, fused-vs-unfused composition
-  (>= 95% identical codes, rest off-by-one from bf16-vs-fp32 activation rounding), 91 tests
-  green incl. full glu/add_norm regression. Parity codes off-by-one max (separately compiled
-  metallibs round exp differently at borderlines — same rationale as the qgemm tolerance).
-- Perf: int8 epilogue T=4096 D=2880: 0.251 ms vs 0.321 ms for swiglu -> quantize_per_token
-  (1.28x, the eliminated bf16 round-trip); T=512: 0.034 vs 0.036 ms.
-
-## Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant (2026-07-05)
-
-quant_rt extensions: quantize_per_group_fp8/int8 (group-wise dynamic quant along the row,
-canonical G=128 — the activation side of block-quantized GEMMs; scale (rows, D/G) f32;
-ue8m0 flag rounds fp8 scales up to powers of two, MX convention) and
-quantize_per_token_int8_azp (vLLM asymmetric: scale=(max-min)/255, azp=rint(-128-min/s),
-constant-row fallback documented). Plus qgemm_w8a8_azp in qgemm_int: the zero-point
-correction epilogue acc - azp[m]*w_rowsum[n] (w_rowsum host-precomputed) — validates the
-azp layout with a real consumer. int8 codes/scales/azp BIT-EXACT vs numpy twins
-(no transcendentals); fp8 verified by power-of-two + coverage + half-ulp reconstruction
-bounds; azp GEMM int-exact vs int64 numpy. 40 correctness + parity-atol-0 green.
-
-## Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention (2026-07-05)
-
-New kernels/gdn/: the Qwen3-Next / Kimi-Linear hybrid-mixer recurrence — per-timestep
-delta rule S = g*S + k*beta*(v - k.S), y = q.S — one simdgroup per (request, hv, dv),
-32 lanes partitioning Dk (Dk in {64,128} compile-time), fp32 state promoted from the
-reference's io dtype. Varlen packed sequences (cu_seqlens) + persistent per-request
-fp32 state pool via slot_mapping (race-free in-place row updates; functional via the
-sscan_pool_clone prepass on both backends). GQA hk = hv/(Hv/Hk); load_initial switches
-decode-continuation vs fresh-prefill.
-
-- Tests: 8 fp64-oracle cases (3 dtypes x GQA shapes, decode step R=16, fresh-prefill
-  ignores pool, untouched-slot preservation) + fp32 cross-backend parity (y and pool).
-- Perf: prefill 2x2048 tokens (Hv=8, Dk=Dv=128) 1.55 ms; decode R=64 single-step
-  0.42 ms (launch-overhead-dominated at tiny work). Recorded bench-gated follow-ups:
-  vec4 k/q loads, ssd_decode-style row-owned geometry at Dk=64, and the chunked-WY
-  parallel prefill (high-risk/high-value, only against this measured baseline).
-
-## Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen (2026-07-05)
-
-New kernels/selective_scan/: sequential-in-time / parallel-over-state (threadgroup per
-(batch, dim), one thread per state index, dstate <= 256, fp32 state, io f32/f16/bf16).
-Reference-faithful port of metal-forge/vLLM mamba semantics (softplus discretization,
-exp(delta*A), D*u skip, silu(z) gate; channel-major layouts) with tk-native bf16 instead
-of uint16 bit-twiddling. Varlen: flattened token axis + query_start_loc, per-request paged
-state pool via cache_indices (null_block_id skip) and has_initial_state; the MLX path is
-functional via an sscan_pool_clone prepass (untouched slots preserved), torch clones too.
-Unlocks Mamba-1 hybrids (Jamba, Falcon-Mamba). varlen_apc (chunked state checkpoints for
-prefix caching) is the recorded next step for this family.
-
-- Tests: 12 fp64-oracle cases (3 dtypes x 3 shapes incl. dstate=160 multi-simd reduce,
-  no-optionals, varlen-vs-dense with scattered pool slots + untouched-slot preservation,
-  null-block skip) + fp32 cross-backend parity (out and state, atol 1e-5).
-- Perf: B2/d2048/L512 0.93 ms (N=16), 5.16 ms (N=128) — sequential-scan bound, no
-  framework baseline exists (per-step composition is pathological to trace). Optimization
-  candidates recorded: vec4 B/C loads, one-simdgroup geometry for dstate<=32, Blelloch
-  time-scan (major rewrite).
-
-## Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE (2026-07-05)
-
-New kernels/qk_norm_rope/: one warp per (token, head) over packed QKV (T, (Hq+Hk+Hv)*D) —
-per-head RMSNorm (gemma (1+w) flag) + RoPE (NeoX split-half via the rope_kv rv_fl<D/2>
-half-vector idiom; GPT-J interleaved via the mla contiguous-lane idiom, pairs lane-local),
-V heads vec-copied through. Functional out-of-place, one dispatch (the Qwen3/gpt-oss
-attention-prep pattern). D in {64,128,256}, full rotary.
-
-- Tests: 9 fp64-oracle cases (both rope styles x gemma, V-region bit-identity,
-  composition cross-check) + cross-backend parity (atol 1e-2 bf16).
-- Perf: Qwen3-8B shape (T=4096, 32/8/8, D=128) 0.388 ms vs 1.005 ms for the
-  mx.fast.rms_norm + fast.rope + concat composition — 2.6x (target was >= 1.5x).
-  T=512: 0.055 vs 0.111 ms. No optimization pass needed at v1.
-
-## Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing (2026-07-05)
-
-moe_route_grouped: HF DeepSeek-V3 "noaux_tc" semantics — sigmoid / softmax / sqrt-softplus
-scoring, e_score_correction_bias for SELECTION only, per-group top-2-sum ranking, top
-`topk_group` groups, expert top-k among survivors, weights from UNBIASED scores
-(renormalize + routed_scaling_factor). One simdgroup/token over threadgroup-staged
-scored/biased (E <= 512, n_group <= 32), both selection levels via the existing masked_topk
-butterfly — barrier-free vs the reference's 256-thread tree-reduce design. Output contract
-== moe_route_topk, so it drops into moe_permute/moe_mlp unchanged.
-
-- Tests: 9 oracle tests (DeepSeek-V3 256/8/4/8, Kimi-K2 384/1/8, all scorings, ids-exact
-  with explicit-tie and bias-flips-selection-not-weights fixtures, group-mask exclusion);
-  cross-backend parity ids atol=0.
-- Perf: T=4096/E=256 grouped 0.1442 ms vs plain moe_route_topk 0.1430 ms — within noise;
-  the reference's E=256 bitonic fast path is confirmed unnecessary on this geometry (skipped
-  as planned).
-
-## Wave-9 — gap port, kernel 2: attention softcap + sinks (2026-07-05)
-
-Gemma-2/3 logit soft-capping (runtime scalar, <=0 off) and gpt-oss attention sinks
-(per-head denominator-only logit) across attn_fwd (+q16), attn_causal, attn_window,
-attn_varlen_prefill, and paged v2 (softcap in the partitions incl. fp8; the sink merged
-EXACTLY ONCE in the shared reduce — which also makes cascade/MLA compositions sink-capable
-for free). Correctness traps pinned in-kernel comments: no log2(e) fold into Q when capped;
-cap BEFORE masks; sink seeds the running max. sinks bound as always-present placeholder
-buffers (q / tmp_out) gated by has_sink — no dummy allocations, no host_name doubling.
-
-- Tests: fp64 oracles per kernel incl. the Gemma-2 (window+softcap) and gpt-oss
-  (window+sink) layer configs; 231 attention-family correctness + 79 parity green.
-- Perf: flagless-path regression guard measured clean — attn fwd 0.454 ms (SDPA 0.504),
-  causal 0.226/0.878 ms, paged v2 0.433 ms (dense-loop base 1.78) at the quick shapes;
-  the flags cost a uniform branch + 3 bound args when off.
-
-## Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs (2026-07-05)
-
-New kernels `moe_grouped_gemm_rect_q<FMT>` / `moe_grouped_gemm_swiglu_q<FMT>` (formats mxfp4,
-kU4, fp8_e4m3, q8_0, nvfp4, q4_K; swiglu has act_mode 0/1 = swiglu / gpt-oss swiglu_oai with
-pre-activation expert bias). Experts packed (N_out, K) so quant groups run along the
-contraction axis; contraction is `mma_ABt` fed by a new col-layout register fill
-(`dequant_into_register_col`, mirrors the col-layout `load` lane map — the two thread
-elements are vertically adjacent). Bench: `@register("moe_q")`, baseline = dense bf16
-grouped GEMM on the same schedule.
-
-### Variant matrix (mlx quick, 2880×2880 gpt-oss tile, M4 Max; 512-row prefill numbers —
-### the 32-row decode cases were session-noise-limited, ratios ~parity with dense)
-
-| variant | rect mxfp4 | rect q8_0 | swiglu_oai mxfp4 |
-|---|---|---|---|
-| dense bf16 baseline | 0.625 | 0.624 | 1.259 |
-| v1 naive frag fill, 1 warp | 0.716 | 0.731 | 2.333 |
-| dequant-to-shared, 1 warp | 0.767 | 0.729 | 2.138 |
-| 4-warp split-K, frag fill | 0.692 | 0.689 | 2.553 |
-| 4-warp split-K, per-warp shared tiles | 0.918 | 0.670 | 2.947 |
-| **4-warp split-K + cols4 span fill (KEPT)** | **0.674** | **0.658** | **1.863** |
-
-### Kept
-- **4-warp intra-threadgroup split-K** (each warp owns every 4th K-step, private fp32
-  accumulator, one staged reduce by warp 0) — fixes the 32-thread-per-tile occupancy starvation
-  of the naive port.
-- **`tk_dequant_cols4_s8<FMT>` span decoder** (dequant.metal): decodes the col-fill's 4
-  stride-8 columns with ONE scale unpack (specialized q8_0/fp8_e4m3/mxfp8/mxfp4/kU4; the mxfp4
-  case reads just 2 bytes + 1 exp2 for 4 weights). The e8m0 formats were paying an `exp2` per
-  ELEMENT in the naive fill — that, not bandwidth, was the bottleneck (mxfp4 regressed under
-  plain split-K while q8_0 improved; the span decoder fixed exactly the mxfp4 side).
-
-### Rejected (measured)
-- Dequant-to-shared at 1 warp: barrier cost eats the span-decode win for the single-tile rect
-  kernel (0.767 vs 0.716); only helped the 2-tile swiglu.
-- Per-warp shared tiles under split-K: 20-28 KB threadgroup memory tanks occupancy
-  (rect mxfp4 0.918 — worst variant).
-
-### Status / follow-ups
-- rect_q within 5-8% of the dense bf16 kernel's wall clock while reading 4-8.5× fewer weight
-  bytes — the capacity win (gpt-oss-120B-class MoEs fitting at all) ships; swiglu_q still
-  1.48× dense (two dequant fills/step), candidates: K-step 64, 2-warp split with per-warp
-  gate/up split, vectorized A loads. Decode-shape bench needs an E=32 sweep (the E=4 decode
-  tile fits in SLC, masking the bandwidth advantage) — revisit when the routing kernel lands.
-- Correctness: 18 MLX tests (6 formats × bias, swiglu×act modes, q8_0-exact-vs-dense,
-  end-to-end quant moe_mlp) + 8 cross-backend parity cases, all green; full qgemm suite
-  re-run green after the dequant.metal change (219 + 66 tests).
-
-## Wave-8 — optimization pass over the Wave-6/7 kernels (2026-07-03)
-
-A measure-first pass over every new kernel. First registered the last unmeasured families in
-`perf/bench_kernels.py` (typical_p, apply_bad_words, dropout, adamw, rms_norm_add, embedding_backward,
-spec_verify_tree, spec_compact, build_dynamic_tree), then benched the whole surface (MLX comprehensive
-+ the new quick cases). Finding: the surface is **already near-optimal** (Waves 6/7 did the heavy
-lifting), with two genuine outliers, both fixed.
-
-**Wins (measured, kept):**
-- **typical_p_sample 1.8×** (10.6 → 5.87 ms, T256×V32000). The kernel's cost is the surprise-threshold
-  bisection, and each step re-scans the full vocab with a per-element `exp` (bandwidth-bound at
-  ~100 GB/s). 32 steps resolve tau to `smax/2³²` — pure overkill; **16 steps** give `smax/65536`,
-  far below the V-token surprise spacing, so the kept set is unchanged. (A one-pass mass-histogram +
-  local refine could roughly halve it again — noted as a follow-on; not done, the 1.8× is the safe win.)
-- **dropout fwd+bwd ~1.9×** (2.14 → 1.09 ms, 16384×4096; ~128 → 246 GB/s). Both kernels were scalar
-  one-thread-per-element — the same bf16 scalar-access bottleneck `gelu_bwd` had. `packed_four` vec4
-  with a scalar tail; the keep-mask stays keyed by the element index so it's byte-identical and the
-  backward still recomputes it from the seed.
-
-**Rejects (measured, reverted/kept-as-is):**
-- **adamw vec4 — reject.** Neutral (0.29→0.29, 1.11→1.13 ms). AdamW is dominated by its **four f32
-  moment arrays** (m_in/v_in/m_out/v_out); f32 scalar access is already aligned/efficient, so the
-  bf16-access penalty that made dropout/gelu_bwd vec4 win simply doesn't exist here. Reverted to the
-  simpler scalar kernel.
-- **lm_head (non-quant) at T>1 — documented tradeoff, not a bug.** argmax_T8 is 0.38× vs matmul+argmax
-  because the fused partials re-read W once per token (T× the weight bandwidth) while the dense matmul
-  reads W once. This is the fused path's off-purpose regime: it exists for T=1 decode and for quant
-  weights (lm_head_q topk_q4_0_T8 is ~0.95×, near parity, since on-the-fly dequant offsets the
-  re-reads). Non-quant T>1 should use matmul+sample. Batching T tokens per tile to amortize W would fix
-  it but is a 6-kernel rewrite (argcat/topk/topp × quant/non-quant) of a hot, well-tested family for a
-  narrower regime — deferred.
-
-**Confirmed already near-optimal (no change):** rms_norm_add ~305 GB/s (register-tile fused norm),
-apply_bad_words / min_p / apply_token_bitmask (bandwidth-bound over (T,V), effective BW ~230 GB/s once
-the multi-pass factor is counted), embedding_backward (the **atomic** default is *faster* than the
-sorted path even at V=256 heavy-dup — 0.11 vs 0.57 ms — Apple's native atomic_float wins over the
-argsort+segment overhead; sorted stays available but is rarely the pick), spec_verify_tree/compact and
-build_dynamic_tree (overhead-bound at sub-30 µs), the Wave-7 fused norm backwards (already on par with
-mx.fast), glu/embedding_lookup/gelu_bwd (already 2–3× ahead). The tiny GB/s numbers for
-varlen_build_worklist / beam_build_copy_pairs / beam advance are latency/overhead-bound, not bandwidth
-(already measured + rejected in Wave 7).
-
----
-
-## Wave-7 close-out (2026-07-03)
-
-Wave 7 closed the full 20-item tail of Wave-6 deferrals (robustness, test gaps, feature
-completeness, one refactor, four measure-first perf items, first-order autograd, bench/docs). All
-dual-backend + parity-tested; full 3-suite regression **2133 passed** and `xcodebuild` SUCCEEDED.
-
-**Perf items (measure-first, keep-if-win) — two prior-wave rejects REVERSED:**
-- **#1 fused norm backward — WIN, reverses the Wave-6 reject below.** New `rms_norm_bwd_fused` /
-  `layernorm_bwd_fused`: one simdgroup per row computes rstd (and mean) in-kernel, writes dX, and
-  accumulates dweight (+ dbias for LN) via `atomic_add_float` in a **single pass**. The dweight-atomic
-  contention the prior wave feared does **not** bite — Apple's native `atomic_float` handles it and
-  the one-pass memory saving dominates. Measured **~2.3–2.5× faster than the old 3-pass hybrid and on
-  par with `mx.fast`'s fused VJP (0.97–1.00×)** across rows 4k–16k, D 2k–8k. Both routers wired to the
-  fused path; the dx-only kernels stay available.
-- **#7 gelu_bwd vec4 — WIN, reverses the Wave-6 "left as-is".** `packed_four` vec4 loads/stores
-  (scalar tail). Measured fp32 ~166–184 → ~352–415 GB/s (2.1–2.3×), bf16 ~88–99 → ~250–344 GB/s
-  (2.8–3.5×). The earlier "tanh-bound, vec4 won't help" call was wrong: the scalar **bf16** element
-  access, not the tanh, was the bottleneck.
-- **#6 beam_build_copy_pairs compaction — REJECT (measured).** The fixed-slot emit is overhead-bound
-  (~130 µs flat from 2k to 262k slots), so a scan + atomic-cursor compaction can't beat the launch/eval
-  floor and would only add contention + nondeterministic ordering. Kept the atomic-free kernel.
-- **#5 cascade single-dispatch fusion — REJECT (measured).** The 3 host concatenates are 5–23% of
-  cascade time (23% only at B=1). A fused write requires decoupling the output stride from the dispatch
-  count + a write-offset in the SHARED paged-attention partition kernels — a regression surface
-  (paged_attention_v2 / cascade / fp8 / multi all route through them) disproportionate to a 5–23%
-  single-path win. Kept the concatenate cascade (already 212–255 GB/s).
-
-**Robustness / correctness (P1):**
-- **#4 spec_compact** now uses the chunked single-threadgroup scan → **any B** (removed the B≤256 cap).
-- **#9 spec_verify_tree** dropped the 64-sibling cap: the residual re-walks `last`'s child chain
-  (exact for any sibling count) + a `tree_valid` first-generation fallback.
-- **#19** Family-A callers validate `K ≤ #candidates` at the host boundary (lm_head `k≤V`,
-  beam `V≥2·beam_width`) so the `masked_topk` `-1`-degenerate round is unreachable.
-- **#11 glu geglu_erf** backward now differentiates the A&S erf approximation itself
-  (`glu_erf_approx_deriv`) → bit-consistent forward/backward pair (tight 3e-5 analytic test).
-
-**Feature completeness (P3):**
-- **#8 exact quant top-p** — new `lm_head_topp_partials_q` emits a per-tile logsumexp so the reduce
-  uses the **true full-vocab normalizer** (not the pool-only approximation); nucleus is exact whenever
-  it fits in the over-selected pool.
-- **#2 build_dynamic_tree** — device-resident draft-tree pointer builder (cap-free, scratch-free)
-  replacing the host serial `spec_build_tree_pointers`.
-- **#3 embedding_backward `method="sorted"`** — atomic-free segment-reduce (argsort + one threadgroup
-  per id) alongside the default atomic scatter; wins under heavy id duplication.
-
-**Refactor (#20):** `masked_topk_local` in `include/ops/group/topk.metal` — the Family-B K-round merge
-shared by the three lm_head partials + beam_topk (emit functor per site).
-
-**Autograd (#10):** `tk.autograd` — first-order differentiable `gelu/glu/rms_norm/layernorm/
-embedding_lookup/dropout` on both backends (MLX `mx.custom_function` vjp → the tk backward; torch
-`autograd.Function`). First order only (the kernels have no CPU path). Gotcha handled:
-`mx.custom_function` passes a mis-shaped `primals` when the forward casts dtype, so each vjp closes
-over the original inputs.
-
-**#16 Xcode unit tests — N/A (confirmed).** The `tests/unit/` harness only tests substrate
-register/shared tile+vec primitives (`warp::tests`/`group::tests`, gated by `TEST_*` leaf flags in
-`testing_flags.hpp`); there is no registration point for kernel-level ops, so sampling/spec/embedding/
-lm_head are inherently Python-tested by design. Nothing to build.
-
-**Test-gap closures (P2):** swiglu_oai clamp-branch gradient (analytic ref, not finite-diff),
-spec_verify_tree residual-distribution histogram (30k rows), cascade_attention_fp8 standalone MPS
-oracle. **Bench (P7):** cascade `full-paged [prefix++suffix]` baseline (#17); numpy `ref=` oracles on
-beam_build_copy_pairs + varlen_build_worklist (#18); torch comprehensive sweep recorded (#15).
-
----
-
-## Wave-6 close-out (2026-07-02/03)
-
-New serving/training families landed dual-backend + parity-tested (see the README "Serving &
-training kernels" table): typical-p / bad-words / grammar-bitmask masking, quant LM-head top-p,
-linear + **tree** speculative verification (`spec_verify_tree`), `spec_compact` / `spec_update_kv_meta`,
-zero-copy beam `beam_remap_block_table`, **N-level** cascade attention, on-device `build_multimodal_src`,
-`embedding_backward` (atomic scatter-add), GLU/GELU/RMSNorm/LayerNorm/fused-add-RMSNorm backward,
-`dropout`, and fused `AdamW`. The comprehensive bench sweep now runs **0 skips across 46 families**
-(`perf/results/2026-07-02/235051-mlx-comprehensive/`); an end-to-end serving+training integration
-test (`tk/tests/test_integration.py`) chains them on both backends. Perf wins + rejects are in the
-"Wave-6 perf pass" section below.
-
-**Follow-ons — now DONE:**
-- **Fully device-resident varlen** ✅ (`attn_varlen_prefill_device`): device `varlen_q_pad_gather` +
-  `varlen_o_regather` replace the host pad/transpose loop; the whole path (worklist → pad/gather →
-  attention → re-gather) runs on-device from a DEVICE `cu_seqlens` with a single scalar readback
-  (`total_padded`). `varlen_build_worklist` now handles **any B** — a single-threadgroup CHUNKED scan
-  (each thread owns a contiguous batch chunk: local totals → threadgroup exclusive scan → re-walk with
-  the base offset) lifted the old B≤256 cap. Validated == host worklist for B up to 1000.
-- **fp8 cascade prefix** ✅ (`cascade_attention_fp8` / `cascade_prefix_partition_fp8`): uint8 fp8
-  (e4m3/e5m2) shared prefix, per-kv-head dequant on read, mirroring `paged_attention_v2_fp8`;
-  validated == full attention over [dequant(prefix) ++ suffix].
-
-Running notebook for the per-kernel optimization loop described in `perf/perf.md`.
-Numbers are throughput-style median per-call ms from `perf/bench_kernels.py`
-(adaptive batched timing, ≥2 ms per timed sample), Apple M4 Max 40-core
-(~546 GB/s DRAM), MLX backend unless noted. Baseline run:
-`perf/results/2026-07-01/172040-mlx-quick/` at `d902519`.
-
-**Timing-methodology note (2026-07-01):** the harness was rewritten. Earlier
-numbers in this file used one submit+sync per call, which adds a ~0.15–0.25 ms
-latency floor and swamped small kernels; conclusions drawn only from per-call-sync
-timing (notably "staged paged attention is slower") did NOT survive the fix —
-see the serving section.
-
-## Baseline classification (2026-07-01, quick preset)
+The heading verdict comes from the Evidence Rules vocabulary in `AGENTS.md`:
+LANDED, KEPT, REJECTED, CANDIDATE, DEFERRED, INCONCLUSIVE, MIXED, or RECORDED.
+This notebook is append-only and ordered oldest-first; never rewrite or
+reorder existing entries. After appending an entry, regenerate the index with
+`python3 ../tools/perf_notebook.py index perf/optimization_status.md`.
+Entries labeled UNLABELED predate the verdict convention; label them only by
+re-reading their evidence, never by guessing.
+
+<!-- qx:index:begin — generated by tools/perf_notebook.py; do not hand-edit -->
+### Index (generated)
+
+| date | entry | verdict | line |
+|---|---|---|---:|
+| 2026-07-01 | Baseline classification (2026-07-01, quick preset) | RECORDED | 104 |
+| 2026-07-01 | Pass 2 (2026-07-01, commits e00a76d..): structural rewrites | UNLABELED | 289 |
+| 2026-07-01 | Pass 3 (2026-07-01, mop-up): the five catalogued gaps | UNLABELED | 378 |
+| 2026-07-02 | Wave 3/4 — serving + training families | UNLABELED | 424 |
+| 2026-07-02 | Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips) | REJECTED | 524 |
+| 2026-07-02 | Wave-6 close-out | UNLABELED | 554 |
+| 2026-07-03 | Wave-7 close-out | UNLABELED | 589 |
+| 2026-07-03 | Wave-8 — optimization pass over the Wave-6/7 kernels | UNLABELED | 655 |
+| 2026-07-05 | Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs | MIXED | 699 |
+| 2026-07-05 | Wave-9 — gap port, kernel 2: attention softcap + sinks | UNLABELED | 747 |
+| 2026-07-05 | Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing | UNLABELED | 763 |
+| 2026-07-05 | Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE | UNLABELED | 780 |
+| 2026-07-05 | Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen | UNLABELED | 794 |
+| 2026-07-05 | Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention | UNLABELED | 814 |
+| 2026-07-05 | Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant | UNLABELED | 831 |
+| 2026-07-05 | Wave-9 — gap port, kernel 8: fused act->quant epilogues | UNLABELED | 843 |
+| 2026-07-05 | Wave-9 — gap port, kernel 9: the sampler zoo | UNLABELED | 862 |
+| 2026-07-05 | Wave-9 — gap port, kernel 10: MInference block-mask builder | UNLABELED | 882 |
+| 2026-07-05 | Wave-9 — gap port, kernel 11: TurboQuant KV codec | UNLABELED | 900 |
+| 2026-07-05 | Wave-9 — gap port, kernel 12: marginal layout/bit utilities | UNLABELED | 925 |
+| 2026-07-05 | Wave-9 — follow-up: selective_scan varlen_apc | UNLABELED | 947 |
+| 2026-07-05 | Wave-9 — optimization pass over the gap-port kernels | UNLABELED | 966 |
+| 2026-07-05 | Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion | UNLABELED | 1000 |
+| 2026-07-05 | Wave-10 K2: fp8 KV gather+upconvert + incremental scale update | UNLABELED | 1020 |
+| 2026-07-05 | Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache | UNLABELED | 1040 |
+| 2026-07-05 | Wave-10 K4: vLLM v1 ragged rejection samplers | UNLABELED | 1060 |
+| 2026-07-05 | Wave-10 K5: EAGLE spec-decode input-prep builders | UNLABELED | 1077 |
+| 2026-07-07 | BitNet training kernel port | KEPT | 1097 |
+| 2026-07-07 | BitNet remaining kernel parity port | KEPT | 1176 |
+| 2026-07-13 | Fused and specialized kernel integration pass | UNLABELED | 1227 |
+| 2026-07-13 | Packed embedding, decode, sparse projection, spatial, and cache-attention pass | CANDIDATE | 1288 |
+| 2026-07-13 | New-kernel second optimization pass | UNLABELED | 1455 |
+| 2026-07-13 | Cross-kernel follow-ups and optimization pass | UNLABELED | 1618 |
+| 2026-07-13 | NVFP4 inference decode and output-projection pass | KEPT | 1783 |
+| 2026-07-13 | MXFP4 inference coverage and hot-path pass | KEPT | 1941 |
+| 2026-07-14 | MXFP8 inference coverage completion | UNLABELED | 2079 |
+| 2026-07-14 | MXFP8 inference hot-path experiments | KEPT | 2177 |
+| 2026-07-14 | FP8 inference hot-path experiments | KEPT | 2323 |
+| 2026-07-14 | Cross-kernel FP8 transfer experiments | KEPT | 2495 |
+| 2026-07-22 | mean_pool_rms_l2 — new embedding-pooling serving kernel | UNLABELED | 2610 |
+| 2026-07-22 | qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV) | UNLABELED | 2639 |
+| 2026-07-22 | rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add) | UNLABELED | 2687 |
+| 2026-07-22 | qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store | UNLABELED | 2723 |
+| 2026-07-22 | attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV) | UNLABELED | 2757 |
+| 2026-07-23 | canonical BaseQN dequant, GEMV, and GEMM routing | KEPT | 2792 |
+| 2026-07-23 | BaseQN QKV and SwiGLU consumer fusion | KEPT | 2874 |
+| 2026-07-23 | BaseQN greedy LM-head routing | UNLABELED | 2955 |
+| 2026-07-23 | BaseQN grouped expert projection and SwiGLU | UNLABELED | 3030 |
+| 2026-07-23 | Positioned, partial, and multimodal RoPE | KEPT | 3109 |
+| 2026-07-23 | QuixiCore Q8_0 KV codec and direct paged read | UNLABELED | 3198 |
+| 2026-07-23 | Gated DeltaNet preparation/output and sigmoid attention gate | UNLABELED | 3301 |
+| 2026-07-23 | calibration reduction and final-logit softcap | KEPT | 3395 |
+| 2026-07-23 | fused low-rank adapter application and routing | UNLABELED | 3453 |
+| 2026-07-23 | BERT token/type embedding and masked normalized pooling | UNLABELED | 3499 |
+| 2026-07-24 | reusable vision patch, position, and pooling operations | UNLABELED | 3529 |
+| 2026-07-24 | audio convolution and cross-attention routes | UNLABELED | 3563 |
+| 2026-07-24 | strict BaseRT vision/audio contract audit | UNLABELED | 3617 |
+| 2026-07-24 | Qwen temporal patch and Gemma value-clip closure | UNLABELED | 3692 |
+| 2026-07-24 | explicit Qwen vision RoPE layout | UNLABELED | 3759 |
+<!-- qx:index:end -->
+
+## 2026-07-01: Baseline classification (2026-07-01, quick preset) — RECORDED
 
 Speedup = best-baseline ms / tk ms (>1 means tk wins).
 
@@ -1043,7 +148,7 @@ artifact of per-call-sync timing. v2 remains the default and is still the right
 choice. TODO: sweep partition_size per context; re-check staged under real
 decode loops (one call per step, no pipelining) before changing any default.
 
-## Per-kernel log
+### Per-kernel log
 
 ### qgemv — status: LANDED (2026-07-01, three stacked wins)
 Three changes, all format-generic, validated by the full regression
@@ -1181,7 +286,7 @@ Results (ms, N=11008 K=4096 M=1; baseline = fp16 `mx.matmul` on the same run):
   under non-pipelined single-call decode (the pipelined harness reverses the
   old conclusion; a real decode loop sits between the two regimes).
 
-## Pass 2 (2026-07-01, commits e00a76d..): structural rewrites
+## 2026-07-01: Pass 2 (2026-07-01, commits e00a76d..): structural rewrites — UNLABELED
 
 ### Chunked linear-time causal linear attention family — LANDED
 The three scan/decay kernels had structurally bad parallelism: lin_attn_causal
@@ -1270,7 +375,7 @@ dispatch_sync per op) is ~1.5 µs over torch's own add (8×8: 0.0105 vs
 0.0091 ms); at 4096×1024 tk.add_rt is 1.2× of torch add. The earlier 0.42×
 harness reading did not reproduce; no fix needed.
 
-## Pass 3 (2026-07-01, mop-up): the five catalogued gaps
+## 2026-07-01: Pass 3 (2026-07-01, mop-up): the five catalogued gaps — UNLABELED
 
 ### mla_decode_fp8 / fp8_sparse — LANDED (partition upgrade, 1.7–3.8× single-call)
 Same v2-style partition as the bf16 decode (dense partitions the token range;
@@ -1316,7 +421,7 @@ Reverted; both rejected geometries documented at the launch site. The moderate-N
 float GEMV gap is now formally an accepted limitation (integer w8a8 got its win
 from 2-row; float paths resist both geometries).
 
-## Wave 3/4 — serving + training families (2026-07-02)
+## 2026-07-02: Wave 3/4 — serving + training families — UNLABELED
 
 Seven new families (MoE schedule/gather, varlen prefill, fused LM-head, beam
 advance, sliding-window paged decode, Mamba2 backward + D=128, fused
@@ -1389,7 +494,7 @@ is that they were built perf-first and there is no shippable win left:
   two-pass (cheap qkv MMA + coalesced scan) is kept and the tradeoff is
   documented at the launch site.
 
-## Decision log
+### Decision log
 - 2026-07-02: Wave-4 perf-pass audit — the new families are already perf-first;
   no shippable win. Rejected the mamba2-backward Qᵀ-via-transpose (bit-exact but
   scatter-bound; −30% on seq-2048). Re-confirmed beam/CE/lm-head/window optima.
@@ -1416,7 +521,7 @@ is that they were built perf-first and there is no shippable win left:
   matmul_custom small-shape routing (calibration kernel), fp16 LUT decoders
   (bit-tricks already exact + cheap).
 
-## Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips)
+## 2026-07-02: Wave-6 perf pass (2026-07-02, comprehensive sweep, 46 families / 536 cases / 0 skips) — REJECTED
 
 Full run: `perf/results/2026-07-02/235051-mlx-comprehensive/`. First measurement of the
 Wave-5 serving/training kernels (they shipped correctness-first, un-profiled).
@@ -1446,7 +551,680 @@ Wave-5 serving/training kernels (they shipped correctness-first, un-profiled).
 - **min_p / apply_token_bitmask / spec_verify_linear** run at 46–756 GB/s over the (T,V) logits —
   bandwidth-bound and already near the floor for a full-vocab pass.
 
-## Fused and specialized kernel integration pass (2026-07-13)
+## 2026-07-02: Wave-6 close-out — UNLABELED
+
+New serving/training families landed dual-backend + parity-tested (see the README "Serving &
+training kernels" table): typical-p / bad-words / grammar-bitmask masking, quant LM-head top-p,
+linear + **tree** speculative verification (`spec_verify_tree`), `spec_compact` / `spec_update_kv_meta`,
+zero-copy beam `beam_remap_block_table`, **N-level** cascade attention, on-device `build_multimodal_src`,
+`embedding_backward` (atomic scatter-add), GLU/GELU/RMSNorm/LayerNorm/fused-add-RMSNorm backward,
+`dropout`, and fused `AdamW`. The comprehensive bench sweep now runs **0 skips across 46 families**
+(`perf/results/2026-07-02/235051-mlx-comprehensive/`); an end-to-end serving+training integration
+test (`tk/tests/test_integration.py`) chains them on both backends. Perf wins + rejects are in the
+"Wave-6 perf pass" section below.
+
+**Follow-ons — now DONE:**
+- **Fully device-resident varlen** ✅ (`attn_varlen_prefill_device`): device `varlen_q_pad_gather` +
+  `varlen_o_regather` replace the host pad/transpose loop; the whole path (worklist → pad/gather →
+  attention → re-gather) runs on-device from a DEVICE `cu_seqlens` with a single scalar readback
+  (`total_padded`). `varlen_build_worklist` now handles **any B** — a single-threadgroup CHUNKED scan
+  (each thread owns a contiguous batch chunk: local totals → threadgroup exclusive scan → re-walk with
+  the base offset) lifted the old B≤256 cap. Validated == host worklist for B up to 1000.
+- **fp8 cascade prefix** ✅ (`cascade_attention_fp8` / `cascade_prefix_partition_fp8`): uint8 fp8
+  (e4m3/e5m2) shared prefix, per-kv-head dequant on read, mirroring `paged_attention_v2_fp8`;
+  validated == full attention over [dequant(prefix) ++ suffix].
+
+Running notebook for the per-kernel optimization loop described in `perf/perf.md`.
+Numbers are throughput-style median per-call ms from `perf/bench_kernels.py`
+(adaptive batched timing, ≥2 ms per timed sample), Apple M4 Max 40-core
+(~546 GB/s DRAM), MLX backend unless noted. Baseline run:
+`perf/results/2026-07-01/172040-mlx-quick/` at `d902519`.
+
+**Timing-methodology note (2026-07-01):** the harness was rewritten. Earlier
+numbers in this file used one submit+sync per call, which adds a ~0.15–0.25 ms
+latency floor and swamped small kernels; conclusions drawn only from per-call-sync
+timing (notably "staged paged attention is slower") did NOT survive the fix —
+see the serving section.
+
+## 2026-07-03: Wave-7 close-out — UNLABELED
+
+Wave 7 closed the full 20-item tail of Wave-6 deferrals (robustness, test gaps, feature
+completeness, one refactor, four measure-first perf items, first-order autograd, bench/docs). All
+dual-backend + parity-tested; full 3-suite regression **2133 passed** and `xcodebuild` SUCCEEDED.
+
+**Perf items (measure-first, keep-if-win) — two prior-wave rejects REVERSED:**
+- **#1 fused norm backward — WIN, reverses the Wave-6 reject below.** New `rms_norm_bwd_fused` /
+  `layernorm_bwd_fused`: one simdgroup per row computes rstd (and mean) in-kernel, writes dX, and
+  accumulates dweight (+ dbias for LN) via `atomic_add_float` in a **single pass**. The dweight-atomic
+  contention the prior wave feared does **not** bite — Apple's native `atomic_float` handles it and
+  the one-pass memory saving dominates. Measured **~2.3–2.5× faster than the old 3-pass hybrid and on
+  par with `mx.fast`'s fused VJP (0.97–1.00×)** across rows 4k–16k, D 2k–8k. Both routers wired to the
+  fused path; the dx-only kernels stay available.
+- **#7 gelu_bwd vec4 — WIN, reverses the Wave-6 "left as-is".** `packed_four` vec4 loads/stores
+  (scalar tail). Measured fp32 ~166–184 → ~352–415 GB/s (2.1–2.3×), bf16 ~88–99 → ~250–344 GB/s
+  (2.8–3.5×). The earlier "tanh-bound, vec4 won't help" call was wrong: the scalar **bf16** element
+  access, not the tanh, was the bottleneck.
+- **#6 beam_build_copy_pairs compaction — REJECT (measured).** The fixed-slot emit is overhead-bound
+  (~130 µs flat from 2k to 262k slots), so a scan + atomic-cursor compaction can't beat the launch/eval
+  floor and would only add contention + nondeterministic ordering. Kept the atomic-free kernel.
+- **#5 cascade single-dispatch fusion — REJECT (measured).** The 3 host concatenates are 5–23% of
+  cascade time (23% only at B=1). A fused write requires decoupling the output stride from the dispatch
+  count + a write-offset in the SHARED paged-attention partition kernels — a regression surface
+  (paged_attention_v2 / cascade / fp8 / multi all route through them) disproportionate to a 5–23%
+  single-path win. Kept the concatenate cascade (already 212–255 GB/s).
+
+**Robustness / correctness (P1):**
+- **#4 spec_compact** now uses the chunked single-threadgroup scan → **any B** (removed the B≤256 cap).
+- **#9 spec_verify_tree** dropped the 64-sibling cap: the residual re-walks `last`'s child chain
+  (exact for any sibling count) + a `tree_valid` first-generation fallback.
+- **#19** Family-A callers validate `K ≤ #candidates` at the host boundary (lm_head `k≤V`,
+  beam `V≥2·beam_width`) so the `masked_topk` `-1`-degenerate round is unreachable.
+- **#11 glu geglu_erf** backward now differentiates the A&S erf approximation itself
+  (`glu_erf_approx_deriv`) → bit-consistent forward/backward pair (tight 3e-5 analytic test).
+
+**Feature completeness (P3):**
+- **#8 exact quant top-p** — new `lm_head_topp_partials_q` emits a per-tile logsumexp so the reduce
+  uses the **true full-vocab normalizer** (not the pool-only approximation); nucleus is exact whenever
+  it fits in the over-selected pool.
+- **#2 build_dynamic_tree** — device-resident draft-tree pointer builder (cap-free, scratch-free)
+  replacing the host serial `spec_build_tree_pointers`.
+- **#3 embedding_backward `method="sorted"`** — atomic-free segment-reduce (argsort + one threadgroup
+  per id) alongside the default atomic scatter; wins under heavy id duplication.
+
+**Refactor (#20):** `masked_topk_local` in `include/ops/group/topk.metal` — the Family-B K-round merge
+shared by the three lm_head partials + beam_topk (emit functor per site).
+
+**Autograd (#10):** `tk.autograd` — first-order differentiable `gelu/glu/rms_norm/layernorm/
+embedding_lookup/dropout` on both backends (MLX `mx.custom_function` vjp → the tk backward; torch
+`autograd.Function`). First order only (the kernels have no CPU path). Gotcha handled:
+`mx.custom_function` passes a mis-shaped `primals` when the forward casts dtype, so each vjp closes
+over the original inputs.
+
+**#16 Xcode unit tests — N/A (confirmed).** The `tests/unit/` harness only tests substrate
+register/shared tile+vec primitives (`warp::tests`/`group::tests`, gated by `TEST_*` leaf flags in
+`testing_flags.hpp`); there is no registration point for kernel-level ops, so sampling/spec/embedding/
+lm_head are inherently Python-tested by design. Nothing to build.
+
+**Test-gap closures (P2):** swiglu_oai clamp-branch gradient (analytic ref, not finite-diff),
+spec_verify_tree residual-distribution histogram (30k rows), cascade_attention_fp8 standalone MPS
+oracle. **Bench (P7):** cascade `full-paged [prefix++suffix]` baseline (#17); numpy `ref=` oracles on
+beam_build_copy_pairs + varlen_build_worklist (#18); torch comprehensive sweep recorded (#15).
+
+---
+
+## 2026-07-03: Wave-8 — optimization pass over the Wave-6/7 kernels — UNLABELED
+
+A measure-first pass over every new kernel. First registered the last unmeasured families in
+`perf/bench_kernels.py` (typical_p, apply_bad_words, dropout, adamw, rms_norm_add, embedding_backward,
+spec_verify_tree, spec_compact, build_dynamic_tree), then benched the whole surface (MLX comprehensive
++ the new quick cases). Finding: the surface is **already near-optimal** (Waves 6/7 did the heavy
+lifting), with two genuine outliers, both fixed.
+
+**Wins (measured, kept):**
+- **typical_p_sample 1.8×** (10.6 → 5.87 ms, T256×V32000). The kernel's cost is the surprise-threshold
+  bisection, and each step re-scans the full vocab with a per-element `exp` (bandwidth-bound at
+  ~100 GB/s). 32 steps resolve tau to `smax/2³²` — pure overkill; **16 steps** give `smax/65536`,
+  far below the V-token surprise spacing, so the kept set is unchanged. (A one-pass mass-histogram +
+  local refine could roughly halve it again — noted as a follow-on; not done, the 1.8× is the safe win.)
+- **dropout fwd+bwd ~1.9×** (2.14 → 1.09 ms, 16384×4096; ~128 → 246 GB/s). Both kernels were scalar
+  one-thread-per-element — the same bf16 scalar-access bottleneck `gelu_bwd` had. `packed_four` vec4
+  with a scalar tail; the keep-mask stays keyed by the element index so it's byte-identical and the
+  backward still recomputes it from the seed.
+
+**Rejects (measured, reverted/kept-as-is):**
+- **adamw vec4 — reject.** Neutral (0.29→0.29, 1.11→1.13 ms). AdamW is dominated by its **four f32
+  moment arrays** (m_in/v_in/m_out/v_out); f32 scalar access is already aligned/efficient, so the
+  bf16-access penalty that made dropout/gelu_bwd vec4 win simply doesn't exist here. Reverted to the
+  simpler scalar kernel.
+- **lm_head (non-quant) at T>1 — documented tradeoff, not a bug.** argmax_T8 is 0.38× vs matmul+argmax
+  because the fused partials re-read W once per token (T× the weight bandwidth) while the dense matmul
+  reads W once. This is the fused path's off-purpose regime: it exists for T=1 decode and for quant
+  weights (lm_head_q topk_q4_0_T8 is ~0.95×, near parity, since on-the-fly dequant offsets the
+  re-reads). Non-quant T>1 should use matmul+sample. Batching T tokens per tile to amortize W would fix
+  it but is a 6-kernel rewrite (argcat/topk/topp × quant/non-quant) of a hot, well-tested family for a
+  narrower regime — deferred.
+
+**Confirmed already near-optimal (no change):** rms_norm_add ~305 GB/s (register-tile fused norm),
+apply_bad_words / min_p / apply_token_bitmask (bandwidth-bound over (T,V), effective BW ~230 GB/s once
+the multi-pass factor is counted), embedding_backward (the **atomic** default is *faster* than the
+sorted path even at V=256 heavy-dup — 0.11 vs 0.57 ms — Apple's native atomic_float wins over the
+argsort+segment overhead; sorted stays available but is rarely the pick), spec_verify_tree/compact and
+build_dynamic_tree (overhead-bound at sub-30 µs), the Wave-7 fused norm backwards (already on par with
+mx.fast), glu/embedding_lookup/gelu_bwd (already 2–3× ahead). The tiny GB/s numbers for
+varlen_build_worklist / beam_build_copy_pairs / beam advance are latency/overhead-bound, not bandwidth
+(already measured + rejected in Wave 7).
+
+---
+
+## 2026-07-05: Wave-9 — metal-forge gap port, kernel 1: quantized grouped expert GEMMs — MIXED
+
+New kernels `moe_grouped_gemm_rect_q<FMT>` / `moe_grouped_gemm_swiglu_q<FMT>` (formats mxfp4,
+kU4, fp8_e4m3, q8_0, nvfp4, q4_K; swiglu has act_mode 0/1 = swiglu / gpt-oss swiglu_oai with
+pre-activation expert bias). Experts packed (N_out, K) so quant groups run along the
+contraction axis; contraction is `mma_ABt` fed by a new col-layout register fill
+(`dequant_into_register_col`, mirrors the col-layout `load` lane map — the two thread
+elements are vertically adjacent). Bench: `@register("moe_q")`, baseline = dense bf16
+grouped GEMM on the same schedule.
+
+### Variant matrix (mlx quick, 2880×2880 gpt-oss tile, M4 Max; 512-row prefill numbers —
+### the 32-row decode cases were session-noise-limited, ratios ~parity with dense)
+
+| variant | rect mxfp4 | rect q8_0 | swiglu_oai mxfp4 |
+|---|---|---|---|
+| dense bf16 baseline | 0.625 | 0.624 | 1.259 |
+| v1 naive frag fill, 1 warp | 0.716 | 0.731 | 2.333 |
+| dequant-to-shared, 1 warp | 0.767 | 0.729 | 2.138 |
+| 4-warp split-K, frag fill | 0.692 | 0.689 | 2.553 |
+| 4-warp split-K, per-warp shared tiles | 0.918 | 0.670 | 2.947 |
+| **4-warp split-K + cols4 span fill (KEPT)** | **0.674** | **0.658** | **1.863** |
+
+### Kept
+- **4-warp intra-threadgroup split-K** (each warp owns every 4th K-step, private fp32
+  accumulator, one staged reduce by warp 0) — fixes the 32-thread-per-tile occupancy starvation
+  of the naive port.
+- **`tk_dequant_cols4_s8<FMT>` span decoder** (dequant.metal): decodes the col-fill's 4
+  stride-8 columns with ONE scale unpack (specialized q8_0/fp8_e4m3/mxfp8/mxfp4/kU4; the mxfp4
+  case reads just 2 bytes + 1 exp2 for 4 weights). The e8m0 formats were paying an `exp2` per
+  ELEMENT in the naive fill — that, not bandwidth, was the bottleneck (mxfp4 regressed under
+  plain split-K while q8_0 improved; the span decoder fixed exactly the mxfp4 side).
+
+### Rejected (measured)
+- Dequant-to-shared at 1 warp: barrier cost eats the span-decode win for the single-tile rect
+  kernel (0.767 vs 0.716); only helped the 2-tile swiglu.
+- Per-warp shared tiles under split-K: 20-28 KB threadgroup memory tanks occupancy
+  (rect mxfp4 0.918 — worst variant).
+
+### Status / follow-ups
+- rect_q within 5-8% of the dense bf16 kernel's wall clock while reading 4-8.5× fewer weight
+  bytes — the capacity win (gpt-oss-120B-class MoEs fitting at all) ships; swiglu_q still
+  1.48× dense (two dequant fills/step), candidates: K-step 64, 2-warp split with per-warp
+  gate/up split, vectorized A loads. Decode-shape bench needs an E=32 sweep (the E=4 decode
+  tile fits in SLC, masking the bandwidth advantage) — revisit when the routing kernel lands.
+- Correctness: 18 MLX tests (6 formats × bias, swiglu×act modes, q8_0-exact-vs-dense,
+  end-to-end quant moe_mlp) + 8 cross-backend parity cases, all green; full qgemm suite
+  re-run green after the dequant.metal change (219 + 66 tests).
+
+## 2026-07-05: Wave-9 — gap port, kernel 2: attention softcap + sinks — UNLABELED
+
+Gemma-2/3 logit soft-capping (runtime scalar, <=0 off) and gpt-oss attention sinks
+(per-head denominator-only logit) across attn_fwd (+q16), attn_causal, attn_window,
+attn_varlen_prefill, and paged v2 (softcap in the partitions incl. fp8; the sink merged
+EXACTLY ONCE in the shared reduce — which also makes cascade/MLA compositions sink-capable
+for free). Correctness traps pinned in-kernel comments: no log2(e) fold into Q when capped;
+cap BEFORE masks; sink seeds the running max. sinks bound as always-present placeholder
+buffers (q / tmp_out) gated by has_sink — no dummy allocations, no host_name doubling.
+
+- Tests: fp64 oracles per kernel incl. the Gemma-2 (window+softcap) and gpt-oss
+  (window+sink) layer configs; 231 attention-family correctness + 79 parity green.
+- Perf: flagless-path regression guard measured clean — attn fwd 0.454 ms (SDPA 0.504),
+  causal 0.226/0.878 ms, paged v2 0.433 ms (dense-loop base 1.78) at the quick shapes;
+  the flags cost a uniform branch + 3 bound args when off.
+
+## 2026-07-05: Wave-9 — gap port, kernel 3: DeepSeek grouped MoE routing — UNLABELED
+
+moe_route_grouped: HF DeepSeek-V3 "noaux_tc" semantics — sigmoid / softmax / sqrt-softplus
+scoring, e_score_correction_bias for SELECTION only, per-group top-2-sum ranking, top
+`topk_group` groups, expert top-k among survivors, weights from UNBIASED scores
+(renormalize + routed_scaling_factor). One simdgroup/token over threadgroup-staged
+scored/biased (E <= 512, n_group <= 32), both selection levels via the existing masked_topk
+butterfly — barrier-free vs the reference's 256-thread tree-reduce design. Output contract
+== moe_route_topk, so it drops into moe_permute/moe_mlp unchanged.
+
+- Tests: 9 oracle tests (DeepSeek-V3 256/8/4/8, Kimi-K2 384/1/8, all scorings, ids-exact
+  with explicit-tie and bias-flips-selection-not-weights fixtures, group-mask exclusion);
+  cross-backend parity ids atol=0.
+- Perf: T=4096/E=256 grouped 0.1442 ms vs plain moe_route_topk 0.1430 ms — within noise;
+  the reference's E=256 bitonic fast path is confirmed unnecessary on this geometry (skipped
+  as planned).
+
+## 2026-07-05: Wave-9 — gap port, kernel 4: fused per-head QK-RMSNorm + RoPE — UNLABELED
+
+New kernels/qk_norm_rope/: one warp per (token, head) over packed QKV (T, (Hq+Hk+Hv)*D) —
+per-head RMSNorm (gemma (1+w) flag) + RoPE (NeoX split-half via the rope_kv rv_fl<D/2>
+half-vector idiom; GPT-J interleaved via the mla contiguous-lane idiom, pairs lane-local),
+V heads vec-copied through. Functional out-of-place, one dispatch (the Qwen3/gpt-oss
+attention-prep pattern). D in {64,128,256}, full rotary.
+
+- Tests: 9 fp64-oracle cases (both rope styles x gemma, V-region bit-identity,
+  composition cross-check) + cross-backend parity (atol 1e-2 bf16).
+- Perf: Qwen3-8B shape (T=4096, 32/8/8, D=128) 0.388 ms vs 1.005 ms for the
+  mx.fast.rms_norm + fast.rope + concat composition — 2.6x (target was >= 1.5x).
+  T=512: 0.055 vs 0.111 ms. No optimization pass needed at v1.
+
+## 2026-07-05: Wave-9 — gap port, kernel 5: Mamba-1 (S6) selective scan, dense + varlen — UNLABELED
+
+New kernels/selective_scan/: sequential-in-time / parallel-over-state (threadgroup per
+(batch, dim), one thread per state index, dstate <= 256, fp32 state, io f32/f16/bf16).
+Reference-faithful port of metal-forge/vLLM mamba semantics (softplus discretization,
+exp(delta*A), D*u skip, silu(z) gate; channel-major layouts) with tk-native bf16 instead
+of uint16 bit-twiddling. Varlen: flattened token axis + query_start_loc, per-request paged
+state pool via cache_indices (null_block_id skip) and has_initial_state; the MLX path is
+functional via an sscan_pool_clone prepass (untouched slots preserved), torch clones too.
+Unlocks Mamba-1 hybrids (Jamba, Falcon-Mamba). varlen_apc (chunked state checkpoints for
+prefix caching) is the recorded next step for this family.
+
+- Tests: 12 fp64-oracle cases (3 dtypes x 3 shapes incl. dstate=160 multi-simd reduce,
+  no-optionals, varlen-vs-dense with scattered pool slots + untouched-slot preservation,
+  null-block skip) + fp32 cross-backend parity (out and state, atol 1e-5).
+- Perf: B2/d2048/L512 0.93 ms (N=16), 5.16 ms (N=128) — sequential-scan bound, no
+  framework baseline exists (per-step composition is pathological to trace). Optimization
+  candidates recorded: vec4 B/C loads, one-simdgroup geometry for dstate<=32, Blelloch
+  time-scan (major rewrite).
+
+## 2026-07-05: Wave-9 — gap port, kernel 6: GDN / GatedDeltaNet linear attention — UNLABELED
+
+New kernels/gdn/: the Qwen3-Next / Kimi-Linear hybrid-mixer recurrence — per-timestep
+delta rule S = g*S + k*beta*(v - k.S), y = q.S — one simdgroup per (request, hv, dv),
+32 lanes partitioning Dk (Dk in {64,128} compile-time), fp32 state promoted from the
+reference's io dtype. Varlen packed sequences (cu_seqlens) + persistent per-request
+fp32 state pool via slot_mapping (race-free in-place row updates; functional via the
+sscan_pool_clone prepass on both backends). GQA hk = hv/(Hv/Hk); load_initial switches
+decode-continuation vs fresh-prefill.
+
+- Tests: 8 fp64-oracle cases (3 dtypes x GQA shapes, decode step R=16, fresh-prefill
+  ignores pool, untouched-slot preservation) + fp32 cross-backend parity (y and pool).
+- Perf: prefill 2x2048 tokens (Hv=8, Dk=Dv=128) 1.55 ms; decode R=64 single-step
+  0.42 ms (launch-overhead-dominated at tiny work). Recorded bench-gated follow-ups:
+  vec4 k/q loads, ssd_decode-style row-owned geometry at Dk=64, and the chunked-WY
+  parallel prefill (high-risk/high-value, only against this measured baseline).
+
+## 2026-07-05: Wave-9 — gap port, kernel 7: per-group + asymmetric activation quant — UNLABELED
+
+quant_rt extensions: quantize_per_group_fp8/int8 (group-wise dynamic quant along the row,
+canonical G=128 — the activation side of block-quantized GEMMs; scale (rows, D/G) f32;
+ue8m0 flag rounds fp8 scales up to powers of two, MX convention) and
+quantize_per_token_int8_azp (vLLM asymmetric: scale=(max-min)/255, azp=rint(-128-min/s),
+constant-row fallback documented). Plus qgemm_w8a8_azp in qgemm_int: the zero-point
+correction epilogue acc - azp[m]*w_rowsum[n] (w_rowsum host-precomputed) — validates the
+azp layout with a real consumer. int8 codes/scales/azp BIT-EXACT vs numpy twins
+(no transcendentals); fp8 verified by power-of-two + coverage + half-ulp reconstruction
+bounds; azp GEMM int-exact vs int64 numpy. 40 correctness + parity-atol-0 green.
+
+## 2026-07-05: Wave-9 — gap port, kernel 8: fused act->quant epilogues — UNLABELED
+
+New kernels/act_quant/ + two substrate additions: tk_e2m1_encode (fp4 nearest-of-16, tie
+behavior matching the host packer's argmin — unblocks device fp4 epilogues later) and the
+glu_eval lift into include/common/glu_eval.metal (one activation definition shared by
+kernels/glu and act_quant; glu suite re-run green). Kernels: silu_mul_quant_{fp8,int8}
+(per-token dynamic, feeding qgemm_fp8_scaled / qgemm_w8a8), silu_mul_quant_fp8_group
+(per-group-128 + ue8m0, feeding block-quant GEMMs), each with mode 0 swiglu / 1 gpt-oss
+swiglu_oai via the shared glu_eval; plus rms_norm_add_int8_dyn (int8 sibling of the fp8
+residual-stream epilogue). Two-pass amax+encode, activation recomputed (memory-bound).
+
+- Tests: reconstruction-bound oracles (exp() between input and code makes bit-exact-vs-numpy
+  the wrong contract), power-of-two/coverage checks for ue8m0, fused-vs-unfused composition
+  (>= 95% identical codes, rest off-by-one from bf16-vs-fp32 activation rounding), 91 tests
+  green incl. full glu/add_norm regression. Parity codes off-by-one max (separately compiled
+  metallibs round exp differently at borderlines — same rationale as the qgemm tolerance).
+- Perf: int8 epilogue T=4096 D=2880: 0.251 ms vs 0.321 ms for swiglu -> quantize_per_token
+  (1.28x, the eliminated bf16 round-trip); T=512: 0.034 vs 0.036 ms.
+
+## 2026-07-05: Wave-9 — gap port, kernel 9: the sampler zoo — UNLABELED
+
+New kernels/sampling/sampling_transforms.metal (+ transforms.cpp/.h): 11 transforms on the
+one-simdgroup-per-row substrate — quadratic/smoothing, top-nsigma, top-A (log-space exact),
+epsilon-cutoff, eta-cutoff (typical_p's S1 entropy trick, one fewer pass than the reference),
+XTC (on-device coin at a non-token RNG counter; e-domain comparisons, no division), skew
+(index-order CDF pow via simd_prefix_exclusive_sum — verified metal-forge contract, no sort;
+exllamav2 sorted-CDF variant deferred), top-k renorm (masked_topk, ties -> smaller id),
+top-p renorm (32-iter bisection, deliberately tighter than the reference's 5), no-repeat-
+ngram (per-lane history starts, benign -inf scatters), and DRY (faithful reference loop with
+the O(max_ngram) inner unwind parallelized via first-violation simd_min; shared breakers
+list + launch-uniform scalars per TM convention).
+
+- Tests: exact-SET oracles on margin-safe 1/64-grid logits + property tests; DRY/ngram vs
+  direct python transcriptions of the reference loops; 11 new + 87-test sampling regression
+  green. Parity: 1e-4 on O(10) logit values (last-ulp fast-math between the two metallib
+  compilers; set flips would read ~1e30), probs-domain 1e-6.
+- Perf: bandwidth-bound as expected — quadratic/nsigma ~0.32 ms at (256, 32000) (~206 GB/s,
+  2 passes), top_a/eta ~0.60 (3 passes), xtc 0.75 (4 passes), DRY 0.18 (copy + uniform scan).
+
+## 2026-07-05: Wave-9 — gap port, kernel 10: MInference block-mask builder — UNLABELED
+
+New kernels/minference/: minference_build_block_mask converts per-head vertical column
+indexes + slash diagonal offsets ((B, H, nnz) i32, -1 pad) into the per-head KV block mask
+(B, H, max_blocks) that paged_attention_block_sparse now consumes directly — the consumer
+gained a mask_heads scalar (buffer 16; 1 = legacy per-batch (B, max_blocks) unchanged,
+H = per-head) so MInference's per-head selectivity is preserved instead of unioned away.
+vertical_topk/slash_topk caps give the _mergehead budget without a second kernel;
+last_n_blocks keeps the local window. The reference's serial two-pointer CSR merge is
+deliberately skipped (deferred until a prefill block-sparse consumer exists) — for decode
+the block mask IS the consumer format.
+
+- Tests: exact int equality vs the numpy marking rule (+topk-cap case), end-to-end per-head
+  mask -> block-sparse attention vs dense numpy restricted to kept blocks, legacy 2-D mask
+  regression, full kv_cache suite (152 green), torch paged subset (24), parity atol=0.
+- Trivial-cost builder (one 32-lane simdgroup per (head, batch)); no bench entry — the win
+  is the KV blocks the consumer skips.
+
+## 2026-07-05: Wave-9 — gap port, kernel 11: TurboQuant KV codec — UNLABELED
+
+New kernels/turboquant/ (arXiv 2502): tq_encode + tq_decode. K = asymmetric-uniform
+per-32-element fp16 scale+zp (2-8 bits, signed q8_0 or unsigned sub-8-bit); V = random-sign
+FWHT rotation -> per-32 fp16 RMS scale -> Lloyd-Max nearest-centroid (searchsorted against
+midpoint boundaries, 2/3/4/8 bits, sub-8-bit byte-packed). The fp16 arithmetic chain is
+transcribed VERBATIM from metal-forge so the numpy oracle reproduces K codes bit-for-bit.
+One threadgroup per (token, kv_head), HEAD_SIZE threads, one simdgroup == one 32-elem scale
+group (min/max/RMS are simd_* reductions); FWHT stages 0-4 are register shuffles, 5+ go
+through threadgroup memory. head_size in {64,128,256}. TM divergences from the reference:
+signs (tq_signs) + Lloyd-Max centroids (lloyd_max_centroids) are BUFFERS not baked tables;
+k_bits/k_signed/v_bits are runtime scalars; slot_mapping int32. Functional 5-cache-array
+return via a byte-clone prepass (untouched slots preserved). Attention integration (rotated-
+domain V accumulate + one deferred inverse FWHT per head, exploiting FWHT linearity) is
+spec'd in the reference and DEFERRED — this cache format already supports it.
+
+- Tests: K codes/scale/zp bit-exact vs the fp16 oracle (8-bit signed + 4-bit unsigned +
+  sub-8-bit byte-straddle); V codes >= 95% exact with off-by-one only at fp16-borderline
+  boundaries; round-trip SNR floors (K 8-bit > 30 dB, V 4-bit > 18 dB); decode-vs-oracle;
+  functional untouched-slot preservation (slot -1 skip). Parity: V codes + all scales
+  atol=0, K codes off-by-one (borderline fp16 rint across separately compiled metallibs).
+- No standalone bench entry (codec throughput dominated by the paged scatter it replaces;
+  the win is the sub-4-bit cache footprint — recorded, revisit with the deferred attention
+  integration).
+
+## 2026-07-05: Wave-9 — gap port, kernel 12: marginal layout/bit utilities — UNLABELED
+
+New kernels/marginal/ (one dir, four ops via a small kind-dispatched primitive):
+- tau_tail: scale the Q and V slices of a packed (T, 3*q_dim) QKV by tanh(tok_qv_lin)+
+  tau_pos_table[pos, head] (K slice passes through); functional via the shared byte-clone
+  prepass. Flat-grid elementwise v1 (any head_dim); the float2 _d64 variant is a bench-gated
+  follow-up. int32 positions (TM convention; ref int64).
+- packbits / segment_packbits: bool/uint8 -> bits, big/little order (np.packbits). Segment
+  variant binary-searches output_indptr (host cumsum of ceil(len/8)); total_output_bytes is
+  a caller-provided int (MLX's lazy graph can't read output_indptr[-1] at build time).
+- permute_cols: dtype-agnostic 16-bit column gather x[:, perm] (Marlin act-order reperm).
+
+- Tests: packbits/segment_packbits exact vs np.packbits (both bit orders, ragged rows);
+  permute_cols exact vs x[:, perm] (uint16 + bf16); tau_tail vs numpy transcription with
+  K-slice-untouched check; 6 green + parity atol=0 (ints/codes) / 1e-5 (tau_tail).
+- Trivial bandwidth-bound ops; no bench entries.
+
+DESIGNATED CUT (per plan): moe_lora_align — vLLM's LoRA-alignment metadata format has no
+ThunderMittens consumer (moe_grouped_gemm* take the existing route/permute/pad output), so
+porting it would ship dead code. Recorded here as the plan's explicit scope-tightening cut,
+not an oversight; revisit if/when a multi-LoRA MoE serving path lands.
+
+## 2026-07-05: Wave-9 — follow-up: selective_scan varlen_apc — UNLABELED
+
+Completes D1.1 (selective scan): the varlen + automatic-prefix-caching (APC) variant.
+Same S6 recurrence as varlen but the running state is checkpointed into PAGED state blocks
+at chunk boundaries (last chunk -> block_idx_last_scheduled_token) and the initial state is
+read from a possibly-cached prefix block (initial_state_idx). Buffer table transcribed 1:1
+from metal-forge's selective_scan_fwd_varlen_apc_state_float32_typed (block_idx_first/last
+scheduled token, initial_state_idx, cu_chunk_seqlen, last_chunk_indices, block_size,
+cache_indices_stride, use_chunk_metadata). New SelectiveScanApc primitive (dedicated, not
+overloaded onto SelectiveScan) with the functional pool-clone prepass; use_chunk_metadata=0
+falls back to fixed block_size chunking. Gated behind its own test per the plan (highest-risk
+chunk metadata).
+
+- Tests: 4 fp64-oracle cases (uniform-chunk f32/bf16, prefix-cache-initial-state from a
+  non-zero block, multi-chunk intermediate checkpoints, untouched-slot preservation) +
+  fp32 parity; 16 selective_scan tests green total. The chunk-metadata (cu_chunk_seqlen)
+  path is implemented and exercised via use_chunk_metadata=False fallback in these tests;
+  the full logical-chunk scheduler metadata is a vLLM-runtime input (recorded).
+
+## 2026-07-05: Wave-9 — optimization pass over the gap-port kernels — UNLABELED
+
+Measure-first sweep over the 12 new kernel families. The clean finding: the **bf16-I/O**
+kernels win from manual vec4 (scalar bf16 loads waste bandwidth — the same lesson as
+gelu_bwd/dropout in Wave-8), while the **f32** kernels do NOT (their scalar strided loads are
+already coalesced and compiler-vectorized, so manual vec4 only adds overhead at scale).
+
+WINS (kept):
+- **gdn_recur** vec4 k/q loads (lanes already own contiguous Dk slices; k now read once/step
+  instead of twice) — prefill 2x2048 1.56 -> 1.50 ms (~7%), decode R64 0.45 -> 0.43 ms (~5%).
+- **act_quant** silu_mul_quant_{fp8,int8,fp8_group} vec4 (quant_rt float4-chunk pattern on
+  both the amax and encode passes) — int8 T4096xD2880 0.30 -> 0.22 ms (~27%), T512 0.038 ->
+  0.027 ms (~30%). Confirms scalar bf16 load, not the silu exp, was the ceiling.
+
+REJECTS (measured, reverted):
+- **quadratic_transform** (and by extension the f32 sampler zoo) vec4: WON at T256 (0.31 ->
+  0.16) but REGRESSED at T1024 (0.70 -> 0.80, repeatable 3x) — the throughput-bound regime
+  that matters more. f32 strided loads are already optimal; reverted. Applies to the whole
+  logit-transform family (all f32) -> left scalar.
+
+LEFT AS-IS (assessed, at/near floor):
+- **selective_scan** N128 5.09 ms — sequential Mamba scan with a per-timestep threadgroup
+  reduce barrier; B/C are strided by total_tokens (not vec4-able) and the recurrence is
+  serial. Only the chunked/Blelloch rewrite (recorded, high-risk) would move it — not an
+  opt-pass change.
+- **moe_grouped_gemm_swiglu_q** swiglu_oai 512-row 1.93 ms vs 1.27 dense (1.52x) — already
+  5-variant-tuned in the port; the two-pass reduce fits the 28 KB threadgroup budget and the
+  gap is dequant + epilogue. Closing it needs the documented deep candidates (K-step 64, fold
+  moe_gather into the A load) that risk correctness for a kernel already reading ~8x fewer
+  bytes than dense. Deferred with spec.
+- **turboquant** (fp16 chain kept verbatim for bit-exactness), **qk_norm_rope** (2.6x already,
+  substrate rv_fl vector loads), **quant_rt** (already float4), tiny utilities
+  (tau_tail/permute_cols/packbits/minference/moe_route, bandwidth/latency-bound) — no change.
+
+## 2026-07-05: Wave-10 — metal-forge serving-glue, K1: norm->quant matrix completion — UNLABELED
+
+Completed the fused-add-norm quant matrix in kernels/add_norm/ (metal-forge
+normalization/layer_norm_quant.metal): layernorm_add_int8_dyn (the one-off int8 LayerNorm gap)
+plus per-128-block fp8/int8 for BOTH rms_add and layernorm_add. The per-block variant emits
+(rows, D/128) group scales directly, so its codes feed the block-quant expert GEMMs
+(moe_grouped_gemm_*_q) with no separate quantize_per_group pass. Novel piece: the per-128-block
+amax in the rv_fl<D> register layout — with G=128 (compile-time, canonical) each lane's w-th
+element lives in block w/4 independent of lane, so per-block absmax is a simd_max over WPB=4
+consecutive w (register-resident, no threadgroup scratch, unlike the reference's group_max[256]).
+Extended the AddNormFp8 primitive with group_size_/ue8m0_; fp8 gets the ue8m0 power-of-two option.
+
+- Tests: int8 codes off-by-one vs a numpy twin (fp32 rsqrt/weight chain flips borderline codes;
+  res_out bit-exact); fp8 half-ulp reconstruction + power-of-two/coverage; 41 add_norm green +
+  parity (codes atol=1 across the two metallibs, scales 1e-4).
+- Perf: the fusion IS the optimization (register-resident single-simdgroup). Fused per-block int8
+  = 1.6x the unfused rms_norm_add -> quantize_per_group chain (16384x1024: 0.287 vs 0.456 ms;
+  65536x768: 0.839 vs 1.396 ms) — eliminates the (N,D) bf16 round-trip. No further opt needed.
+- Deferred (documented): standalone non-add norm-quant, scale_ub clamp, block sizes != 128.
+
+## 2026-07-05: Wave-10 K2: fp8 KV gather+upconvert + incremental scale update — UNLABELED
+
+Extended kernels/kv_cache/ (metal-forge cache/gather_kv_cache.metal + kv_scale_update.metal,
+credit AlpinDale) to close the fp8 KV loop. kv_cache_gather_fp8<OUT_T>: the READ path for a
+paged fp8 prefix cache — reads e4m3/e5m2 code bytes and dequantizes to bf16 via
+code * scale[kv_head] (per-kv_head scales, round-trips exactly with kv_cache_scatter_fp8),
+same worklist as kv_cache_gather (one TG/token, cu_seq_lens binary search, block<0 zero-fill),
+fmt runtime scalar. kv_cache_scale_update: incremental per-tensor running-max (new = max(old,
+absmax/240)) — the streaming-decode analogue of the one-shot kv_cache_scales; single 256-thread
+threadgroup, no atomics needed for the scalar (grid-stride reduction seeds from the old value).
+
+- Tests: scatter_fp8 -> gather_fp8 round-trip (== decode(code)*scale exactly, within fp8
+  relative precision of the original K, e4m3 + e5m2); scale_update vs numpy running-max
+  (only-raises verified); 154 kv_cache green + parity (bf16 rows 2e-2, scales 1e-5).
+- Perf: bandwidth-bound read path, reads 1-byte codes vs the bf16 gather's 2-byte (halved
+  cache read bandwidth); nb256 gather 0.104 ms. Same near-optimal one-TG/token coalesced
+  structure as kv_cache_gather — no further opt.
+- Deferred (documented): per-tensor (vs per-kv_head) fp8 gather variant; the MLA-cache
+  upconvert-gather (cp_gather_upconvert_fp8_mla — different 656-byte cache layout).
+
+## 2026-07-05: Wave-10 K3: DeepSeek-V3.2 indexer K quant-and-cache — UNLABELED
+
+New kernels/indexer/ (metal-forge indexer_k_quant_and_cache; credit AlpinDale). Quantizes the
+DSA/NSA indexer K per quant_block_size (canonical 128) into a low-precision e4m3 cache the
+sparse-attention top-k selector reads cheaply — pairs with the MInference block masks to give
+TM a real sparse-attention SELECTION path, not just a mask consumer. TM-native layout: SEPARATE
+code cache (uchar, num_slots x head_dim) + fp32 scale cache (num_slots x head_dim/qbs) indexed
+directly by slot_mapping (like the TurboQuant codec), not the reference's interleaved paged
+single-buffer. One simdgroup per (token, qblock), simd_max absmax (no threadgroup scratch);
+use_ue8m0 rounds the fp32 scale to a power of two. indexer_k_gather dequantizes back to bf16 for
+a slot list. Functional (clone-then-insert; untouched slots preserved).
+
+- Tests: fp32 scales bit-exact vs numpy (plain) / power-of-two + coverage (ue8m0); e4m3 codes
+  reconstruction-bounded (round-to-nearest-even ties differ from a numpy argmin — the repo's
+  fp8 contract); round-trip + slot<0 skip + untouched-slot preservation; 19 green + parity
+  (codes off-by-one across the two metallibs, scales 1e-4).
+- Perf: bandwidth-bound (reads bf16 K, writes u8 codes), 16384x128 0.062 ms; near-optimal
+  one-simdgroup/qblock. No further opt.
+- Deferred (documented): fused DSA sparse decode over the indexer cache (the consumer).
+
+## 2026-07-05: Wave-10 K4: vLLM v1 ragged rejection samplers — UNLABELED
+
+Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with the
+vLLM v1 ragged rejection pipeline TM's dense spec_verify_linear didn't cover:
+rejection_greedy_sample (argmax-match verify, no probs — no prior TM analogue),
+rejection_random_sample (stochastic u <= p_target/q_draft, recovered token a precomputed input),
+sample_recovered_tokens (argmax of max(0, p_t - q_d) * inv_q via a 32-lane simd reduction with
+smaller-id tie-break). Variable drafts/request via cu_num_draft_tokens (B+1,) with a leading 0;
+TM int32 ids; external-noise buffers (uniform_probs, inv_q) match the vLLM contract (host-
+generated, seed-reproducible). Output (B, max_draft+1) cleared to -1. One RejectionSampler
+primitive (kind selector). is_greedy per-request gate; no_draft_probs -> q=1.
+
+- Tests: each kernel vs a direct python transcription of the reference loop (exact int ids),
+  incl. the two-kernel pipeline (sample_recovered -> rejection_random); 6 green + parity atol=0.
+- Overhead-bound integer kernels (like the existing spec_verify_* / build_dynamic_tree) — no
+  bench entry.
+
+## 2026-07-05: Wave-10 K5: EAGLE spec-decode input-prep builders — UNLABELED
+
+Extended kernels/sampling/ (metal-forge sequence/spec_decode.metal; credit AlpinDale) with
+EAGLE's draft-input plumbing (zero prior TM coverage): eagle_prepare_inputs_padded (rejected =
+num_draft>0 ? num_draft+1-valid : 0; token_indices_to_sample, num_rejected),
+eagle_prepare_next_token_padded (next seed = last valid sampled or backup),
+eagle_step_slot_mapping_metadata (new_pos = min(pos+1, max_len); block-table -> paged slot;
+advance seq_lens; pad beyond the real batch), eagle_expand_int32 (broadcast a per-request scalar
+across its ragged token span with a replace substitution). Integer, one thread/request; TM int32;
+cu_* (B+1,) leading-0. One EagleMeta primitive (kind selector). Completes TM's spec-decode
+surface (verify + rejection + EAGLE prep).
+
+- Tests: each builder vs a direct python transcription (exact int32, incl. padded input_batch
+  and exceed-max-len paths); 5 green + parity atol=0. Overhead-bound integer kernels — no bench.
+- Deferred (documented): copy_and_expand_eagle_inputs (the full padded-batch layout builder) —
+  the four builders above cover the metadata a draft step needs.
+
+Wave-10 COMPLETE: K1 norm->quant matrix, K2 fp8 KV gather+scale-update, K3 DeepSeek indexer,
+K4 rejection samplers, K5 EAGLE prep. All credited to AlpinDale / metal-forge.
+
+## 2026-07-07: BitNet training kernel port — KEPT
+
+Status: landed.
+
+Current implementation: ported the production BitNet training kernels that were missing from
+QuixiCore Metal:
+`weight_quant_ternary` / `weight_quant_ternary_pt`, `fake_quant_int8`,
+`silu_mul_fake_quant_int8`, `kd_kl_topk_fwd` / `kd_kl_topk_bwd`, and `adamw_masked`.
+Added MLX primitives, PyTorch MPS wrappers, Metal source registration, manifest paths,
+correctness tests, MPS tests, and benchmark cases.
+
+Current public route: `tk.weight_quant_ternary`, `tk.weight_quant_ternary_pt`,
+`tk.fake_quant_int8`, `tk.silu_mul_fake_quant_int8`, `tk.kd_kl_topk_fwd`,
+`tk.kd_kl_topk_bwd`, and `tk.adamw_masked`; all auto-route to MLX or `tk_torch`
+based on tensor type.
+
+References inspected:
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/weight_quant_ternary.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/fake_quant.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/kd_kl_topk.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/optimizers/optim/adamw.metal`
+- `/Users/eric/BitNet/bitnet_train/metal/perf/bitnet_training_kernels.md`
+- Rejected after inspection: `/Users/eric/BitNet/bitnet_train/metal/kernels/bitnet/qgemm_bwd.metal`
+  and `/Users/eric/BitNet/bitnet_train/metal/kernels/matmul/gemm_v3/gemm_v3.metal`.
+  BitNet's notebook records `qgemm_bwd` losing to `torch.matmul` on every measured shape and
+  `gemm_v3` reaching 94-99% of MPS without beating it, so neither is a QuixiCore win to expose.
+
+Correctness:
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
+  passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test correctness -q
+  tests/correctness/quantization/weight_quant_ternary
+  tests/correctness/quantization/fake_quant tests/correctness/utils/kd_kl_topk
+  tests/correctness/optimizers/optim/test_adamw.py` ran the correctness suite and passed:
+  1420 passed, 27 skipped.
+- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/build pytorch_mps` passed.
+- `PYTHON=/Users/eric/BitNet/.venv/bin/python ./scripts/test mps -q` passed:
+  452 passed.
+
+Focused perf run:
+- Integration path: MLX Python extension.
+- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Xcode 26.6
+  (17F113), Metal 32023.883, Python 3.12.9, MLX 0.21.1.
+- Working-tree label: `e484dc7-dirty`.
+- Command: `/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python perf/bench_kernels.py
+  --backend mlx --preset quick --kernel fake_quant,weight_quant_ternary,kd_kl_topk,adamw_masked
+  --warmup 5 --iters 20 --out-dir perf/results/2026-07-07/bitnet-port-quick`
+- Raw results: `perf/results/2026-07-07/bitnet-port-quick/`.
+
+| kernel | dtype/path | shape | median ms | p20/p80 ms | CV | baseline | speedup | rel err | decision |
+|---|---|---:|---:|---:|---:|---|---:|---:|---|
+| fake_quant plain | bf16 MLX | T512 D2880 | 0.0200 | 0.0195/0.0216 | 0.5619 | quantize_then_dequant 0.0438 | 2.19 | 6.45e-03 | keep |
+| fake_quant swiglu | bf16 MLX | T512 D2880 | 0.0320 | 0.0304/0.0415 | 0.3738 | swiglu_then_quant_dequant 0.0631 | 1.97 | 3.46e-03 | keep |
+| fake_quant plain | bf16 MLX | T4096 D2880 | 0.1383 | 0.1351/0.1953 | 0.5535 | quantize_then_dequant 0.3286 | 2.38 | 5.95e-03 | keep |
+| fake_quant swiglu | bf16 MLX | T4096 D2880 | 0.2851 | 0.2766/0.3211 | 0.2518 | swiglu_then_quant_dequant 0.5296 | 1.86 | 3.39e-03 | keep |
+| weight_quant_ternary | bf16 MLX | N512 K2880 G32 | 0.0443 | 0.0441/0.0452 | 0.1691 | framework_deq_only 0.1323 | 2.99 | 2.88e-03 | keep |
+| weight_quant_ternary | bf16 MLX | N4096 K2880 G32 | 0.2877 | 0.2855/0.2943 | 0.1763 | framework_deq_only 0.9898 | 3.44 | 3.48e-03 | keep |
+| weight_quant_ternary_pt | bf16 MLX | E2 N512 K2880 | 0.0805 | 0.0793/0.0886 | 0.2181 | framework_deq_only 0.2986 | 3.71 | 2.30e-03 | keep |
+| kd_kl_topk tail0 | f32 MLX | T256 V32000 K32 | 0.5136 | 0.5023/0.5583 | 0.0539 | none | n/a | 1.66e-07 | keep |
+| kd_kl_topk tail1 | f32 MLX | T256 V32000 K32 | 0.4775 | 0.4701/0.4949 | 0.0584 | none | n/a | 8.30e-08 | keep |
+| kd_kl_topk tail0 | f32 MLX | T1024 V32000 K32 | 0.7561 | 0.7454/0.7716 | 0.2550 | none | n/a | 1.28e-07 | keep |
+| kd_kl_topk tail1 | f32 MLX | T1024 V32000 K32 | 0.7493 | 0.7386/0.7636 | 0.2480 | none | n/a | 6.38e-08 | keep |
+| adamw_masked mode0 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3177 | 0.3141/0.3283 | 0.3174 | unmasked_adamw 0.2981 | 0.94 | 5.38e-08 | keep as semantic path |
+| adamw_masked mode1 | f32 MLX | numel 4194304 seg256 active 0.650 | 0.3435 | 0.3385/0.3496 | 0.1060 | unmasked_adamw 0.2914 | 0.85 | 5.38e-08 | keep as semantic path |
+| adamw_masked mode0 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.2584 | 1.1901/1.6126 | 0.1472 | unmasked_adamw 1.1074 | 0.88 | 5.33e-08 | keep as semantic path |
+| adamw_masked mode1 | f32 MLX | numel 16777216 seg256 active 0.653 | 1.0982 | 1.0900/1.1216 | 0.1075 | unmasked_adamw 1.1169 | 1.02 | 5.32e-08 | keep as semantic path |
+
+Decision: keep the production BitNet kernels. `fake_quant*` and `weight_quant_ternary*`
+are clear wins over decomposed framework paths. `kd_kl_topk` has no useful decomposed baseline
+because its value is avoiding dense teacher materialization, but the sparse fwd+bwd path passed
+dense-reference checks and is fast enough for the intended training route. `adamw_masked` is
+not a speedup over unmasked AdamW and should not be marketed as one; it is kept for the segment
+mask semantics. Reject `qgemm_bwd` and `gemm_v3` for this port because the source project's own
+measurements do not show a Metal win.
+
+Open questions: add a future dense-teacher KD baseline if a training harness exposes the exact
+end-to-end loss path; revisit `adamw_masked` only if segment sparsity is high enough to justify
+a compacted-index variant.
+
+## 2026-07-07: BitNet remaining kernel parity port — KEPT
+
+Status: landed as parity/coverage; no performance claim.
+
+Current implementation: ported the remaining first-party BitNet Metal kernels that were absent
+from QuixiCore Metal: `attn_decode`, `fake_quant_fp8`, `kd_kl_dense`, `qgemm_bwd`,
+`qgemm_w2a8_fused`, `quantize_tq2_0`, `ternary_stats`, and `gemm_v3`. Also added
+`tq2_0` dequant/GEMM/GEMV/MoE format support, `qgemv_w2a8_v2`, dynamic-width `rms_norm`,
+and MoE backward helpers.
+
+Current public route: MLX and PyTorch MPS bindings expose the new kernels through `tk` and
+`tk_torch`; manifests include the new paths and `tq2_0` format metadata.
+
+References inspected:
+- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/torch_kernels.mm`
+- `/Users/eric/BitNet/bitnet_train/metal/tk_torch/__init__.py`
+- `/Users/eric/BitNet/bitnet_train/metal/kernels/`
+
+Correctness:
+- Hardware/toolchain: Apple M4 Max MacBook Pro, macOS 26.5.1 (25F80), Metal 32023.883,
+  Python 3.12.9.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build python`
+  passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/build pytorch_mps`
+  passed.
+- `PYTHONPATH=/Users/eric/QuixiCore/QuixiCore-Metal/bindings/pytorch_mps
+  /Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python -c 'import tk_torch; ...'`
+  compiled/imported the PyTorch metallib and ObjC++ extension; all checked new symbols were present.
+- Targeted correctness command:
+  `.venv/bin/python -m pytest -q tests/correctness/quantization/quantize_tq2_0
+  tests/correctness/quantization/ternary_stats tests/correctness/utils/kd_kl_dense
+  tests/correctness/attention/attn_decode tests/correctness/quantization/qgemv_int/test_qgemv_int.py`
+  passed: 14 passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test mps -q`
+  passed: 452 passed.
+- `PYTHON=/Users/eric/QuixiCore/QuixiCore-Metal/.venv/bin/python ./scripts/test python -q`
+  passed: 44 passed.
+- Direct PyTorch MPS smoke checked `quantize_tq2_0`, dense KD-KL fwd/bwd, and `attn_decode`
+  against CPU references; passed.
+
+Baseline: not run for this parity port.
+
+Experiments: none. This was a source/API parity port, not a focused optimization pass.
+
+Decision: keep the ported kernels as coverage and interoperability surface. The previous
+performance decision for `qgemm_bwd` and `gemm_v3` still stands: do not present them as Metal
+speedups without a new focused benchmark showing a win on priority shapes.
+
+Open questions: run a focused benchmark before any future speedup claim or routing preference
+change for these kernels.
+
+## 2026-07-13: Fused and specialized kernel integration pass — UNLABELED
 
 Focused hypothesis: the specialized kernels should win when fusion removes an
 intermediate tensor or packed GGUF reads avoid expanded weights. Serial
@@ -1507,7 +1285,7 @@ and packed qgemv+argmax for the Q6_K LM-head routing comparison. No speed claim
 is made for the five retained non-default kernels. The implementations and
 benchmark routing are accepted with the keep/reject decisions above.
 
-## 2026-07-13: Packed embedding, decode, sparse projection, spatial, and cache-attention pass
+## 2026-07-13: Packed embedding, decode, sparse projection, spatial, and cache-attention pass — CANDIDATE
 
 Status: candidate; correctness and focused performance work complete.
 
@@ -1674,7 +1452,7 @@ Raw results:
 - `perf/results/2026-07-13/new-kernels-final-smoke/`
 - `perf/results/2026-07-13/new-kernels-final-quick/`
 
-## 2026-07-13: New-kernel second optimization pass
+## 2026-07-13: New-kernel second optimization pass — UNLABELED
 
 Status: complete. This pass supersedes the launch/decode conclusions in the
 preceding entry where explicitly noted; the earlier measurements remain above
@@ -1837,7 +1615,7 @@ Raw results:
   `new-kernels-second-pass-cache-mps-quick/`, and
   `new-kernels-second-pass-cache-mps-comprehensive/`.
 
-## 2026-07-13: Cross-kernel follow-ups and optimization pass
+## 2026-07-13: Cross-kernel follow-ups and optimization pass — UNLABELED
 
 Status: complete. This entry implements the follow-ups identified after the
 new-kernel passes: whole-block q4_0 LM-head decode, factorized pairwise MLP,
@@ -2002,7 +1780,303 @@ Raw results:
   `cross-kernel-attn-decode-shared32-launch8/`, and
   `cross-kernel-attn-decode-final-route-repeat/`.
 
-## 2026-07-14: MXFP8 inference coverage completion
+## 2026-07-13: NVFP4 inference decode and output-projection pass — KEPT
+
+Status: landed; retained implementations have passed focused performance and
+repository-wide correctness/parity validation.
+
+Current implementation:
+
+- `dequant_into_register` uses an NVFP4-specific row-fragment decoder for the
+  `{c,c+1,c+8,c+9,c+16,c+17,c+24,c+25}` register layout. It reads the two E4M3
+  scales and four packed bytes needed by the fragment once, preserving the
+  established half-rounded tile contract.
+- `dequant_into_register_col` uses an NVFP4 two-block decoder for the
+  `{c,c+8,c+16,c+24}` column fragment used by rectangular MoE kernels.
+- Fused decode epilogue and SwiGLU kernels consume a complete 16-value NVFP4
+  block per lane. Their decoder keeps scale/code products in fp32 to match the
+  public one-final-rounding contract.
+- Quantized LM-head sampling uses a whole-block half-rounded decoder, while
+  masked and CSR-candidate projection use a whole-block fp32 decoder. NVFP4 is
+  exposed for argmax/categorical/top-k/top-p sampling, masked/candidate output
+  projection, and exact beam advance in MLX and PyTorch MPS.
+- The MLX CMake target now tracks every `include/metal/*.metal` file as a
+  metallib dependency. This prevents header-only decoder changes from leaving
+  a stale incremental-build metallib, which was observed during this pass.
+
+Current public route:
+
+- QGEMM/QFlux keep their existing direct launch geometry and use the new
+  row-fragment decoder. Rectangular MoE keeps four warps and uses the new
+  column-fragment decoder.
+- Decode epilogue/SwiGLU and sequential LM-head row dots use complete-block
+  NVFP4 decode.
+- Beam advance keeps row-wise no-logits fusion for at most four rows and routes
+  larger row batches through packed QGEMM, matching the existing q4_0 policy.
+
+References inspected: existing repository q4_0 whole-block decoders and the
+local NVFP4 `{E4M3 scale, 8 packed E2M1 bytes}` format contract. No external
+implementation code was imported.
+
+Correctness:
+
+- Hardware/toolchain: MacBook Pro (Mac16,5), Apple M4 Max, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Metal 32023.883; Python 3.12.9; MLX 0.21.1.
+- Working-tree label: `c880769-dirty`.
+- QGEMM/QFlux focused suite: 174 passed after the row-fragment change.
+- Quantized MoE focused suite: 18 passed for each tested warp topology and the
+  retained column decoder.
+- `pytest tests/correctness/matmul/decode_linear/test_decode_linear.py -q`:
+  47 passed.
+- `pytest tests/correctness/quantization/lm_head/test_lm_head.py -q`:
+  90 passed before beam coverage was added; subsequent NVFP4 sampling, sparse,
+  and beam subsets passed 9, 1, and 4 cases respectively.
+- Final builds: `scripts/build kernels` and `scripts/build pytorch_mps` passed.
+  Touching `dequant.metal` then rerunning the incremental MLX build emitted
+  `Building mlx_ext.metallib`, validating the new header dependency tracking.
+- Final suites: `scripts/test correctness -q` passed 2085 tests;
+  `scripts/test parity -q` passed 412; `scripts/test mps -q` passed 472.
+- Final benchmark reference errors were `2.29e-7` relative for decode epilogue,
+  `2.39e-7` for SwiGLU, and zero selected-id error for masked/candidate paths.
+
+Focused commands (MLX integration path, `--warmup 10 --iters 40`):
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemm,qflux,moe_q --formats nvfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/nvfp4-experiments-baseline
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel decode_linear_epilogue,decode_swiglu --formats nvfp4 \
+  --warmup 10 --iters 40 --out-dir <variant-directory>
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
+  --formats nvfp4 --warmup 10 --iters 40 --out-dir <variant-directory>
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam \
+  --formats nvfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/nvfp4-experiments-final
+```
+
+Fragment decoder results (median milliseconds; brackets are p20/p80, followed
+by coefficient of variation):
+
+| Path / shape | Baseline | Candidate | Change | Decision |
+|---|---:|---:|---:|---|
+| QGEMM N4096 K4096 M32 | 0.1291 [0.1235/0.1398], CV .1009 | 0.1151 [0.1132/0.1234], CV .0758 | -10.9% | keep row decoder |
+| QGEMM N4096 K4096 M128 | 0.4307 [0.4160/0.4566], CV .0495 | 0.3745 [0.3623/0.4050], CV .0577 | -13.1% | keep row decoder |
+| QGEMM N4096 K4096 M512 | 1.5207 [1.4695/1.5748], CV .0374 | 1.3976 [1.3577/1.4745], CV .0412 | -8.1% | keep row decoder |
+| QFlux N4096 K4096 M128 | 0.4050 [0.3951/0.4333], CV .0600 | 0.3686 [0.3619/0.3950], CV .0545 | -9.0% | keep row decoder |
+| MoE E4 K2880 N2880 rows32 | 0.1782 [0.1584/0.2629], CV .2714 | 0.1779 [0.1554/0.2601], CV .3496 | flat | keep for larger shape |
+| MoE E4 K2880 N2880 rows512 | 0.8255 [0.7734/0.8970], CV .0680 | 0.7269 [0.7096/0.8144], CV .0672 | -11.9% | keep column decoder |
+
+Whole-block fused results compare the un-specialized generic NVFP4 integration
+against the complete-block decoder:
+
+| Path / shape | Generic median ms | Whole-block median ms | Change | Candidate p20/p80, CV | Decision |
+|---|---:|---:|---:|---:|---|
+| Decode epilogue B1 K1536 N4096 | 0.0752 | 0.0223 | -70.3% | 0.0194/0.0277, .7636 | keep; repeat 0.0170 ms |
+| Decode SwiGLU B1 K1536 N4096 | 0.1589 | 0.0244 | -84.6% | 0.0238/0.0257, .2510 | keep; repeat 0.0300 ms |
+| LM-head top-k T1 V32000 K4096 | 0.4008 | 0.2967 | -26.0% | 0.2867/0.3211, .0999 | keep; repeat 0.2926 ms |
+| LM-head top-k T8 V32000 K4096 | 1.4058 | 1.3460 | -4.2% | 1.3157/1.4519, .0528 | keep; repeat 1.3486 ms |
+| Masked T1 V8192 K1024 legal256 | 0.1051 | 0.0406 | -61.4% | 0.0379/0.0512, .2151 | keep; repeat 0.0457 ms |
+| Masked T8 V8192 K1024 legal64 | 0.0569 | 0.0425 | -25.4% | 0.0414/0.0498, .2100 | keep; repeat 0.0425 ms |
+| Candidates T1 V8192 K1024 C256 | 0.0778 | 0.0400 | -48.6% | 0.0389/0.0443, .0988 | keep; repeat 0.0404 ms |
+| Candidates T8 V8192 K1024 C64 | 0.0327 | 0.0169 | -48.5% | 0.0163/0.0213, .2786 | keep; repeat 0.0164 ms |
+| Beam B1 BM4 V32000 K4096 | 0.8477 | 0.8152 | -3.8% | 0.8065/0.8289, .0284 | keep shared decoder |
+| Beam B4 BM4 V32000 K4096 | 0.9823 | 0.9831 | flat | 0.9714/1.0088, .0221 | keep QGEMM route |
+
+Final retained run medians were 0.1121/0.3582/1.3264 ms for QGEMM M32/M128/M512,
+0.3581 ms for QFlux M128, 0.1360/0.6980 ms for MoE rows32/rows512,
+0.0187/0.0246 ms for decode epilogue/SwiGLU, 0.2854/1.3310 ms for LM-head
+top-k T1/T8, 0.0329/0.0422 ms for masked T1/T8, 0.0346/0.0163 ms for
+candidate T1/T8, and 0.8216/0.9794 ms for beam B1/B4. Per-case p20/p80,
+CV, bandwidth, and baseline data are in the final JSONL.
+
+Rejected experiments:
+
+- Two-warp, 64-row decoded-weight reuse: M128 was 0.3686 versus 0.3602 ms
+  direct (+2.3%); M512 was 1.3667 versus 1.3630 ms (flat). Reject the extra
+  barriers and routing.
+- Four-warp, 128-row decoded-weight reuse: repeat medians were 0.3589 versus
+  0.3643 ms direct at M128 and 1.3566 versus 1.3692 ms at M512 (only 1.5% and
+  0.9%). It still trails resident fp16 matmul and does not justify a second
+  pipeline or synchronization cost. Reject.
+- Rectangular MoE at two warps: rows32 improved only 1.7% (0.1748 versus
+  0.1779 ms) while rows512 was flat/slightly worse (0.7281 versus 0.7269 ms).
+  One warp regressed rows32 to 0.3136 ms and rows512 to 0.7347 ms. Keep four.
+- Forcing 16 NVFP4 beam rows through serial row fusion regressed 0.9831 to
+  2.6393 ms. Keep the packed-QGEMM route above four rows.
+
+Decision: keep both fragment decoders, all three whole-block decoder uses, and
+the new NVFP4 fused inference coverage. Reject decoded-weight sharing, reduced
+MoE warp counts, and the larger-row beam routing change. The main remaining
+QGEMM opportunity is a different matrix execution strategy; small launch or
+barrier variations did not pay for their complexity.
+
+Open questions: profile instruction mix/register pressure for the complete-block
+decode at larger hidden sizes; revisit T8 LM-head sampling only with a design
+that shares packed weights across rows without materializing logits.
+
+Raw results:
+
+- Baseline/fragment runs: `nvfp4-experiments-baseline`,
+  `nvfp4-experiments-row-fragment`, `nvfp4-experiments-column-fragment`.
+- Rejected launch runs: `nvfp4-experiments-reuse-m64-controlled`,
+  `nvfp4-experiments-reuse-m128-controlled`,
+  `nvfp4-experiments-reuse-m128-repeat`, `nvfp4-experiments-moe-w1`,
+  `nvfp4-experiments-moe-w2`, `nvfp4-experiments-lm-head-beam-force-row`.
+- Fused decoder runs: `nvfp4-experiments-decode-generic`,
+  `nvfp4-experiments-decode-whole-block`,
+  `nvfp4-experiments-decode-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-generic`,
+  `nvfp4-experiments-lm-head-whole-block`,
+  `nvfp4-experiments-lm-head-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-sparse-generic`,
+  `nvfp4-experiments-lm-head-sparse-whole-block`,
+  `nvfp4-experiments-lm-head-sparse-whole-block-repeat`,
+  `nvfp4-experiments-lm-head-beam-generic`, and
+  `nvfp4-experiments-lm-head-beam-whole-block`.
+- Final retained run: `perf/results/2026-07-13/nvfp4-experiments-final/`.
+
+## 2026-07-13: MXFP4 inference coverage and hot-path pass — KEPT
+
+Status: candidate; retained implementations have passed focused benchmarks,
+repository-wide correctness/parity validation, both backend builds, and the
+Xcode test build.
+
+Current implementation:
+
+- MXFP4 is available in fused decode epilogue/SwiGLU, LM-head
+  argmax/categorical/top-k/top-p sampling, packed-mask and CSR-candidate output
+  projection, and exact beam advance on MLX and PyTorch MPS.
+- QGEMV has an MXFP4 whole-block kernel: one lane consumes the 32 weights behind
+  one E8M0 scale instead of invoking four 8-value span decoders per block.
+- Decode/SwiGLU and LM-head sequential dots likewise consume complete 32-value
+  blocks. Decode and sparse projection keep scale/code products in fp32 where
+  their public contract requires one final rounding; the sampler preserves its
+  established half-rounded dequant contract.
+- `tk_e8m0_decode_f32` reconstructs E8M0 powers of two directly from IEEE-754
+  exponent bits, including the code-zero subnormal and code-255 infinity cases.
+  The float 8-value decoder used by packed embedding lookup and the retained
+  complete-block paths use it instead of a transcendental `exp2`.
+- Generic half fragment decode remains unchanged for QGEMM/QFlux. The
+  four-column MoE decoder also retains native half `exp2`; controlled variants
+  did not improve their full priority shape sets.
+
+Current public route:
+
+- Packed decode and LM-head operations dispatch directly to their MXFP4 Metal
+  instantiations. Beam advance uses row-wise no-logits fusion for at most four
+  rows and the existing packed QGEMM route above four rows when the vocabulary
+  is matrix-tile aligned.
+- MXFP4 QGEMV dispatches to the complete-block kernel. QGEMM, QFlux, and
+  quantized MoE retain their previous launch geometry and generic decoders.
+
+References inspected: the repository's existing MXFP4
+`{E8M0 scale, 16 packed E2M1 bytes}` contract, q4_0 complete-block kernels, and
+the preceding NVFP4 inference pass. No external implementation code was
+imported.
+
+Environment and method:
+
+- Hardware/toolchain: MacBook Pro Mac16,5, Apple M4 Max, 128 GB; macOS 26.5.1
+  (25F80); Xcode 26.6 (17F113); Metal 32023.883 / Metal toolchain 17.6.109.0;
+  Python 3.12.9; MLX 0.21.1; PyTorch 2.12.1 MPS.
+- Working-tree label: `3cab797-dirty`.
+- Performance integration path: MLX Python extension, format `mxfp4`, fp16
+  QGEMV/QGEMM/QFlux/MoE and embedding inputs, and fp32 fused decode/LM-head
+  inputs. The harness performs its clock ramp and at least 50 ms of per-thunk
+  warmup, adaptively batches calls to at least 2 ms per sample, synchronizes
+  each sample, and reports per-call median, p20/p80, and CV.
+- All focused runs requested 10 warmups and 40 measured samples. The initial
+  and final commands were:
+
+```bash
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemv,qgemm,qflux,moe_q --formats mxfp4 \
+  --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/mxfp4-inference-baseline
+.venv/bin/python perf/bench_kernels.py --backend mlx --preset quick \
+  --kernel qgemv,qgemm,qflux,moe_q,decode_linear_epilogue,decode_swiglu,lm_head_q,lm_head_masked,lm_head_candidates,lm_head_beam,quantized_embedding \
+  --formats mxfp4 --warmup 10 --iters 40 \
+  --out-dir perf/results/2026-07-13/mxfp4-inference-final
+```
+
+Correctness and validation:
+
+- `scripts/build kernels` and `scripts/build pytorch_mps` passed.
+- `scripts/test correctness -q`: 2110 passed.
+- `scripts/test parity -q`: 420 passed, including MXFP4 decode, sampling,
+  top-p, sparse projection, and beam parity.
+- `scripts/test mps -q`: 472 passed.
+- `scripts/test xcode`: test build succeeded for the shared primitive target.
+- The final benchmark observed relative errors of `8.23e-7` and `8.94e-5`
+  for QGEMV, `2.32e-7` for decode epilogue, `2.07e-7` for SwiGLU, and zero
+  selected-id error for masked/candidate projection. Structured sampling and
+  beam outputs are covered by exact-id tests.
+
+Retained QGEMV results compare the original generic 8-value-span kernel with
+the final whole-block route. Times are milliseconds; brackets contain p20/p80,
+followed by CV.
+
+| Shape | Original | Final | Change | Final packed-weight GB/s |
+|---|---:|---:|---:|---:|
+| N4096 K4096 | 0.0331 [0.0325/0.0340], .0621 | 0.0269 [0.0261/0.0284], .0777 | -18.7% | 331 |
+| N11008 K4096 | 0.0786 [0.0775/0.0857], .0567 | 0.0539 [0.0515/0.0570], .0831 | -31.4% | 444 |
+
+The new fused-operation controls used the simplest correct generic MXFP4
+integration before complete-block specialization. Final values include the
+retained complete-block and E8M0 bit-reconstruction changes.
+
+| Path / shape | Generic control ms | Final ms [p20/p80], CV | Change | Error / check |
+|---|---:|---:|---:|---:|
+| Decode epilogue B1 K1536 N4096 | 0.0240 | 0.0191 [0.0187/0.0195], .0736 | -20.4% | 2.32e-7 rel |
+| Decode SwiGLU B1 K1536 N4096 | 0.0373 | 0.0292 [0.0279/0.0341], .1261 | -21.9% | 2.07e-7 rel |
+| LM-head top-k T1 V32000 K4096 | 0.5141 | 0.2754 [0.2722/0.2807], .0348 | -46.4% | exact selected ids |
+| LM-head top-k T8 V32000 K4096 | 2.1984 | 1.2691 [1.2586/1.2952], .0198 | -42.3% | exact selected ids |
+| Masked T1 V8192 K1024 legal256 | 0.0834 | 0.0313 [0.0303/0.0340], .0969 | -62.4% | exact ids/log-probs |
+| Masked T8 V8192 K1024 legal64 | 0.0564 | 0.0429 [0.0398/0.0462], .0946 | -24.0% | exact ids/log-probs |
+| Candidates T1 V8192 K1024 C256 | 0.0574 | 0.0366 [0.0356/0.0379], .0901 | -36.3% | exact ids/log-probs |
+| Candidates T8 V8192 K1024 C64 | 0.0185 | 0.0162 [0.0160/0.0169], .1085 | -12.3% | exact ids/log-probs |
+| Beam B1 BM4 V32000 K4096 | 1.2039 | 0.7713 [0.7674/0.7852], .0215 | -35.9% | exact token/parent |
+| Beam B4 BM4 V32000 K4096 | 0.9835 | 0.9739 [0.9655/0.9906], .0162 | flat | exact token/parent |
+
+Controlled experiments and decisions:
+
+| Factor | Priority control | Candidate / repeat | Decision |
+|---|---:|---:|---|
+| Packed embedding E8M0 `exp2` -> bit reconstruction, T1/T256 R8192 D1024 | 0.01169 / 0.02205 ms | 0.00959 / 0.02182 ms | Keep; T1 improves 17.9%, T256 is flat, outputs exact. Candidate p20/p80 were 0.00934/0.01032 and 0.02112/0.02263 ms. |
+| LM-head generic spans -> whole 32-value block, top-k T1/T8 | 0.5141 / 2.1984 ms | 0.3558 / 1.2619 ms | Keep; 30.8% / 42.6%. |
+| E8M0 bit reconstruction after whole-block LM-head, top-k T1/T8 | 0.3558 / 1.2619 ms | 0.2618 / 1.2811 ms | Keep for decode-priority T1 and shared paths; T8 movement is within the central bands. |
+| MXFP4 row-fragment specialization, QGEMM M32/M128/M512 | 0.0998 / 0.3611 / 1.3302 ms | first 0.1058 / 0.3524 / 1.3102; repeat 0.1207 / 0.3588 / 1.3193 ms | Reject; M32 regressed and larger shapes were below the 3% keep threshold. Generic compiler CSE already amortizes the scale. |
+| Same row fragment, QFlux M128 | 0.3540 ms | 0.3557; repeat 0.3680 ms | Reject and restore generic decoder. |
+| Bit reconstruction in generic MMA decoder, QGEMM M32/M128/M512 | 0.0999 / 0.3527 / 1.2935 ms | 0.0976 / 0.3531 / 1.3034 ms | Reject; mixed/noisy and M512 regressed. Restore native half `exp2`. |
+| Bit reconstruction in four-column MoE decoder, rect rows32 / SwiGLU rows512 | 0.1089 / 1.9034 ms | repeat 0.1433 / 1.7532 ms | Reject global change: the 7.9% large-SwiGLU win does not justify the repeatable 31.6% decode-shape regression. Restore native half `exp2`. |
+
+Decision: keep the new MXFP4 inference coverage, complete-block QGEMV and
+sequential fused decoders, and exact E8M0 reconstruction in fp32 span/complete-
+block paths. Reject row-fragment specialization and generic MMA/MoE E8M0 bit
+reconstruction. Matrix and MoE paths remain intentionally unchanged.
+
+Open questions: a future matrix-path pass needs a genuinely different MXFP4
+execution strategy rather than more fragment temporaries. The large-row MoE
+SwiGLU bit-decoder result may justify a separately routed prefill kernel only
+if a shape-aware implementation can preserve the small-row decode path.
+
+Raw results:
+
+- Baseline/control/final: `mxfp4-inference-baseline`,
+  `mxfp4-coverage-generic`, and `mxfp4-inference-final` under
+  `perf/results/2026-07-13/`.
+- Retained variants: `mxfp4-coverage-whole-block`,
+  `mxfp4-decode-whole-block-repeat`, `mxfp4-coverage-e8m0-bits`,
+  `mxfp4-e8m0-bits`, `mxfp4-e8m0-bits-repeat`,
+  `mxfp4-embedding-e8m0-bits`, and `mxfp4-embedding-exp2`.
+- Rejected variants: `mxfp4-hotpaths-candidate`,
+  `mxfp4-row-fragment-repeat`, `mxfp4-pre-e8m0-bits`, and
+  `mxfp4-moe-column-exp2-restored`.
+
+## 2026-07-14: MXFP8 inference coverage completion — UNLABELED
 
 Status: complete for coverage. This pass instantiates the existing MXFP8
 decoders across packed embedding lookup/bag, decode linear epilogues and
@@ -2100,7 +2174,7 @@ Decisions and follow-ups:
 
 Raw results: `perf/results/2026-07-14/mxfp8-coverage-generic/`.
 
-## 2026-07-14: MXFP8 inference hot-path experiments
+## 2026-07-14: MXFP8 inference hot-path experiments — KEPT
 
 Status: complete. Retained variants pass focused and repository-wide
 correctness, parity, MPS, Metal, and Xcode validation. Performance claims are
@@ -2246,7 +2320,7 @@ Rejected runs are the other `mxfp8-exp-*` directories under
 `perf/results/2026-07-14/`, including the attention, global LUT, combined
 exponent, 4x32 QGEMM, hybrid MoE, and split-plane variants.
 
-## 2026-07-14: FP8 inference hot-path experiments
+## 2026-07-14: FP8 inference hot-path experiments — KEPT
 
 Status: candidate; the retained implementation passes the focused kernel
 build and 389 affected correctness cases. The changes are measured but not yet
@@ -2418,7 +2492,7 @@ Retained controlled runs are `fp8-paged-scale-hoist-{baseline,candidate}-d64-d12
 `fp8-*candidate` and MLA experiment directories under
 `perf/results/2026-07-14/`.
 
-## 2026-07-14: Cross-kernel FP8 transfer experiments
+## 2026-07-14: Cross-kernel FP8 transfer experiments — KEPT
 
 Status: complete; the retained implementation is measured and the focused,
 repository-wide, parity, and PyTorch MPS validations pass.
@@ -2533,7 +2607,7 @@ Restore all other source variants. Raw controls/candidates are under
 `decode-swiglu-mxfp8-two-warp-candidate` directories. The production-only
 confirmation is `cross-kernel-transfer-final-retained`.
 
-## 2026-07-22: mean_pool_rms_l2 — new embedding-pooling serving kernel
+## 2026-07-22: mean_pool_rms_l2 — new embedding-pooling serving kernel — UNLABELED
 
 Status: kept (small-M embedding pooling); large-M variant is future work.
 
@@ -2562,7 +2636,7 @@ row-parallel variant is the next optimization for long pooled sequences.
 
 Results: perf/results/2026-07-22/002351-torch-quick/
 
-## 2026-07-22: qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV)
+## 2026-07-22: qgemv_fused — fused packed-Q4_0 decode GEMVs (up+gate+GELU / up+gate / QKV) — UNLABELED
 
 Status: kept (up_gate_gelu and qkv are wins; up_gate is parity-to-win, kept for the
 fused-family API and single-launch coalescing).
@@ -2610,7 +2684,7 @@ standalone qgemv path is untouched), so nothing regresses.
 
 Results: perf/results/2026-07-22/004219-torch-comprehensive/
 
-## 2026-07-22: rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add)
+## 2026-07-22: rms_norm_residual_next — fused residual-stream seam (two RMSNorms + add) — UNLABELED
 
 Status: kept.
 
@@ -2646,7 +2720,7 @@ a couple of sub-0.02 ms small shapes wobble to parity (launch-latency noise). Ad
 
 Results: perf/results/2026-07-22/004943-torch-comprehensive/
 
-## 2026-07-22: qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store
+## 2026-07-22: qk_norm_rope_kv_f16 — qk_norm_rope with a fused f16 KV split-store — UNLABELED
 
 Status: kept.
 
@@ -2680,7 +2754,7 @@ norm-rope pass. Additive (the packed qk_norm_rope path is untouched).
 
 Results: perf/results/2026-07-22/005647-torch-comprehensive/
 
-## 2026-07-22: attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV)
+## 2026-07-22: attn_fwd_sg_d256 — simdgroup_matrix flash attention (D=256, GQA, f16 KV) — UNLABELED
 
 Status: kept.
 
@@ -2715,7 +2789,7 @@ attn_fwd path (D in {64,128}) does not cover. Additive; nothing regresses.
 
 Results: perf/results/2026-07-22/010655-torch-comprehensive/
 
-## 2026-07-23: canonical BaseQN dequant, GEMV, and GEMM routing
+## 2026-07-23: canonical BaseQN dequant, GEMV, and GEMM routing — KEPT
 
 Status: kept for the direct decode-GEMV and M>1 framework-GEMM route; rejected
 the direct decode-GEMM candidate for M>1.
@@ -2797,7 +2871,7 @@ Final verification: MLX extension build and PyTorch-MPS package build passed;
 passed 435, `scripts/test mps -q` passed 541, and the Xcode build-for-testing
 gate passed (only pre-existing compiler warnings).
 
-## 2026-07-23: BaseQN QKV and SwiGLU consumer fusion
+## 2026-07-23: BaseQN QKV and SwiGLU consumer fusion — KEPT
 
 Status: keep the short-K QKV grid and fused SwiGLU kernel; reject the combined
 QKV grid for long K and route that public operation to the three direct BaseQN
@@ -2878,7 +2952,7 @@ passed 435, and `scripts/test mps -q` passed 549. The first unqualified
 pytest; rerunning with `PYTHON=$PWD/.venv/bin/python` produced the recorded
 passing gate.
 
-## 2026-07-23: BaseQN greedy LM-head routing
+## 2026-07-23: BaseQN greedy LM-head routing — UNLABELED
 
 Status: operation kept via columnwise direct GEMV composition; both dedicated
 packed-reduction kernels rejected and removed.
@@ -2953,7 +3027,7 @@ without changing the sampling kernel. A focused repeat under
 1.6009, and 2.9103 ms, with overlapping distributions. Correctness then
 passed 2,237 tests, parity 435, MPS 565, and Xcode build-for-testing.
 
-## 2026-07-23: BaseQN grouped expert projection and SwiGLU
+## 2026-07-23: BaseQN grouped expert projection and SwiGLU — UNLABELED
 
 Status: keep direct register-tile expert decode; keep one simdgroup for the
 rectangular projection and four-way split-K only for fused expert SwiGLU.
@@ -3032,7 +3106,7 @@ passed 2,261 tests, `scripts/test parity -q` passed 441, and
 removed a test-fixture return regression; the recorded 580-test rerun is the
 clean final gate.
 
-## 2026-07-23: Positioned, partial, and multimodal RoPE
+## 2026-07-23: Positioned, partial, and multimodal RoPE — KEPT
 
 Status: keep the generic single-pass positioned/M-RoPE kernels and the fused
 Q/K RMSNorm variant.
@@ -3121,7 +3195,7 @@ PyTorch-MPS package rebuild, and Xcode build-for-testing passed.
 `scripts/test correctness -q` passed 2,285 tests, `scripts/test parity -q`
 passed 450, and `scripts/test mps -q` passed 589.
 
-## 2026-07-23: QuixiCore Q8_0 KV codec and direct paged read
+## 2026-07-23: QuixiCore Q8_0 KV codec and direct paged read — UNLABELED
 
 Status: keep the separate-plane storage ABI, exact safe-FP encoder, and direct
 dequant-on-read paged attention. The standalone codec is required format
@@ -3224,7 +3298,7 @@ compilation through both integrations, and Xcode build-for-testing passed.
 `scripts/test correctness -q` passed 2,300 tests, `scripts/test parity -q`
 passed 453, and `scripts/test mps -q` passed 593.
 
-## 2026-07-23: Gated DeltaNet preparation/output and sigmoid attention gate
+## 2026-07-23: Gated DeltaNet preparation/output and sigmoid attention gate — UNLABELED
 
 Status: keep all four GDN preparation/output kernels and the reusable GLU
 sigmoid-product mode. This is tensor-kernel coverage only; no model graph,
@@ -3318,7 +3392,7 @@ priority shape is at least 1.12x faster than the corresponding composition.
 The sequential `gdn_recur` remains the correctness baseline; chunk-parallel
 prefill is still a separate experiment and has no unmeasured route.
 
-## 2026-07-23: calibration reduction and final-logit softcap
+## 2026-07-23: calibration reduction and final-logit softcap — KEPT
 
 Status: keep both direct kernels. They complete reusable calibration and
 output-transform semantics; neither operation introduces a model graph,
@@ -3376,7 +3450,7 @@ Decision: retain both kernels. The short rows have timing-floor noise, but the
 p20/p80 intervals remain separated and the realistic larger cases confirm the
 same 2.87-3.34x conclusion.
 
-## 2026-07-23: fused low-rank adapter application and routing
+## 2026-07-23: fused low-rank adapter application and routing — UNLABELED
 
 Status: keep the fused direct decode/small-batch kernel and the conservative
 measured route; use framework F16 matmuls outside that route.
@@ -3422,7 +3496,7 @@ JSONL. Decision: use the contiguous, low-risk `M<=4 && rank<=16` direct region;
 keep the larger-rank direct implementation only as an explicit diagnostic
 route until a broader monotonic crossover is established.
 
-## 2026-07-23: BERT token/type embedding and masked normalized pooling
+## 2026-07-23: BERT token/type embedding and masked normalized pooling — UNLABELED
 
 Status: keep both direct kernels.
 
@@ -3452,7 +3526,7 @@ Command:
 | masked pool B4/T128/D768 | 0.03254 | 0.03020/0.03647 | .1745 | 0.09176 | 2.82x | keep |
 | masked pool B8/T512/D768 | 0.03327 | 0.03156/0.04016 | .2594 | 0.21679 | 6.52x | keep |
 
-## 2026-07-24: reusable vision patch, position, and pooling operations
+## 2026-07-24: reusable vision patch, position, and pooling operations — UNLABELED
 
 Status: keep interpolation and pooling direct. Keep the general direct patch
 gather for padded/overlapping semantics, but route canonical divisible,
@@ -3486,7 +3560,7 @@ Command:
 Patchify H224 has high CV at the timing floor, but the direct p20 is still
 more than four times the framework p80, so the rejection is unambiguous.
 
-## 2026-07-24: audio convolution and cross-attention routes
+## 2026-07-24: audio convolution and cross-attention routes — UNLABELED
 
 Status: retain general convolution semantics but use framework convolution by
 default; keep direct depthwise convolution with fused SiLU; use direct online
@@ -3540,7 +3614,7 @@ passed 464, `scripts/test mps -q` passed 604, and `scripts/test python -q`
 passed 44. The kernel registry parsed successfully and `git diff --check`
 reported no whitespace errors.
 
-## 2026-07-24: strict BaseRT vision/audio contract audit
+## 2026-07-24: strict BaseRT vision/audio contract audit — UNLABELED
 
 Status: keep factorized position, two-axis vision RoPE, causal depthwise, and
 blocked relative-attention kernels. Keep coordinate pooling as the general
@@ -3615,7 +3689,7 @@ valid; it cannot implement the public arbitrary-coordinate/padding contract.
 Raw results:
 `perf/results/2026-07-24/basert-contract-quick/`.
 
-## 2026-07-24: Qwen temporal patch and Gemma value-clip closure
+## 2026-07-24: Qwen temporal patch and Gemma value-clip closure — UNLABELED
 
 Status: keep the general direct NTHWC patch extractor, but route canonical
 divisible non-overlapping temporal/spatial patchification through framework
@@ -3682,7 +3756,7 @@ Raw results:
 `perf/results/2026-07-24/basert-qwen3d-routing/` and
 `perf/results/2026-07-24/basert-value-clip-routing/`.
 
-## 2026-07-24: explicit Qwen vision RoPE layout
+## 2026-07-24: explicit Qwen vision RoPE layout — UNLABELED
 
 Status: keep the direct global-split mode in `vision_rope_2d` and expose it as
 `qwen_vision_rope_2d`.
