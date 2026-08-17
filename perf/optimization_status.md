@@ -3798,3 +3798,33 @@ MLX and PyTorch-MPS builds passed; correctness passed 2,434 tests, cross-backend
 parity passed 464, direct MPS passed 604, Python package tests passed 44, and
 Xcode build-for-testing succeeded. Metadata parsing and `git diff --check`
 passed.
+
+## 2026-08-14 - DSV4 M1 Ultra serving-campaign port from SlimServe
+
+- Status: retained (port of measured, gated work)
+- Scope: DeepSeek V4 Flash 0731 serving kernels developed and measured in the
+  SlimServe tree (QuixiAI/SlimServe PR #2), ported back per the vendoring
+  contract. Apple M1 Ultra, macOS 15.7.2, Apple metal 32023.864.
+- New kernels: kernels/moe/moe_mm_id (qc_moe_mm_map0 work queue + 64-slot
+  dual-half iq2_xxs simdgroup-MMA tile + q2_K AoS/SoA down twins),
+  kernels/serving/dsv4_mhc (fused mHC pre/post incl. Sinkhorn),
+  kernels/serving/dsv4_router (top-k with bias/hash routes),
+  kernels/serving/moe_finalize (weighted sum), kernels/serving/rms_norm
+  (w32/strided variants), kernels/serving/swiglu.
+- Extended: mla.metal (prefill dequant scratch + dense-causal MMA FA,
+  split-K decode, fp16-direct inserts), qgemv.metal (multi-row MoE GEMVs,
+  sum-folded q2_K down, SoA planes, bf16 axis), qgemm.metal (wide-tile
+  transposed-store q8_0), indexer.metal, paged_attn_v2.metal,
+  dequant.metal, and tk_launch.h (launch ABI for all of the above).
+- Measured results (SlimServe serving stack on this box, exact-token
+  harness, 1k-in/2k-out and 2048-token prefill workloads): prefill 79 ->
+  371.6 tok/s (134% of the antirez ds4 reference's 277 on the same box);
+  decode 15 -> 30.5 tok/s end-to-end (ds4 bar 21.1 end-to-end / 25.5
+  decode-only: beaten). Correctness: bit-exact serving anchors (sha256 +
+  spec-decode counters) plus six kernel oracle tests in the SlimServe tree;
+  method and raw artifacts in SlimServe perf/optimization_status.md and
+  perf/baseline_status.md.
+- Port validation here: full metallib compiles from this tree's kernel set
+  (xcrun metal 3.1, all families); bindings/pytorch_mps/tk_torch/
+  torch_kernels.mm passes -fsyntax-only against the updated tk_launch.h.
+  In-repo benchmark wiring for the new kernels is follow-up work.
